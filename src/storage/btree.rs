@@ -43,6 +43,7 @@ pub const PTRMAP_OVERFLOW2: u8 = 4;
 pub const PTRMAP_BTREE: u8 = 5;
 
 bitflags! {
+    #[derive(Clone, Copy)]
     pub struct BtreeOpenFlags: u8 {
         const OMIT_JOURNAL = 0x01;
         const MEMORY = 0x02;

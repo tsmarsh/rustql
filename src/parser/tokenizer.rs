@@ -480,6 +480,11 @@ impl<'a> Tokenizer<'a> {
             return self.scan_number();
         }
 
+        // Blob literals (must check before identifiers since X is alphabetic)
+        if (c == b'x' || c == b'X') && self.peek() == Some(b'\'') {
+            return self.scan_blob();
+        }
+
         // Identifiers and keywords
         if c.is_ascii_alphabetic() || c == b'_' {
             return self.scan_identifier();
@@ -493,11 +498,6 @@ impl<'a> Tokenizer<'a> {
         // Strings
         if c == b'\'' {
             return self.scan_string();
-        }
-
-        // Blob literals
-        if (c == b'x' || c == b'X') && self.peek() == Some(b'\'') {
-            return self.scan_blob();
         }
 
         // Operators and punctuation

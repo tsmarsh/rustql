@@ -596,19 +596,37 @@ impl QueryPlanner {
         table_info: &[(String, Option<String>, u64)],
         term: &mut WhereTerm,
     ) -> Result<()> {
-        match term.expr.as_mut() {
-            Expr::Binary { left, right, .. } => {
-                let left_is_column = matches!(left.as_ref(), Expr::Column(_));
-                let right_is_column = matches!(right.as_ref(), Expr::Column(_));
-                if !left_is_column && right_is_column {
-                    where_expr::commute_comparison(term.expr.as_mut());
+        let needs_commute = match term.expr.as_ref() {
+            Expr::Binary { op, left, right } => {
+                let is_comparison = matches!(
+                    op,
+                    BinaryOp::Eq
+                        | BinaryOp::Ne
+                        | BinaryOp::Lt
+                        | BinaryOp::Le
+                        | BinaryOp::Gt
+                        | BinaryOp::Ge
+                        | BinaryOp::Is
+                        | BinaryOp::IsNot
+                );
+                if !is_comparison {
+                    false
+                } else {
+                    let left_is_column = matches!(left.as_ref(), Expr::Column(_));
+                    let right_is_column = matches!(right.as_ref(), Expr::Column(_));
+                    !left_is_column && right_is_column
                 }
+            }
+            _ => false,
+        };
 
-                let op = match term.expr.as_ref() {
-                    Expr::Binary { op, .. } => op,
-                    _ => return Ok(()),
-                };
+        if needs_commute {
+            where_expr::commute_comparison(term.expr.as_mut());
+        }
 
+        let expr = term.expr.clone();
+        match expr.as_ref() {
+            Expr::Binary { op, left, .. } => {
                 term.op = Some(match op {
                     BinaryOp::Eq => TermOp::Eq,
                     BinaryOp::Ne => TermOp::Ne,
@@ -628,7 +646,7 @@ impl QueryPlanner {
                     _ => 0.25,
                 };
 
-                let left = match term.expr.as_ref() {
+                let left = match expr.as_ref() {
                     Expr::Binary { left, .. } => left,
                     _ => return Ok(()),
                 };
@@ -676,7 +694,7 @@ impl QueryPlanner {
                 });
                 term.selectivity = 0.25;
                 term.flags |= WhereTermFlags::LIKE;
-                if let Expr::Like { pattern, .. } = term.expr.as_ref() {
+                if let Expr::Like { pattern, .. } = expr.as_ref() {
                     if Self::like_prefix(pattern, *op) {
                         term.flags |= WhereTermFlags::LIKE_PREFIX;
                     }

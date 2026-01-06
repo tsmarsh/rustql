@@ -9,6 +9,7 @@ pub mod executor;
 pub mod functions;
 pub mod os;
 pub mod util;
+pub mod schema;
 
 // Re-export main public types
 pub use error::{Error, Result};

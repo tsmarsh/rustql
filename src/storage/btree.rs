@@ -20,6 +20,7 @@ pub const BTREE_AUTOVACUUM_INCR: u8 = 2;
 
 pub const BTREE_INTKEY: u8 = 1;
 pub const BTREE_BLOBKEY: u8 = 2;
+pub const BTREE_HINT_RANGE: u8 = 0;
 
 pub const BTREE_FREE_PAGE_COUNT: usize = 0;
 pub const BTREE_SCHEMA_VERSION: usize = 1;
@@ -152,6 +153,27 @@ pub struct BtShared {
     pub preformat_size: i32,
 }
 
+impl BtShared {
+    fn update_payload_params(&mut self) {
+        let usable = self.usable_size;
+        if usable < 480 {
+            return;
+        }
+        let usable_minus = usable.saturating_sub(12);
+        let max_local = usable_minus.saturating_mul(64) / 255;
+        let min_local = usable_minus.saturating_mul(32) / 255;
+        self.max_local = max_local.saturating_sub(23) as u16;
+        self.min_local = min_local.saturating_sub(23) as u16;
+        self.max_leaf = usable.saturating_sub(35) as u16;
+        self.min_leaf = self.min_local;
+        self.max_payload_1byte = if self.max_local > 127 {
+            127
+        } else {
+            self.max_local as u8
+        };
+    }
+}
+
 pub struct BtCursor {
     pub state: CursorState,
     pub cur_flags: BtCursorFlags,
@@ -194,6 +216,7 @@ pub struct MemPage {
     pub n_overflow: u8,
     pub first_freeblock: u16,
     pub mask_page: u16,
+    pub n_free: i32,
 }
 
 pub struct BtreePayload {
@@ -228,6 +251,44 @@ impl Default for CellInfo {
 pub struct KeyInfo;
 
 pub struct UnpackedRecord;
+
+pub struct IntegrityCheckResult {
+    pub errors: Vec<String>,
+}
+
+pub fn integrity_check(
+    _db: &dyn Connection,
+    _btree: &Btree,
+    _roots: &[Pgno],
+    _max_errors: i32,
+) -> Result<IntegrityCheckResult> {
+    Err(Error::new(ErrorCode::Internal))
+}
+
+pub fn fake_valid_cursor(btree: Arc<Btree>) -> BtCursor {
+    BtCursor {
+        state: CursorState::Valid,
+        cur_flags: BtCursorFlags::empty(),
+        cur_pager_flags: PagerGetFlags::empty(),
+        hints: CursorHints::empty(),
+        skip_next: 0,
+        btree: Arc::clone(&btree),
+        overflow: Vec::new(),
+        key: None,
+        bt_shared: Arc::downgrade(&btree.shared),
+        next: None,
+        info: CellInfo::default(),
+        n_key: 0,
+        root_page: 0,
+        i_page: -1,
+        cur_int_key: false,
+        ix: 0,
+        idx_stack: Vec::new(),
+        key_info: None,
+        page: None,
+        page_stack: Vec::new(),
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct PageLimits {
@@ -299,6 +360,15 @@ fn read_varint32(data: &[u8], offset: usize) -> Result<(u32, usize)> {
 
 impl MemPage {
     pub fn parse(pgno: Pgno, data: Vec<u8>, limits: PageLimits) -> Result<Self> {
+        Self::parse_with_shared(pgno, data, limits, None)
+    }
+
+    pub fn parse_with_shared(
+        pgno: Pgno,
+        data: Vec<u8>,
+        limits: PageLimits,
+        shared: Option<&BtShared>,
+    ) -> Result<Self> {
         let header_start = limits.header_start();
         if data.len() < header_start + 8 {
             return Err(Error::new(ErrorCode::Corrupt));
@@ -328,7 +398,7 @@ impl MemPage {
         let child_ptr_size = if is_leaf { 0 } else { 4 };
         let mask_page = limits.page_size.wrapping_sub(1) as u16;
 
-        Ok(Self {
+        let mut page = Self {
             pgno,
             data,
             is_init: true,
@@ -347,7 +417,15 @@ impl MemPage {
             n_overflow: 0,
             first_freeblock,
             mask_page,
-        })
+            n_free: -1,
+        };
+
+        if let Some(shared) = shared {
+            page.apply_shared(shared)?;
+        }
+        page.n_free = page.compute_free_space(limits)?;
+
+        Ok(page)
     }
 
     pub fn cell_content_offset(&self, limits: PageLimits) -> Result<usize> {
@@ -406,6 +484,43 @@ impl MemPage {
             return Err(Error::new(ErrorCode::Corrupt));
         }
         self.validate_freeblocks(limits, cell_offset)?;
+        Ok(())
+    }
+
+    fn apply_shared(&mut self, shared: &BtShared) -> Result<()> {
+        let flag_byte = (if self.is_leaf { BTREE_PAGEFLAG_LEAF } else { 0 })
+            | (if self.is_intkey { BTREE_PAGEFLAG_INTKEY } else { 0 })
+            | (if self.is_leafdata { BTREE_PAGEFLAG_LEAFDATA } else { 0 })
+            | (if self.is_zerodata { BTREE_PAGEFLAG_ZERODATA } else { 0 });
+
+        let is_table = (flag_byte & BTREE_PAGEFLAG_INTKEY != 0)
+            && (flag_byte & BTREE_PAGEFLAG_LEAFDATA != 0);
+        let is_index = (flag_byte & BTREE_PAGEFLAG_ZERODATA != 0);
+
+        if self.is_leaf {
+            self.child_ptr_size = 0;
+            if is_table {
+                self.max_local = shared.max_leaf;
+                self.min_local = shared.min_leaf;
+            } else if is_index {
+                self.max_local = shared.max_local;
+                self.min_local = shared.min_local;
+            } else {
+                return Err(Error::new(ErrorCode::Corrupt));
+            }
+        } else {
+            self.child_ptr_size = 4;
+            if is_table {
+                self.max_local = shared.max_leaf;
+                self.min_local = shared.min_leaf;
+            } else if is_index {
+                self.max_local = shared.max_local;
+                self.min_local = shared.min_local;
+            } else {
+                return Err(Error::new(ErrorCode::Corrupt));
+            }
+        }
+
         Ok(())
     }
 
@@ -522,6 +637,39 @@ impl MemPage {
 
         Ok(())
     }
+
+    fn compute_free_space(&self, limits: PageLimits) -> Result<i32> {
+        let header_start = limits.header_start();
+        let header_size = self.header_size();
+        let ptr_array_end = header_start + header_size + (self.n_cell as usize * 2);
+        let cell_offset = self.cell_content_offset(limits)?;
+        if cell_offset < ptr_array_end {
+            return Err(Error::new(ErrorCode::Corrupt));
+        }
+        let mut n_free = (cell_offset - ptr_array_end) as i32 + (self.free_bytes as i32);
+
+        let usable_end = limits.usable_end();
+        let mut next = self.first_freeblock as usize;
+        let mut steps = 0usize;
+        while next != 0 {
+            if next >= usable_end {
+                return Err(Error::new(ErrorCode::Corrupt));
+            }
+            let size = read_u16(&self.data, next + 2).ok_or(Error::new(ErrorCode::Corrupt))?;
+            if size < 4 {
+                return Err(Error::new(ErrorCode::Corrupt));
+            }
+            n_free += size as i32;
+            let next_ptr = read_u16(&self.data, next).ok_or(Error::new(ErrorCode::Corrupt))?;
+            next = next_ptr as usize;
+            steps += 1;
+            if steps > self.n_cell as usize + 1 {
+                return Err(Error::new(ErrorCode::Corrupt));
+            }
+        }
+
+        Ok(n_free)
+    }
 }
 
 fn pager_open_flags_from_btree(flags: BtreeOpenFlags) -> PagerOpenFlags {
@@ -549,7 +697,7 @@ impl Btree {
         let page_size = pager.page_size;
         let usable_size = pager.usable_size;
 
-        let shared = BtShared {
+        let mut shared = BtShared {
             pager,
             db: db.as_ref().map(Arc::downgrade),
             cursor_list: Vec::new(),
@@ -575,6 +723,18 @@ impl Btree {
             temp_space: vec![0u8; page_size as usize],
             preformat_size: 0,
         };
+
+        shared.update_payload_params();
+
+        let page1_limits = PageLimits::for_page1(shared.page_size, shared.usable_size);
+        if let Ok(mut page) = shared.pager.get(1, PagerGetFlags::empty()) {
+            if let Ok(mut mem_page) =
+                MemPage::parse_with_shared(1, page.data.clone(), page1_limits, Some(&shared))
+            {
+                let _ = mem_page.validate_layout(page1_limits);
+                shared.page1 = Some(mem_page);
+            }
+        }
 
         Ok(Arc::new(Btree {
             db,
@@ -633,6 +793,7 @@ impl Btree {
         shared.pager.set_page_size(page_size, reserve)?;
         shared.page_size = shared.pager.page_size;
         shared.usable_size = shared.pager.usable_size;
+        shared.update_payload_params();
         if fix {
             shared.bts_flags.insert(BtsFlags::PAGESIZE_FIXED);
         }
@@ -722,6 +883,11 @@ impl Btree {
         Ok(())
     }
 
+    /// sqlite3BtreeBeginTrans with schema flag
+    pub fn begin_trans_with_schema(&mut self, write: bool, _schema_modified: &mut i32) -> Result<()> {
+        self.begin_trans(write)
+    }
+
     /// sqlite3BtreeCommitPhaseOne
     pub fn commit_phase_one(&mut self, super_journal: Option<&str>) -> Result<()> {
         let mut shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
@@ -730,7 +896,7 @@ impl Btree {
     }
 
     /// sqlite3BtreeCommitPhaseTwo
-    pub fn commit_phase_two(&mut self) -> Result<()> {
+    pub fn commit_phase_two(&mut self, _cleanup: bool) -> Result<()> {
         let mut shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
         shared.pager.commit_phase_two()?;
         shared.in_transaction = TransState::None;
@@ -741,7 +907,7 @@ impl Btree {
     /// sqlite3BtreeCommit
     pub fn commit(&mut self) -> Result<()> {
         self.commit_phase_one(None)?;
-        self.commit_phase_two()
+        self.commit_phase_two(false)
     }
 
     /// sqlite3BtreeRollback
@@ -926,9 +1092,69 @@ impl Btree {
     pub fn new_db(&mut self) -> Result<()> {
         Err(Error::new(ErrorCode::Internal))
     }
+
+    /// sqlite3BtreeSetVersion
+    pub fn set_version(&mut self, _version: i32) -> Result<()> {
+        Err(Error::new(ErrorCode::Internal))
+    }
+
+    /// sqlite3BtreeIsReadonly
+    pub fn is_readonly(&self) -> bool {
+        self.shared
+            .read()
+            .map(|shared| shared.bts_flags.contains(BtsFlags::READ_ONLY))
+            .unwrap_or(false)
+    }
+
+    /// sqlite3BtreeClosesWithCursor (debug)
+    pub fn closes_with_cursor(&self, _cursor: &BtCursor) -> bool {
+        false
+    }
+
+    /// sqlite3BtreeCount
+    pub fn count(&mut self, _cursor: &mut BtCursor) -> Result<i64> {
+        Err(Error::new(ErrorCode::Internal))
+    }
+
+    /// sqlite3BtreeCursorInfo
+    pub fn cursor_info(&mut self, _cursor: &mut BtCursor, _op: i32) -> Result<i32> {
+        Err(Error::new(ErrorCode::Internal))
+    }
+
+    /// sqlite3BtreeTransferRow
+    pub fn transfer_row(&mut self, _source: &mut BtCursor, _dest: &mut BtCursor, _i_rowid: i64) -> Result<()> {
+        Err(Error::new(ErrorCode::Internal))
+    }
 }
 
 impl BtCursor {
+    /// sqlite3BtreeCursorSize
+    pub fn size() -> usize {
+        std::mem::size_of::<BtCursor>()
+    }
+
+    /// sqlite3BtreeCursorZero
+    pub fn reset(&mut self) {
+        self.state = CursorState::Invalid;
+        self.cur_flags = BtCursorFlags::empty();
+        self.cur_pager_flags = PagerGetFlags::empty();
+        self.hints = CursorHints::empty();
+        self.skip_next = 0;
+        self.overflow.clear();
+        self.key = None;
+        self.next = None;
+        self.info = CellInfo::default();
+        self.n_key = 0;
+        self.root_page = 0;
+        self.i_page = -1;
+        self.cur_int_key = false;
+        self.ix = 0;
+        self.idx_stack.clear();
+        self.key_info = None;
+        self.page = None;
+        self.page_stack.clear();
+    }
+
     /// sqlite3BtreeFirst
     pub fn first(&mut self) -> Result<bool> {
         Err(Error::new(ErrorCode::Internal))
@@ -946,6 +1172,16 @@ impl BtCursor {
 
     /// sqlite3BtreePrevious
     pub fn previous(&mut self, _flags: i32) -> Result<()> {
+        Err(Error::new(ErrorCode::Internal))
+    }
+
+    /// sqlite3BtreeIsEmpty
+    pub fn is_empty(&mut self) -> Result<bool> {
+        Err(Error::new(ErrorCode::Internal))
+    }
+
+    /// sqlite3BtreeCount
+    pub fn count(&mut self) -> Result<i64> {
         Err(Error::new(ErrorCode::Internal))
     }
 
@@ -978,6 +1214,16 @@ impl BtCursor {
             return Err(Error::new(ErrorCode::Corrupt));
         }
         Ok(payload[start..end].to_vec())
+    }
+
+    /// sqlite3BtreePayloadChecked
+    pub fn payload_checked(&self, offset: u32, amount: u32) -> Result<Vec<u8>> {
+        self.payload(offset, amount)
+    }
+
+    /// sqlite3BtreePutData
+    pub fn put_data(&mut self, _offset: u32, _amount: u32, _data: &[u8]) -> Result<()> {
+        Err(Error::new(ErrorCode::Internal))
     }
 
     /// sqlite3BtreeCursorPin
@@ -1026,8 +1272,33 @@ impl BtCursor {
         false
     }
 
+    /// sqlite3BtreeCursorHasHint
+    pub fn has_hint(&self, mask: u32) -> bool {
+        (self.hints.bits() as u32 & mask) != 0
+    }
+
+    /// sqlite3BtreeCursorIsValid
+    pub fn is_valid(&self) -> bool {
+        self.state == CursorState::Valid
+    }
+
+    /// sqlite3BtreeCursorIsValidNN
+    pub fn is_valid_nn(&self) -> bool {
+        self.is_valid()
+    }
+
     /// sqlite3BtreeCursorRestore
     pub fn restore(&mut self) -> Result<bool> {
         Err(Error::new(ErrorCode::Internal))
+    }
+
+    /// sqlite3BtreeCursorInfo
+    pub fn cursor_info(&self, _opcode: i32) -> Result<i32> {
+        Err(Error::new(ErrorCode::Internal))
+    }
+
+    /// sqlite3BtreeCursorHint
+    pub fn hint(&mut self, _hint: i32) -> Result<()> {
+        Ok(())
     }
 }

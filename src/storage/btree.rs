@@ -414,6 +414,52 @@ fn write_u16(data: &mut [u8], offset: usize, value: u16) -> Result<()> {
     Ok(())
 }
 
+fn write_varint(mut value: u64, out: &mut Vec<u8>) {
+    if value <= 0x7f {
+        out.push(value as u8);
+        return;
+    }
+
+    let mut buf = [0u8; 9];
+    let mut i = 8;
+    buf[i] = (value & 0xff) as u8;
+    value >>= 8;
+    while value > 0 {
+        i -= 1;
+        buf[i] = ((value & 0x7f) as u8) | 0x80;
+        value >>= 7;
+    }
+    out.extend_from_slice(&buf[i..]);
+}
+
+fn build_cell(page: &MemPage, payload: &BtreePayload) -> Result<Vec<u8>> {
+    if !page.is_leaf {
+        return Err(Error::new(ErrorCode::Internal));
+    }
+
+    let mut cell = Vec::new();
+    if page.is_intkey && page.is_leafdata {
+        let data = payload.data.as_deref().unwrap_or(&[]);
+        let payload_size = data.len() + payload.n_zero.max(0) as usize;
+        write_varint(payload_size as u64, &mut cell);
+        write_varint(payload.n_key as u64, &mut cell);
+        cell.extend_from_slice(data);
+        if payload.n_zero > 0 {
+            cell.extend(std::iter::repeat(0u8).take(payload.n_zero as usize));
+        }
+        return Ok(cell);
+    }
+
+    if page.is_zerodata {
+        let key = payload.key.as_deref().ok_or(Error::new(ErrorCode::Misuse))?;
+        write_varint(key.len() as u64, &mut cell);
+        cell.extend_from_slice(key);
+        return Ok(cell);
+    }
+
+    Err(Error::new(ErrorCode::Internal))
+}
+
 fn read_varint(data: &[u8], offset: usize) -> Result<(u64, usize)> {
     let mut value = 0u64;
     for i in 0..9 {
@@ -1111,12 +1157,94 @@ impl Btree {
         _flags: BtreeInsertFlags,
         _seek_result: i32,
     ) -> Result<()> {
-        Err(Error::new(ErrorCode::Internal))
+        if _flags.contains(BtreeInsertFlags::PREFORMAT) {
+            return Err(Error::new(ErrorCode::Internal));
+        }
+        let shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut shared_guard = shared;
+        let root_pgno = _cursor.root_page;
+        let (mut mem_page, limits) = _cursor.load_page(&mut shared_guard, root_pgno)?;
+        if !mem_page.is_leaf {
+            return Err(Error::new(ErrorCode::Internal));
+        }
+
+        let cell = build_cell(&mem_page, _payload)?;
+        let cell_size = cell.len();
+        if cell_size > mem_page.max_local as usize && mem_page.max_local != 0 {
+            return Err(Error::new(ErrorCode::Internal));
+        }
+
+        let header_start = limits.header_start();
+        let header_size = mem_page.header_size();
+        let ptr_array_end = header_start + header_size + (mem_page.n_cell as usize * 2);
+        let cell_offset = mem_page.cell_content_offset(limits)?;
+        if cell_offset < ptr_array_end + cell_size {
+            return Err(Error::new(ErrorCode::Full));
+        }
+        let new_cell_offset = cell_offset - cell_size;
+
+        let insert_index = if _flags.contains(BtreeInsertFlags::APPEND) || _cursor.state != CursorState::Valid {
+            mem_page.n_cell
+        } else {
+            _cursor.ix.min(mem_page.n_cell)
+        };
+        let mut page = shared_guard.pager.get(root_pgno, PagerGetFlags::empty())?;
+        shared_guard.pager.write(&mut page)?;
+
+        let data = &mut page.data;
+        data[new_cell_offset..new_cell_offset + cell_size].copy_from_slice(&cell);
+
+        let ptr_array_start = header_start + header_size;
+        let ptr_array_end = ptr_array_start + (mem_page.n_cell as usize * 2);
+        let insert_ptr_offset = ptr_array_start + (insert_index as usize * 2);
+        if insert_ptr_offset < ptr_array_end {
+            data.copy_within(insert_ptr_offset..ptr_array_end, insert_ptr_offset + 2);
+        }
+        let ptr_write = header_start + header_size + (insert_index as usize * 2);
+        write_u16(data, ptr_write, new_cell_offset as u16)?;
+        write_u16(data, header_start + 3, mem_page.n_cell + 1)?;
+        write_u16(data, header_start + 5, new_cell_offset as u16)?;
+
+        mem_page.data = data.clone();
+        mem_page.n_cell += 1;
+        mem_page.cell_offset = new_cell_offset as u16;
+        _cursor.page = Some(mem_page);
+        Ok(())
     }
 
     /// sqlite3BtreeDelete
     pub fn delete(&mut self, _cursor: &mut BtCursor, _flags: BtreeInsertFlags) -> Result<()> {
-        Err(Error::new(ErrorCode::Internal))
+        let shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut shared_guard = shared;
+        let root_pgno = _cursor.root_page;
+        let (mem_page, limits) = _cursor.load_page(&mut shared_guard, root_pgno)?;
+        if !mem_page.is_leaf {
+            return Err(Error::new(ErrorCode::Internal));
+        }
+        if _cursor.ix >= mem_page.n_cell {
+            return Err(Error::new(ErrorCode::Range));
+        }
+
+        let header_start = limits.header_start();
+        let header_size = mem_page.header_size();
+        let ptr_array_start = header_start + header_size;
+        let mut page = shared_guard.pager.get(root_pgno, PagerGetFlags::empty())?;
+        shared_guard.pager.write(&mut page)?;
+        let data = &mut page.data;
+
+        let cell_offset = mem_page.cell_ptr(_cursor.ix, limits)?;
+        let info = mem_page.parse_cell(cell_offset, limits)?;
+        let cell_size = info.n_size as i32;
+
+        let from = ptr_array_start + ((_cursor.ix as usize + 1) * 2);
+        let to = ptr_array_start + (_cursor.ix as usize * 2);
+        let ptr_end = ptr_array_start + (mem_page.n_cell as usize * 2);
+        data.copy_within(from..ptr_end, to);
+
+        write_u16(data, header_start + 3, mem_page.n_cell - 1)?;
+
+        _cursor.state = CursorState::Invalid;
+        Ok(())
     }
 
     /// sqlite3BtreeCreateTable

@@ -543,6 +543,10 @@ fn build_leaf_page_data(
         let ptr_offset = header_start + 8 + (i * 2);
         write_u16(&mut data, ptr_offset, content_start as u16)?;
     }
+    let ptr_end = header_start + 8 + (cells.len() * 2);
+    if content_start < ptr_end {
+        return Err(Error::new(ErrorCode::Full));
+    }
     write_u16(&mut data, header_start + 5, content_start as u16)?;
     Ok(data)
 }
@@ -631,6 +635,10 @@ fn build_internal_page_data(
         data[content_start..content_start + cell.len()].copy_from_slice(cell);
         let ptr_offset = header_start + 12 + (i * 2);
         write_u16(&mut data, ptr_offset, content_start as u16)?;
+    }
+    let ptr_end = header_start + 12 + (keys.len() * 2);
+    if content_start < ptr_end {
+        return Err(Error::new(ErrorCode::Full));
     }
     write_u16(&mut data, header_start + 5, content_start as u16)?;
     Ok(data)

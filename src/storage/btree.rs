@@ -74,6 +74,35 @@ pub struct MemPage {
 
 pub struct Pager;
 
+#[derive(Clone, Copy, Debug)]
+pub struct PageLimits {
+    pub page_size: u32,
+    pub usable_size: u32,
+    pub header_offset: usize,
+}
+
+impl PageLimits {
+    pub fn new(page_size: u32, usable_size: u32) -> Self {
+        Self {
+            page_size,
+            usable_size,
+            header_offset: 0,
+        }
+    }
+
+    pub fn for_page1(page_size: u32, usable_size: u32) -> Self {
+        Self {
+            page_size,
+            usable_size,
+            header_offset: 100,
+        }
+    }
+
+    fn header_start(&self) -> usize {
+        self.header_offset
+    }
+}
+
 fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
     data.get(offset..offset + 2)
         .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
@@ -86,27 +115,28 @@ fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
 }
 
 impl MemPage {
-    pub fn parse(pgno: Pgno, data: Vec<u8>) -> Result<Self> {
-        if data.len() < 8 {
+    pub fn parse(pgno: Pgno, data: Vec<u8>, limits: PageLimits) -> Result<Self> {
+        let header_start = limits.header_start();
+        if data.len() < header_start + 8 {
             return Err(Error);
         }
 
-        let flags = data[0];
+        let flags = data[header_start];
         let is_leaf = (flags & BTREE_PAGEFLAG_LEAF) != 0;
         let is_intkey = (flags & BTREE_PAGEFLAG_INTKEY) != 0;
         let header_size = if is_leaf { 8 } else { 12 };
 
-        if data.len() < header_size {
+        if data.len() < header_start + header_size {
             return Err(Error);
         }
 
-        let n_cell = read_u16(&data, 3).ok_or(Error)?;
-        let cell_offset = read_u16(&data, 5).ok_or(Error)?;
-        let free_bytes = data[7] as u16;
+        let n_cell = read_u16(&data, header_start + 3).ok_or(Error)?;
+        let cell_offset = read_u16(&data, header_start + 5).ok_or(Error)?;
+        let free_bytes = data[header_start + 7] as u16;
         let rightmost_ptr = if is_leaf {
             None
         } else {
-            Some(read_u32(&data, 8).ok_or(Error)?)
+            Some(read_u32(&data, header_start + 8).ok_or(Error)?)
         };
 
         Ok(Self {
@@ -131,20 +161,40 @@ impl MemPage {
         }
     }
 
-    pub fn cell_ptr(&self, index: u16) -> Result<u16> {
+    pub fn cell_ptr(&self, index: u16, limits: PageLimits) -> Result<u16> {
         if index >= self.n_cell {
             return Err(Error);
         }
-        let offset = self.header_size() + (index as usize * 2);
+        let offset = limits.header_start() + self.header_size() + (index as usize * 2);
         read_u16(&self.data, offset).ok_or(Error)
     }
 
-    pub fn cell_ptrs(&self) -> Result<Vec<u16>> {
+    pub fn cell_ptrs(&self, limits: PageLimits) -> Result<Vec<u16>> {
         let mut pointers = Vec::with_capacity(self.n_cell as usize);
         for i in 0..self.n_cell {
-            pointers.push(self.cell_ptr(i)?);
+            pointers.push(self.cell_ptr(i, limits)?);
         }
         Ok(pointers)
+    }
+
+    pub fn validate_layout(&self, limits: PageLimits) -> Result<()> {
+        if limits.page_size < limits.usable_size {
+            return Err(Error);
+        }
+        if self.data.len() < limits.page_size as usize {
+            return Err(Error);
+        }
+        let header_start = limits.header_start();
+        let header_size = self.header_size();
+        let ptr_array_end = header_start + header_size + (self.n_cell as usize * 2);
+        let usable_end = header_start + limits.usable_size as usize;
+        if ptr_array_end > usable_end {
+            return Err(Error);
+        }
+        if self.cell_offset as usize > limits.usable_size as usize {
+            return Err(Error);
+        }
+        Ok(())
     }
 }
 

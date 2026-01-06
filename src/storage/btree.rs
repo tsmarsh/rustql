@@ -32,6 +32,7 @@ pub const BTREE_USER_VERSION: usize = 6;
 pub const BTREE_INCR_VACUUM: usize = 7;
 pub const BTREE_APPLICATION_ID: usize = 8;
 pub const BTREE_DATA_VERSION: usize = 15;
+pub const SQLITE_N_BTREE_META: usize = 16;
 
 bitflags! {
     pub struct BtreeOpenFlags: u8 {
@@ -379,6 +380,15 @@ fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
     data.get(offset..offset + 4).map(|bytes| {
         u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
     })
+}
+
+fn write_u32(data: &mut [u8], offset: usize, value: u32) -> Result<()> {
+    let bytes = value.to_be_bytes();
+    let target = data
+        .get_mut(offset..offset + 4)
+        .ok_or(Error::new(ErrorCode::Corrupt))?;
+    target.copy_from_slice(&bytes);
+    Ok(())
 }
 
 fn read_varint(data: &[u8], offset: usize) -> Result<(u64, usize)> {
@@ -857,6 +867,9 @@ impl Btree {
         shared.page_size = shared.pager.page_size;
         shared.usable_size = shared.pager.usable_size;
         shared.update_payload_params();
+        if reserve >= 0 && reserve <= u8::MAX as i32 {
+            shared.reserve_wanted = reserve as u8;
+        }
         if fix {
             shared.bts_flags.insert(BtsFlags::PAGESIZE_FIXED);
         }
@@ -1143,12 +1156,35 @@ impl Btree {
 
     /// sqlite3BtreeGetMeta
     pub fn get_meta(&self, _idx: usize) -> Result<u32> {
-        Err(Error::new(ErrorCode::Internal))
+        if _idx >= SQLITE_N_BTREE_META {
+            return Err(Error::new(ErrorCode::Range));
+        }
+        if _idx == BTREE_DATA_VERSION {
+            return Ok(0);
+        }
+        let shared = self.shared.read().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let page1 = shared.page1.as_ref().ok_or(Error::new(ErrorCode::Corrupt))?;
+        let offset = 36usize + (_idx * 4);
+        read_u32(&page1.data, offset).ok_or(Error::new(ErrorCode::Corrupt))
     }
 
     /// sqlite3BtreeUpdateMeta
     pub fn update_meta(&mut self, _idx: usize, _value: u32) -> Result<()> {
-        Err(Error::new(ErrorCode::Internal))
+        let mut shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        if _idx >= SQLITE_N_BTREE_META {
+            return Err(Error::new(ErrorCode::Range));
+        }
+        let offset = 36usize + (_idx * 4);
+        if let Ok(mut page) = shared.pager.get(1, PagerGetFlags::empty()) {
+            shared.pager.write(&mut page)?;
+            write_u32(&mut page.data, offset, _value)?;
+            if let Some(ref mut page1) = shared.page1 {
+                let _ = write_u32(&mut page1.data, offset, _value);
+            }
+            Ok(())
+        } else {
+            Err(Error::new(ErrorCode::Corrupt))
+        }
     }
 
     /// sqlite3BtreeNewDb

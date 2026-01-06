@@ -40,6 +40,80 @@ Run commands from a separate build directory when possible:
 - This tree mirrors SQLite, whose upstream uses Fossil and generally does not accept pull requests because the code is public domain.
 - There is no Git history in this workspace; if you commit locally, prefer issue-linked messages like `[abc12] Fix X` (see “Workflow & Issues”).
 
-## Workflow & Issues
-- Issues live under `.moth/` and are managed with the `moth` CLI.
-- Typical flow: `moth ls`, `moth show`, `moth start <id>`, `moth done <id>`.
+## Workflow & Issues (Team Collaboration)
+
+This is a team project with multiple agents. **Always coordinate via git and moth.**
+
+### The Golden Rules
+1. **Always `git pull` before starting work** - sync with team
+2. **Always `moth start` before writing code** - claim the issue
+3. **Always push after `moth start`** - teammates see you're working on it
+4. **Always push after `moth done`** - signal completion
+5. **Always `git pull` after completing work** - stay in sync
+
+### Before Starting ANY Implementation
+
+```bash
+# 1. Sync with remote
+git fetch origin && git pull origin main
+
+# 2. Check for work in progress
+moth ls -t doing
+
+# 3. If nothing in progress, pick an issue (priority order: crit > high > med > low)
+moth ls -t ready -s crit
+moth ls -t ready
+
+# 4. Start the moth BEFORE writing any code
+moth start {id}
+
+# 5. Push immediately so teammates know you claimed it
+git add .moth/ && git commit -m "[{id}] Started work on: {title}"
+git push origin main
+```
+
+### During Development
+
+```bash
+# Commit frequently with issue ID prefix
+git add src/
+git commit -m "[{id}] Implement feature X"
+git push origin main
+```
+
+### Completing Work
+
+```bash
+# 1. Mark done
+moth done
+
+# 2. Push completion status
+git add .moth/ && git commit -m "[{id}] Completed: {title}"
+git push origin main
+
+# 3. Sync and pick up next issue
+git fetch origin && git pull origin main
+moth ls -t ready
+```
+
+### Resuming After Context Loss
+
+```bash
+git fetch origin && git pull origin main
+moth ls -t doing              # Check if you have work in progress
+moth show                     # View current issue details
+# If nothing in doing, start a new issue per "Before Starting" workflow
+```
+
+### Quick Reference
+
+| Command | Purpose |
+|---------|---------|
+| `moth ls` | List active issues |
+| `moth ls -t ready` | List available issues |
+| `moth ls -t doing` | See what's being worked on |
+| `moth show` | Show current issue |
+| `moth start {id}` | Claim an issue |
+| `moth done` | Complete current issue |
+
+**Why this matters:** If you don't push moth status changes, another agent may start the same work, causing merge conflicts and wasted effort.

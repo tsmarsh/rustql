@@ -1,1 +1,1365 @@
-//! VDBE core execution
+//! VDBE Core Execution Engine
+//!
+//! The Virtual Database Engine (VDBE) is the bytecode interpreter that
+//! executes all SQL statements. This module implements the main execution
+//! loop and manages the virtual machine state.
+
+use std::cmp::Ordering;
+use std::time::Instant;
+
+use crate::error::{Error, ErrorCode, Result};
+use crate::types::{ColumnType, Pgno, Value};
+use crate::vdbe::mem::Mem;
+use crate::vdbe::ops::{Opcode, P4, VdbeOp};
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// Magic number for valid VDBE state
+const VDBE_MAGIC_INIT: u32 = 0x26bceaa5;
+const VDBE_MAGIC_RUN: u32 = 0xbdf20da3;
+const VDBE_MAGIC_HALT: u32 = 0x519c2973;
+const VDBE_MAGIC_DEAD: u32 = 0xb606c3c8;
+
+/// Default number of memory cells
+const DEFAULT_MEM_SIZE: usize = 128;
+
+/// Default number of cursor slots
+const DEFAULT_CURSOR_SLOTS: usize = 16;
+
+// ============================================================================
+// Execution Result
+// ============================================================================
+
+/// Result of a single execution step
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecResult {
+    /// SQLITE_ROW - a result row is available
+    Row,
+    /// SQLITE_DONE - execution completed successfully
+    Done,
+    /// Execution should continue
+    Continue,
+}
+
+/// EXPLAIN mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExplainMode {
+    /// Normal execution
+    #[default]
+    None,
+    /// EXPLAIN - show opcodes
+    Explain,
+    /// EXPLAIN QUERY PLAN
+    QueryPlan,
+}
+
+// ============================================================================
+// VDBE Cursor
+// ============================================================================
+
+/// Cursor state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorState {
+    /// Cursor is not positioned
+    Invalid,
+    /// Cursor is at a valid row
+    Valid,
+    /// At end of table/index
+    AtEnd,
+    /// Cursor requires seek
+    RequireSeek,
+}
+
+/// A cursor for iterating over table/index rows
+#[derive(Debug)]
+pub struct VdbeCursor {
+    /// Cursor ID
+    pub id: i32,
+    /// Root page number
+    pub root_page: Pgno,
+    /// Is this a writable cursor?
+    pub writable: bool,
+    /// Is this an index cursor?
+    pub is_index: bool,
+    /// Is this an ephemeral table?
+    pub is_ephemeral: bool,
+    /// Current state
+    pub state: CursorState,
+    /// Current key (for index cursors)
+    pub key: Option<Vec<u8>>,
+    /// Current rowid
+    pub rowid: Option<i64>,
+    /// Cached row data
+    pub row_data: Option<Vec<u8>>,
+    /// Number of columns
+    pub n_field: i32,
+    /// Null row flag (for outer joins)
+    pub null_row: bool,
+    /// Deferred seek key
+    pub seek_key: Option<Vec<Mem>>,
+}
+
+impl VdbeCursor {
+    /// Create a new cursor
+    pub fn new(id: i32, root_page: Pgno, writable: bool) -> Self {
+        Self {
+            id,
+            root_page,
+            writable,
+            is_index: false,
+            is_ephemeral: false,
+            state: CursorState::Invalid,
+            key: None,
+            rowid: None,
+            row_data: None,
+            n_field: 0,
+            null_row: false,
+            seek_key: None,
+        }
+    }
+
+    /// Check if cursor is valid
+    pub fn is_valid(&self) -> bool {
+        self.state == CursorState::Valid
+    }
+
+    /// Set null row mode
+    pub fn set_null_row(&mut self, null_row: bool) {
+        self.null_row = null_row;
+        if null_row {
+            self.row_data = None;
+        }
+    }
+}
+
+// ============================================================================
+// VDBE Frame (for subroutines)
+// ============================================================================
+
+/// Stack frame for subroutine calls
+#[derive(Debug)]
+pub struct VdbeFrame {
+    /// Return address (PC to return to)
+    pub return_pc: i32,
+    /// Base memory register for this frame
+    pub mem_base: i32,
+    /// Number of memory cells in this frame
+    pub n_mem: i32,
+    /// Base cursor for this frame
+    pub cursor_base: i32,
+    /// Number of cursors in this frame
+    pub n_cursor: i32,
+}
+
+// ============================================================================
+// VDBE Virtual Machine
+// ============================================================================
+
+/// The VDBE virtual machine
+pub struct Vdbe {
+    /// Magic number for state validation
+    magic: u32,
+
+    /// Program counter
+    pc: i32,
+
+    /// Most recent result code
+    rc: ErrorCode,
+
+    /// Array of opcodes (the program)
+    ops: Vec<VdbeOp>,
+
+    /// Memory cells (registers)
+    mem: Vec<Mem>,
+
+    /// Cursors
+    cursors: Vec<Option<VdbeCursor>>,
+
+    /// Stack frames for subroutines
+    frames: Vec<VdbeFrame>,
+
+    /// EXPLAIN mode
+    explain_mode: ExplainMode,
+
+    /// Is execution complete?
+    is_done: bool,
+
+    /// Has a result row?
+    has_result: bool,
+
+    /// Error message
+    error_msg: Option<String>,
+
+    /// Number of rows modified
+    n_change: i64,
+
+    /// Start time (for timeout)
+    start_time: Option<Instant>,
+
+    /// Bound parameters
+    vars: Vec<Mem>,
+
+    /// Parameter names
+    var_names: Vec<Option<String>>,
+
+    /// Interrupt flag
+    interrupted: bool,
+
+    /// Result row start register
+    result_start: i32,
+
+    /// Result row count
+    result_count: i32,
+
+    /// Column names for result
+    column_names: Vec<String>,
+}
+
+impl Default for Vdbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Vdbe {
+    /// Create a new empty VDBE
+    pub fn new() -> Self {
+        Self {
+            magic: VDBE_MAGIC_INIT,
+            pc: 0,
+            rc: ErrorCode::Ok,
+            ops: Vec::new(),
+            mem: vec![Mem::new(); DEFAULT_MEM_SIZE],
+            cursors: (0..DEFAULT_CURSOR_SLOTS).map(|_| None).collect(),
+            frames: Vec::new(),
+            explain_mode: ExplainMode::None,
+            is_done: false,
+            has_result: false,
+            error_msg: None,
+            n_change: 0,
+            start_time: None,
+            vars: Vec::new(),
+            var_names: Vec::new(),
+            interrupted: false,
+            result_start: 0,
+            result_count: 0,
+            column_names: Vec::new(),
+        }
+    }
+
+    /// Create from a list of operations
+    pub fn from_ops(ops: Vec<VdbeOp>) -> Self {
+        let mut vdbe = Self::new();
+        vdbe.ops = ops;
+        vdbe
+    }
+
+    // ========================================================================
+    // Program Management
+    // ========================================================================
+
+    /// Add an instruction to the program
+    pub fn add_op(&mut self, op: VdbeOp) -> i32 {
+        let addr = self.ops.len() as i32;
+        self.ops.push(op);
+        addr
+    }
+
+    /// Get instruction at address
+    pub fn op_at(&self, addr: i32) -> Option<&VdbeOp> {
+        self.ops.get(addr as usize)
+    }
+
+    /// Get mutable instruction at address
+    pub fn op_at_mut(&mut self, addr: i32) -> Option<&mut VdbeOp> {
+        self.ops.get_mut(addr as usize)
+    }
+
+    /// Get current program counter
+    pub fn get_pc(&self) -> i32 {
+        self.pc
+    }
+
+    /// Get number of operations
+    pub fn op_count(&self) -> i32 {
+        self.ops.len() as i32
+    }
+
+    /// Set column names for result
+    pub fn set_column_names(&mut self, names: Vec<String>) {
+        self.column_names = names;
+    }
+
+    // ========================================================================
+    // Memory Management
+    // ========================================================================
+
+    /// Ensure we have enough memory cells
+    pub fn ensure_mem(&mut self, n: i32) {
+        let n = n as usize;
+        if self.mem.len() < n {
+            self.mem.resize_with(n, Mem::new);
+        }
+    }
+
+    /// Get memory cell
+    pub fn mem(&self, reg: i32) -> &Mem {
+        &self.mem[reg as usize]
+    }
+
+    /// Get mutable memory cell
+    pub fn mem_mut(&mut self, reg: i32) -> &mut Mem {
+        &mut self.mem[reg as usize]
+    }
+
+    /// Set memory cell value
+    pub fn set_mem(&mut self, reg: i32, value: Mem) {
+        self.mem[reg as usize] = value;
+    }
+
+    // ========================================================================
+    // Parameter Binding
+    // ========================================================================
+
+    /// Ensure we have enough parameter slots
+    pub fn ensure_vars(&mut self, n: i32) {
+        let n = n as usize;
+        if self.vars.len() < n {
+            self.vars.resize_with(n, Mem::new);
+            self.var_names.resize(n, None);
+        }
+    }
+
+    /// Bind NULL to parameter (1-indexed)
+    pub fn bind_null(&mut self, idx: i32) -> Result<()> {
+        self.check_param_index(idx)?;
+        self.vars[(idx - 1) as usize].set_null();
+        Ok(())
+    }
+
+    /// Bind integer to parameter (1-indexed)
+    pub fn bind_int(&mut self, idx: i32, value: i64) -> Result<()> {
+        self.check_param_index(idx)?;
+        self.vars[(idx - 1) as usize].set_int(value);
+        Ok(())
+    }
+
+    /// Bind real to parameter (1-indexed)
+    pub fn bind_real(&mut self, idx: i32, value: f64) -> Result<()> {
+        self.check_param_index(idx)?;
+        self.vars[(idx - 1) as usize].set_real(value);
+        Ok(())
+    }
+
+    /// Bind text to parameter (1-indexed)
+    pub fn bind_text(&mut self, idx: i32, value: &str) -> Result<()> {
+        self.check_param_index(idx)?;
+        self.vars[(idx - 1) as usize].set_str(value);
+        Ok(())
+    }
+
+    /// Bind blob to parameter (1-indexed)
+    pub fn bind_blob(&mut self, idx: i32, value: &[u8]) -> Result<()> {
+        self.check_param_index(idx)?;
+        self.vars[(idx - 1) as usize].set_blob(value);
+        Ok(())
+    }
+
+    /// Bind value to parameter (1-indexed)
+    pub fn bind_value(&mut self, idx: i32, value: &Value) -> Result<()> {
+        self.check_param_index(idx)?;
+        self.vars[(idx - 1) as usize].set_value(value);
+        Ok(())
+    }
+
+    /// Clear all bindings
+    pub fn clear_bindings(&mut self) {
+        for var in &mut self.vars {
+            var.set_null();
+        }
+    }
+
+    fn check_param_index(&self, idx: i32) -> Result<()> {
+        if idx < 1 || idx > self.vars.len() as i32 {
+            return Err(Error::with_message(
+                ErrorCode::Range,
+                format!("parameter index {} out of range", idx),
+            ));
+        }
+        Ok(())
+    }
+
+    // ========================================================================
+    // Cursor Management
+    // ========================================================================
+
+    /// Ensure we have enough cursor slots
+    pub fn ensure_cursors(&mut self, n: i32) {
+        let n = n as usize;
+        if self.cursors.len() < n {
+            self.cursors.resize_with(n, || None);
+        }
+    }
+
+    /// Open a cursor
+    pub fn open_cursor(&mut self, id: i32, root_page: Pgno, writable: bool) -> Result<()> {
+        self.ensure_cursors(id + 1);
+        self.cursors[id as usize] = Some(VdbeCursor::new(id, root_page, writable));
+        Ok(())
+    }
+
+    /// Close a cursor
+    pub fn close_cursor(&mut self, id: i32) -> Result<()> {
+        if let Some(slot) = self.cursors.get_mut(id as usize) {
+            *slot = None;
+        }
+        Ok(())
+    }
+
+    /// Get cursor
+    pub fn cursor(&self, id: i32) -> Option<&VdbeCursor> {
+        self.cursors.get(id as usize).and_then(|c| c.as_ref())
+    }
+
+    /// Get mutable cursor
+    pub fn cursor_mut(&mut self, id: i32) -> Option<&mut VdbeCursor> {
+        self.cursors.get_mut(id as usize).and_then(|c| c.as_mut())
+    }
+
+    // ========================================================================
+    // Execution Control
+    // ========================================================================
+
+    /// Reset the VM for re-execution
+    pub fn reset(&mut self) {
+        self.pc = 0;
+        self.rc = ErrorCode::Ok;
+        self.is_done = false;
+        self.has_result = false;
+        self.error_msg = None;
+        self.n_change = 0;
+        self.start_time = None;
+        self.interrupted = false;
+        self.magic = VDBE_MAGIC_INIT;
+
+        // Clear memory cells
+        for mem in &mut self.mem {
+            mem.set_null();
+        }
+
+        // Close all cursors
+        for cursor in &mut self.cursors {
+            *cursor = None;
+        }
+
+        // Clear frames
+        self.frames.clear();
+    }
+
+    /// Interrupt execution
+    pub fn interrupt(&mut self) {
+        self.interrupted = true;
+    }
+
+    /// Check if interrupted
+    pub fn is_interrupted(&self) -> bool {
+        self.interrupted
+    }
+
+    /// Get result code
+    pub fn result_code(&self) -> ErrorCode {
+        self.rc
+    }
+
+    /// Get error message
+    pub fn error_message(&self) -> Option<&str> {
+        self.error_msg.as_deref()
+    }
+
+    /// Get number of changes
+    pub fn changes(&self) -> i64 {
+        self.n_change
+    }
+
+    /// Check if execution is done
+    pub fn is_done(&self) -> bool {
+        self.is_done
+    }
+
+    // ========================================================================
+    // Result Row Access
+    // ========================================================================
+
+    /// Get number of columns in result
+    pub fn column_count(&self) -> i32 {
+        self.result_count
+    }
+
+    /// Get column name
+    pub fn column_name(&self, idx: i32) -> &str {
+        self.column_names
+            .get(idx as usize)
+            .map(|s| s.as_str())
+            .unwrap_or("")
+    }
+
+    /// Get column type
+    pub fn column_type(&self, idx: i32) -> ColumnType {
+        let reg = self.result_start + idx;
+        self.mem(reg).column_type()
+    }
+
+    /// Get column as integer
+    pub fn column_int(&self, idx: i32) -> i64 {
+        let reg = self.result_start + idx;
+        self.mem(reg).to_int()
+    }
+
+    /// Get column as real
+    pub fn column_real(&self, idx: i32) -> f64 {
+        let reg = self.result_start + idx;
+        self.mem(reg).to_real()
+    }
+
+    /// Get column as text
+    pub fn column_text(&self, idx: i32) -> String {
+        let reg = self.result_start + idx;
+        self.mem(reg).to_str()
+    }
+
+    /// Get column as blob
+    pub fn column_blob(&self, idx: i32) -> Vec<u8> {
+        let reg = self.result_start + idx;
+        self.mem(reg).to_blob()
+    }
+
+    /// Get column as Value
+    pub fn column_value(&self, idx: i32) -> Value {
+        let reg = self.result_start + idx;
+        self.mem(reg).to_value()
+    }
+
+    // ========================================================================
+    // Main Execution Loop
+    // ========================================================================
+
+    /// Execute one step of the program
+    pub fn step(&mut self) -> Result<ExecResult> {
+        if self.is_done {
+            return Ok(ExecResult::Done);
+        }
+
+        if self.magic == VDBE_MAGIC_INIT {
+            self.magic = VDBE_MAGIC_RUN;
+            self.start_time = Some(Instant::now());
+        }
+
+        // Check for interrupt
+        if self.interrupted {
+            self.is_done = true;
+            self.rc = ErrorCode::Interrupt;
+            return Err(Error::new(ErrorCode::Interrupt));
+        }
+
+        // Execute instructions until we hit a stopping point
+        loop {
+            if self.pc < 0 || self.pc >= self.ops.len() as i32 {
+                self.is_done = true;
+                self.magic = VDBE_MAGIC_HALT;
+                return Ok(ExecResult::Done);
+            }
+
+            let result = self.exec_op()?;
+
+            match result {
+                ExecResult::Row => {
+                    self.has_result = true;
+                    return Ok(ExecResult::Row);
+                }
+                ExecResult::Done => {
+                    self.is_done = true;
+                    self.magic = VDBE_MAGIC_HALT;
+                    return Ok(ExecResult::Done);
+                }
+                ExecResult::Continue => {
+                    // Continue to next instruction
+                }
+            }
+
+            // Check for interrupt periodically
+            if self.interrupted {
+                self.is_done = true;
+                self.rc = ErrorCode::Interrupt;
+                return Err(Error::new(ErrorCode::Interrupt));
+            }
+        }
+    }
+
+    /// Execute a single opcode
+    fn exec_op(&mut self) -> Result<ExecResult> {
+        let pc = self.pc;
+        let op = self.ops[pc as usize].clone();
+        self.pc += 1;
+
+        match op.opcode {
+            // ================================================================
+            // Control Flow
+            // ================================================================
+            Opcode::Init => {
+                // Jump to start of program
+                if op.p2 != 0 {
+                    self.pc = op.p2;
+                }
+            }
+
+            Opcode::Goto => {
+                self.pc = op.p2;
+            }
+
+            Opcode::Halt => {
+                self.rc = ErrorCode::from_i32(op.p1).unwrap_or(ErrorCode::Error);
+                if let P4::Text(ref msg) = op.p4 {
+                    self.error_msg = Some(msg.clone());
+                }
+                return Ok(ExecResult::Done);
+            }
+
+            Opcode::If => {
+                let val = self.mem(op.p1);
+                if val.is_truthy() {
+                    self.pc = op.p2;
+                }
+            }
+
+            Opcode::IfNot => {
+                let val = self.mem(op.p1);
+                if !val.is_truthy() {
+                    self.pc = op.p2;
+                }
+            }
+
+            Opcode::IsNull => {
+                if self.mem(op.p1).is_null() {
+                    self.pc = op.p2;
+                }
+            }
+
+            Opcode::NotNull => {
+                if !self.mem(op.p1).is_null() {
+                    self.pc = op.p2;
+                }
+            }
+
+            Opcode::Gosub => {
+                // Store return address in P1, jump to P2
+                let return_addr = self.pc;
+                self.mem_mut(op.p1).set_int(return_addr as i64);
+                self.pc = op.p2;
+            }
+
+            Opcode::Return => {
+                // Return to address in P1
+                let addr = self.mem(op.p1).to_int();
+                self.pc = addr as i32;
+            }
+
+            Opcode::Yield => {
+                // Save PC to P1, jump to address in P1
+                let saved = self.mem(op.p1).to_int() as i32;
+                let current_pc = self.pc;
+                self.mem_mut(op.p1).set_int(current_pc as i64);
+                self.pc = saved;
+                if op.p2 != 0 && self.pc == 0 {
+                    self.pc = op.p2;
+                }
+            }
+
+            Opcode::Noop => {
+                // Do nothing
+            }
+
+            // ================================================================
+            // Data Movement
+            // ================================================================
+            Opcode::Null => {
+                // Store NULL in P2
+                let count = if op.p3 > 0 { op.p3 - op.p2 + 1 } else { 1 };
+                for i in 0..count {
+                    self.mem_mut(op.p2 + i).set_null();
+                }
+            }
+
+            Opcode::Integer => {
+                self.mem_mut(op.p2).set_int(op.p1 as i64);
+            }
+
+            Opcode::Int64 => {
+                if let P4::Int64(v) = op.p4 {
+                    self.mem_mut(op.p2).set_int(v);
+                }
+            }
+
+            Opcode::Real => {
+                if let P4::Real(v) = op.p4 {
+                    self.mem_mut(op.p2).set_real(v);
+                }
+            }
+
+            Opcode::String8 => {
+                if let P4::Text(ref s) = op.p4 {
+                    self.mem_mut(op.p2).set_str(s);
+                }
+            }
+
+            Opcode::Blob => {
+                if let P4::Blob(ref b) = op.p4 {
+                    self.mem_mut(op.p2).set_blob(b);
+                }
+            }
+
+            Opcode::Variable => {
+                // Copy bound parameter P1 to register P2
+                if op.p1 >= 1 && (op.p1 as usize) <= self.vars.len() {
+                    let val = self.vars[(op.p1 - 1) as usize].clone();
+                    self.set_mem(op.p2, val);
+                } else {
+                    self.mem_mut(op.p2).set_null();
+                }
+            }
+
+            Opcode::Copy => {
+                // Copy P1 to P2
+                let val = self.mem(op.p1).clone();
+                self.set_mem(op.p2, val);
+            }
+
+            Opcode::SCopy => {
+                // Shallow copy (same as Copy for our implementation)
+                let val = self.mem(op.p1).clone();
+                self.set_mem(op.p2, val);
+            }
+
+            Opcode::Move => {
+                // Move P1 to P2, leaving P1 as NULL
+                let count = op.p3.max(1);
+                for i in 0..count {
+                    let val = self.mem(op.p1 + i).clone();
+                    self.set_mem(op.p2 + i, val);
+                    self.mem_mut(op.p1 + i).set_null();
+                }
+            }
+
+            // ================================================================
+            // Comparison
+            // ================================================================
+            Opcode::Eq => {
+                let cmp = self.mem(op.p1).compare(self.mem(op.p3));
+                if cmp == Ordering::Equal {
+                    self.pc = op.p2;
+                }
+            }
+
+            Opcode::Ne => {
+                let cmp = self.mem(op.p1).compare(self.mem(op.p3));
+                if cmp != Ordering::Equal {
+                    self.pc = op.p2;
+                }
+            }
+
+            Opcode::Lt => {
+                let cmp = self.mem(op.p3).compare(self.mem(op.p1));
+                if cmp == Ordering::Less {
+                    self.pc = op.p2;
+                }
+            }
+
+            Opcode::Le => {
+                let cmp = self.mem(op.p3).compare(self.mem(op.p1));
+                if cmp != Ordering::Greater {
+                    self.pc = op.p2;
+                }
+            }
+
+            Opcode::Gt => {
+                let cmp = self.mem(op.p3).compare(self.mem(op.p1));
+                if cmp == Ordering::Greater {
+                    self.pc = op.p2;
+                }
+            }
+
+            Opcode::Ge => {
+                let cmp = self.mem(op.p3).compare(self.mem(op.p1));
+                if cmp != Ordering::Less {
+                    self.pc = op.p2;
+                }
+            }
+
+            // ================================================================
+            // Arithmetic
+            // ================================================================
+            Opcode::Add => {
+                let mut result = self.mem(op.p2).clone();
+                result.add(self.mem(op.p1))?;
+                self.set_mem(op.p3, result);
+            }
+
+            Opcode::Subtract => {
+                let mut result = self.mem(op.p2).clone();
+                result.subtract(self.mem(op.p1))?;
+                self.set_mem(op.p3, result);
+            }
+
+            Opcode::Multiply => {
+                let mut result = self.mem(op.p2).clone();
+                result.multiply(self.mem(op.p1))?;
+                self.set_mem(op.p3, result);
+            }
+
+            Opcode::Divide => {
+                let mut result = self.mem(op.p2).clone();
+                result.divide(self.mem(op.p1))?;
+                self.set_mem(op.p3, result);
+            }
+
+            Opcode::Remainder => {
+                let mut result = self.mem(op.p2).clone();
+                result.remainder(self.mem(op.p1))?;
+                self.set_mem(op.p3, result);
+            }
+
+            Opcode::Concat => {
+                let mut result = self.mem(op.p2).clone();
+                result.concat(self.mem(op.p1))?;
+                self.set_mem(op.p3, result);
+            }
+
+            Opcode::Negative => {
+                let mut result = self.mem(op.p1).clone();
+                result.negate()?;
+                self.set_mem(op.p2, result);
+            }
+
+            Opcode::Not => {
+                let mut result = self.mem(op.p1).clone();
+                result.logical_not();
+                self.set_mem(op.p2, result);
+            }
+
+            Opcode::BitNot => {
+                let mut result = self.mem(op.p1).clone();
+                result.bit_not()?;
+                self.set_mem(op.p2, result);
+            }
+
+            Opcode::BitAnd => {
+                let mut result = self.mem(op.p2).clone();
+                result.bit_and(self.mem(op.p1))?;
+                self.set_mem(op.p3, result);
+            }
+
+            Opcode::BitOr => {
+                let mut result = self.mem(op.p2).clone();
+                result.bit_or(self.mem(op.p1))?;
+                self.set_mem(op.p3, result);
+            }
+
+            Opcode::ShiftLeft => {
+                let mut result = self.mem(op.p2).clone();
+                result.shift_left(self.mem(op.p1))?;
+                self.set_mem(op.p3, result);
+            }
+
+            Opcode::ShiftRight => {
+                let mut result = self.mem(op.p2).clone();
+                result.shift_right(self.mem(op.p1))?;
+                self.set_mem(op.p3, result);
+            }
+
+            // ================================================================
+            // Result Row
+            // ================================================================
+            Opcode::ResultRow => {
+                // P1 = start register, P2 = number of columns
+                self.result_start = op.p1;
+                self.result_count = op.p2;
+                return Ok(ExecResult::Row);
+            }
+
+            // ================================================================
+            // Cursor Operations (placeholder - needs btree integration)
+            // ================================================================
+            Opcode::OpenRead => {
+                // P1 = cursor, P2 = root page, P3 = num columns
+                self.open_cursor(op.p1, op.p2 as Pgno, false)?;
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    cursor.n_field = op.p3;
+                }
+            }
+
+            Opcode::OpenWrite => {
+                self.open_cursor(op.p1, op.p2 as Pgno, true)?;
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    cursor.n_field = op.p3;
+                }
+            }
+
+            Opcode::OpenEphemeral => {
+                self.open_cursor(op.p1, 0, true)?;
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    cursor.is_ephemeral = true;
+                    cursor.n_field = op.p2;
+                }
+            }
+
+            Opcode::Close => {
+                self.close_cursor(op.p1)?;
+            }
+
+            Opcode::Rewind => {
+                // Move cursor to first row, jump to P2 if empty
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    // Placeholder: In real implementation, this would call btree
+                    cursor.state = CursorState::AtEnd; // Assume empty for now
+                }
+                // Jump if no rows
+                if self.cursor(op.p1).map_or(true, |c| c.state == CursorState::AtEnd) {
+                    self.pc = op.p2;
+                }
+            }
+
+            Opcode::Next => {
+                // Move cursor to next row, jump to P2 if done
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    // Placeholder: In real implementation, this would call btree
+                    cursor.state = CursorState::AtEnd;
+                }
+                if self.cursor(op.p1).map_or(true, |c| c.state == CursorState::AtEnd) {
+                    self.pc = op.p2;
+                }
+            }
+
+            Opcode::Prev => {
+                // Move cursor to previous row, jump to P2 if done
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    cursor.state = CursorState::AtEnd;
+                }
+                if self.cursor(op.p1).map_or(true, |c| c.state == CursorState::AtEnd) {
+                    self.pc = op.p2;
+                }
+            }
+
+            Opcode::Column => {
+                // Read column P2 from cursor P1 into register P3
+                if let Some(cursor) = self.cursor(op.p1) {
+                    if cursor.null_row {
+                        self.mem_mut(op.p3).set_null();
+                    } else {
+                        // Placeholder: In real implementation, decode from row_data
+                        self.mem_mut(op.p3).set_null();
+                    }
+                } else {
+                    self.mem_mut(op.p3).set_null();
+                }
+            }
+
+            Opcode::Rowid => {
+                // Get rowid from cursor P1 into register P2
+                if let Some(cursor) = self.cursor(op.p1) {
+                    if let Some(rowid) = cursor.rowid {
+                        self.mem_mut(op.p2).set_int(rowid);
+                    } else {
+                        self.mem_mut(op.p2).set_null();
+                    }
+                } else {
+                    self.mem_mut(op.p2).set_null();
+                }
+            }
+
+            Opcode::NullRow => {
+                // Set cursor to null row mode
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    cursor.set_null_row(true);
+                }
+            }
+
+            // ================================================================
+            // Record Operations
+            // ================================================================
+            Opcode::MakeRecord => {
+                // Make record from P1..P1+P2-1, store in P3
+                let _start = op.p1;
+                let _count = op.p2;
+                // Placeholder: Would encode registers into record format
+                self.mem_mut(op.p3).set_blob(&[]);
+            }
+
+            // ================================================================
+            // Transaction (placeholder)
+            // ================================================================
+            Opcode::Transaction => {
+                // P1 = database, P2 = write flag
+                // Placeholder: Would start transaction
+            }
+
+            Opcode::AutoCommit => {
+                // P1 = 1 to commit, 0 to rollback
+                // Placeholder: Would handle autocommit
+            }
+
+            // ================================================================
+            // Aggregation (placeholder)
+            // ================================================================
+            Opcode::AggStep | Opcode::AggStep0 => {
+                // Placeholder: Would call aggregate step function
+            }
+
+            Opcode::AggFinal | Opcode::AggValue => {
+                // Placeholder: Would call aggregate final function
+                self.mem_mut(op.p1).set_null();
+            }
+
+            // ================================================================
+            // Function Call (placeholder)
+            // ================================================================
+            Opcode::Function | Opcode::Function0 => {
+                // Placeholder: Would call the function
+                if let P4::FuncDef(ref name) = op.p4 {
+                    // Simple built-in function handling
+                    match name.as_str() {
+                        "current_time" => {
+                            // Placeholder time
+                            self.mem_mut(op.p2).set_str("12:00:00");
+                        }
+                        "current_date" => {
+                            self.mem_mut(op.p2).set_str("2024-01-01");
+                        }
+                        "current_timestamp" => {
+                            self.mem_mut(op.p2).set_str("2024-01-01 12:00:00");
+                        }
+                        _ => {
+                            // Unknown function returns NULL
+                            self.mem_mut(op.p2).set_null();
+                        }
+                    }
+                } else {
+                    self.mem_mut(op.p2).set_null();
+                }
+            }
+
+            // ================================================================
+            // Other opcodes (placeholder implementations)
+            // ================================================================
+            Opcode::Last
+            | Opcode::SeekRowid
+            | Opcode::SeekGE
+            | Opcode::SeekGT
+            | Opcode::SeekLE
+            | Opcode::SeekLT
+            | Opcode::SeekNull
+            | Opcode::NotExists
+            | Opcode::Delete
+            | Opcode::Insert
+            | Opcode::InsertInt
+            | Opcode::NewRowid
+            | Opcode::IdxGE
+            | Opcode::IdxGT
+            | Opcode::IdxLE
+            | Opcode::IdxLT
+            | Opcode::IdxRowid
+            | Opcode::IdxInsert
+            | Opcode::IdxDelete => {
+                // Placeholder: These need btree integration
+            }
+
+            Opcode::OpenPseudo
+            | Opcode::OpenAutoindex
+            | Opcode::ResetSorter
+            | Opcode::SorterInsert
+            | Opcode::SorterSort
+            | Opcode::SorterNext
+            | Opcode::SorterData
+            | Opcode::SorterCompare => {
+                // Placeholder: Sorter operations
+            }
+
+            Opcode::ReadCookie | Opcode::SetCookie | Opcode::VerifyCookie => {
+                // Placeholder: Schema cookie operations
+            }
+
+            Opcode::Savepoint | Opcode::Checkpoint => {
+                // Placeholder: Savepoint operations
+            }
+
+            Opcode::Cast | Opcode::Affinity => {
+                // Placeholder: Type conversion
+            }
+
+            Opcode::Compare | Opcode::Jump | Opcode::Once => {
+                // Placeholder: Advanced comparison
+            }
+
+            Opcode::Between | Opcode::Like | Opcode::Glob | Opcode::Regexp => {
+                // Placeholder: Pattern matching
+            }
+
+            Opcode::IfNullRow | Opcode::EndCoroutine => {
+                // Placeholder: Advanced control flow
+            }
+
+            Opcode::And | Opcode::Or => {
+                // These are typically handled inline by the compiler
+            }
+
+            Opcode::Trace | Opcode::Explain | Opcode::SqlExec => {
+                // Debug/explain operations
+            }
+
+            Opcode::FinishSeek | Opcode::SortKey | Opcode::Sequence | Opcode::Count => {
+                // Placeholder: Misc operations
+            }
+
+            Opcode::MaxOpcode => {
+                // Should never be executed
+                return Err(Error::with_message(
+                    ErrorCode::Internal,
+                    "MaxOpcode should not be executed",
+                ));
+            }
+        }
+
+        Ok(ExecResult::Continue)
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_vdbe_new() {
+        let vdbe = Vdbe::new();
+        assert_eq!(vdbe.magic, VDBE_MAGIC_INIT);
+        assert_eq!(vdbe.pc, 0);
+        assert!(!vdbe.is_done);
+    }
+
+    #[test]
+    fn test_vdbe_simple_program() {
+        // Program: Integer 42 -> r1, ResultRow r1 1, Halt
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::Integer, 42, 1, 0),
+            VdbeOp::new(Opcode::ResultRow, 1, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        // First step should return Row
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_count(), 1);
+        assert_eq!(vdbe.column_int(0), 42);
+
+        // Second step should return Done
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Done);
+    }
+
+    #[test]
+    fn test_vdbe_arithmetic() {
+        // Program: 10 + 20 = 30
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::Integer, 10, 1, 0),
+            VdbeOp::new(Opcode::Integer, 20, 2, 0),
+            VdbeOp::new(Opcode::Add, 2, 1, 3), // r3 = r1 + r2
+            VdbeOp::new(Opcode::ResultRow, 3, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), 30);
+    }
+
+    #[test]
+    fn test_vdbe_goto() {
+        // Program: Goto 2, Integer 1 (skipped), Integer 42, ResultRow, Halt
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::Goto, 0, 2, 0),
+            VdbeOp::new(Opcode::Integer, 1, 1, 0), // Skipped
+            VdbeOp::new(Opcode::Integer, 42, 1, 0),
+            VdbeOp::new(Opcode::ResultRow, 1, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), 42);
+    }
+
+    #[test]
+    fn test_vdbe_conditional() {
+        // Program: If r1 is truthy, jump to 3; otherwise result is 0
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::Integer, 1, 1, 0), // r1 = 1 (truthy)
+            VdbeOp::new(Opcode::If, 1, 4, 0),      // if r1, goto 4
+            VdbeOp::new(Opcode::Integer, 0, 2, 0), // r2 = 0 (not taken)
+            VdbeOp::new(Opcode::Goto, 0, 5, 0),
+            VdbeOp::new(Opcode::Integer, 99, 2, 0), // r2 = 99 (taken)
+            VdbeOp::new(Opcode::ResultRow, 2, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), 99);
+    }
+
+    #[test]
+    fn test_vdbe_parameter_binding() {
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::Variable, 1, 1, 0), // r1 = ?1
+            VdbeOp::new(Opcode::ResultRow, 1, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        vdbe.ensure_vars(1);
+        vdbe.bind_int(1, 42).unwrap();
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), 42);
+    }
+
+    #[test]
+    fn test_vdbe_string_operations() {
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::with_p4(
+                Opcode::String8,
+                0,
+                1,
+                0,
+                P4::Text("hello".to_string()),
+            ),
+            VdbeOp::with_p4(
+                Opcode::String8,
+                0,
+                2,
+                0,
+                P4::Text(" world".to_string()),
+            ),
+            VdbeOp::new(Opcode::Concat, 2, 1, 3),
+            VdbeOp::new(Opcode::ResultRow, 3, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_text(0), "hello world");
+    }
+
+    #[test]
+    fn test_vdbe_null_handling() {
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::Null, 0, 1, 0),
+            VdbeOp::new(Opcode::Integer, 42, 2, 0),
+            VdbeOp::new(Opcode::Add, 2, 1, 3), // NULL + 42 = NULL
+            VdbeOp::new(Opcode::ResultRow, 3, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_type(0), ColumnType::Null);
+    }
+
+    #[test]
+    fn test_vdbe_comparison() {
+        // Test Lt: if 5 < 10, jump
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::Integer, 10, 1, 0), // r1 = 10
+            VdbeOp::new(Opcode::Integer, 5, 2, 0),  // r2 = 5
+            VdbeOp::new(Opcode::Lt, 1, 5, 2),       // if r2 < r1, goto 5
+            VdbeOp::new(Opcode::Integer, 0, 3, 0),  // r3 = 0 (not taken)
+            VdbeOp::new(Opcode::Goto, 0, 6, 0),
+            VdbeOp::new(Opcode::Integer, 1, 3, 0), // r3 = 1 (taken)
+            VdbeOp::new(Opcode::ResultRow, 3, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), 1); // Jump was taken
+    }
+
+    #[test]
+    fn test_vdbe_gosub_return() {
+        // Program with subroutine
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::Gosub, 1, 3, 0), // Call sub at 3, return addr in r1
+            VdbeOp::new(Opcode::ResultRow, 2, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+            // Subroutine at 3:
+            VdbeOp::new(Opcode::Integer, 42, 2, 0),
+            VdbeOp::new(Opcode::Return, 1, 0, 0), // Return to r1
+        ]);
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), 42);
+    }
+
+    #[test]
+    fn test_vdbe_reset() {
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::Integer, 42, 1, 0),
+            VdbeOp::new(Opcode::ResultRow, 1, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        // First run
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        vdbe.step().unwrap(); // Done
+
+        // Reset and run again
+        vdbe.reset();
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), 42);
+    }
+
+    #[test]
+    fn test_vdbe_interrupt() {
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::Goto, 0, 0, 0), // Infinite loop
+        ]);
+
+        vdbe.interrupt();
+        let result = vdbe.step();
+        assert!(result.is_err());
+        assert_eq!(vdbe.result_code(), ErrorCode::Interrupt);
+    }
+
+    #[test]
+    fn test_vdbe_multiple_results() {
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::Integer, 1, 1, 0),
+            VdbeOp::new(Opcode::Integer, 2, 2, 0),
+            VdbeOp::new(Opcode::Integer, 3, 3, 0),
+            VdbeOp::new(Opcode::ResultRow, 1, 3, 0), // 3 columns
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_count(), 3);
+        assert_eq!(vdbe.column_int(0), 1);
+        assert_eq!(vdbe.column_int(1), 2);
+        assert_eq!(vdbe.column_int(2), 3);
+    }
+}

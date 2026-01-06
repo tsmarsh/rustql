@@ -434,32 +434,80 @@ fn write_varint(mut value: u64, out: &mut Vec<u8>) {
     out.extend_from_slice(&buf[i..]);
 }
 
-fn build_cell(page: &MemPage, payload: &BtreePayload) -> Result<Vec<u8>> {
+struct OverflowChain {
+    first: Option<Pgno>,
+    pages: Vec<Vec<u8>>,
+}
+
+fn build_cell(
+    page: &MemPage,
+    limits: PageLimits,
+    payload: &BtreePayload,
+) -> Result<(Vec<u8>, OverflowChain, bool)> {
     if !page.is_leaf {
         return Err(Error::new(ErrorCode::Internal));
     }
 
     let mut cell = Vec::new();
+    let mut overflow = OverflowChain { first: None, pages: Vec::new() };
+    let mut needs_overflow_ptr = false;
     if page.is_intkey && page.is_leafdata {
         let data = payload.data.as_deref().unwrap_or(&[]);
         let payload_size = data.len() + payload.n_zero.max(0) as usize;
         write_varint(payload_size as u64, &mut cell);
         write_varint(payload.n_key as u64, &mut cell);
-        cell.extend_from_slice(data);
-        if payload.n_zero > 0 {
-            cell.extend(std::iter::repeat(0u8).take(payload.n_zero as usize));
+        let local = page.payload_to_local(payload_size as i64, limits)? as usize;
+        cell.extend_from_slice(&data[..std::cmp::min(data.len(), local)]);
+        if local > data.len() {
+            cell.extend(std::iter::repeat(0u8).take(local - data.len()));
+        } else if payload.n_zero > 0 && local >= data.len() {
+            let remaining = local - data.len();
+            if remaining > 0 {
+                cell.extend(std::iter::repeat(0u8).take(remaining));
+            }
         }
-        return Ok(cell);
+        if local < payload_size {
+            let mut full = Vec::with_capacity(payload_size);
+            full.extend_from_slice(data);
+            if payload.n_zero > 0 {
+                full.extend(std::iter::repeat(0u8).take(payload.n_zero as usize));
+            }
+            let overflow_bytes = &full[local..];
+            overflow = build_overflow_pages(limits, overflow_bytes);
+            needs_overflow_ptr = true;
+        }
+        return Ok((cell, overflow, needs_overflow_ptr));
     }
 
     if page.is_zerodata {
         let key = payload.key.as_deref().ok_or(Error::new(ErrorCode::Misuse))?;
-        write_varint(key.len() as u64, &mut cell);
-        cell.extend_from_slice(key);
-        return Ok(cell);
+        let payload_size = key.len();
+        write_varint(payload_size as u64, &mut cell);
+        let local = page.payload_to_local(payload_size as i64, limits)? as usize;
+        cell.extend_from_slice(&key[..std::cmp::min(key.len(), local)]);
+        if local < payload_size {
+            let overflow_bytes = &key[local..];
+            overflow = build_overflow_pages(limits, overflow_bytes);
+            needs_overflow_ptr = true;
+        }
+        return Ok((cell, overflow, needs_overflow_ptr));
     }
 
     Err(Error::new(ErrorCode::Internal))
+}
+
+fn build_overflow_pages(limits: PageLimits, payload: &[u8]) -> OverflowChain {
+    let mut pages = Vec::new();
+    let mut offset = 0usize;
+    let ovfl_size = limits.usable_size.saturating_sub(4) as usize;
+    while offset < payload.len() {
+        let take = std::cmp::min(ovfl_size, payload.len() - offset);
+        let mut page = vec![0u8; limits.page_size as usize];
+        page[4..4 + take].copy_from_slice(&payload[offset..offset + take]);
+        pages.push(page);
+        offset += take;
+    }
+    OverflowChain { first: None, pages }
 }
 
 fn read_varint(data: &[u8], offset: usize) -> Result<(u64, usize)> {
@@ -1172,7 +1220,31 @@ impl Btree {
             return Err(Error::new(ErrorCode::Internal));
         }
 
-        let cell = build_cell(&mem_page, _payload)?;
+        let (mut cell, mut overflow, needs_overflow_ptr) =
+            build_cell(&mem_page, limits, _payload)?;
+        if !overflow.pages.is_empty() {
+            let pages_len = overflow.pages.len();
+            let first_pgno = shared_guard.pager.db_size + 1;
+            overflow.first = Some(first_pgno);
+            for (idx, mut page) in overflow.pages.into_iter().enumerate() {
+                let pgno = first_pgno + idx as u32;
+                let next_pgno = if idx + 1 < pages_len {
+                    first_pgno + idx as u32 + 1
+                } else {
+                    0
+                };
+                let _ = write_u32(&mut page, 0, next_pgno);
+                let mut db_page = shared_guard.pager.get(pgno, PagerGetFlags::empty())?;
+                shared_guard.pager.write(&mut db_page)?;
+                db_page.data = page;
+                shared_guard.pager.db_size = pgno.max(shared_guard.pager.db_size);
+            }
+            shared_guard.n_page = shared_guard.pager.db_size;
+            if needs_overflow_ptr {
+                cell.extend_from_slice(&first_pgno.to_be_bytes());
+            }
+        }
+
         let cell_size = cell.len();
         if cell_size > mem_page.max_local as usize && mem_page.max_local != 0 {
             return Err(Error::new(ErrorCode::Internal));

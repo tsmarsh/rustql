@@ -33,6 +33,14 @@ pub const BTREE_INCR_VACUUM: usize = 7;
 pub const BTREE_APPLICATION_ID: usize = 8;
 pub const BTREE_DATA_VERSION: usize = 15;
 pub const SQLITE_N_BTREE_META: usize = 16;
+pub const BTCURSOR_MAX_DEPTH: usize = 20;
+pub const BT_MAX_LOCAL: u16 = 65501;
+
+pub const PTRMAP_ROOTPAGE: u8 = 1;
+pub const PTRMAP_FREEPAGE: u8 = 2;
+pub const PTRMAP_OVERFLOW1: u8 = 3;
+pub const PTRMAP_OVERFLOW2: u8 = 4;
+pub const PTRMAP_BTREE: u8 = 5;
 
 bitflags! {
     pub struct BtreeOpenFlags: u8 {

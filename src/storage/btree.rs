@@ -210,6 +210,7 @@ pub struct BtCursor {
     pub page_stack: Vec<MemPage>,
 }
 
+#[derive(Clone)]
 pub struct MemPage {
     pub pgno: Pgno,
     pub data: Vec<u8>,
@@ -645,6 +646,17 @@ impl MemPage {
         }
         let start = cell_offset as usize;
         read_u32(&self.data, start).ok_or(Error::new(ErrorCode::Corrupt))
+    }
+
+    pub fn child_pgno_for_index(&self, index: u16, limits: PageLimits) -> Result<Pgno> {
+        if index < self.n_cell {
+            let cell_offset = self.cell_ptr(index, limits)?;
+            self.child_pgno(cell_offset)
+        } else if index == self.n_cell {
+            self.rightmost_ptr.ok_or(Error::new(ErrorCode::Corrupt))
+        } else {
+            Err(Error::new(ErrorCode::Range))
+        }
     }
 
     pub fn cell_offset_for_index(&self, index: u16, limits: PageLimits) -> Result<usize> {
@@ -1586,6 +1598,17 @@ impl Btree {
 }
 
 impl BtCursor {
+    fn set_to_cell(&mut self, page: MemPage, limits: PageLimits, index: u16) -> Result<()> {
+        let cell_offset = page.cell_ptr(index, limits)?;
+        let info = page.parse_cell(cell_offset, limits)?;
+        self.info = info;
+        self.n_key = self.info.n_key;
+        self.ix = index;
+        self.state = CursorState::Valid;
+        self.page = Some(page);
+        Ok(())
+    }
+
     fn load_root_page(&self) -> Result<(MemPage, PageLimits)> {
         let shared = self
             .bt_shared
@@ -1630,6 +1653,36 @@ impl BtCursor {
         Ok((mem_page, limits))
     }
 
+    fn descend_leftmost(&mut self, shared: &mut BtShared, pgno: Pgno) -> Result<(MemPage, PageLimits)> {
+        let mut current_pgno = pgno;
+        loop {
+            let (page, limits) = self.load_page(shared, current_pgno)?;
+            if page.is_leaf {
+                return Ok((page, limits));
+            }
+            self.page_stack.push(page);
+            self.idx_stack.push(0);
+            let child = self.page_stack.last().unwrap().child_pgno_for_index(0, limits)?;
+            current_pgno = child;
+        }
+    }
+
+    fn descend_rightmost(&mut self, shared: &mut BtShared, pgno: Pgno) -> Result<(MemPage, PageLimits)> {
+        let mut current_pgno = pgno;
+        loop {
+            let (page, limits) = self.load_page(shared, current_pgno)?;
+            if page.is_leaf {
+                return Ok((page, limits));
+            }
+            let child_index = page.n_cell;
+            self.page_stack.push(page);
+            self.idx_stack.push(child_index);
+            let parent = self.page_stack.last().unwrap();
+            let child = parent.child_pgno_for_index(child_index, limits)?;
+            current_pgno = child;
+        }
+    }
+
     /// sqlite3BtreeCursorSize
     pub fn size() -> usize {
         std::mem::size_of::<BtCursor>()
@@ -1659,36 +1712,38 @@ impl BtCursor {
 
     /// sqlite3BtreeFirst
     pub fn first(&mut self) -> Result<bool> {
-        let (mem_page, limits) = self.load_leaf_root()?;
+        let shared = self
+            .bt_shared
+            .upgrade()
+            .ok_or(Error::new(ErrorCode::Internal))?;
+        let mut shared_guard = shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        self.page_stack.clear();
+        self.idx_stack.clear();
+        let (mem_page, limits) = self.descend_leftmost(&mut shared_guard, self.root_page)?;
         if mem_page.n_cell == 0 {
             self.state = CursorState::Invalid;
             return Ok(true);
         }
-        let cell_offset = mem_page.cell_ptr(0, limits)?;
-        let info = mem_page.parse_cell(cell_offset, limits)?;
-        self.info = info;
-        self.n_key = self.info.n_key;
-        self.state = CursorState::Valid;
-        self.ix = 0;
-        self.page = Some(mem_page);
+        self.set_to_cell(mem_page, limits, 0)?;
         Ok(false)
     }
 
     /// sqlite3BtreeLast
     pub fn last(&mut self) -> Result<bool> {
-        let (mem_page, limits) = self.load_leaf_root()?;
+        let shared = self
+            .bt_shared
+            .upgrade()
+            .ok_or(Error::new(ErrorCode::Internal))?;
+        let mut shared_guard = shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        self.page_stack.clear();
+        self.idx_stack.clear();
+        let (mem_page, limits) = self.descend_rightmost(&mut shared_guard, self.root_page)?;
         if mem_page.n_cell == 0 {
             self.state = CursorState::Invalid;
             return Ok(true);
         }
         let last_index = mem_page.n_cell - 1;
-        let cell_offset = mem_page.cell_ptr(last_index, limits)?;
-        let info = mem_page.parse_cell(cell_offset, limits)?;
-        self.info = info;
-        self.n_key = self.info.n_key;
-        self.state = CursorState::Valid;
-        self.ix = last_index;
-        self.page = Some(mem_page);
+        self.set_to_cell(mem_page, limits, last_index)?;
         Ok(false)
     }
 
@@ -1699,26 +1754,44 @@ impl BtCursor {
             return Err(Error::new(ErrorCode::Internal));
         }
         let next_ix = self.ix.saturating_add(1);
-        if next_ix >= page.n_cell {
-            self.state = CursorState::Invalid;
-            return Ok(());
-        }
         let shared = self
             .bt_shared
             .upgrade()
             .ok_or(Error::new(ErrorCode::Internal))?;
-        let shared_guard = shared.read().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut shared_guard = shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
         let limits = if page.pgno == 1 {
             PageLimits::for_page1(shared_guard.page_size, shared_guard.usable_size)
         } else {
             PageLimits::new(shared_guard.page_size, shared_guard.usable_size)
         };
-        let cell_offset = page.cell_ptr(next_ix, limits)?;
-        let info = page.parse_cell(cell_offset, limits)?;
-        self.info = info;
-        self.n_key = self.info.n_key;
-        self.ix = next_ix;
-        self.state = CursorState::Valid;
+        if next_ix < page.n_cell {
+            self.set_to_cell(page.clone(), limits, next_ix)?;
+            return Ok(());
+        }
+        while let (Some(parent), Some(child_index)) = (self.page_stack.pop(), self.idx_stack.pop())
+        {
+            if child_index < parent.n_cell {
+                let next_child = child_index + 1;
+                self.page_stack.push(parent);
+                self.idx_stack.push(next_child);
+                let parent_ref = self.page_stack.last().unwrap();
+                let parent_limits = if parent_ref.pgno == 1 {
+                    PageLimits::for_page1(shared_guard.page_size, shared_guard.usable_size)
+                } else {
+                    PageLimits::new(shared_guard.page_size, shared_guard.usable_size)
+                };
+                let child_pgno = parent_ref.child_pgno_for_index(next_child, parent_limits)?;
+                let (leaf, leaf_limits) =
+                    self.descend_leftmost(&mut shared_guard, child_pgno)?;
+                if leaf.n_cell == 0 {
+                    self.state = CursorState::Invalid;
+                    return Ok(());
+                }
+                self.set_to_cell(leaf, leaf_limits, 0)?;
+                return Ok(());
+            }
+        }
+        self.state = CursorState::Invalid;
         Ok(())
     }
 
@@ -1728,27 +1801,46 @@ impl BtCursor {
         if !page.is_leaf {
             return Err(Error::new(ErrorCode::Internal));
         }
-        if self.ix == 0 {
-            self.state = CursorState::Invalid;
-            return Ok(());
-        }
-        let prev_ix = self.ix - 1;
         let shared = self
             .bt_shared
             .upgrade()
             .ok_or(Error::new(ErrorCode::Internal))?;
-        let shared_guard = shared.read().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut shared_guard = shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
         let limits = if page.pgno == 1 {
             PageLimits::for_page1(shared_guard.page_size, shared_guard.usable_size)
         } else {
             PageLimits::new(shared_guard.page_size, shared_guard.usable_size)
         };
-        let cell_offset = page.cell_ptr(prev_ix, limits)?;
-        let info = page.parse_cell(cell_offset, limits)?;
-        self.info = info;
-        self.n_key = self.info.n_key;
-        self.ix = prev_ix;
-        self.state = CursorState::Valid;
+        if self.ix > 0 {
+            let prev_ix = self.ix - 1;
+            self.set_to_cell(page.clone(), limits, prev_ix)?;
+            return Ok(());
+        }
+        while let (Some(parent), Some(child_index)) = (self.page_stack.pop(), self.idx_stack.pop())
+        {
+            if child_index > 0 {
+                let prev_child = child_index - 1;
+                self.page_stack.push(parent);
+                self.idx_stack.push(prev_child);
+                let parent_ref = self.page_stack.last().unwrap();
+                let parent_limits = if parent_ref.pgno == 1 {
+                    PageLimits::for_page1(shared_guard.page_size, shared_guard.usable_size)
+                } else {
+                    PageLimits::new(shared_guard.page_size, shared_guard.usable_size)
+                };
+                let child_pgno = parent_ref.child_pgno_for_index(prev_child, parent_limits)?;
+                let (leaf, leaf_limits) =
+                    self.descend_rightmost(&mut shared_guard, child_pgno)?;
+                if leaf.n_cell == 0 {
+                    self.state = CursorState::Invalid;
+                    return Ok(());
+                }
+                let last_index = leaf.n_cell - 1;
+                self.set_to_cell(leaf, leaf_limits, last_index)?;
+                return Ok(());
+            }
+        }
+        self.state = CursorState::Invalid;
         Ok(())
     }
 

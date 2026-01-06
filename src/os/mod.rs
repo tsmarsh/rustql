@@ -4,6 +4,7 @@
 //! SQLite to work across different operating systems.
 
 pub mod mutex;
+pub mod threads;
 pub mod vfs;
 
 #[cfg(unix)]

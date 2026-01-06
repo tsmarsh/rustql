@@ -1885,9 +1885,28 @@ impl Btree {
         let shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
         let mut shared_guard = shared;
         let root_pgno = _cursor.root_page;
-        let (mut mem_page, limits) = _cursor.load_page(&mut shared_guard, root_pgno)?;
+        let mut mem_page = _cursor.load_page(&mut shared_guard, root_pgno)?.0;
+        let mut limits = if root_pgno == 1 {
+            PageLimits::for_page1(shared_guard.page_size, shared_guard.usable_size)
+        } else {
+            PageLimits::new(shared_guard.page_size, shared_guard.usable_size)
+        };
         if !mem_page.is_leaf {
-            return Err(Error::new(ErrorCode::Internal));
+            if mem_page.is_intkey {
+                let _ = _cursor.table_moveto(_payload.n_key, false)?;
+            } else if let Some(key) = _payload.key.clone() {
+                let _ = _cursor.index_moveto(&UnpackedRecord { key })?;
+            }
+            if let Some(ref page) = _cursor.page {
+                mem_page = page.clone();
+                limits = if mem_page.pgno == 1 {
+                    PageLimits::for_page1(shared_guard.page_size, shared_guard.usable_size)
+                } else {
+                    PageLimits::new(shared_guard.page_size, shared_guard.usable_size)
+                };
+            } else {
+                return Err(Error::new(ErrorCode::Internal));
+            }
         }
 
         let (mut cell, mut overflow, needs_overflow_ptr) =

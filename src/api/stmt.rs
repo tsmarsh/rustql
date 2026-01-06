@@ -593,9 +593,134 @@ pub fn sqlite3_sql(stmt: &PreparedStmt) -> &str {
 }
 
 /// sqlite3_expanded_sql - Get SQL with bound parameters
+///
+/// Returns the SQL text with bound parameters replaced by their actual values.
+/// This is useful for logging and debugging.
 pub fn sqlite3_expanded_sql(stmt: &PreparedStmt) -> Option<String> {
-    // TODO: Implement parameter expansion
-    Some(stmt.sql.clone())
+    if stmt.params.is_empty() {
+        return Some(stmt.sql.clone());
+    }
+
+    let mut result = String::with_capacity(stmt.sql.len() * 2);
+    let mut param_idx = 0usize;
+    let bytes = stmt.sql.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+
+        // Handle string literals - don't replace ? inside strings
+        if c == b'\'' || c == b'"' {
+            let quote = c;
+            result.push(c as char);
+            i += 1;
+            while i < bytes.len() {
+                let cc = bytes[i];
+                result.push(cc as char);
+                i += 1;
+                if cc == quote {
+                    // Check for escaped quote
+                    if i < bytes.len() && bytes[i] == quote {
+                        result.push(quote as char);
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Handle positional parameter ?
+        if c == b'?' {
+            i += 1;
+            // Check for numbered parameter ?N
+            let mut num = 0i32;
+            let mut has_num = false;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                has_num = true;
+                num = num * 10 + (bytes[i] - b'0') as i32;
+                i += 1;
+            }
+
+            let idx = if has_num {
+                (num - 1) as usize
+            } else {
+                let idx = param_idx;
+                param_idx += 1;
+                idx
+            };
+
+            if let Some(value) = stmt.params.get(idx) {
+                result.push_str(&value_to_sql_literal(value));
+            } else {
+                result.push('?');
+                if has_num {
+                    result.push_str(&num.to_string());
+                }
+            }
+            continue;
+        }
+
+        // Handle named parameters :name, $name, @name
+        if c == b':' || c == b'$' || c == b'@' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let name = &stmt.sql[start..i];
+
+            // Look up by name
+            let mut found = false;
+            for (idx, param_name) in stmt.param_names.iter().enumerate() {
+                if let Some(n) = param_name {
+                    if n == name {
+                        if let Some(value) = stmt.params.get(idx) {
+                            result.push_str(&value_to_sql_literal(value));
+                            found = true;
+                        }
+                        break;
+                    }
+                }
+            }
+            if !found {
+                result.push_str(name);
+            }
+            continue;
+        }
+
+        result.push(c as char);
+        i += 1;
+    }
+
+    Some(result)
+}
+
+/// Convert a Value to SQL literal representation
+fn value_to_sql_literal(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Integer(i) => i.to_string(),
+        Value::Real(r) => {
+            // Ensure proper float representation
+            if r.fract() == 0.0 {
+                format!("{}.0", r)
+            } else {
+                r.to_string()
+            }
+        }
+        Value::Text(s) => {
+            // Escape single quotes by doubling them
+            let escaped = s.replace('\'', "''");
+            format!("'{}'", escaped)
+        }
+        Value::Blob(b) => {
+            // Convert to X'...' hex literal
+            let hex: String = b.iter().map(|byte| format!("{:02X}", byte)).collect();
+            format!("X'{}'", hex)
+        }
+    }
 }
 
 /// sqlite3_normalized_sql - Get normalized SQL
@@ -626,6 +751,78 @@ pub fn sqlite3_data_count(stmt: &PreparedStmt) -> i32 {
     } else {
         0
     }
+}
+
+// ============================================================================
+// Statement Status
+// ============================================================================
+
+/// Statement status counter operations
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum StmtStatusOp {
+    /// Number of full table scans
+    FullscanStep = 1,
+    /// Number of sort operations
+    Sort = 2,
+    /// Number of auto-index creations
+    AutoIndex = 3,
+    /// Number of VM steps executed
+    VmStep = 4,
+    /// Number of statement reprepares
+    Reprepare = 5,
+    /// Number of times statement was run
+    Run = 6,
+    /// Memory used by statement
+    MemUsed = 99,
+}
+
+impl TryFrom<i32> for StmtStatusOp {
+    type Error = ();
+
+    fn try_from(value: i32) -> std::result::Result<Self, Self::Error> {
+        match value {
+            1 => Ok(StmtStatusOp::FullscanStep),
+            2 => Ok(StmtStatusOp::Sort),
+            3 => Ok(StmtStatusOp::AutoIndex),
+            4 => Ok(StmtStatusOp::VmStep),
+            5 => Ok(StmtStatusOp::Reprepare),
+            6 => Ok(StmtStatusOp::Run),
+            99 => Ok(StmtStatusOp::MemUsed),
+            _ => Err(()),
+        }
+    }
+}
+
+/// sqlite3_stmt_status - Get statement status counter
+///
+/// Returns the value of a status counter for the statement.
+/// If reset is true, the counter is reset to zero after reading.
+pub fn sqlite3_stmt_status(stmt: &mut PreparedStmt, op: i32, reset: bool) -> i32 {
+    let op = match StmtStatusOp::try_from(op) {
+        Ok(op) => op,
+        Err(_) => return 0,
+    };
+
+    // Get value from VDBE if present
+    let value = if let Some(vdbe) = &stmt.vdbe {
+        match op {
+            StmtStatusOp::FullscanStep => 0, // Would track full scans
+            StmtStatusOp::Sort => 0,          // Would track sorts
+            StmtStatusOp::AutoIndex => 0,     // Would track auto-index
+            StmtStatusOp::VmStep => vdbe.get_pc() as i32, // Approximate VM steps
+            StmtStatusOp::Reprepare => 0,     // Would track reprepares
+            StmtStatusOp::Run => if stmt.stepped { 1 } else { 0 },
+            StmtStatusOp::MemUsed => 0,       // Would track memory
+        }
+    } else {
+        0
+    };
+
+    // Reset not yet implemented (would need mutable status in Vdbe)
+    let _ = reset;
+
+    value
 }
 
 // ============================================================================
@@ -791,5 +988,108 @@ mod tests {
         assert_eq!(count_parameters("SELECT ?"), 1);
         assert_eq!(count_parameters("SELECT ?, ?"), 2);
         assert_eq!(count_parameters("SELECT '?'"), 0); // In string
+    }
+
+    #[test]
+    fn test_expanded_sql_no_params() {
+        let stmt = PreparedStmt::new("SELECT 1, 2, 3");
+        let expanded = sqlite3_expanded_sql(&stmt).unwrap();
+        assert_eq!(expanded, "SELECT 1, 2, 3");
+    }
+
+    #[test]
+    fn test_expanded_sql_positional() {
+        let mut stmt = PreparedStmt::new("SELECT ?, ?");
+        stmt.set_param_count(2);
+        sqlite3_bind_int(&mut stmt, 1, 42).unwrap();
+        sqlite3_bind_text(&mut stmt, 2, "hello").unwrap();
+
+        let expanded = sqlite3_expanded_sql(&stmt).unwrap();
+        assert_eq!(expanded, "SELECT 42, 'hello'");
+    }
+
+    #[test]
+    fn test_expanded_sql_numbered() {
+        let mut stmt = PreparedStmt::new("SELECT ?2, ?1");
+        stmt.set_param_count(2);
+        sqlite3_bind_int(&mut stmt, 1, 10).unwrap();
+        sqlite3_bind_int(&mut stmt, 2, 20).unwrap();
+
+        let expanded = sqlite3_expanded_sql(&stmt).unwrap();
+        assert_eq!(expanded, "SELECT 20, 10");
+    }
+
+    #[test]
+    fn test_expanded_sql_null() {
+        let mut stmt = PreparedStmt::new("SELECT ?");
+        stmt.set_param_count(1);
+        sqlite3_bind_null(&mut stmt, 1).unwrap();
+
+        let expanded = sqlite3_expanded_sql(&stmt).unwrap();
+        assert_eq!(expanded, "SELECT NULL");
+    }
+
+    #[test]
+    fn test_expanded_sql_blob() {
+        let mut stmt = PreparedStmt::new("SELECT ?");
+        stmt.set_param_count(1);
+        sqlite3_bind_blob(&mut stmt, 1, &[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
+
+        let expanded = sqlite3_expanded_sql(&stmt).unwrap();
+        assert_eq!(expanded, "SELECT X'DEADBEEF'");
+    }
+
+    #[test]
+    fn test_expanded_sql_escaping() {
+        let mut stmt = PreparedStmt::new("SELECT ?");
+        stmt.set_param_count(1);
+        sqlite3_bind_text(&mut stmt, 1, "it's a test").unwrap();
+
+        let expanded = sqlite3_expanded_sql(&stmt).unwrap();
+        assert_eq!(expanded, "SELECT 'it''s a test'");
+    }
+
+    #[test]
+    fn test_expanded_sql_in_string() {
+        let mut stmt = PreparedStmt::new("SELECT '?', ?");
+        stmt.set_param_count(1);
+        sqlite3_bind_int(&mut stmt, 1, 42).unwrap();
+
+        let expanded = sqlite3_expanded_sql(&stmt).unwrap();
+        assert_eq!(expanded, "SELECT '?', 42");
+    }
+
+    #[test]
+    fn test_stmt_status_run() {
+        let mut stmt = PreparedStmt::new("SELECT 1");
+        // Before stepping, run count is 0 (no VDBE = 0)
+        let run_count = sqlite3_stmt_status(&mut stmt, StmtStatusOp::Run as i32, false);
+        assert_eq!(run_count, 0);
+
+        // Unknown status op returns 0
+        let unknown = sqlite3_stmt_status(&mut stmt, 999, false);
+        assert_eq!(unknown, 0);
+    }
+
+    #[test]
+    fn test_stmt_status_enum() {
+        assert_eq!(StmtStatusOp::try_from(1), Ok(StmtStatusOp::FullscanStep));
+        assert_eq!(StmtStatusOp::try_from(2), Ok(StmtStatusOp::Sort));
+        assert_eq!(StmtStatusOp::try_from(3), Ok(StmtStatusOp::AutoIndex));
+        assert_eq!(StmtStatusOp::try_from(4), Ok(StmtStatusOp::VmStep));
+        assert_eq!(StmtStatusOp::try_from(5), Ok(StmtStatusOp::Reprepare));
+        assert_eq!(StmtStatusOp::try_from(6), Ok(StmtStatusOp::Run));
+        assert_eq!(StmtStatusOp::try_from(99), Ok(StmtStatusOp::MemUsed));
+        assert!(StmtStatusOp::try_from(100).is_err());
+    }
+
+    #[test]
+    fn test_value_to_sql_literal() {
+        assert_eq!(value_to_sql_literal(&Value::Null), "NULL");
+        assert_eq!(value_to_sql_literal(&Value::Integer(42)), "42");
+        assert_eq!(value_to_sql_literal(&Value::Real(3.14)), "3.14");
+        assert_eq!(value_to_sql_literal(&Value::Real(5.0)), "5.0");
+        assert_eq!(value_to_sql_literal(&Value::Text("test".to_string())), "'test'");
+        assert_eq!(value_to_sql_literal(&Value::Blob(vec![1, 2, 3])), "X'010203'");
     }
 }

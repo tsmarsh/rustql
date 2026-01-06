@@ -2277,7 +2277,7 @@ impl Btree {
         let new_n_cell = mem_page.n_cell - 1;
         write_u16(data, header_start + 3, new_n_cell)?;
 
-        if mem_page.is_underfull(leaf_limits).unwrap_or(false) {
+        if mem_page.is_underfull(limits).unwrap_or(false) {
             if let (Some(parent), Some(child_index)) =
                 (_cursor.page_stack.last(), _cursor.idx_stack.last())
             {

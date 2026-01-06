@@ -260,9 +260,13 @@ impl Default for CellInfo {
     }
 }
 
-pub struct KeyInfo;
+pub struct KeyInfo {
+    pub encoding: u8,
+}
 
-pub struct UnpackedRecord;
+pub struct UnpackedRecord {
+    pub key: Vec<u8>,
+}
 
 pub struct IntegrityCheckResult {
     pub errors: Vec<String>,
@@ -1521,7 +1525,44 @@ impl BtCursor {
 
     /// sqlite3BtreeIndexMoveto
     pub fn index_moveto(&mut self, _key: &UnpackedRecord) -> Result<i32> {
-        Err(Error::new(ErrorCode::Internal))
+        let (mem_page, limits) = self.load_leaf_root()?;
+        if mem_page.n_cell == 0 {
+            self.state = CursorState::Invalid;
+            return Ok(1);
+        }
+        for i in 0..mem_page.n_cell {
+            let cell_offset = mem_page.cell_ptr(i, limits)?;
+            let info = mem_page.parse_cell(cell_offset, limits)?;
+            let payload = info.payload.as_deref().unwrap_or(&[]);
+            match payload.cmp(_key.key.as_slice()) {
+                std::cmp::Ordering::Equal => {
+                    self.info = info;
+                    self.n_key = self.info.n_key;
+                    self.ix = i;
+                    self.state = CursorState::Valid;
+                    self.page = Some(mem_page);
+                    return Ok(0);
+                }
+                std::cmp::Ordering::Greater => {
+                    self.info = info;
+                    self.n_key = self.info.n_key;
+                    self.ix = i;
+                    self.state = CursorState::Valid;
+                    self.page = Some(mem_page);
+                    return Ok(-1);
+                }
+                std::cmp::Ordering::Less => {}
+            }
+        }
+        let last_index = mem_page.n_cell - 1;
+        let cell_offset = mem_page.cell_ptr(last_index, limits)?;
+        let info = mem_page.parse_cell(cell_offset, limits)?;
+        self.info = info;
+        self.n_key = self.info.n_key;
+        self.ix = last_index;
+        self.state = CursorState::Valid;
+        self.page = Some(mem_page);
+        Ok(1)
     }
 
     /// sqlite3BtreeCursorHasMoved

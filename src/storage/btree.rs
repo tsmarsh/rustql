@@ -101,6 +101,10 @@ impl PageLimits {
     fn header_start(&self) -> usize {
         self.header_offset
     }
+
+    fn usable_end(&self) -> usize {
+        self.usable_size as usize
+    }
 }
 
 fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
@@ -153,6 +157,13 @@ impl MemPage {
         })
     }
 
+    pub fn cell_content_offset(&self, limits: PageLimits) -> Result<usize> {
+        if self.cell_offset == 0 && limits.usable_size == 65536 {
+            return Ok(65536);
+        }
+        Ok(self.cell_offset as usize)
+    }
+
     pub fn header_size(&self) -> usize {
         if self.is_leaf {
             8
@@ -186,12 +197,19 @@ impl MemPage {
         }
         let header_start = limits.header_start();
         let header_size = self.header_size();
+        let usable_end = limits.usable_end();
+        if header_start + header_size > usable_end {
+            return Err(Error::new(ErrorCode::Corrupt));
+        }
         let ptr_array_end = header_start + header_size + (self.n_cell as usize * 2);
-        let usable_end = header_start + limits.usable_size as usize;
         if ptr_array_end > usable_end {
             return Err(Error::new(ErrorCode::Corrupt));
         }
-        if self.cell_offset as usize > limits.usable_size as usize {
+        let cell_offset = self.cell_content_offset(limits)?;
+        if cell_offset < ptr_array_end {
+            return Err(Error::new(ErrorCode::Corrupt));
+        }
+        if cell_offset > usable_end {
             return Err(Error::new(ErrorCode::Corrupt));
         }
         Ok(())

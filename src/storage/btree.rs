@@ -164,6 +164,7 @@ pub struct BtShared {
     pub preformat_size: i32,
     pub schema_cookie: u32,
     pub file_format: u8,
+    pub free_pages: Vec<Pgno>,
 }
 
 impl BtShared {
@@ -517,9 +518,18 @@ fn free_overflow_chain(shared: &mut BtShared, start: Pgno) -> Result<()> {
     while next != 0 {
         let page = shared.pager.get(next, PagerGetFlags::empty())?;
         let next_pgno = read_u32(&page.data, 0).ok_or(Error::new(ErrorCode::Corrupt))?;
+        shared.free_pages.push(next);
         next = next_pgno;
     }
     Ok(())
+}
+
+fn allocate_page(shared: &mut BtShared) -> Pgno {
+    if let Some(pgno) = shared.free_pages.pop() {
+        pgno
+    } else {
+        shared.pager.db_size + 1
+    }
 }
 
 fn collapse_root_if_empty(shared: &mut BtShared, root_pgno: Pgno) -> Result<()> {
@@ -710,8 +720,8 @@ fn split_internal_root(
     let left_children = children[..mid + 1].to_vec();
     let right_children = children[mid + 1..].to_vec();
 
-    let left_pgno = shared.pager.db_size + 1;
-    let right_pgno = shared.pager.db_size + 2;
+    let left_pgno = allocate_page(shared);
+    let right_pgno = allocate_page(shared);
     let flags = parent.data[parent_limits.header_start()];
     let left_data = build_internal_page_data(
         PageLimits::new(shared.page_size, shared.usable_size),
@@ -793,7 +803,7 @@ fn split_internal_with_parent(
     let right_children = children[mid + 1..].to_vec();
 
     let left_pgno = parent.pgno;
-    let right_pgno = shared.pager.db_size + 1;
+    let right_pgno = allocate_page(shared);
     let flags = parent.data[parent_limits.header_start()];
     let left_data = build_internal_page_data(
         PageLimits::new(shared.page_size, shared.usable_size),
@@ -1022,8 +1032,8 @@ fn split_root_leaf(
         return Err(Error::new(ErrorCode::Corrupt));
     }
 
-    let left_pgno = shared.pager.db_size + 1;
-    let right_pgno = shared.pager.db_size + 2;
+    let left_pgno = allocate_page(shared);
+    let right_pgno = allocate_page(shared);
     let flags = mem_page.data[limits.header_start()];
     let left_data = build_leaf_page_data(PageLimits::new(shared.page_size, shared.usable_size), flags, &left_cells)?;
     let right_data = build_leaf_page_data(PageLimits::new(shared.page_size, shared.usable_size), flags, &right_cells)?;
@@ -1103,7 +1113,7 @@ fn split_leaf_with_parent(
     shared.pager.write(&mut left_page)?;
     left_page.data = left_data;
 
-    let right_pgno = shared.pager.db_size + 1;
+    let right_pgno = allocate_page(shared);
     let mut right_page = shared.pager.get(right_pgno, PagerGetFlags::empty())?;
     shared.pager.write(&mut right_page)?;
     right_page.data = right_data;
@@ -1578,6 +1588,7 @@ impl Btree {
             preformat_size: 0,
             schema_cookie: 0,
             file_format: 0,
+            free_pages: Vec::new(),
         };
 
         if let Ok(page) = shared.pager.get(1, PagerGetFlags::empty()) {
@@ -1863,12 +1874,16 @@ impl Btree {
             build_cell(&mem_page, limits, _payload)?;
         if !overflow.pages.is_empty() {
             let pages_len = overflow.pages.len();
-            let first_pgno = shared_guard.pager.db_size + 1;
+            let mut pgno_list = Vec::with_capacity(pages_len);
+            for _ in 0..pages_len {
+                pgno_list.push(allocate_page(&mut shared_guard));
+            }
+            let first_pgno = pgno_list[0];
             overflow.first = Some(first_pgno);
             for (idx, mut page) in overflow.pages.into_iter().enumerate() {
-                let pgno = first_pgno + idx as u32;
+                let pgno = pgno_list[idx];
                 let next_pgno = if idx + 1 < pages_len {
-                    first_pgno + idx as u32 + 1
+                    pgno_list[idx + 1]
                 } else {
                     0
                 };
@@ -2051,7 +2066,7 @@ impl Btree {
     /// sqlite3BtreeCreateTable
     pub fn create_table(&mut self, _flags: u8) -> Result<Pgno> {
         let mut shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
-        let new_pgno = shared.pager.db_size + 1;
+        let new_pgno = allocate_page(&mut shared);
         let mut page = shared.pager.get(new_pgno, PagerGetFlags::empty())?;
         shared.pager.write(&mut page)?;
         page.data.fill(0);
@@ -2067,7 +2082,7 @@ impl Btree {
         write_u16(&mut page.data, header_start + 3, 0)?;
         write_u16(&mut page.data, header_start + 5, shared.usable_size as u16)?;
         page.data[header_start + 7] = 0;
-        shared.pager.db_size = new_pgno;
+        shared.pager.db_size = new_pgno.max(shared.pager.db_size);
         shared.n_page = shared.pager.db_size;
         Ok(new_pgno)
     }

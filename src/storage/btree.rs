@@ -230,6 +230,7 @@ pub struct MemPage {
     pub first_freeblock: u16,
     pub mask_page: u16,
     pub n_free: i32,
+    pub parent: Option<Pgno>,
 }
 
 pub struct BtreePayload {
@@ -510,6 +511,16 @@ fn build_overflow_pages(limits: PageLimits, payload: &[u8]) -> OverflowChain {
     OverflowChain { first: None, pages }
 }
 
+fn free_overflow_chain(shared: &mut BtShared, start: Pgno) -> Result<()> {
+    let mut next = start;
+    while next != 0 {
+        let page = shared.pager.get(next, PagerGetFlags::empty())?;
+        let next_pgno = read_u32(&page.data, 0).ok_or(Error::new(ErrorCode::Corrupt))?;
+        next = next_pgno;
+    }
+    Ok(())
+}
+
 fn read_varint(data: &[u8], offset: usize) -> Result<(u64, usize)> {
     let mut value = 0u64;
     for i in 0..9 {
@@ -594,6 +605,7 @@ impl MemPage {
             first_freeblock,
             mask_page,
             n_free: -1,
+            parent: None,
         };
 
         if let Some(shared) = shared {
@@ -1310,6 +1322,9 @@ impl Btree {
 
         let cell_offset = mem_page.cell_ptr(_cursor.ix, limits)?;
         let info = mem_page.parse_cell(cell_offset, limits)?;
+        if let Some(overflow_pgno) = info.overflow_pgno {
+            free_overflow_chain(&mut shared_guard, overflow_pgno)?;
+        }
         let cell_size = info.n_size as i32;
 
         let from = ptr_array_start + ((_cursor.ix as usize + 1) * 2);
@@ -1362,6 +1377,14 @@ impl Btree {
         } else {
             PageLimits::new(shared.page_size, shared.usable_size)
         };
+        let mem_page = MemPage::parse_with_shared(_root_page, page.data.clone(), limits, Some(&shared))?;
+        for i in 0..mem_page.n_cell {
+            let cell_offset = mem_page.cell_ptr(i, limits)?;
+            let info = mem_page.parse_cell(cell_offset, limits)?;
+            if let Some(overflow_pgno) = info.overflow_pgno {
+                free_overflow_chain(&mut shared, overflow_pgno)?;
+            }
+        }
         let header_start = limits.header_start();
         write_u16(&mut page.data, header_start + 1, 0)?;
         write_u16(&mut page.data, header_start + 3, 0)?;

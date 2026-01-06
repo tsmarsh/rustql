@@ -1,0 +1,35 @@
+# Rust build artifacts
+/target/
+
+# SQLite build outputs (if built in-tree)
+/sqlite3/*.o
+/sqlite3/*.obj
+/sqlite3/*.lo
+/sqlite3/*.la
+/sqlite3/*.a
+/sqlite3/*.so
+/sqlite3/*.dylib
+/sqlite3/*.dll
+/sqlite3/*.exe
+/sqlite3/*.out
+/sqlite3/*.d
+/sqlite3/*.gcda
+/sqlite3/*.gcno
+/sqlite3/sqlite3
+/sqlite3/sqldiff
+/sqlite3/sqlite3_analyzer
+/sqlite3/testfixture
+/sqlite3/testfixture.exe
+/sqlite3/sqlite3.c
+/sqlite3/sqlite3.h
+/sqlite3/tsrc/
+
+# Common local build dirs
+/build/
+/bld/
+
+# Editor/OS noise
+.DS_Store
+
+# Agent-specific metadata
+/.claude/

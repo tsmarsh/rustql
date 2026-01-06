@@ -1686,21 +1686,63 @@ impl BtCursor {
 
     /// sqlite3BtreePayloadFetch
     pub fn payload_fetch(&self) -> Option<&[u8]> {
-        self.info.payload.as_deref()
+        if self.info.overflow_pgno.is_some() {
+            None
+        } else {
+            self.info.payload.as_deref()
+        }
     }
 
     /// sqlite3BtreePayload
     pub fn payload(&self, offset: u32, amount: u32) -> Result<Vec<u8>> {
-        if self.info.overflow_pgno.is_some() {
-            return Err(Error::new(ErrorCode::Internal));
-        }
-        let payload = self.info.payload.as_ref().ok_or(Error::new(ErrorCode::Corrupt))?;
+        let payload = if self.info.overflow_pgno.is_some() {
+            self.read_overflow_payload()?
+        } else {
+            self.info.payload.clone().ok_or(Error::new(ErrorCode::Corrupt))?
+        };
         let start = offset as usize;
         let end = start.checked_add(amount as usize).ok_or(Error::new(ErrorCode::Corrupt))?;
         if end > payload.len() {
             return Err(Error::new(ErrorCode::Corrupt));
         }
         Ok(payload[start..end].to_vec())
+    }
+
+    fn read_overflow_payload(&self) -> Result<Vec<u8>> {
+        let shared = self
+            .bt_shared
+            .upgrade()
+            .ok_or(Error::new(ErrorCode::Internal))?;
+        let mut shared_guard = shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut result = self.info.payload.clone().unwrap_or_default();
+        let mut remaining = self.info.n_payload.saturating_sub(self.info.n_local as u32);
+        let mut next = self.info.overflow_pgno.ok_or(Error::new(ErrorCode::Corrupt))?;
+        let ovfl_size = shared_guard.usable_size.saturating_sub(4) as usize;
+
+        while remaining > 0 {
+            let page = shared_guard.pager.get(next, PagerGetFlags::empty())?;
+            if page.data.len() < 4 {
+                return Err(Error::new(ErrorCode::Corrupt));
+            }
+            let next_pgno = read_u32(&page.data, 0).ok_or(Error::new(ErrorCode::Corrupt))?;
+            let take = std::cmp::min(remaining as usize, ovfl_size);
+            let start = 4;
+            let end = start + take;
+            if end > page.data.len() {
+                return Err(Error::new(ErrorCode::Corrupt));
+            }
+            result.extend_from_slice(&page.data[start..end]);
+            remaining -= take as u32;
+            if remaining == 0 {
+                break;
+            }
+            if next_pgno == 0 {
+                return Err(Error::new(ErrorCode::Corrupt));
+            }
+            next = next_pgno;
+        }
+
+        Ok(result)
     }
 
     /// sqlite3BtreePayloadChecked

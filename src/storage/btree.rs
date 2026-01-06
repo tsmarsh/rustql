@@ -151,6 +151,8 @@ pub struct BtShared {
     pub has_content: Option<Vec<u8>>,
     pub temp_space: Vec<u8>,
     pub preformat_size: i32,
+    pub schema_cookie: u32,
+    pub file_format: u8,
 }
 
 impl BtShared {
@@ -254,6 +256,51 @@ pub struct UnpackedRecord;
 
 pub struct IntegrityCheckResult {
     pub errors: Vec<String>,
+}
+
+pub struct DbHeader {
+    pub page_size: u32,
+    pub reserve: u8,
+    pub file_format: u8,
+    pub schema_cookie: u32,
+    pub auto_vacuum: u8,
+    pub incr_vacuum: u8,
+}
+
+impl DbHeader {
+    pub fn parse(data: &[u8]) -> Result<Self> {
+        if data.len() < 100 {
+            return Err(Error::new(ErrorCode::Corrupt));
+        }
+        let mut page_size = read_u16(data, 16).ok_or(Error::new(ErrorCode::Corrupt))? as u32;
+        if page_size == 1 {
+            page_size = 65536;
+        }
+        if page_size < 512 || page_size > 65536 || !page_size.is_power_of_two() {
+            return Err(Error::new(ErrorCode::Corrupt));
+        }
+        let reserve = data[20];
+        let file_format = data[18];
+        let schema_cookie = read_u32(data, 40).ok_or(Error::new(ErrorCode::Corrupt))?;
+        let auto_vacuum = if read_u32(data, 36 + 4 * 4).unwrap_or(0) != 0 {
+            1
+        } else {
+            0
+        };
+        let incr_vacuum = if read_u32(data, 36 + 7 * 4).unwrap_or(0) != 0 {
+            1
+        } else {
+            0
+        };
+        Ok(Self {
+            page_size,
+            reserve,
+            file_format,
+            schema_cookie,
+            auto_vacuum,
+            incr_vacuum,
+        })
+    }
 }
 
 pub fn integrity_check(
@@ -722,12 +769,28 @@ impl Btree {
             has_content: None,
             temp_space: vec![0u8; page_size as usize],
             preformat_size: 0,
+            schema_cookie: 0,
+            file_format: 0,
         };
+
+        if let Ok(page) = shared.pager.get(1, PagerGetFlags::empty()) {
+            if let Ok(header) = DbHeader::parse(&page.data) {
+                if header.page_size != shared.page_size {
+                    let _ = shared.pager.set_page_size(header.page_size, header.reserve as i32);
+                    shared.page_size = shared.pager.page_size;
+                    shared.usable_size = shared.pager.usable_size;
+                }
+                shared.schema_cookie = header.schema_cookie;
+                shared.file_format = header.file_format;
+                shared.auto_vacuum = header.auto_vacuum;
+                shared.incr_vacuum = header.incr_vacuum;
+            }
+        }
 
         shared.update_payload_params();
 
         let page1_limits = PageLimits::for_page1(shared.page_size, shared.usable_size);
-        if let Ok(mut page) = shared.pager.get(1, PagerGetFlags::empty()) {
+        if let Ok(page) = shared.pager.get(1, PagerGetFlags::empty()) {
             if let Ok(mut mem_page) =
                 MemPage::parse_with_shared(1, page.data.clone(), page1_limits, Some(&shared))
             {

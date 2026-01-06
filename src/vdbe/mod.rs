@@ -6,6 +6,7 @@ pub mod mem;
 pub mod sort;
 pub mod expr;
 pub mod value;
+pub mod aux;
 
 pub use value::{
     SqliteValue, FunctionContext,
@@ -16,4 +17,11 @@ pub use value::{
     sqlite3_result_double, sqlite3_result_text, sqlite3_result_blob,
     sqlite3_result_error, sqlite3_result_value,
     sqlite3_aggregate_context,
+};
+
+pub use aux::{
+    SerialType, VdbeBuilder, Label,
+    get_varint, put_varint, varint_len,
+    decode_record_header, make_record, deserialize_value,
+    explain_program,
 };

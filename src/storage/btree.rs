@@ -522,6 +522,193 @@ fn free_overflow_chain(shared: &mut BtShared, start: Pgno) -> Result<()> {
     Ok(())
 }
 
+fn build_leaf_page_data(
+    limits: PageLimits,
+    flags: u8,
+    cells: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let mut data = vec![0u8; limits.page_size as usize];
+    let header_start = limits.header_start();
+    data[header_start] = flags;
+    write_u16(&mut data, header_start + 1, 0)?;
+    write_u16(&mut data, header_start + 3, cells.len() as u16)?;
+    data[header_start + 7] = 0;
+
+    let mut content_start = limits.usable_size as usize;
+    for (i, cell) in cells.iter().enumerate() {
+        content_start = content_start
+            .checked_sub(cell.len())
+            .ok_or(Error::new(ErrorCode::Corrupt))?;
+        data[content_start..content_start + cell.len()].copy_from_slice(cell);
+        let ptr_offset = header_start + 8 + (i * 2);
+        write_u16(&mut data, ptr_offset, content_start as u16)?;
+    }
+    write_u16(&mut data, header_start + 5, content_start as u16)?;
+    Ok(data)
+}
+
+fn build_internal_cell(child_pgno: Pgno, key: &CellInfo, is_index: bool) -> Result<Vec<u8>> {
+    let mut cell = Vec::new();
+    cell.extend_from_slice(&child_pgno.to_be_bytes());
+    if is_index {
+        let payload = key.payload.as_ref().ok_or(Error::new(ErrorCode::Internal))?;
+        write_varint(payload.len() as u64, &mut cell);
+        cell.extend_from_slice(payload);
+    } else {
+        write_varint(key.n_key as u64, &mut cell);
+    }
+    Ok(cell)
+}
+
+fn build_internal_root_data(
+    limits: PageLimits,
+    flags: u8,
+    left_child: Pgno,
+    right_child: Pgno,
+    sep: &CellInfo,
+    is_index: bool,
+) -> Result<Vec<u8>> {
+    let cell = build_internal_cell(left_child, sep, is_index)?;
+    let mut data = vec![0u8; limits.page_size as usize];
+    let header_start = limits.header_start();
+    data[header_start] = flags;
+    write_u16(&mut data, header_start + 1, 0)?;
+    write_u16(&mut data, header_start + 3, 1)?;
+    data[header_start + 7] = 0;
+    write_u32(&mut data, header_start + 8, right_child)?;
+    let mut content_start = limits.usable_size as usize;
+    content_start = content_start
+        .checked_sub(cell.len())
+        .ok_or(Error::new(ErrorCode::Corrupt))?;
+    data[content_start..content_start + cell.len()].copy_from_slice(&cell);
+    let ptr_offset = header_start + 12;
+    write_u16(&mut data, ptr_offset, content_start as u16)?;
+    write_u16(&mut data, header_start + 5, content_start as u16)?;
+    Ok(data)
+}
+
+fn parse_cell_from_bytes(page: &MemPage, limits: PageLimits, cell: &[u8]) -> Result<CellInfo> {
+    if cell.is_empty() {
+        return Err(Error::new(ErrorCode::Corrupt));
+    }
+    let mut cursor = 0usize;
+    if page.child_ptr_size == 4 {
+        if cell.len() < 4 {
+            return Err(Error::new(ErrorCode::Corrupt));
+        }
+        cursor += 4;
+    }
+
+    let (payload_size, n1) = read_varint32(cell, cursor)?;
+    cursor = cursor.checked_add(n1).ok_or(Error::new(ErrorCode::Corrupt))?;
+
+    let (n_key, n2) = if page.is_intkey {
+        read_varint(cell, cursor)?
+    } else if page.is_zerodata {
+        (payload_size as u64, 0usize)
+    } else {
+        let (key_bytes, bytes) = read_varint32(cell, cursor)?;
+        (key_bytes as u64, bytes)
+    };
+    cursor = cursor.checked_add(n2).ok_or(Error::new(ErrorCode::Corrupt))?;
+
+    let mut info = CellInfo::default();
+    info.n_key = n_key as i64;
+    info.n_payload = payload_size;
+    if !page.is_intkey || page.is_leaf {
+        let end = cursor
+            .checked_add(payload_size as usize)
+            .ok_or(Error::new(ErrorCode::Corrupt))?;
+        if end > cell.len() {
+            return Err(Error::new(ErrorCode::Corrupt));
+        }
+        if payload_size > 0 {
+            info.payload = Some(cell[cursor..end].to_vec());
+        }
+    }
+    if payload_size as u16 > page.max_local && page.max_local != 0 {
+        info.overflow_pgno = None;
+        info.n_local = page.payload_to_local(payload_size as i64, limits)?;
+        info.n_size = (cursor + info.n_local as usize) as u16 + 4;
+    } else {
+        info.n_local = payload_size as u16;
+        info.n_size = (cursor + payload_size as usize) as u16;
+    }
+    Ok(info)
+}
+
+fn split_root_leaf(
+    shared: &mut BtShared,
+    root_pgno: Pgno,
+    mem_page: &MemPage,
+    limits: PageLimits,
+    insert_index: u16,
+    new_cell: Vec<u8>,
+) -> Result<()> {
+    let mut cells = Vec::with_capacity(mem_page.n_cell as usize + 1);
+    for i in 0..mem_page.n_cell {
+        let cell_offset = mem_page.cell_ptr(i, limits)?;
+        let info = mem_page.parse_cell(cell_offset, limits)?;
+        let start = cell_offset as usize;
+        let end = start + info.n_size as usize;
+        if end > mem_page.data.len() {
+            return Err(Error::new(ErrorCode::Corrupt));
+        }
+        cells.push(mem_page.data[start..end].to_vec());
+    }
+
+    let insert_at = insert_index.min(mem_page.n_cell) as usize;
+    cells.insert(insert_at, new_cell);
+
+    let mid = cells.len() / 2;
+    let left_cells = cells[..mid].to_vec();
+    let right_cells = cells[mid..].to_vec();
+    if right_cells.is_empty() {
+        return Err(Error::new(ErrorCode::Corrupt));
+    }
+
+    let left_pgno = shared.pager.db_size + 1;
+    let right_pgno = shared.pager.db_size + 2;
+    let flags = mem_page.data[limits.header_start()];
+    let left_data = build_leaf_page_data(PageLimits::new(shared.page_size, shared.usable_size), flags, &left_cells)?;
+    let right_data = build_leaf_page_data(PageLimits::new(shared.page_size, shared.usable_size), flags, &right_cells)?;
+
+    let mut left_page = shared.pager.get(left_pgno, PagerGetFlags::empty())?;
+    shared.pager.write(&mut left_page)?;
+    left_page.data = left_data;
+
+    let mut right_page = shared.pager.get(right_pgno, PagerGetFlags::empty())?;
+    shared.pager.write(&mut right_page)?;
+    right_page.data = right_data;
+
+    shared.pager.db_size = right_pgno.max(shared.pager.db_size);
+    shared.n_page = shared.pager.db_size;
+
+    let sep_info = parse_cell_from_bytes(mem_page, limits, &right_cells[0])?;
+    let internal_flags = if mem_page.is_intkey {
+        BTREE_PAGEFLAG_LEAFDATA | BTREE_PAGEFLAG_INTKEY
+    } else {
+        BTREE_PAGEFLAG_ZERODATA
+    };
+    let root_limits = if root_pgno == 1 {
+        PageLimits::for_page1(shared.page_size, shared.usable_size)
+    } else {
+        PageLimits::new(shared.page_size, shared.usable_size)
+    };
+    let root_data = build_internal_root_data(
+        root_limits,
+        internal_flags,
+        left_pgno,
+        right_pgno,
+        &sep_info,
+        !mem_page.is_intkey,
+    )?;
+    let mut root_page = shared.pager.get(root_pgno, PagerGetFlags::empty())?;
+    shared.pager.write(&mut root_page)?;
+    root_page.data = root_data;
+    Ok(())
+}
+
 fn read_varint(data: &[u8], offset: usize) -> Result<(u64, usize)> {
     let mut value = 0u64;
     for i in 0..9 {
@@ -1279,6 +1466,17 @@ impl Btree {
         let ptr_array_end = header_start + header_size + (mem_page.n_cell as usize * 2);
         let cell_offset = mem_page.cell_content_offset(limits)?;
         if cell_offset < ptr_array_end + cell_size {
+            if root_pgno == _cursor.root_page && mem_page.is_leaf {
+                split_root_leaf(
+                    &mut shared_guard,
+                    root_pgno,
+                    &mem_page,
+                    limits,
+                    insert_index,
+                    cell,
+                )?;
+                return Ok(());
+            }
             return Err(Error::new(ErrorCode::Full));
         }
         let new_cell_offset = cell_offset - cell_size;

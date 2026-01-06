@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 use std::sync::RwLock;
 
 use crate::error::{Error, ErrorCode, Result};
+use crate::os::mutex;
 
 // ============================================================================
 // Threading Mode
@@ -259,6 +260,7 @@ pub fn sqlite3_initialize() -> Result<()> {
     // - Mutex system
     // - Page cache
     // - etc.
+    mutex::mutex_init();
 
     config.is_init.store(true, Ordering::SeqCst);
     config.in_progress.store(false, Ordering::SeqCst);
@@ -283,6 +285,7 @@ pub fn sqlite3_shutdown() -> Result<()> {
     // - Memory allocator
     // - Mutex system
     // - etc.
+    mutex::mutex_end();
 
     config.is_init.store(false, Ordering::SeqCst);
 

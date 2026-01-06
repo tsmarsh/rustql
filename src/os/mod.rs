@@ -1,5 +1,6 @@
 //! OS abstraction layer: VFS and platform implementations
 
+pub mod mutex;
 pub mod vfs;
 
 #[cfg(unix)]

@@ -8,6 +8,8 @@ pub mod expr;
 pub mod value;
 pub mod aux;
 pub mod types;
+pub mod trace;
+pub mod bytecode;
 
 pub use value::{
     SqliteValue, FunctionContext,
@@ -33,4 +35,18 @@ pub use types::{
     VDBE_MAGIC_RESET, VDBE_MAGIC_DEAD,
     SQLITE_MAX_VARIABLE_NUMBER,
     compare_flags, seek_flags, insert_flags,
+};
+
+pub use sort::{
+    VdbeSorter, SorterState, SorterRecord,
+};
+
+pub use trace::{
+    TraceFlags, TraceEvent, TraceInfo, TraceCallback, Tracer,
+    expand_sql,
+};
+
+pub use bytecode::{
+    BytecodeRow, BytecodeIterator,
+    explain_bytecode, explain_query_plan, bytecode_schema,
 };

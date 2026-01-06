@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 use std::ffi::c_void;
 use std::sync::{Arc, Weak};
 
-use crate::api::connection::SqliteConnection;
+use crate::api::SqliteConnection;
 use crate::storage::btree::BtCursor;
 use crate::types::Pgno;
 use crate::vdbe::engine::Vdbe;
@@ -691,8 +691,10 @@ pub enum Opcode {
     Noop = 188,
     Explain = 189,
     Abortable = 190,
-    MaxOpcode = 190,
 }
+
+/// Maximum opcode value (same as Abortable)
+pub const MAX_OPCODE: u8 = 190;
 
 // ============================================================================
 // Tests

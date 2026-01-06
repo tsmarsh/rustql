@@ -1483,7 +1483,40 @@ impl BtCursor {
 
     /// sqlite3BtreeTableMoveto
     pub fn table_moveto(&mut self, _int_key: RowId, _bias: bool) -> Result<i32> {
-        Err(Error::new(ErrorCode::Internal))
+        let (mem_page, limits) = self.load_leaf_root()?;
+        if mem_page.n_cell == 0 {
+            self.state = CursorState::Invalid;
+            return Ok(1);
+        }
+        for i in 0..mem_page.n_cell {
+            let cell_offset = mem_page.cell_ptr(i, limits)?;
+            let info = mem_page.parse_cell(cell_offset, limits)?;
+            if info.n_key == _int_key {
+                self.info = info;
+                self.n_key = _int_key;
+                self.ix = i;
+                self.state = CursorState::Valid;
+                self.page = Some(mem_page);
+                return Ok(0);
+            }
+            if _int_key < info.n_key {
+                self.info = info;
+                self.n_key = self.info.n_key;
+                self.ix = i;
+                self.state = CursorState::Valid;
+                self.page = Some(mem_page);
+                return Ok(-1);
+            }
+        }
+        let last_index = mem_page.n_cell - 1;
+        let cell_offset = mem_page.cell_ptr(last_index, limits)?;
+        let info = mem_page.parse_cell(cell_offset, limits)?;
+        self.info = info;
+        self.n_key = self.info.n_key;
+        self.ix = last_index;
+        self.state = CursorState::Valid;
+        self.page = Some(mem_page);
+        Ok(1)
     }
 
     /// sqlite3BtreeIndexMoveto

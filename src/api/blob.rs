@@ -6,10 +6,7 @@
 //!
 //! Translation of sqlite3/src/vdbeblob.c
 
-use std::sync::Arc;
-
 use crate::error::{Error, ErrorCode, Result};
-use crate::types::Value;
 
 /// Blob handle for incremental I/O
 ///

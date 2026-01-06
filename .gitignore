@@ -34,3 +34,4 @@
 # Agent-specific metadata
 /.claude/
 .moth/.current
+.current

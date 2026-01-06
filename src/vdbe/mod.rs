@@ -8,6 +8,7 @@ pub mod expr;
 pub mod value;
 pub mod aux;
 pub mod types;
+pub mod int;
 
 pub use value::{
     SqliteValue, FunctionContext,

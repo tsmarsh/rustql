@@ -1262,12 +1262,12 @@ impl Btree {
 
     /// sqlite3BtreeCount
     pub fn count(&mut self, _cursor: &mut BtCursor) -> Result<i64> {
-        Err(Error::new(ErrorCode::Internal))
+        _cursor.count()
     }
 
     /// sqlite3BtreeCursorInfo
     pub fn cursor_info(&mut self, _cursor: &mut BtCursor, _op: i32) -> Result<i32> {
-        Err(Error::new(ErrorCode::Internal))
+        _cursor.cursor_info(_op)
     }
 
     /// sqlite3BtreeTransferRow
@@ -1451,7 +1451,8 @@ impl BtCursor {
 
     /// sqlite3BtreeCount
     pub fn count(&mut self) -> Result<i64> {
-        Err(Error::new(ErrorCode::Internal))
+        let (mem_page, _) = self.load_leaf_root()?;
+        Ok(mem_page.n_cell as i64)
     }
 
     /// sqlite3BtreeEof

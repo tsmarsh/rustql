@@ -1846,14 +1846,26 @@ impl BtCursor {
 
     /// sqlite3BtreeIsEmpty
     pub fn is_empty(&mut self) -> Result<bool> {
-        let (mem_page, _) = self.load_leaf_root()?;
+        let shared = self
+            .bt_shared
+            .upgrade()
+            .ok_or(Error::new(ErrorCode::Internal))?;
+        let mut shared_guard = shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        self.page_stack.clear();
+        self.idx_stack.clear();
+        let (mem_page, _) = self.descend_leftmost(&mut shared_guard, self.root_page)?;
         Ok(mem_page.n_cell == 0)
     }
 
     /// sqlite3BtreeCount
     pub fn count(&mut self) -> Result<i64> {
-        let (mem_page, _) = self.load_leaf_root()?;
-        Ok(mem_page.n_cell as i64)
+        let mut total = 0i64;
+        let _ = self.first()?;
+        while self.is_valid() {
+            total += 1;
+            self.next(0)?;
+        }
+        Ok(total)
     }
 
     /// sqlite3BtreeEof

@@ -4,7 +4,7 @@ use std::sync::{Arc, Weak, RwLock};
 
 use bitflags::bitflags;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorCode, Result};
 
 type Pgno = u32;
 
@@ -73,17 +73,17 @@ pub struct Pager;
 impl Btree {
     /// sqlite3BtreeOpen
     pub fn open() -> Result<Self> {
-        Err(Error)
+        Err(Error::new(ErrorCode::Internal))
     }
 
     /// sqlite3BtreeClose
     pub fn close(&mut self) -> Result<()> {
-        Err(Error)
+        Err(Error::new(ErrorCode::Internal))
     }
 
     /// sqlite3BtreeSetPageSize
     pub fn set_page_size(&mut self, _size: u32) -> Result<()> {
-        Err(Error)
+        Err(Error::new(ErrorCode::Internal))
     }
 
     /// sqlite3BtreeGetPageSize
@@ -93,81 +93,81 @@ impl Btree {
 
     /// sqlite3BtreeBeginTrans
     pub fn begin_trans(&mut self) -> Result<()> {
-        Err(Error)
+        Err(Error::new(ErrorCode::Internal))
     }
 
     /// sqlite3BtreeCommit
     pub fn commit(&mut self) -> Result<()> {
-        Err(Error)
+        Err(Error::new(ErrorCode::Internal))
     }
 
     /// sqlite3BtreeRollback
     pub fn rollback(&mut self) -> Result<()> {
-        Err(Error)
+        Err(Error::new(ErrorCode::Internal))
     }
 
     /// sqlite3BtreeCursor
     pub fn cursor(&self, _root_page: Pgno) -> Result<BtCursor> {
-        Err(Error)
+        Err(Error::new(ErrorCode::Internal))
     }
 
     /// sqlite3BtreeCloseCursor
     pub fn close_cursor(&self, _cursor: BtCursor) -> Result<()> {
-        Err(Error)
+        Err(Error::new(ErrorCode::Internal))
     }
 
     /// sqlite3BtreeFirst
     pub fn first(&self, _cursor: &mut BtCursor) -> Result<()> {
-        Err(Error)
+        Err(Error::new(ErrorCode::Internal))
     }
 
     /// sqlite3BtreeLast
     pub fn last(&self, _cursor: &mut BtCursor) -> Result<()> {
-        Err(Error)
+        Err(Error::new(ErrorCode::Internal))
     }
 
     /// sqlite3BtreeNext
     pub fn next(&self, _cursor: &mut BtCursor) -> Result<()> {
-        Err(Error)
+        Err(Error::new(ErrorCode::Internal))
     }
 
     /// sqlite3BtreePrevious
     pub fn previous(&self, _cursor: &mut BtCursor) -> Result<()> {
-        Err(Error)
+        Err(Error::new(ErrorCode::Internal))
     }
 
     /// sqlite3BtreeInsert
     pub fn insert(&mut self, _cursor: &mut BtCursor, _key: &[u8], _data: &[u8]) -> Result<()> {
-        Err(Error)
+        Err(Error::new(ErrorCode::Internal))
     }
 
     /// sqlite3BtreeDelete
     pub fn delete(&mut self, _cursor: &mut BtCursor) -> Result<()> {
-        Err(Error)
+        Err(Error::new(ErrorCode::Internal))
     }
 
     /// sqlite3BtreeKey
     pub fn key(&self, _cursor: &BtCursor) -> Result<Vec<u8>> {
-        Err(Error)
+        Err(Error::new(ErrorCode::Internal))
     }
 
     /// sqlite3BtreeData
     pub fn data(&self, _cursor: &BtCursor) -> Result<Vec<u8>> {
-        Err(Error)
+        Err(Error::new(ErrorCode::Internal))
     }
 
     /// sqlite3BtreeCreateTable
     pub fn create_table(&mut self) -> Result<Pgno> {
-        Err(Error)
+        Err(Error::new(ErrorCode::Internal))
     }
 
     /// sqlite3BtreeDropTable
     pub fn drop_table(&mut self, _root_page: Pgno) -> Result<()> {
-        Err(Error)
+        Err(Error::new(ErrorCode::Internal))
     }
 
     /// sqlite3BtreeClearTable
     pub fn clear_table(&mut self, _root_page: Pgno) -> Result<()> {
-        Err(Error)
+        Err(Error::new(ErrorCode::Internal))
     }
 }

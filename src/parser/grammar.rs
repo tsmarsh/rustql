@@ -2209,12 +2209,8 @@ impl<'a> Parser<'a> {
             return Ok(Expr::Literal(self.parse_literal()?));
         }
 
-        // Parameters
-        if self.check(TokenKind::Question)
-            || self.check(TokenKind::Colon)
-            || self.check(TokenKind::At)
-            || self.check(TokenKind::Dollar)
-        {
+        // Parameters (variables like ?, ?1, :name, @name, $name)
+        if self.check(TokenKind::Variable) {
             return Ok(Expr::Variable(self.parse_variable()?));
         }
 
@@ -2334,22 +2330,25 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_variable(&mut self) -> Result<Variable> {
-        if self.match_token(TokenKind::Question) {
-            // Check for numbered parameter
-            if self.check(TokenKind::Integer) {
-                let num: i32 = self.current_text().parse().map_err(|_| {
-                    Error::with_message(ErrorCode::Error, "invalid parameter number")
-                })?;
-                self.advance();
-                return Ok(Variable::Numbered(Some(num)));
-            }
-            return Ok(Variable::Numbered(None));
-        }
-
-        let prefix = self.current_text().chars().next().unwrap();
+        // Variables are now returned as single tokens by the tokenizer
+        let text = self.current_text().to_string();
         self.advance();
 
-        let name = self.expect_identifier()?;
+        if text.starts_with('?') {
+            // Numbered parameter: ? or ?NNN
+            let num_part = &text[1..];
+            if num_part.is_empty() {
+                return Ok(Variable::Numbered(None));
+            }
+            let num: i32 = num_part.parse().map_err(|_| {
+                Error::with_message(ErrorCode::Error, "invalid parameter number")
+            })?;
+            return Ok(Variable::Numbered(Some(num)));
+        }
+
+        // Named parameter: :name, @name, $name
+        let prefix = text.chars().next().unwrap();
+        let name = text[1..].to_string();
 
         Ok(Variable::Named { prefix, name })
     }

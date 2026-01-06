@@ -194,19 +194,23 @@ pub enum TokenKind {
     Tilde,        // ~
     Bang,         // !
 
+    // JSON operators
+    Ptr,          // ->
+    PtrPtr,       // ->>
+
     // Punctuation
     LParen,       // (
     RParen,       // )
     Comma,        // ,
     Semicolon,    // ;
     Dot,          // .
-    Colon,        // :
-    Question,     // ?
-    At,           // @
-    Dollar,       // $
+
+    // Variables (?NNN, :name, @name, $name)
+    Variable,
 
     // Special
     Eof,
+    Illegal,
 }
 
 impl TokenKind {
@@ -500,8 +504,47 @@ impl<'a> Tokenizer<'a> {
             return self.scan_string();
         }
 
+        // Variables (?NNN, :name, @name, $name)
+        if c == b'?' || c == b':' || c == b'@' || c == b'$' {
+            return self.scan_variable();
+        }
+
         // Operators and punctuation
         self.scan_operator()
+    }
+
+    /// Scan a variable (?NNN, :name, @name, $name)
+    fn scan_variable(&mut self) -> Result<TokenKind> {
+        let c = self.current();
+        self.advance();
+
+        if c == b'?' {
+            // ?NNN - numeric variable
+            while !self.is_eof() && self.current().is_ascii_digit() {
+                self.advance();
+            }
+            return Ok(TokenKind::Variable);
+        }
+
+        // :name, @name, $name - named variable
+        // Must have at least one identifier character after the prefix
+        let mut count = 0;
+        while !self.is_eof() {
+            let ch = self.current();
+            if ch.is_ascii_alphanumeric() || ch == b'_' {
+                self.advance();
+                count += 1;
+            } else {
+                break;
+            }
+        }
+
+        if count == 0 {
+            // No name after prefix - illegal
+            return Ok(TokenKind::Illegal);
+        }
+
+        Ok(TokenKind::Variable)
     }
 
     /// Scan a number (integer or float)
@@ -661,14 +704,28 @@ impl<'a> Tokenizer<'a> {
         match c {
             b'+' => Ok(TokenKind::Plus),
             b'-' => {
-                // Check for -- comment
-                if !self.is_eof() && self.current() == b'-' {
-                    // This shouldn't happen as comments are skipped
-                    self.advance();
-                    while !self.is_eof() && self.current() != b'\n' {
-                        self.advance();
+                if !self.is_eof() {
+                    match self.current() {
+                        b'-' => {
+                            // -- comment (shouldn't happen as comments are skipped)
+                            self.advance();
+                            while !self.is_eof() && self.current() != b'\n' {
+                                self.advance();
+                            }
+                            self.next_token().map(|t| t.kind)
+                        }
+                        b'>' => {
+                            self.advance();
+                            // Check for ->>
+                            if !self.is_eof() && self.current() == b'>' {
+                                self.advance();
+                                Ok(TokenKind::PtrPtr)
+                            } else {
+                                Ok(TokenKind::Ptr)
+                            }
+                        }
+                        _ => Ok(TokenKind::Minus),
                     }
-                    self.next_token().map(|t| t.kind)
                 } else {
                     Ok(TokenKind::Minus)
                 }
@@ -727,7 +784,8 @@ impl<'a> Tokenizer<'a> {
                     self.advance();
                     Ok(TokenKind::BangEq)
                 } else {
-                    Ok(TokenKind::Bang)
+                    // Standalone ! is illegal in SQL
+                    Ok(TokenKind::Illegal)
                 }
             }
             b'&' => Ok(TokenKind::Ampersand),
@@ -745,10 +803,7 @@ impl<'a> Tokenizer<'a> {
             b',' => Ok(TokenKind::Comma),
             b';' => Ok(TokenKind::Semicolon),
             b'.' => Ok(TokenKind::Dot),
-            b':' => Ok(TokenKind::Colon),
-            b'?' => Ok(TokenKind::Question),
-            b'@' => Ok(TokenKind::At),
-            b'$' => Ok(TokenKind::Dollar),
+            // Note: :, ?, @, $ are handled by scan_variable before reaching here
             _ => Err(Error::with_message(
                 ErrorCode::Error,
                 format!("unexpected character '{}' at line {}", c as char, self.line),
@@ -759,6 +814,14 @@ impl<'a> Tokenizer<'a> {
     /// Skip whitespace and comments
     fn skip_whitespace_and_comments(&mut self) {
         loop {
+            // Skip UTF-8 BOM at start of file
+            if self.pos == 0 && self.bytes.len() >= 3 {
+                if self.bytes[0] == 0xEF && self.bytes[1] == 0xBB && self.bytes[2] == 0xBF {
+                    self.pos = 3;
+                    self.column = 4;
+                }
+            }
+
             // Skip whitespace
             while !self.is_eof() && self.current().is_ascii_whitespace() {
                 if self.current() == b'\n' {
@@ -1098,16 +1161,20 @@ mod tests {
 
     #[test]
     fn test_tokenize_parameters() {
+        // Variables are now returned as single tokens
         let tokens = tokenize("? ?1 :name @var $dollar").unwrap();
-        assert_eq!(tokens[0].kind, TokenKind::Question);
-        assert_eq!(tokens[1].kind, TokenKind::Question);
-        assert_eq!(tokens[2].kind, TokenKind::Integer);
-        assert_eq!(tokens[3].kind, TokenKind::Colon);
-        assert_eq!(tokens[4].kind, TokenKind::Identifier);
-        assert_eq!(tokens[5].kind, TokenKind::At);
-        assert_eq!(tokens[6].kind, TokenKind::Identifier);
-        assert_eq!(tokens[7].kind, TokenKind::Dollar);
-        assert_eq!(tokens[8].kind, TokenKind::Identifier);
+        assert_eq!(tokens.len(), 6); // 5 variables + Eof
+        assert_eq!(tokens[0].kind, TokenKind::Variable);
+        assert_eq!(tokens[0].text("? ?1 :name @var $dollar"), "?");
+        assert_eq!(tokens[1].kind, TokenKind::Variable);
+        assert_eq!(tokens[1].text("? ?1 :name @var $dollar"), "?1");
+        assert_eq!(tokens[2].kind, TokenKind::Variable);
+        assert_eq!(tokens[2].text("? ?1 :name @var $dollar"), ":name");
+        assert_eq!(tokens[3].kind, TokenKind::Variable);
+        assert_eq!(tokens[3].text("? ?1 :name @var $dollar"), "@var");
+        assert_eq!(tokens[4].kind, TokenKind::Variable);
+        assert_eq!(tokens[4].text("? ?1 :name @var $dollar"), "$dollar");
+        assert_eq!(tokens[5].kind, TokenKind::Eof);
     }
 
     #[test]
@@ -1130,5 +1197,56 @@ mod tests {
         let tokens = tokenize("SELECT\nFROM").unwrap();
         assert_eq!(tokens[0].line, 1);
         assert_eq!(tokens[1].line, 2);
+    }
+
+    #[test]
+    fn test_json_pointer_operators() {
+        // -> operator
+        let tokens = tokenize("json_col->>'name'").unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::Identifier);
+        assert_eq!(tokens[1].kind, TokenKind::PtrPtr);
+        assert_eq!(tokens[2].kind, TokenKind::String);
+
+        // -> vs ->>
+        let tokens = tokenize("a->b a->>c").unwrap();
+        assert_eq!(tokens[1].kind, TokenKind::Ptr);
+        assert_eq!(tokens[4].kind, TokenKind::PtrPtr);
+    }
+
+    #[test]
+    fn test_utf8_bom() {
+        // UTF-8 BOM (EF BB BF) should be skipped
+        let bom_sql = "\u{FEFF}SELECT 1";
+        let tokens = tokenize(bom_sql).unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::Select);
+        assert_eq!(tokens[1].kind, TokenKind::Integer);
+    }
+
+    #[test]
+    fn test_standalone_bang_illegal() {
+        // Standalone ! should be illegal
+        let tokens = tokenize("a ! b").unwrap();
+        assert_eq!(tokens[1].kind, TokenKind::Illegal);
+
+        // But != should work
+        let tokens = tokenize("a != b").unwrap();
+        assert_eq!(tokens[1].kind, TokenKind::BangEq);
+    }
+
+    #[test]
+    fn test_variable_edge_cases() {
+        // Standalone : @ $ should be illegal (no identifier after)
+        let tokens = tokenize(":").unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::Illegal);
+
+        let tokens = tokenize("@").unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::Illegal);
+
+        let tokens = tokenize("$").unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::Illegal);
+
+        // But ? alone is valid (anonymous parameter)
+        let tokens = tokenize("?").unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::Variable);
     }
 }

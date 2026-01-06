@@ -516,6 +516,19 @@ impl MemPage {
         read_u16(&self.data, offset).ok_or(Error::new(ErrorCode::Corrupt))
     }
 
+    pub fn cell_offset_for_index(&self, index: u16, limits: PageLimits) -> Result<usize> {
+        let ptr = self.cell_ptr(index, limits)? as usize;
+        Ok((ptr & self.mask_page as usize) as usize)
+    }
+
+    pub fn cell_slice(&self, index: u16, limits: PageLimits) -> Result<&[u8]> {
+        let offset = self.cell_offset_for_index(index, limits)?;
+        if offset >= self.data.len() {
+            return Err(Error::new(ErrorCode::Corrupt));
+        }
+        Ok(&self.data[offset..])
+    }
+
     pub fn cell_ptrs(&self, limits: PageLimits) -> Result<Vec<u16>> {
         let mut pointers = Vec::with_capacity(self.n_cell as usize);
         for i in 0..self.n_cell {

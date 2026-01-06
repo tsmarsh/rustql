@@ -2664,7 +2664,45 @@ impl BtCursor {
 
     /// sqlite3BtreePutData
     pub fn put_data(&mut self, _offset: u32, _amount: u32, _data: &[u8]) -> Result<()> {
-        Err(Error::new(ErrorCode::Internal))
+        if self.info.overflow_pgno.is_some() {
+            return Err(Error::new(ErrorCode::Internal));
+        }
+        let page = self.page.as_ref().ok_or(Error::new(ErrorCode::Corrupt))?;
+        let shared = self
+            .bt_shared
+            .upgrade()
+            .ok_or(Error::new(ErrorCode::Internal))?;
+        let mut shared_guard = shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let limits = if page.pgno == 1 {
+            PageLimits::for_page1(shared_guard.page_size, shared_guard.usable_size)
+        } else {
+            PageLimits::new(shared_guard.page_size, shared_guard.usable_size)
+        };
+        let cell_offset = page.cell_ptr(self.ix, limits)?;
+        let mut cursor = cell_offset as usize;
+        if page.child_ptr_size == 4 {
+            cursor += 4;
+        }
+        let (_, n1) = read_varint32(&page.data, cursor)?;
+        cursor += n1;
+        if page.is_intkey {
+            let (_, n2) = read_varint(&page.data, cursor)?;
+            cursor += n2;
+        } else {
+            let (_, n2) = read_varint32(&page.data, cursor)?;
+            cursor += n2;
+        }
+        let payload_start = cursor;
+        let payload_end = payload_start + self.info.n_local as usize;
+        let write_start = payload_start + _offset as usize;
+        let write_end = write_start + _amount as usize;
+        if write_end > payload_end || _data.len() != _amount as usize {
+            return Err(Error::new(ErrorCode::Range));
+        }
+        let mut db_page = shared_guard.pager.get(page.pgno, PagerGetFlags::empty())?;
+        shared_guard.pager.write(&mut db_page)?;
+        db_page.data[write_start..write_end].copy_from_slice(_data);
+        Ok(())
     }
 
     /// sqlite3BtreeCursorPin

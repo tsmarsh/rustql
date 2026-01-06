@@ -1249,6 +1249,33 @@ impl Btree {
 }
 
 impl BtCursor {
+    fn load_root_page(&self) -> Result<(MemPage, PageLimits)> {
+        let shared = self
+            .bt_shared
+            .upgrade()
+            .ok_or(Error::new(ErrorCode::Internal))?;
+        let mut shared_guard = shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let pgno = self.root_page;
+        let limits = if pgno == 1 {
+            PageLimits::for_page1(shared_guard.page_size, shared_guard.usable_size)
+        } else {
+            PageLimits::new(shared_guard.page_size, shared_guard.usable_size)
+        };
+        let page = shared_guard.pager.get(pgno, PagerGetFlags::empty())?;
+        let mut mem_page =
+            MemPage::parse_with_shared(pgno, page.data.clone(), limits, Some(&shared_guard))?;
+        mem_page.validate_layout(limits)?;
+        Ok((mem_page, limits))
+    }
+
+    fn load_leaf_root(&mut self) -> Result<(MemPage, PageLimits)> {
+        let (mem_page, limits) = self.load_root_page()?;
+        if !mem_page.is_leaf {
+            return Err(Error::new(ErrorCode::Internal));
+        }
+        Ok((mem_page, limits))
+    }
+
     /// sqlite3BtreeCursorSize
     pub fn size() -> usize {
         std::mem::size_of::<BtCursor>()
@@ -1278,27 +1305,103 @@ impl BtCursor {
 
     /// sqlite3BtreeFirst
     pub fn first(&mut self) -> Result<bool> {
-        Err(Error::new(ErrorCode::Internal))
+        let (mem_page, limits) = self.load_leaf_root()?;
+        if mem_page.n_cell == 0 {
+            self.state = CursorState::Invalid;
+            return Ok(true);
+        }
+        let cell_offset = mem_page.cell_ptr(0, limits)?;
+        let info = mem_page.parse_cell(cell_offset, limits)?;
+        self.info = info;
+        self.n_key = self.info.n_key;
+        self.state = CursorState::Valid;
+        self.ix = 0;
+        self.page = Some(mem_page);
+        Ok(false)
     }
 
     /// sqlite3BtreeLast
     pub fn last(&mut self) -> Result<bool> {
-        Err(Error::new(ErrorCode::Internal))
+        let (mem_page, limits) = self.load_leaf_root()?;
+        if mem_page.n_cell == 0 {
+            self.state = CursorState::Invalid;
+            return Ok(true);
+        }
+        let last_index = mem_page.n_cell - 1;
+        let cell_offset = mem_page.cell_ptr(last_index, limits)?;
+        let info = mem_page.parse_cell(cell_offset, limits)?;
+        self.info = info;
+        self.n_key = self.info.n_key;
+        self.state = CursorState::Valid;
+        self.ix = last_index;
+        self.page = Some(mem_page);
+        Ok(false)
     }
 
     /// sqlite3BtreeNext
     pub fn next(&mut self, _flags: i32) -> Result<()> {
-        Err(Error::new(ErrorCode::Internal))
+        let page = self.page.as_ref().ok_or(Error::new(ErrorCode::Corrupt))?;
+        if !page.is_leaf {
+            return Err(Error::new(ErrorCode::Internal));
+        }
+        let next_ix = self.ix.saturating_add(1);
+        if next_ix >= page.n_cell {
+            self.state = CursorState::Invalid;
+            return Ok(());
+        }
+        let shared = self
+            .bt_shared
+            .upgrade()
+            .ok_or(Error::new(ErrorCode::Internal))?;
+        let shared_guard = shared.read().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let limits = if page.pgno == 1 {
+            PageLimits::for_page1(shared_guard.page_size, shared_guard.usable_size)
+        } else {
+            PageLimits::new(shared_guard.page_size, shared_guard.usable_size)
+        };
+        let cell_offset = page.cell_ptr(next_ix, limits)?;
+        let info = page.parse_cell(cell_offset, limits)?;
+        self.info = info;
+        self.n_key = self.info.n_key;
+        self.ix = next_ix;
+        self.state = CursorState::Valid;
+        Ok(())
     }
 
     /// sqlite3BtreePrevious
     pub fn previous(&mut self, _flags: i32) -> Result<()> {
-        Err(Error::new(ErrorCode::Internal))
+        let page = self.page.as_ref().ok_or(Error::new(ErrorCode::Corrupt))?;
+        if !page.is_leaf {
+            return Err(Error::new(ErrorCode::Internal));
+        }
+        if self.ix == 0 {
+            self.state = CursorState::Invalid;
+            return Ok(());
+        }
+        let prev_ix = self.ix - 1;
+        let shared = self
+            .bt_shared
+            .upgrade()
+            .ok_or(Error::new(ErrorCode::Internal))?;
+        let shared_guard = shared.read().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let limits = if page.pgno == 1 {
+            PageLimits::for_page1(shared_guard.page_size, shared_guard.usable_size)
+        } else {
+            PageLimits::new(shared_guard.page_size, shared_guard.usable_size)
+        };
+        let cell_offset = page.cell_ptr(prev_ix, limits)?;
+        let info = page.parse_cell(cell_offset, limits)?;
+        self.info = info;
+        self.n_key = self.info.n_key;
+        self.ix = prev_ix;
+        self.state = CursorState::Valid;
+        Ok(())
     }
 
     /// sqlite3BtreeIsEmpty
     pub fn is_empty(&mut self) -> Result<bool> {
-        Err(Error::new(ErrorCode::Internal))
+        let (mem_page, _) = self.load_leaf_root()?;
+        Ok(mem_page.n_cell == 0)
     }
 
     /// sqlite3BtreeCount

@@ -522,6 +522,34 @@ fn free_overflow_chain(shared: &mut BtShared, start: Pgno) -> Result<()> {
     Ok(())
 }
 
+fn collapse_root_if_empty(shared: &mut BtShared, root_pgno: Pgno) -> Result<()> {
+    let limits = if root_pgno == 1 {
+        PageLimits::for_page1(shared.page_size, shared.usable_size)
+    } else {
+        PageLimits::new(shared.page_size, shared.usable_size)
+    };
+    let root_page = shared.pager.get(root_pgno, PagerGetFlags::empty())?;
+    let mem_page = MemPage::parse_with_shared(root_pgno, root_page.data.clone(), limits, Some(shared))?;
+    if mem_page.is_leaf {
+        return Ok(());
+    }
+    if mem_page.n_cell > 0 {
+        return Ok(());
+    }
+    let child_pgno = mem_page.rightmost_ptr.ok_or(Error::new(ErrorCode::Corrupt))?;
+    let child_limits = if child_pgno == 1 {
+        PageLimits::for_page1(shared.page_size, shared.usable_size)
+    } else {
+        PageLimits::new(shared.page_size, shared.usable_size)
+    };
+    let child_page = shared.pager.get(child_pgno, PagerGetFlags::empty())?;
+    let mut root_write = shared.pager.get(root_pgno, PagerGetFlags::empty())?;
+    shared.pager.write(&mut root_write)?;
+    root_write.data = child_page.data.clone();
+    let _ = MemPage::parse_with_shared(root_pgno, root_write.data.clone(), limits, Some(shared))?;
+    Ok(())
+}
+
 fn build_leaf_page_data(
     limits: PageLimits,
     flags: u8,
@@ -1897,6 +1925,7 @@ impl Btree {
         write_u16(data, header_start + 3, mem_page.n_cell - 1)?;
 
         _cursor.state = CursorState::Invalid;
+        let _ = collapse_root_if_empty(&mut shared_guard, root_pgno);
         Ok(())
     }
 

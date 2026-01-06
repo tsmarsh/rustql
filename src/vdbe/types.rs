@@ -3,7 +3,6 @@
 //! Internal types and constants used by the VDBE implementation.
 //! These correspond to the definitions in SQLite's vdbeInt.h.
 
-use std::any::Any;
 use std::cmp::Ordering;
 use std::ffi::c_void;
 use std::sync::{Arc, Weak};

@@ -179,32 +179,112 @@ Output includes: commit info, story changes (created, moved, edited, deleted), a
 - If translating the parser, prefer a Rust-native generator like `lalrpop` or a hand-written parser; keep `parse.y` as the source of truth.
 - SQLite’s “Why C?” rationale (`https://sqlite.org/whyc.html`) is important context; we intentionally diverge by using Rust while preserving behavior and design intent.
 
-## Agent Best Practices
+## Agent Best Practices (Team Workflow)
 
-### Starting Work
+This is a team project. Multiple agents may work on issues concurrently. Following this workflow ensures coordination and prevents conflicts.
 
-1. Check current issues: `moth ls`
-2. Find issue to work on or check current: `moth show`
-3. Start working: `moth start {id}`
+### Before Starting ANY Implementation
+
+**MANDATORY: Always sync with remote and claim your work before coding.**
+
+```bash
+# 1. Fetch latest changes from remote
+git fetch origin && git pull origin main
+
+# 2. Check if you have work in progress
+moth ls -t doing
+
+# 3a. If you have a moth in "doing", resume that work
+moth show
+
+# 3b. If no work in progress, check what's available
+moth ls -t ready -s crit   # Check critical issues first
+moth ls -t ready -s high   # Then high priority
+moth ls -t ready           # All ready issues
+
+# 4. Start the moth BEFORE writing any code
+moth start {id}
+
+# 5. Push the status change so teammates know you're working on it
+git add .moth/ && git commit -m "[{id}] Started work on: {title}"
+git push origin main
+```
+
+**Why this matters:** If you don't push the moth status, another agent may start the same work, causing merge conflicts and wasted effort.
 
 ### During Development
 
 1. Make changes and commit frequently
-2. Prefix commits with issue ID: `[{id}] description`
-3. Keep issue content updated if requirements change
+2. **Always prefix commits with issue ID:** `[{id}] description`
+3. Push regularly to share progress: `git push origin main`
+4. Keep issue content updated if requirements change
+
+```bash
+# Example commit workflow
+git add src/
+git commit -m "[abc12] Implement btree page split logic"
+git push origin main
+```
 
 ### Completing Work
 
-1. Ensure all changes committed
-2. Mark issue done: `moth done`
-3. The `.current` file is automatically cleared
+**MANDATORY: Push completion status so teammates can pick up new work.**
+
+```bash
+# 1. Ensure all changes are committed
+git status
+
+# 2. Mark the moth as done
+moth done
+
+# 3. Commit and push the completion
+git add .moth/ && git commit -m "[{id}] Completed: {title}"
+git push origin main
+
+# 4. Fetch latest to see if others completed work
+git fetch origin && git pull origin main
+
+# 5. Pick up the next issue (go back to "Before Starting" workflow)
+moth ls -t ready
+```
+
+### Resuming After Context Loss
+
+If your session was interrupted or you're resuming work:
+
+```bash
+# 1. Always fetch first
+git fetch origin && git pull origin main
+
+# 2. Check what you were working on
+moth ls -t doing
+
+# 3. If something is in "doing", that's your current work
+moth show
+
+# 4. If nothing in "doing", start fresh with a new issue
+moth ls -t ready
+moth start {id}
+git add .moth/ && git commit -m "[{id}] Started work on: {title}"
+git push origin main
+```
 
 ### Creating New Issues
 
 When user requests new work:
-1. Create issue: `moth new "Title" -s {severity} --no-edit`
-2. Optionally start immediately with `--start` flag
-3. Update issue file with detailed requirements if needed
+```bash
+# 1. Create issue
+moth new "Title" -s {severity} --no-edit
+
+# 2. Commit the new issue
+git add .moth/ && git commit -m "Created moth: {title}"
+git push origin main
+
+# 3. Optionally start immediately
+moth start {id}
+git add .moth/ && git commit -m "[{id}] Started work on: {title}"
+git push origin main
+```
 
 ### Checking Status
 
@@ -215,9 +295,34 @@ moth ls
 # What am I working on?
 moth show
 
+# What are teammates working on?
+moth ls -t doing
+
 # Full project state
 moth ls -a
 ```
+
+### Conflict Resolution
+
+If you encounter merge conflicts in `.moth/`:
+
+```bash
+# 1. Fetch and see the conflict
+git fetch origin && git pull origin main
+
+# 2. If another agent took your issue, pick a different one
+moth ls -t ready
+
+# 3. If you both completed the same work, coordinate with the team
+```
+
+### Summary: The Golden Rules
+
+1. **Always `git pull` before starting work**
+2. **Always `moth start` before writing code**
+3. **Always push after `moth start`** - claim your work publicly
+4. **Always push after `moth done`** - signal completion
+5. **Always `git pull` after completing work** - stay in sync
 
 ## Configuration Reference
 

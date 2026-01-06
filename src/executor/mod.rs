@@ -5,3 +5,10 @@ pub mod insert;
 pub mod update;
 pub mod delete;
 pub mod planner;
+pub mod where_clause;
+
+pub use where_clause::{
+    WhereInfo, WhereTerm, WhereLevel, WherePlan, WhereClause,
+    QueryPlanner, TableInfo, IndexInfo, TermOp,
+    analyze_where, estimate_simple_cost,
+};

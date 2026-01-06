@@ -896,6 +896,7 @@ impl Expr {
             database: None,
             table: None,
             column: name.into(),
+            column_index: None,
         })
     }
 }
@@ -920,6 +921,7 @@ pub struct ColumnRef {
     pub database: Option<String>,
     pub table: Option<String>,
     pub column: String,
+    pub column_index: Option<i32>,
 }
 
 impl ColumnRef {
@@ -928,6 +930,7 @@ impl ColumnRef {
             database: None,
             table: None,
             column: column.into(),
+            column_index: None,
         }
     }
 
@@ -936,6 +939,7 @@ impl ColumnRef {
             database: None,
             table: Some(table.into()),
             column: column.into(),
+            column_index: None,
         }
     }
 }

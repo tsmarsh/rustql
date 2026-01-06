@@ -2442,6 +2442,7 @@ impl<'a> Parser<'a> {
                     database: Some(first),
                     table: Some(second),
                     column,
+                    column_index: None,
                 }));
             }
             // table.column
@@ -2449,6 +2450,7 @@ impl<'a> Parser<'a> {
                 database: None,
                 table: Some(first),
                 column: second,
+                column_index: None,
             }));
         }
 

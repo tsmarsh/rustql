@@ -30,6 +30,8 @@ bitflags::bitflags! {
         const BLOB = 0x0010;
         /// Value is a rowid (special integer)
         const ROWID = 0x0020;
+        /// Value is a zero-blob (lazily materialized)
+        const ZERO = 0x0040;
         /// String is zero-terminated
         const TERM = 0x0200;
         /// String is static (don't free)
@@ -61,6 +63,8 @@ pub struct Mem {
     r: f64,
     /// String or blob data
     data: Vec<u8>,
+    /// Zero-blob size (when flags contains ZERO)
+    zeroblob_size: i32,
     /// Collation sequence name
     pub collation: String,
 }
@@ -79,8 +83,16 @@ impl Mem {
             i: 0,
             r: 0.0,
             data: Vec::new(),
+            zeroblob_size: 0,
             collation: "BINARY".to_string(),
         }
+    }
+
+    /// Create a zero-filled blob (lazily materialized)
+    pub fn from_zeroblob(size: i32) -> Self {
+        let mut mem = Self::new();
+        mem.set_zeroblob(size);
+        mem
     }
 
     /// Create a memory cell with an integer value
@@ -151,6 +163,11 @@ impl Mem {
         self.flags.contains(MemFlags::BLOB)
     }
 
+    /// Check if the value is a zero-blob
+    pub fn is_zeroblob(&self) -> bool {
+        self.flags.contains(MemFlags::ZERO)
+    }
+
     /// Get the SQLite column type
     pub fn column_type(&self) -> ColumnType {
         if self.is_null() {
@@ -210,6 +227,16 @@ impl Mem {
         self.i = 0;
         self.r = 0.0;
         self.data = value.to_vec();
+        self.zeroblob_size = 0;
+    }
+
+    /// Set to a zero-filled blob (lazily materialized)
+    pub fn set_zeroblob(&mut self, size: i32) {
+        self.flags = MemFlags::BLOB | MemFlags::ZERO;
+        self.i = 0;
+        self.r = 0.0;
+        self.data.clear();
+        self.zeroblob_size = size;
     }
 
     /// Set from a Value enum
@@ -273,7 +300,9 @@ impl Mem {
 
     /// Get as blob (with coercion)
     pub fn to_blob(&self) -> Vec<u8> {
-        if self.is_blob() || self.is_str() {
+        if self.is_zeroblob() {
+            vec![0u8; self.zeroblob_size as usize]
+        } else if self.is_blob() || self.is_str() {
             self.data.clone()
         } else if self.is_int() {
             self.i.to_string().into_bytes()
@@ -291,7 +320,9 @@ impl Mem {
 
     /// Get byte length
     pub fn len(&self) -> usize {
-        if self.is_str() || self.is_blob() {
+        if self.is_zeroblob() {
+            self.zeroblob_size as usize
+        } else if self.is_str() || self.is_blob() {
             self.data.len()
         } else if self.is_int() {
             8
@@ -317,10 +348,33 @@ impl Mem {
             Value::Real(self.r)
         } else if self.is_str() {
             Value::Text(self.to_str())
+        } else if self.is_zeroblob() {
+            Value::Blob(vec![0u8; self.zeroblob_size as usize])
         } else if self.is_blob() {
             Value::Blob(self.data.clone())
         } else {
             Value::Null
+        }
+    }
+
+    /// Format as SQL literal (for EXPLAIN and debugging)
+    pub fn to_sql_literal(&self) -> String {
+        if self.is_null() {
+            "NULL".to_string()
+        } else if self.is_int() {
+            self.i.to_string()
+        } else if self.is_real() {
+            format!("{}", self.r)
+        } else if self.is_str() {
+            let s = self.to_str();
+            format!("'{}'", s.replace('\'', "''"))
+        } else if self.is_zeroblob() {
+            format!("zeroblob({})", self.zeroblob_size)
+        } else if self.is_blob() {
+            let hex: String = self.data.iter().map(|b| format!("{:02X}", b)).collect();
+            format!("X'{}'", hex)
+        } else {
+            "NULL".to_string()
         }
     }
 
@@ -951,5 +1005,62 @@ mod tests {
 
         let mem = Mem::from_value(&Value::Text("hello".to_string()));
         assert_eq!(mem.to_str(), "hello");
+    }
+
+    #[test]
+    fn test_mem_zeroblob() {
+        let mem = Mem::from_zeroblob(10);
+        assert!(mem.is_blob());
+        assert!(mem.is_zeroblob());
+        assert_eq!(mem.len(), 10);
+        assert_eq!(mem.column_type(), ColumnType::Blob);
+
+        // to_blob should materialize zeroblob
+        let blob = mem.to_blob();
+        assert_eq!(blob.len(), 10);
+        assert!(blob.iter().all(|&b| b == 0));
+
+        // to_value should also materialize
+        let value = mem.to_value();
+        assert_eq!(value, Value::Blob(vec![0u8; 10]));
+    }
+
+    #[test]
+    fn test_mem_set_zeroblob() {
+        let mut mem = Mem::from_int(42);
+        mem.set_zeroblob(5);
+        assert!(mem.is_zeroblob());
+        assert_eq!(mem.len(), 5);
+        assert_eq!(mem.to_blob(), vec![0u8; 5]);
+    }
+
+    #[test]
+    fn test_mem_to_sql_literal() {
+        // NULL
+        assert_eq!(Mem::new().to_sql_literal(), "NULL");
+
+        // Integer
+        assert_eq!(Mem::from_int(42).to_sql_literal(), "42");
+        assert_eq!(Mem::from_int(-123).to_sql_literal(), "-123");
+
+        // Real
+        assert_eq!(Mem::from_real(3.14).to_sql_literal(), "3.14");
+
+        // Text - simple
+        assert_eq!(Mem::from_str("hello").to_sql_literal(), "'hello'");
+
+        // Text - with quotes (should escape)
+        assert_eq!(Mem::from_str("it's").to_sql_literal(), "'it''s'");
+        assert_eq!(
+            Mem::from_str("say 'hello'").to_sql_literal(),
+            "'say ''hello'''"
+        );
+
+        // Blob
+        assert_eq!(Mem::from_blob(&[0xDE, 0xAD, 0xBE, 0xEF]).to_sql_literal(), "X'DEADBEEF'");
+        assert_eq!(Mem::from_blob(&[]).to_sql_literal(), "X''");
+
+        // Zeroblob
+        assert_eq!(Mem::from_zeroblob(10).to_sql_literal(), "zeroblob(10)");
     }
 }

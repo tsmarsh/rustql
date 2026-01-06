@@ -8,6 +8,9 @@ use crate::error::{Error, Result};
 
 type Pgno = u32;
 
+const BTREE_PAGEFLAG_INTKEY: u8 = 0x01;
+const BTREE_PAGEFLAG_LEAF: u8 = 0x08;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransState {
     None,
@@ -65,10 +68,85 @@ pub struct MemPage {
     pub n_cell: u16,
     pub cell_offset: u16,
     pub free_bytes: u16,
+    pub rightmost_ptr: Option<Pgno>,
     pub n_overflow: u8,
 }
 
 pub struct Pager;
+
+fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
+    data.get(offset..offset + 2)
+        .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
+    data.get(offset..offset + 4).map(|bytes| {
+        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    })
+}
+
+impl MemPage {
+    pub fn parse(pgno: Pgno, data: Vec<u8>) -> Result<Self> {
+        if data.len() < 8 {
+            return Err(Error);
+        }
+
+        let flags = data[0];
+        let is_leaf = (flags & BTREE_PAGEFLAG_LEAF) != 0;
+        let is_intkey = (flags & BTREE_PAGEFLAG_INTKEY) != 0;
+        let header_size = if is_leaf { 8 } else { 12 };
+
+        if data.len() < header_size {
+            return Err(Error);
+        }
+
+        let n_cell = read_u16(&data, 3).ok_or(Error)?;
+        let cell_offset = read_u16(&data, 5).ok_or(Error)?;
+        let free_bytes = data[7] as u16;
+        let rightmost_ptr = if is_leaf {
+            None
+        } else {
+            Some(read_u32(&data, 8).ok_or(Error)?)
+        };
+
+        Ok(Self {
+            pgno,
+            data,
+            is_init: true,
+            is_leaf,
+            is_intkey,
+            n_cell,
+            cell_offset,
+            free_bytes,
+            rightmost_ptr,
+            n_overflow: 0,
+        })
+    }
+
+    pub fn header_size(&self) -> usize {
+        if self.is_leaf {
+            8
+        } else {
+            12
+        }
+    }
+
+    pub fn cell_ptr(&self, index: u16) -> Result<u16> {
+        if index >= self.n_cell {
+            return Err(Error);
+        }
+        let offset = self.header_size() + (index as usize * 2);
+        read_u16(&self.data, offset).ok_or(Error)
+    }
+
+    pub fn cell_ptrs(&self) -> Result<Vec<u16>> {
+        let mut pointers = Vec::with_capacity(self.n_cell as usize);
+        for i in 0..self.n_cell {
+            pointers.push(self.cell_ptr(i)?);
+        }
+        Ok(pointers)
+    }
+}
 
 impl Btree {
     /// sqlite3BtreeOpen

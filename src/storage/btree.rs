@@ -932,6 +932,93 @@ fn merge_leaf_with_sibling(
         )
     };
 
+    if left_page.n_cell > 1 && right_page.n_cell == 0 {
+        return Ok(());
+    }
+
+    if left_page.n_cell > 1 && right_page.n_cell > 0 {
+        let borrow_from_left = left_page.n_cell > right_page.n_cell;
+        let (donor, receiver, donor_limits, receiver_limits, donor_pgno, receiver_pgno) =
+            if borrow_from_left {
+                (
+                    left_page.clone(),
+                    right_page.clone(),
+                    left_limits,
+                    right_limits,
+                    left_pgno,
+                    right_pgno,
+                )
+            } else {
+                (
+                    right_page.clone(),
+                    left_page.clone(),
+                    right_limits,
+                    left_limits,
+                    right_pgno,
+                    left_pgno,
+                )
+            };
+
+        let donor_index = if borrow_from_left {
+            donor.n_cell - 1
+        } else {
+            0
+        };
+        let donor_cell_offset = donor.cell_ptr(donor_index, donor_limits)?;
+        let donor_info = donor.parse_cell(donor_cell_offset, donor_limits)?;
+        let donor_start = donor_cell_offset as usize;
+        let donor_end = donor_start + donor_info.n_size as usize;
+        if donor_end > donor.data.len() {
+            return Err(Error::new(ErrorCode::Corrupt));
+        }
+        let borrowed = donor.data[donor_start..donor_end].to_vec();
+
+        let mut donor_cells = Vec::new();
+        for i in 0..donor.n_cell {
+            if i == donor_index {
+                continue;
+            }
+            let cell_offset = donor.cell_ptr(i, donor_limits)?;
+            let info = donor.parse_cell(cell_offset, donor_limits)?;
+            let start = cell_offset as usize;
+            let end = start + info.n_size as usize;
+            if end > donor.data.len() {
+                return Err(Error::new(ErrorCode::Corrupt));
+            }
+            donor_cells.push(donor.data[start..end].to_vec());
+        }
+
+        let mut receiver_cells = Vec::new();
+        for i in 0..receiver.n_cell {
+            let cell_offset = receiver.cell_ptr(i, receiver_limits)?;
+            let info = receiver.parse_cell(cell_offset, receiver_limits)?;
+            let start = cell_offset as usize;
+            let end = start + info.n_size as usize;
+            if end > receiver.data.len() {
+                return Err(Error::new(ErrorCode::Corrupt));
+            }
+            receiver_cells.push(receiver.data[start..end].to_vec());
+        }
+        if borrow_from_left {
+            receiver_cells.insert(0, borrowed);
+        } else {
+            receiver_cells.push(borrowed);
+        }
+
+        let flags = donor.data[donor_limits.header_start()];
+        let donor_data = build_leaf_page_data(donor_limits, flags, &donor_cells)?;
+        let mut donor_page = shared.pager.get(donor_pgno, PagerGetFlags::empty())?;
+        shared.pager.write(&mut donor_page)?;
+        donor_page.data = donor_data;
+
+        let flags = receiver.data[receiver_limits.header_start()];
+        let receiver_data = build_leaf_page_data(receiver_limits, flags, &receiver_cells)?;
+        let mut receiver_page = shared.pager.get(receiver_pgno, PagerGetFlags::empty())?;
+        shared.pager.write(&mut receiver_page)?;
+        receiver_page.data = receiver_data;
+        return Ok(());
+    }
+
     let mut cells = Vec::new();
     for i in 0..left_page.n_cell {
         let cell_offset = left_page.cell_ptr(i, left_limits)?;

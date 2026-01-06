@@ -521,6 +521,14 @@ impl MemPage {
         read_u16(&self.data, offset).ok_or(Error::new(ErrorCode::Corrupt))
     }
 
+    pub fn child_pgno(&self, cell_offset: u16) -> Result<Pgno> {
+        if self.child_ptr_size == 0 {
+            return Err(Error::new(ErrorCode::Misuse));
+        }
+        let start = cell_offset as usize;
+        read_u32(&self.data, start).ok_or(Error::new(ErrorCode::Corrupt))
+    }
+
     pub fn cell_offset_for_index(&self, index: u16, limits: PageLimits) -> Result<usize> {
         let ptr = self.cell_ptr(index, limits)? as usize;
         Ok((ptr & self.mask_page as usize) as usize)
@@ -618,8 +626,21 @@ impl MemPage {
             cursor = cursor.checked_add(4).ok_or(Error::new(ErrorCode::Corrupt))?;
         }
 
+        let mut info = CellInfo::default();
+
+        if self.is_intkey && !self.is_leaf && self.is_leafdata {
+            let (n_key, n_bytes) = read_varint(&self.data, cursor)?;
+            cursor = cursor.checked_add(n_bytes).ok_or(Error::new(ErrorCode::Corrupt))?;
+            info.n_key = n_key as i64;
+            info.n_payload = 0;
+            info.n_local = 0;
+            info.n_size = (cursor - start) as u16;
+            return Ok(info);
+        }
+
         let (payload_size, n1) = if self.is_zerodata {
-            (0u32, 0usize)
+            let (payload, bytes) = read_varint32(&self.data, cursor)?;
+            (payload, bytes)
         } else {
             let (payload, bytes) = read_varint32(&self.data, cursor)?;
             (payload, bytes)
@@ -628,13 +649,14 @@ impl MemPage {
 
         let (n_key, n2) = if self.is_intkey {
             read_varint(&self.data, cursor)?
+        } else if self.is_zerodata {
+            (payload_size as u64, 0usize)
         } else {
             let (key_bytes, bytes) = read_varint32(&self.data, cursor)?;
             (key_bytes as u64, bytes)
         };
         cursor = cursor.checked_add(n2).ok_or(Error::new(ErrorCode::Corrupt))?;
 
-        let mut info = CellInfo::default();
         info.n_key = n_key as i64;
         info.n_payload = payload_size;
 
@@ -647,7 +669,9 @@ impl MemPage {
             }
             info.n_local = payload_size as u16;
             info.n_size = (payload_end - start) as u16;
-            info.payload = Some(self.data[cursor..payload_end].to_vec());
+            if payload_size > 0 {
+                info.payload = Some(self.data[cursor..payload_end].to_vec());
+            }
         } else {
             let local = self.payload_to_local(payload_size as i64, limits)?;
             info.n_local = local;
@@ -1280,6 +1304,23 @@ impl BtCursor {
         Ok((mem_page, limits))
     }
 
+    fn load_page(
+        &self,
+        shared: &mut BtShared,
+        pgno: Pgno,
+    ) -> Result<(MemPage, PageLimits)> {
+        let limits = if pgno == 1 {
+            PageLimits::for_page1(shared.page_size, shared.usable_size)
+        } else {
+            PageLimits::new(shared.page_size, shared.usable_size)
+        };
+        let page = shared.pager.get(pgno, PagerGetFlags::empty())?;
+        let mut mem_page =
+            MemPage::parse_with_shared(pgno, page.data.clone(), limits, Some(shared))?;
+        mem_page.validate_layout(limits)?;
+        Ok((mem_page, limits))
+    }
+
     /// sqlite3BtreeCursorSize
     pub fn size() -> usize {
         std::mem::size_of::<BtCursor>()
@@ -1487,82 +1528,143 @@ impl BtCursor {
 
     /// sqlite3BtreeTableMoveto
     pub fn table_moveto(&mut self, _int_key: RowId, _bias: bool) -> Result<i32> {
-        let (mem_page, limits) = self.load_leaf_root()?;
-        if mem_page.n_cell == 0 {
-            self.state = CursorState::Invalid;
-            return Ok(1);
-        }
-        for i in 0..mem_page.n_cell {
-            let cell_offset = mem_page.cell_ptr(i, limits)?;
-            let info = mem_page.parse_cell(cell_offset, limits)?;
-            if info.n_key == _int_key {
-                self.info = info;
-                self.n_key = _int_key;
-                self.ix = i;
-                self.state = CursorState::Valid;
-                self.page = Some(mem_page);
-                return Ok(0);
-            }
-            if _int_key < info.n_key {
+        let shared = self
+            .bt_shared
+            .upgrade()
+            .ok_or(Error::new(ErrorCode::Internal))?;
+        let mut shared_guard = shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut pgno = self.root_page;
+        self.page_stack.clear();
+        self.idx_stack.clear();
+
+        loop {
+            let (mem_page, limits) = self.load_page(&mut shared_guard, pgno)?;
+            if mem_page.is_leaf {
+                if mem_page.n_cell == 0 {
+                    self.state = CursorState::Invalid;
+                    return Ok(1);
+                }
+                for i in 0..mem_page.n_cell {
+                    let cell_offset = mem_page.cell_ptr(i, limits)?;
+                    let info = mem_page.parse_cell(cell_offset, limits)?;
+                    if info.n_key == _int_key {
+                        self.info = info;
+                        self.n_key = _int_key;
+                        self.ix = i;
+                        self.state = CursorState::Valid;
+                        self.page = Some(mem_page);
+                        return Ok(0);
+                    }
+                    if _int_key < info.n_key {
+                        self.info = info;
+                        self.n_key = self.info.n_key;
+                        self.ix = i;
+                        self.state = CursorState::Valid;
+                        self.page = Some(mem_page);
+                        return Ok(-1);
+                    }
+                }
+                let last_index = mem_page.n_cell - 1;
+                let cell_offset = mem_page.cell_ptr(last_index, limits)?;
+                let info = mem_page.parse_cell(cell_offset, limits)?;
                 self.info = info;
                 self.n_key = self.info.n_key;
-                self.ix = i;
+                self.ix = last_index;
                 self.state = CursorState::Valid;
                 self.page = Some(mem_page);
-                return Ok(-1);
+                return Ok(1);
             }
+
+            let mut child = mem_page
+                .rightmost_ptr
+                .ok_or(Error::new(ErrorCode::Corrupt))?;
+            let mut child_index = mem_page.n_cell;
+            for i in 0..mem_page.n_cell {
+                let cell_offset = mem_page.cell_ptr(i, limits)?;
+                let info = mem_page.parse_cell(cell_offset, limits)?;
+                if _int_key < info.n_key {
+                    child = mem_page.child_pgno(cell_offset)?;
+                    child_index = i;
+                    break;
+                }
+            }
+            self.page_stack.push(mem_page);
+            self.idx_stack.push(child_index);
+            pgno = child;
         }
-        let last_index = mem_page.n_cell - 1;
-        let cell_offset = mem_page.cell_ptr(last_index, limits)?;
-        let info = mem_page.parse_cell(cell_offset, limits)?;
-        self.info = info;
-        self.n_key = self.info.n_key;
-        self.ix = last_index;
-        self.state = CursorState::Valid;
-        self.page = Some(mem_page);
-        Ok(1)
     }
 
     /// sqlite3BtreeIndexMoveto
     pub fn index_moveto(&mut self, _key: &UnpackedRecord) -> Result<i32> {
-        let (mem_page, limits) = self.load_leaf_root()?;
-        if mem_page.n_cell == 0 {
-            self.state = CursorState::Invalid;
-            return Ok(1);
-        }
-        for i in 0..mem_page.n_cell {
-            let cell_offset = mem_page.cell_ptr(i, limits)?;
-            let info = mem_page.parse_cell(cell_offset, limits)?;
-            let payload = info.payload.as_deref().unwrap_or(&[]);
-            match payload.cmp(_key.key.as_slice()) {
-                std::cmp::Ordering::Equal => {
-                    self.info = info;
-                    self.n_key = self.info.n_key;
-                    self.ix = i;
-                    self.state = CursorState::Valid;
-                    self.page = Some(mem_page);
-                    return Ok(0);
+        let shared = self
+            .bt_shared
+            .upgrade()
+            .ok_or(Error::new(ErrorCode::Internal))?;
+        let mut shared_guard = shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut pgno = self.root_page;
+        self.page_stack.clear();
+        self.idx_stack.clear();
+
+        loop {
+            let (mem_page, limits) = self.load_page(&mut shared_guard, pgno)?;
+            if mem_page.is_leaf {
+                if mem_page.n_cell == 0 {
+                    self.state = CursorState::Invalid;
+                    return Ok(1);
                 }
-                std::cmp::Ordering::Greater => {
-                    self.info = info;
-                    self.n_key = self.info.n_key;
-                    self.ix = i;
-                    self.state = CursorState::Valid;
-                    self.page = Some(mem_page);
-                    return Ok(-1);
+                for i in 0..mem_page.n_cell {
+                    let cell_offset = mem_page.cell_ptr(i, limits)?;
+                    let info = mem_page.parse_cell(cell_offset, limits)?;
+                    let payload = info.payload.as_deref().unwrap_or(&[]);
+                    match payload.cmp(_key.key.as_slice()) {
+                        std::cmp::Ordering::Equal => {
+                            self.info = info;
+                            self.n_key = self.info.n_key;
+                            self.ix = i;
+                            self.state = CursorState::Valid;
+                            self.page = Some(mem_page);
+                            return Ok(0);
+                        }
+                        std::cmp::Ordering::Greater => {
+                            self.info = info;
+                            self.n_key = self.info.n_key;
+                            self.ix = i;
+                            self.state = CursorState::Valid;
+                            self.page = Some(mem_page);
+                            return Ok(-1);
+                        }
+                        std::cmp::Ordering::Less => {}
+                    }
                 }
-                std::cmp::Ordering::Less => {}
+                let last_index = mem_page.n_cell - 1;
+                let cell_offset = mem_page.cell_ptr(last_index, limits)?;
+                let info = mem_page.parse_cell(cell_offset, limits)?;
+                self.info = info;
+                self.n_key = self.info.n_key;
+                self.ix = last_index;
+                self.state = CursorState::Valid;
+                self.page = Some(mem_page);
+                return Ok(1);
             }
+
+            let mut child = mem_page
+                .rightmost_ptr
+                .ok_or(Error::new(ErrorCode::Corrupt))?;
+            let mut child_index = mem_page.n_cell;
+            for i in 0..mem_page.n_cell {
+                let cell_offset = mem_page.cell_ptr(i, limits)?;
+                let info = mem_page.parse_cell(cell_offset, limits)?;
+                let payload = info.payload.as_deref().unwrap_or(&[]);
+                if payload > _key.key.as_slice() {
+                    child = mem_page.child_pgno(cell_offset)?;
+                    child_index = i;
+                    break;
+                }
+            }
+            self.page_stack.push(mem_page);
+            self.idx_stack.push(child_index);
+            pgno = child;
         }
-        let last_index = mem_page.n_cell - 1;
-        let cell_offset = mem_page.cell_ptr(last_index, limits)?;
-        let info = mem_page.parse_cell(cell_offset, limits)?;
-        self.info = info;
-        self.n_key = self.info.n_key;
-        self.ix = last_index;
-        self.state = CursorState::Valid;
-        self.page = Some(mem_page);
-        Ok(1)
     }
 
     /// sqlite3BtreeCursorHasMoved

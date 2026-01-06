@@ -745,6 +745,83 @@ fn split_internal_root(
     Ok(())
 }
 
+fn split_internal_with_parent(
+    shared: &mut BtShared,
+    grandparent: &MemPage,
+    grand_limits: PageLimits,
+    child_index: u16,
+    parent: &MemPage,
+    parent_limits: PageLimits,
+) -> Result<()> {
+    let (keys, children) = rebuild_internal_children(parent, parent_limits)?;
+    if keys.len() < 2 {
+        return Err(Error::new(ErrorCode::Corrupt));
+    }
+    let mid = keys.len() / 2;
+    let left_keys = keys[..mid].to_vec();
+    let right_keys = keys[mid + 1..].to_vec();
+    let sep_key = keys[mid].clone();
+    let left_children = children[..mid + 1].to_vec();
+    let right_children = children[mid + 1..].to_vec();
+
+    let left_pgno = parent.pgno;
+    let right_pgno = shared.pager.db_size + 1;
+    let flags = parent.data[parent_limits.header_start()];
+    let left_data = build_internal_page_data(
+        PageLimits::new(shared.page_size, shared.usable_size),
+        flags,
+        &left_keys,
+        &left_children,
+    )?;
+    let right_data = build_internal_page_data(
+        PageLimits::new(shared.page_size, shared.usable_size),
+        flags,
+        &right_keys,
+        &right_children,
+    )?;
+
+    let mut left_page = shared.pager.get(left_pgno, PagerGetFlags::empty())?;
+    shared.pager.write(&mut left_page)?;
+    left_page.data = left_data;
+
+    let mut right_page = shared.pager.get(right_pgno, PagerGetFlags::empty())?;
+    shared.pager.write(&mut right_page)?;
+    right_page.data = right_data;
+
+    shared.pager.db_size = right_pgno.max(shared.pager.db_size);
+    shared.n_page = shared.pager.db_size;
+
+    let (mut keys_gp, mut children_gp) = rebuild_internal_children(grandparent, grand_limits)?;
+    let insert_pos = child_index as usize;
+    children_gp[insert_pos] = left_pgno;
+    children_gp.insert(insert_pos + 1, right_pgno);
+    if grandparent.is_intkey {
+        if let InternalKey::Int(k) = sep_key {
+            keys_gp.insert(insert_pos, InternalKey::Int(k));
+        } else {
+            return Err(Error::new(ErrorCode::Internal));
+        }
+    } else {
+        if let InternalKey::Blob(blob) = sep_key {
+            keys_gp.insert(insert_pos, InternalKey::Blob(blob));
+        } else {
+            return Err(Error::new(ErrorCode::Internal));
+        }
+    }
+
+    let grand_flags = grandparent.data[grand_limits.header_start()];
+    let new_data = build_internal_page_data(grand_limits, grand_flags, &keys_gp, &children_gp);
+    let mut grand_page = shared.pager.get(grandparent.pgno, PagerGetFlags::empty())?;
+    shared.pager.write(&mut grand_page)?;
+    match new_data {
+        Ok(data) => {
+            grand_page.data = data;
+            Ok(())
+        }
+        Err(_) => split_internal_root(shared, grandparent.pgno, grandparent, grand_limits),
+    }
+}
+
 fn parse_cell_from_bytes(page: &MemPage, limits: PageLimits, cell: &[u8]) -> Result<CellInfo> {
     if cell.is_empty() {
         return Err(Error::new(ErrorCode::Corrupt));
@@ -1730,6 +1807,27 @@ impl Btree {
                     )?;
                     return Ok(());
                 }
+            } else if let (Some(parent), Some(child_index)) =
+                (_cursor.page_stack.get(_cursor.page_stack.len().saturating_sub(2)),
+                 _cursor.idx_stack.get(_cursor.idx_stack.len().saturating_sub(2)))
+            {
+                let parent_limits = if parent.pgno == 1 {
+                    PageLimits::for_page1(shared_guard.page_size, shared_guard.usable_size)
+                } else {
+                    PageLimits::new(shared_guard.page_size, shared_guard.usable_size)
+                };
+                split_internal_with_parent(
+                    &mut shared_guard,
+                    parent,
+                    parent_limits,
+                    *child_index,
+                    &mem_page,
+                    limits,
+                )?;
+                return Ok(());
+            } else if root_pgno == mem_page.pgno {
+                split_internal_root(&mut shared_guard, root_pgno, &mem_page, limits)?;
+                return Ok(());
             }
             return Err(Error::new(ErrorCode::Full));
         }

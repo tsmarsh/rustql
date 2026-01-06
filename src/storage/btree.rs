@@ -8,11 +8,30 @@ use bitflags::bitflags;
 use crate::error::{Error, ErrorCode, Result};
 use crate::storage::pager::{Pager, PagerFlags, PagerGetFlags, PagerOpenFlags, SavepointOp};
 use crate::types::{Connection, OpenFlags, Pgno, RowId, Value, Vfs};
+use crate::util::bitvec::BitVec;
 
 const BTREE_PAGEFLAG_INTKEY: u8 = 0x01;
 const BTREE_PAGEFLAG_ZERODATA: u8 = 0x02;
 const BTREE_PAGEFLAG_LEAFDATA: u8 = 0x04;
 const BTREE_PAGEFLAG_LEAF: u8 = 0x08;
+
+pub const PTF_INTKEY: u8 = BTREE_PAGEFLAG_INTKEY;
+pub const PTF_ZERODATA: u8 = BTREE_PAGEFLAG_ZERODATA;
+pub const PTF_LEAFDATA: u8 = BTREE_PAGEFLAG_LEAFDATA;
+pub const PTF_LEAF: u8 = BTREE_PAGEFLAG_LEAF;
+pub const PTF_TABLE_LEAF: u8 = PTF_INTKEY | PTF_LEAFDATA | PTF_LEAF;
+pub const PTF_TABLE_INTERIOR: u8 = PTF_INTKEY | PTF_LEAFDATA;
+pub const PTF_INDEX_LEAF: u8 = PTF_LEAF | PTF_ZERODATA;
+pub const PTF_INDEX_INTERIOR: u8 = PTF_ZERODATA;
+
+pub const PAGE_HEADER_SIZE_LEAF: usize = 8;
+pub const PAGE_HEADER_SIZE_INTERIOR: usize = 12;
+pub const MAX_EMBEDDED: u8 = 64;
+pub const MIN_EMBEDDED: u8 = 32;
+pub const CELL_PTR_SIZE: usize = 2;
+pub const MAX_PAGE_SIZE: u32 = 65536;
+pub const MIN_PAGE_SIZE: u32 = 512;
+pub const DEFAULT_PAGE_SIZE: u32 = 4096;
 
 pub const BTREE_AUTOVACUUM_NONE: u8 = 0;
 pub const BTREE_AUTOVACUUM_FULL: u8 = 1;
@@ -107,6 +126,13 @@ pub enum TransState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
+pub enum BtLock {
+    Read = 1,
+    Write = 2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum CursorState {
     Valid = 0,
     Invalid = 1,
@@ -186,6 +212,35 @@ impl BtShared {
             self.max_local as u8
         };
     }
+
+    pub fn max_local_payload(&self, is_leaf: bool) -> u32 {
+        let usable = self.usable_size;
+        if is_leaf {
+            usable
+                .saturating_sub(35)
+                .saturating_mul(MAX_EMBEDDED as u32)
+                / 255
+                .saturating_sub(23)
+        } else {
+            usable
+                .saturating_sub(12)
+                .saturating_mul(MAX_EMBEDDED as u32)
+                / 255
+                .saturating_sub(23)
+        }
+    }
+
+    pub fn min_local_payload(&self, _is_leaf: bool) -> u32 {
+        self.usable_size
+            .saturating_sub(12)
+            .saturating_mul(MIN_EMBEDDED as u32)
+            / 255
+            .saturating_sub(23)
+    }
+
+    pub fn overflow_threshold(&self, is_leaf: bool) -> u32 {
+        self.max_local_payload(is_leaf)
+    }
 }
 
 pub struct BtCursor {
@@ -251,6 +306,7 @@ pub struct CellInfo {
     pub n_payload: u32,
     pub n_local: u16,
     pub n_size: u16,
+    pub n_header: u16,
     pub overflow_pgno: Option<Pgno>,
 }
 
@@ -262,6 +318,7 @@ impl Default for CellInfo {
             n_payload: 0,
             n_local: 0,
             n_size: 0,
+            n_header: 0,
             overflow_pgno: None,
         }
     }
@@ -276,6 +333,16 @@ pub struct UnpackedRecord {
 }
 
 pub struct IntegrityCheckResult {
+    pub errors: Vec<String>,
+}
+
+pub struct IntegrityCk {
+    pub db: Arc<dyn Connection>,
+    pub btree: Arc<RwLock<BtShared>>,
+    pub page_refs: BitVec,
+    pub page_counts: Vec<u32>,
+    pub max_err: i32,
+    pub n_err: i32,
     pub errors: Vec<String>,
 }
 
@@ -1125,17 +1192,88 @@ fn merge_internal_with_sibling(
         )
     };
 
-    let (mut keys, mut children) = rebuild_internal_children(&left_page, left_limits)?;
-    let (right_keys, right_children) = rebuild_internal_children(&right_page, right_limits)?;
+    let (mut left_keys, mut left_children) = rebuild_internal_children(&left_page, left_limits)?;
+    let (mut right_keys, mut right_children) = rebuild_internal_children(&right_page, right_limits)?;
     let sep_index = if use_left { child_index - 1 } else { child_index };
     let sep_offset = parent.cell_ptr(sep_index, parent_limits)?;
     let sep_info = parent.parse_cell(sep_offset, parent_limits)?;
-    if left_page.is_intkey {
-        keys.push(InternalKey::Int(sep_info.n_key));
+    let sep_key = if left_page.is_intkey {
+        InternalKey::Int(sep_info.n_key)
     } else {
         let payload = sep_info.payload.clone().ok_or(Error::new(ErrorCode::Internal))?;
-        keys.push(InternalKey::Blob(payload));
+        InternalKey::Blob(payload)
+    };
+
+    if left_keys.len() > 1 && right_keys.len() > 0 {
+        let borrow_from_left = left_keys.len() > right_keys.len();
+        if borrow_from_left {
+            let borrowed_child = left_children.pop().ok_or(Error::new(ErrorCode::Corrupt))?;
+            let new_sep = left_keys.pop().ok_or(Error::new(ErrorCode::Corrupt))?;
+            right_children.insert(0, borrowed_child);
+            right_keys.insert(0, sep_key.clone());
+
+            let (mut pkeys, mut pchildren) = rebuild_internal_children(parent, parent_limits)?;
+            let sep_pos = sep_index as usize;
+            if sep_pos < pkeys.len() {
+                pkeys[sep_pos] = new_sep.clone();
+            }
+            let parent_flags = parent.data[parent_limits.header_start()];
+            let parent_data =
+                build_internal_page_data(parent_limits, parent_flags, &pkeys, &pchildren)?;
+            let mut parent_page = shared.pager.get(parent.pgno, PagerGetFlags::empty())?;
+            shared.pager.write(&mut parent_page)?;
+            parent_page.data = parent_data;
+
+            let flags = left_page.data[left_limits.header_start()];
+            let left_data = build_internal_page_data(left_limits, flags, &left_keys, &left_children)?;
+            let mut left_db_page = shared.pager.get(left_pgno, PagerGetFlags::empty())?;
+            shared.pager.write(&mut left_db_page)?;
+            left_db_page.data = left_data;
+
+            let flags = right_page.data[right_limits.header_start()];
+            let right_data =
+                build_internal_page_data(right_limits, flags, &right_keys, &right_children)?;
+            let mut right_db_page = shared.pager.get(right_pgno, PagerGetFlags::empty())?;
+            shared.pager.write(&mut right_db_page)?;
+            right_db_page.data = right_data;
+            return Ok(());
+        } else {
+            let borrowed_child = right_children.remove(0);
+            let new_sep = right_keys.remove(0);
+            left_children.push(borrowed_child);
+            left_keys.push(sep_key.clone());
+
+            let (mut pkeys, mut pchildren) = rebuild_internal_children(parent, parent_limits)?;
+            let sep_pos = sep_index as usize;
+            if sep_pos < pkeys.len() {
+                pkeys[sep_pos] = new_sep.clone();
+            }
+            let parent_flags = parent.data[parent_limits.header_start()];
+            let parent_data =
+                build_internal_page_data(parent_limits, parent_flags, &pkeys, &pchildren)?;
+            let mut parent_page = shared.pager.get(parent.pgno, PagerGetFlags::empty())?;
+            shared.pager.write(&mut parent_page)?;
+            parent_page.data = parent_data;
+
+            let flags = left_page.data[left_limits.header_start()];
+            let left_data = build_internal_page_data(left_limits, flags, &left_keys, &left_children)?;
+            let mut left_db_page = shared.pager.get(left_pgno, PagerGetFlags::empty())?;
+            shared.pager.write(&mut left_db_page)?;
+            left_db_page.data = left_data;
+
+            let flags = right_page.data[right_limits.header_start()];
+            let right_data =
+                build_internal_page_data(right_limits, flags, &right_keys, &right_children)?;
+            let mut right_db_page = shared.pager.get(right_pgno, PagerGetFlags::empty())?;
+            shared.pager.write(&mut right_db_page)?;
+            right_db_page.data = right_data;
+            return Ok(());
+        }
     }
+
+    let mut keys = left_keys;
+    let mut children = left_children;
+    keys.push(sep_key);
     keys.extend(right_keys);
     children.extend(right_children);
 
@@ -1390,6 +1528,65 @@ fn read_varint32(data: &[u8], offset: usize) -> Result<(u32, usize)> {
     Ok((value as u32, size))
 }
 
+pub fn get_varint(data: &[u8]) -> Result<(u64, usize)> {
+    read_varint(data, 0)
+}
+
+pub fn get_varint32(data: &[u8]) -> Result<(u32, usize)> {
+    read_varint32(data, 0)
+}
+
+pub fn put_varint(buf: &mut [u8], value: u64) -> usize {
+    let len = varint_len(value);
+    if buf.len() < len {
+        return 0;
+    }
+    put_varint_at(buf, value)
+}
+
+pub fn varint_len(value: u64) -> usize {
+    if value <= 0x7F {
+        1
+    } else if value <= 0x3FFF {
+        2
+    } else if value <= 0x1FFFFF {
+        3
+    } else if value <= 0x0FFFFFFF {
+        4
+    } else if value <= 0x07FFFFFFFF {
+        5
+    } else if value <= 0x03FFFFFFFFFF {
+        6
+    } else if value <= 0x01FFFFFFFFFFFF {
+        7
+    } else if value <= 0x00FFFFFFFFFFFFFF {
+        8
+    } else {
+        9
+    }
+}
+
+fn put_varint_at(buf: &mut [u8], value: u64) -> usize {
+    let len = varint_len(value);
+    if len == 9 {
+        buf[0] = 0xFF;
+        for i in 1..9 {
+            buf[i] = ((value >> (8 - i) * 8) & 0xFF) as u8;
+        }
+    } else {
+        let mut v = value;
+        for i in (0..len).rev() {
+            if i == len - 1 {
+                buf[i] = (v & 0x7F) as u8;
+            } else {
+                buf[i] = ((v & 0x7F) | 0x80) as u8;
+            }
+            v >>= 7;
+        }
+    }
+    len
+}
+
 impl MemPage {
     pub fn parse(pgno: Pgno, data: Vec<u8>, limits: PageLimits) -> Result<Self> {
         Self::parse_with_shared(pgno, data, limits, None)
@@ -1610,6 +1807,7 @@ impl MemPage {
             info.n_payload = 0;
             info.n_local = 0;
             info.n_size = (cursor - start) as u16;
+            info.n_header = info.n_size;
             return Ok(info);
         }
 
@@ -1634,6 +1832,7 @@ impl MemPage {
 
         info.n_key = n_key as i64;
         info.n_payload = payload_size;
+        info.n_header = (cursor - start) as u16;
 
         if payload_size as u16 <= self.max_local || self.max_local == 0 {
             let payload_end = cursor

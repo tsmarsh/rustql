@@ -247,6 +247,7 @@ pub struct CellInfo {
     pub n_payload: u32,
     pub n_local: u16,
     pub n_size: u16,
+    pub overflow_pgno: Option<Pgno>,
 }
 
 impl Default for CellInfo {
@@ -257,6 +258,7 @@ impl Default for CellInfo {
             n_payload: 0,
             n_local: 0,
             n_size: 0,
+            overflow_pgno: None,
         }
     }
 }
@@ -739,6 +741,8 @@ impl MemPage {
             }
             info.n_size = (payload_end - start) as u16 + 4;
             info.payload = Some(self.data[cursor..payload_end].to_vec());
+            let overflow_offset = payload_end;
+            info.overflow_pgno = read_u32(&self.data, overflow_offset);
         }
 
         Ok(info)
@@ -1249,22 +1253,54 @@ impl Btree {
 
     /// sqlite3BtreeCreateTable
     pub fn create_table(&mut self, _flags: u8) -> Result<Pgno> {
-        Err(Error::new(ErrorCode::Internal))
+        let mut shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let new_pgno = shared.pager.db_size + 1;
+        let mut page = shared.pager.get(new_pgno, PagerGetFlags::empty())?;
+        shared.pager.write(&mut page)?;
+        page.data.fill(0);
+        let limits = PageLimits::new(shared.page_size, shared.usable_size);
+        let header_start = limits.header_start();
+        let flags = if _flags & BTREE_INTKEY != 0 {
+            BTREE_PAGEFLAG_LEAFDATA | BTREE_PAGEFLAG_INTKEY | BTREE_PAGEFLAG_LEAF
+        } else {
+            BTREE_PAGEFLAG_ZERODATA | BTREE_PAGEFLAG_LEAF
+        };
+        page.data[header_start] = flags;
+        write_u16(&mut page.data, header_start + 1, 0)?;
+        write_u16(&mut page.data, header_start + 3, 0)?;
+        write_u16(&mut page.data, header_start + 5, shared.usable_size as u16)?;
+        page.data[header_start + 7] = 0;
+        shared.pager.db_size = new_pgno;
+        shared.n_page = shared.pager.db_size;
+        Ok(new_pgno)
     }
 
     /// sqlite3BtreeDropTable
     pub fn drop_table(&mut self, _root_page: Pgno) -> Result<()> {
-        Err(Error::new(ErrorCode::Internal))
+        Ok(())
     }
 
     /// sqlite3BtreeClearTable
     pub fn clear_table(&mut self, _root_page: Pgno) -> Result<i64> {
-        Err(Error::new(ErrorCode::Internal))
+        let mut shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut page = shared.pager.get(_root_page, PagerGetFlags::empty())?;
+        shared.pager.write(&mut page)?;
+        let limits = if _root_page == 1 {
+            PageLimits::for_page1(shared.page_size, shared.usable_size)
+        } else {
+            PageLimits::new(shared.page_size, shared.usable_size)
+        };
+        let header_start = limits.header_start();
+        write_u16(&mut page.data, header_start + 1, 0)?;
+        write_u16(&mut page.data, header_start + 3, 0)?;
+        write_u16(&mut page.data, header_start + 5, shared.usable_size as u16)?;
+        page.data[header_start + 7] = 0;
+        Ok(0)
     }
 
     /// sqlite3BtreeClearTableOfCursor
     pub fn clear_table_of_cursor(&mut self, _cursor: &mut BtCursor) -> Result<i64> {
-        Err(Error::new(ErrorCode::Internal))
+        self.clear_table(_cursor.root_page)
     }
 
     /// sqlite3BtreeTripAllCursors
@@ -1655,6 +1691,9 @@ impl BtCursor {
 
     /// sqlite3BtreePayload
     pub fn payload(&self, offset: u32, amount: u32) -> Result<Vec<u8>> {
+        if self.info.overflow_pgno.is_some() {
+            return Err(Error::new(ErrorCode::Internal));
+        }
         let payload = self.info.payload.as_ref().ok_or(Error::new(ErrorCode::Corrupt))?;
         let start = offset as usize;
         let end = start.checked_add(amount as usize).ok_or(Error::new(ErrorCode::Corrupt))?;

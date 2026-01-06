@@ -345,6 +345,9 @@ impl WhereCodeGen {
             Some(TermOp::Eq) => {
                 self.code_comparison_filter(term, Opcode::Ne, skip_label)?;
             }
+            Some(TermOp::Is) => {
+                self.code_comparison_filter(term, Opcode::Ne, skip_label)?;
+            }
             Some(TermOp::Ne) => {
                 self.code_comparison_filter(term, Opcode::Eq, skip_label)?;
             }

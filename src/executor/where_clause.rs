@@ -6,7 +6,9 @@
 use bitflags::bitflags;
 
 use crate::error::{Error, ErrorCode, Result};
-use crate::parser::ast::{BinaryOp, Expr, LikeOp, UnaryOp};
+use crate::parser::ast::{BinaryOp, Expr, LikeOp, Literal, UnaryOp};
+
+use super::where_expr;
 
 // ============================================================================
 // Constants
@@ -56,6 +58,8 @@ bitflags! {
         const AND = 0x0400;
         /// Term references outer query
         const OUTER_REF = 0x0800;
+        /// LIKE term has a usable prefix
+        const LIKE_PREFIX = 0x1000;
     }
 }
 
@@ -164,6 +168,9 @@ pub struct WhereTerm {
 
     /// Operator type
     pub op: Option<TermOp>,
+
+    /// OR clause components (if this term is an OR expression)
+    pub or_terms: Vec<Expr>,
 }
 
 /// Operator type for a WHERE term
@@ -175,6 +182,7 @@ pub enum TermOp {
     Gt,        // >
     Ge,        // >=
     Ne,        // != or <>
+    Is,        // IS
     Like,      // LIKE
     Glob,      // GLOB
     In,        // IN
@@ -195,6 +203,7 @@ impl WhereTerm {
             left_col: None,
             selectivity: 0.25, // Default 25% selectivity
             op: None,
+            or_terms: Vec::new(),
         }
     }
 
@@ -203,6 +212,7 @@ impl WhereTerm {
         matches!(
             self.op,
             Some(TermOp::Eq)
+                | Some(TermOp::Is)
                 | Some(TermOp::Lt)
                 | Some(TermOp::Le)
                 | Some(TermOp::Gt)
@@ -213,7 +223,7 @@ impl WhereTerm {
 
     /// Check if this is an equality term
     pub fn is_equality(&self) -> bool {
-        self.op == Some(TermOp::Eq)
+        matches!(self.op, Some(TermOp::Eq) | Some(TermOp::Is))
     }
 
     /// Check if this is a range term
@@ -362,8 +372,11 @@ impl WhereClause {
 
     /// Add a term to the WHERE clause
     pub fn add_term(&mut self, term: WhereTerm) {
+        let is_virtual = term.flags.contains(WhereTermFlags::VIRTUAL);
         self.terms.push(term);
-        self.n_base = self.terms.len();
+        if !is_virtual {
+            self.n_base = self.terms.len();
+        }
     }
 
     /// Get number of terms
@@ -515,7 +528,39 @@ impl QueryPlanner {
                 let idx = self.where_clause.terms.len() as i32;
                 let mut term = WhereTerm::new(expr.clone(), idx);
                 term.flags |= WhereTermFlags::OR_INFO;
+                term.or_terms = where_expr::split_or_clause(expr);
                 self.where_clause.add_term(term);
+            }
+
+            Expr::Between {
+                expr: inner,
+                low,
+                high,
+                negated: false,
+            } => {
+                let idx = self.where_clause.terms.len() as i32;
+                let mut lower = WhereTerm::new(
+                    Expr::Binary {
+                        op: BinaryOp::Ge,
+                        left: inner.clone(),
+                        right: low.clone(),
+                    },
+                    idx,
+                );
+                lower.flags |= WhereTermFlags::BETWEEN | WhereTermFlags::VIRTUAL;
+                self.where_clause.add_term(lower);
+
+                let idx = self.where_clause.terms.len() as i32;
+                let mut upper = WhereTerm::new(
+                    Expr::Binary {
+                        op: BinaryOp::Le,
+                        left: inner.clone(),
+                        right: high.clone(),
+                    },
+                    idx,
+                );
+                upper.flags |= WhereTermFlags::BETWEEN | WhereTermFlags::VIRTUAL;
+                self.where_clause.add_term(upper);
             }
 
             // All other expressions become individual terms
@@ -538,6 +583,8 @@ impl QueryPlanner {
             .collect();
 
         for term in self.where_clause.iter_mut() {
+            term.mask = where_expr::expr_usage(term.expr.as_ref(), &table_info);
+            term.prereq = term.mask;
             // Determine operator type and selectivity
             Self::analyze_term_expr_static(&table_info, term)?;
         }
@@ -549,12 +596,19 @@ impl QueryPlanner {
         table_info: &[(String, Option<String>, u64)],
         term: &mut WhereTerm,
     ) -> Result<()> {
-        // Clone the expression to avoid borrow conflicts
-        let expr = term.expr.clone();
+        match term.expr.as_mut() {
+            Expr::Binary { left, right, .. } => {
+                let left_is_column = matches!(left.as_ref(), Expr::Column(_));
+                let right_is_column = matches!(right.as_ref(), Expr::Column(_));
+                if !left_is_column && right_is_column {
+                    where_expr::commute_comparison(term.expr.as_mut());
+                }
 
-        match expr.as_ref() {
-            Expr::Binary { op, left, .. } => {
-                // Set operator type
+                let op = match term.expr.as_ref() {
+                    Expr::Binary { op, .. } => op,
+                    _ => return Ok(()),
+                };
+
                 term.op = Some(match op {
                     BinaryOp::Eq => TermOp::Eq,
                     BinaryOp::Ne => TermOp::Ne,
@@ -562,35 +616,48 @@ impl QueryPlanner {
                     BinaryOp::Le => TermOp::Le,
                     BinaryOp::Gt => TermOp::Gt,
                     BinaryOp::Ge => TermOp::Ge,
+                    BinaryOp::Is => TermOp::Is,
                     _ => return Ok(()),
                 });
 
-                // Set selectivity based on operator
                 term.selectivity = match term.op {
-                    Some(TermOp::Eq) => 0.1, // 10% for equality
-                    Some(TermOp::Ne) => 0.9, // 90% for not-equal
+                    Some(TermOp::Eq) | Some(TermOp::Is) => 0.1, // 10% for equality
+                    Some(TermOp::Ne) => 0.9,                    // 90% for not-equal
                     Some(TermOp::Lt | TermOp::Le | TermOp::Gt | TermOp::Ge) => 0.33,
                     Some(TermOp::Like | TermOp::Glob) => 0.25,
                     _ => 0.25,
                 };
 
-                // Analyze left side for column reference
+                let left = match term.expr.as_ref() {
+                    Expr::Binary { left, .. } => left,
+                    _ => return Ok(()),
+                };
                 Self::analyze_column_ref_static(table_info, term, left)?;
+                if term.left_col.is_some() && term.is_index_usable() {
+                    term.flags |= WhereTermFlags::INDEX_CONSTRAINT;
+                }
             }
 
-            Expr::IsNull { negated, .. } => {
+            Expr::IsNull { negated, expr } => {
                 term.op = Some(if *negated {
                     TermOp::IsNotNull
                 } else {
                     TermOp::IsNull
                 });
                 term.selectivity = if *negated { 0.95 } else { 0.05 };
+                Self::analyze_column_ref_static(table_info, term, expr)?;
+                if term.left_col.is_some() {
+                    term.flags |= WhereTermFlags::INDEX_CONSTRAINT;
+                }
             }
 
             Expr::In { expr: inner, .. } => {
                 term.op = Some(TermOp::In);
                 term.selectivity = 0.25;
                 Self::analyze_column_ref_static(table_info, term, inner)?;
+                if term.left_col.is_some() {
+                    term.flags |= WhereTermFlags::INDEX_CONSTRAINT;
+                }
             }
 
             Expr::Between { expr: inner, .. } => {
@@ -609,6 +676,11 @@ impl QueryPlanner {
                 });
                 term.selectivity = 0.25;
                 term.flags |= WhereTermFlags::LIKE;
+                if let Expr::Like { pattern, .. } = term.expr.as_ref() {
+                    if Self::like_prefix(pattern, *op) {
+                        term.flags |= WhereTermFlags::LIKE_PREFIX;
+                    }
+                }
                 Self::analyze_column_ref_static(table_info, term, inner)?;
             }
 
@@ -652,6 +724,24 @@ impl QueryPlanner {
             }
         }
         Ok(())
+    }
+
+    fn like_prefix(pattern: &Expr, op: LikeOp) -> bool {
+        let text = match pattern {
+            Expr::Literal(Literal::String(text)) => text,
+            _ => return false,
+        };
+
+        let mut chars = text.chars();
+        let first = match chars.next() {
+            Some(ch) => ch,
+            None => return false,
+        };
+
+        match op {
+            LikeOp::Like | LikeOp::Regexp | LikeOp::Match => first != '%' && first != '_',
+            LikeOp::Glob => first != '*' && first != '?',
+        }
     }
 
     /// Find the optimal query plan
@@ -1070,6 +1160,78 @@ mod tests {
 
         // Should be split into 2 terms
         assert_eq!(planner.where_clause.len(), 2);
+    }
+
+    #[test]
+    fn test_where_clause_between_split() {
+        let mut planner = QueryPlanner::new();
+        planner.add_table("users".to_string(), None, 1000);
+
+        let expr = Expr::Between {
+            expr: Box::new(Expr::column("a")),
+            low: Box::new(Expr::Literal(crate::parser::ast::Literal::Integer(1))),
+            high: Box::new(Expr::Literal(crate::parser::ast::Literal::Integer(10))),
+            negated: false,
+        };
+
+        planner.analyze_where(Some(&expr)).unwrap();
+        assert_eq!(planner.where_clause.len(), 2);
+        assert!(planner
+            .where_clause
+            .terms
+            .iter()
+            .any(|term| term.op == Some(TermOp::Ge)));
+        assert!(planner
+            .where_clause
+            .terms
+            .iter()
+            .any(|term| term.op == Some(TermOp::Le)));
+    }
+
+    #[test]
+    fn test_where_clause_or_split() {
+        let mut planner = QueryPlanner::new();
+        planner.add_table("users".to_string(), None, 1000);
+
+        let expr = Expr::Binary {
+            op: BinaryOp::Or,
+            left: Box::new(Expr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(Expr::column("a")),
+                right: Box::new(Expr::Literal(crate::parser::ast::Literal::Integer(1))),
+            }),
+            right: Box::new(Expr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(Expr::column("b")),
+                right: Box::new(Expr::Literal(crate::parser::ast::Literal::Integer(2))),
+            }),
+        };
+
+        planner.analyze_where(Some(&expr)).unwrap();
+        assert_eq!(planner.where_clause.len(), 1);
+        let term = &planner.where_clause.terms[0];
+        assert!(term.flags.contains(WhereTermFlags::OR_INFO));
+        assert_eq!(term.or_terms.len(), 2);
+    }
+
+    #[test]
+    fn test_like_prefix_flag() {
+        let mut planner = QueryPlanner::new();
+        planner.add_table("users".to_string(), None, 1000);
+
+        let expr = Expr::Like {
+            expr: Box::new(Expr::column("a")),
+            pattern: Box::new(Expr::Literal(crate::parser::ast::Literal::String(
+                "abc%".to_string(),
+            ))),
+            escape: None,
+            op: LikeOp::Like,
+            negated: false,
+        };
+
+        planner.analyze_where(Some(&expr)).unwrap();
+        let term = &planner.where_clause.terms[0];
+        assert!(term.flags.contains(WhereTermFlags::LIKE_PREFIX));
     }
 
     #[test]

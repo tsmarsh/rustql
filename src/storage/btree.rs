@@ -1957,6 +1957,13 @@ impl Btree {
             return Err(Error::new(ErrorCode::Internal));
         }
 
+        // Calculate insert_index before checking if split is needed
+        let insert_index = if _flags.contains(BtreeInsertFlags::APPEND) || _cursor.state != CursorState::Valid {
+            mem_page.n_cell
+        } else {
+            _cursor.ix.min(mem_page.n_cell)
+        };
+
         let header_start = limits.header_start();
         let header_size = mem_page.header_size();
         let ptr_array_end = header_start + header_size + (mem_page.n_cell as usize * 2);
@@ -2020,12 +2027,6 @@ impl Btree {
             return Err(Error::new(ErrorCode::Full));
         }
         let new_cell_offset = cell_offset - cell_size;
-
-        let insert_index = if _flags.contains(BtreeInsertFlags::APPEND) || _cursor.state != CursorState::Valid {
-            mem_page.n_cell
-        } else {
-            _cursor.ix.min(mem_page.n_cell)
-        };
         let mut page = shared_guard.pager.get(root_pgno, PagerGetFlags::empty())?;
         shared_guard.pager.write(&mut page)?;
 

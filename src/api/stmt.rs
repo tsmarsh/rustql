@@ -3,7 +3,10 @@
 //! This module implements sqlite3_stmt (prepared statement) and related functions.
 
 use crate::error::{Error, ErrorCode, Result};
+use crate::executor::prepare::{compile_sql, CompiledStmt, StmtType};
 use crate::types::{ColumnType, StepResult, Value};
+use crate::vdbe::engine::Vdbe;
+use crate::vdbe::ops::VdbeOp;
 
 use super::connection::SqliteConnection;
 
@@ -39,6 +42,12 @@ pub struct PreparedStmt {
     explain: i32,
     /// Expanded SQL (with bound parameters)
     expanded_sql: Option<String>,
+    /// Compiled VDBE bytecode
+    ops: Vec<VdbeOp>,
+    /// Statement type
+    stmt_type: Option<StmtType>,
+    /// VDBE virtual machine (created on first step)
+    vdbe: Option<Vdbe>,
 }
 
 impl PreparedStmt {
@@ -58,7 +67,46 @@ impl PreparedStmt {
             read_only: true,
             explain: 0,
             expanded_sql: None,
+            ops: Vec::new(),
+            stmt_type: None,
+            vdbe: None,
         }
+    }
+
+    /// Create from a compiled statement
+    pub fn from_compiled(sql: &str, compiled: CompiledStmt, tail: &str) -> Self {
+        Self {
+            sql: sql.to_string(),
+            tail: tail.to_string(),
+            column_names: compiled.column_names,
+            column_types: compiled.column_types,
+            params: vec![Value::Null; compiled.param_count as usize],
+            param_names: compiled.param_names,
+            param_count: compiled.param_count,
+            row_values: Vec::new(),
+            stepped: false,
+            done: false,
+            read_only: compiled.read_only,
+            explain: match compiled.stmt_type {
+                StmtType::Explain => 1,
+                StmtType::ExplainQueryPlan => 2,
+                _ => 0,
+            },
+            expanded_sql: None,
+            ops: compiled.ops,
+            stmt_type: Some(compiled.stmt_type),
+            vdbe: None,
+        }
+    }
+
+    /// Get the compiled bytecode
+    pub fn ops(&self) -> &[VdbeOp] {
+        &self.ops
+    }
+
+    /// Get statement type
+    pub fn stmt_type(&self) -> Option<StmtType> {
+        self.stmt_type
     }
 
     /// Get SQL text
@@ -132,6 +180,11 @@ impl PreparedStmt {
         self.stepped = false;
         self.done = false;
         self.row_values.clear();
+
+        // Reset VDBE if present
+        if let Some(vdbe) = &mut self.vdbe {
+            vdbe.reset();
+        }
     }
 
     /// Clear all bindings
@@ -165,38 +218,30 @@ pub fn sqlite3_prepare_v2<'a>(
 ) -> Result<(Box<PreparedStmt>, &'a str)> {
     conn.clear_error();
 
-    // TODO: Actually parse and compile the SQL
-    // For now, create a stub statement
-
-    let mut stmt = Box::new(PreparedStmt::new(sql));
-
-    // Find the first statement boundary (semicolon)
-    let tail = find_statement_end(sql);
-    stmt.set_tail(tail);
-
-    // Count parameters (? placeholders)
-    let param_count = count_parameters(sql);
-    stmt.set_param_count(param_count);
-
-    // Determine if read-only
-    let trimmed = sql.trim().to_uppercase();
-    stmt.set_read_only(
-        trimmed.starts_with("SELECT")
-            || trimmed.starts_with("EXPLAIN")
-            || trimmed.starts_with("PRAGMA")
-            || trimmed.starts_with("BEGIN")
-            || trimmed.starts_with("COMMIT")
-            || trimmed.starts_with("ROLLBACK"),
-    );
-
-    // Check for EXPLAIN
-    if trimmed.starts_with("EXPLAIN QUERY PLAN") {
-        stmt.set_explain(2);
-    } else if trimmed.starts_with("EXPLAIN") {
-        stmt.set_explain(1);
+    // Skip leading whitespace
+    let trimmed = sql.trim_start();
+    if trimmed.is_empty() {
+        // Empty statement - return stub
+        return Ok((Box::new(PreparedStmt::new("")), ""));
     }
 
-    Ok((stmt, tail))
+    // Compile the SQL to VDBE bytecode
+    match compile_sql(sql) {
+        Ok((compiled, tail)) => {
+            let stmt = Box::new(PreparedStmt::from_compiled(sql, compiled, tail));
+            // Calculate actual tail position in original string
+            let tail_start = if tail.is_empty() {
+                sql.len()
+            } else {
+                sql.len() - tail.len()
+            };
+            Ok((stmt, &sql[tail_start..]))
+        }
+        Err(e) => {
+            conn.set_error(e.code, e.message.as_deref().unwrap_or("error"));
+            Err(e)
+        }
+    }
 }
 
 /// sqlite3_prepare_v3 - Prepare with flags
@@ -229,15 +274,62 @@ pub fn sqlite3_prepare16(
 ///
 /// Returns Row if a row is available, Done if finished, or an error.
 pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
+    use crate::vdbe::engine::ExecResult;
+
     if stmt.done {
         return Ok(StepResult::Done);
     }
 
-    // TODO: Actually execute the VDBE program
-    // For now, just return Done
+    // Create VDBE if not already created
+    if stmt.vdbe.is_none() {
+        if stmt.ops.is_empty() {
+            // No bytecode - this is an empty or stub statement
+            stmt.set_done();
+            return Ok(StepResult::Done);
+        }
 
-    stmt.set_done();
-    Ok(StepResult::Done)
+        // Create VDBE from compiled bytecode
+        let mut vdbe = Vdbe::from_ops(stmt.ops.clone());
+
+        // Set up parameters
+        vdbe.ensure_vars(stmt.param_count);
+        for (i, param) in stmt.params.iter().enumerate() {
+            let _ = vdbe.bind_value((i + 1) as i32, param);
+        }
+
+        // Set column names
+        vdbe.set_column_names(stmt.column_names.clone());
+
+        stmt.vdbe = Some(vdbe);
+    }
+
+    // Execute one step
+    let vdbe = stmt.vdbe.as_mut().unwrap();
+    match vdbe.step() {
+        Ok(ExecResult::Row) => {
+            // Copy result row to statement
+            let col_count = vdbe.column_count();
+            let mut row = Vec::with_capacity(col_count as usize);
+            for i in 0..col_count {
+                row.push(vdbe.column_value(i));
+            }
+            stmt.set_row(row);
+            stmt.stepped = true;
+            Ok(StepResult::Row)
+        }
+        Ok(ExecResult::Done) => {
+            stmt.set_done();
+            Ok(StepResult::Done)
+        }
+        Ok(ExecResult::Continue) => {
+            // Internal state - keep stepping
+            sqlite3_step(stmt)
+        }
+        Err(e) => {
+            stmt.set_done();
+            Err(e)
+        }
+    }
 }
 
 /// sqlite3_reset - Reset statement for re-execution

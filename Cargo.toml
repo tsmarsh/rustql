@@ -1,0 +1,19 @@
+[package]
+name = "rustql"
+version = "0.1.0"
+edition = "2021"
+description = "SQLite3 database engine rewritten in Rust"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["fts5", "rtree", "session"]
+fts3 = []
+fts5 = []
+rtree = []
+session = []
+json = []
+
+[dependencies]
+bitflags = "2"
+
+[dev-dependencies]

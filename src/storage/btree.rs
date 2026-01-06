@@ -2109,6 +2109,14 @@ impl Btree {
 
     /// sqlite3BtreeDropTable
     pub fn drop_table(&mut self, _root_page: Pgno) -> Result<()> {
+        if _root_page == 0 {
+            return Err(Error::new(ErrorCode::Range));
+        }
+        if _root_page != 1 {
+            let mut shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+            shared.free_pages.push(_root_page);
+            update_free_page_count(&mut shared, 1)?;
+        }
         Ok(())
     }
 

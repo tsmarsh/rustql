@@ -515,21 +515,41 @@ fn build_overflow_pages(limits: PageLimits, payload: &[u8]) -> OverflowChain {
 
 fn free_overflow_chain(shared: &mut BtShared, start: Pgno) -> Result<()> {
     let mut next = start;
+    let mut freed = 0;
     while next != 0 {
         let page = shared.pager.get(next, PagerGetFlags::empty())?;
         let next_pgno = read_u32(&page.data, 0).ok_or(Error::new(ErrorCode::Corrupt))?;
         shared.free_pages.push(next);
+        freed += 1;
         next = next_pgno;
+    }
+    if freed > 0 {
+        update_free_page_count(shared, freed)?;
     }
     Ok(())
 }
 
 fn allocate_page(shared: &mut BtShared) -> Pgno {
     if let Some(pgno) = shared.free_pages.pop() {
+        let _ = update_free_page_count(shared, -1);
         pgno
     } else {
         shared.pager.db_size + 1
     }
+}
+
+fn update_free_page_count(shared: &mut BtShared, delta: i32) -> Result<()> {
+    let mut page = shared.pager.get(1, PagerGetFlags::empty())?;
+    shared.pager.write(&mut page)?;
+    let offset = 36usize + (BTREE_FREE_PAGE_COUNT * 4);
+    let current = read_u32(&page.data, offset).unwrap_or(0);
+    let updated = if delta.is_negative() {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        current.saturating_add(delta as u32)
+    };
+    write_u32(&mut page.data, offset, updated)?;
+    Ok(())
 }
 
 fn collapse_root_if_empty(shared: &mut BtShared, root_pgno: Pgno) -> Result<()> {

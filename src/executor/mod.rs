@@ -18,3 +18,6 @@ pub use wherecode::{
     WhereCodeGen, Affinity,
     generate_where_code, apply_affinity,
 };
+
+pub use insert::{InsertCompiler, compile_insert};
+pub use update::{UpdateCompiler, compile_update};

@@ -15,5 +15,6 @@ json = []
 
 [dependencies]
 bitflags = "2"
+lazy_static = "1.4"
 
 [dev-dependencies]

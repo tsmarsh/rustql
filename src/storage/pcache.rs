@@ -101,7 +101,7 @@ impl PCache {
     }
 
     pub fn fetch(&mut self, pgno: Pgno, create: bool) -> Option<NonNull<PgHdr>> {
-        let page = self.cache.fetch(pgno, create || self.create_flag)?;
+        let mut page = self.cache.fetch(pgno, create || self.create_flag)?;
         unsafe {
             let page_ref = page.as_mut();
             page_ref.n_ref += 1;
@@ -110,7 +110,7 @@ impl PCache {
         Some(page)
     }
 
-    pub fn release(&mut self, page: NonNull<PgHdr>) {
+    pub fn release(&mut self, mut page: NonNull<PgHdr>) {
         unsafe {
             let page_ref = page.as_mut();
             if page_ref.n_ref > 0 {
@@ -121,7 +121,7 @@ impl PCache {
         self.cache.unpin(page, false);
     }
 
-    pub fn make_dirty(&mut self, page: NonNull<PgHdr>) {
+    pub fn make_dirty(&mut self, mut page: NonNull<PgHdr>) {
         unsafe {
             let page_ref = page.as_mut();
             if page_ref.is_dirty() {
@@ -133,7 +133,7 @@ impl PCache {
         self.cache.make_dirty(page);
     }
 
-    pub fn make_clean(&mut self, page: NonNull<PgHdr>) {
+    pub fn make_clean(&mut self, mut page: NonNull<PgHdr>) {
         unsafe {
             let page_ref = page.as_mut();
             if !page_ref.is_dirty() {
@@ -178,7 +178,7 @@ impl PCache {
         }
     }
 
-    fn add_dirty(&mut self, page: NonNull<PgHdr>) {
+    fn add_dirty(&mut self, mut page: NonNull<PgHdr>) {
         unsafe {
             let page_ref = page.as_mut();
             page_ref.dirty_prev = None;
@@ -195,7 +195,7 @@ impl PCache {
         }
     }
 
-    fn remove_dirty(&mut self, page: NonNull<PgHdr>) {
+    fn remove_dirty(&mut self, mut page: NonNull<PgHdr>) {
         unsafe {
             let page_ref = page.as_mut();
             if let Some(mut next) = page_ref.dirty_next {
@@ -303,11 +303,18 @@ impl PcacheImpl for PCache1 {
 
     fn fetch(&mut self, pgno: Pgno, create: bool) -> Option<NonNull<PgHdr>> {
         if let Some(&idx) = self.map.get(&pgno) {
-            let page = self.pages.get_mut(idx)?.as_mut()?;
-            if page.n_ref == 0 {
+            let mut remove_lru = false;
+            let page_ptr = {
+                let page = self.pages.get_mut(idx)?.as_mut()?;
+                if page.n_ref == 0 {
+                    remove_lru = true;
+                }
+                NonNull::from(page.as_mut())
+            };
+            if remove_lru {
                 self.remove_from_lru(idx);
             }
-            return Some(NonNull::from(page.as_mut()));
+            return Some(page_ptr);
         }
 
         if !create {

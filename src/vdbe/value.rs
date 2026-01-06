@@ -197,7 +197,9 @@ impl FunctionContext {
 
     /// Get error
     pub fn get_error(&self) -> Option<(&str, ErrorCode)> {
-        self.error.as_ref().map(|msg| (msg.as_str(), self.error_code))
+        self.error
+            .as_ref()
+            .map(|msg| (msg.as_str(), self.error_code))
     }
 
     /// Get result subtype

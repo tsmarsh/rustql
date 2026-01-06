@@ -10,7 +10,7 @@ use std::time::Instant;
 use crate::error::{Error, ErrorCode, Result};
 use crate::types::{ColumnType, Pgno, Value};
 use crate::vdbe::mem::Mem;
-use crate::vdbe::ops::{Opcode, P4, VdbeOp};
+use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
 // ============================================================================
 // Constants
@@ -924,7 +924,10 @@ impl Vdbe {
                     cursor.state = CursorState::AtEnd; // Assume empty for now
                 }
                 // Jump if no rows
-                if self.cursor(op.p1).map_or(true, |c| c.state == CursorState::AtEnd) {
+                if self
+                    .cursor(op.p1)
+                    .map_or(true, |c| c.state == CursorState::AtEnd)
+                {
                     self.pc = op.p2;
                 }
             }
@@ -935,7 +938,10 @@ impl Vdbe {
                     // Placeholder: In real implementation, this would call btree
                     cursor.state = CursorState::AtEnd;
                 }
-                if self.cursor(op.p1).map_or(true, |c| c.state == CursorState::AtEnd) {
+                if self
+                    .cursor(op.p1)
+                    .map_or(true, |c| c.state == CursorState::AtEnd)
+                {
                     self.pc = op.p2;
                 }
             }
@@ -945,7 +951,10 @@ impl Vdbe {
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     cursor.state = CursorState::AtEnd;
                 }
-                if self.cursor(op.p1).map_or(true, |c| c.state == CursorState::AtEnd) {
+                if self
+                    .cursor(op.p1)
+                    .map_or(true, |c| c.state == CursorState::AtEnd)
+                {
                     self.pc = op.p2;
                 }
             }
@@ -1238,20 +1247,8 @@ mod tests {
     #[test]
     fn test_vdbe_string_operations() {
         let mut vdbe = Vdbe::from_ops(vec![
-            VdbeOp::with_p4(
-                Opcode::String8,
-                0,
-                1,
-                0,
-                P4::Text("hello".to_string()),
-            ),
-            VdbeOp::with_p4(
-                Opcode::String8,
-                0,
-                2,
-                0,
-                P4::Text(" world".to_string()),
-            ),
+            VdbeOp::with_p4(Opcode::String8, 0, 1, 0, P4::Text("hello".to_string())),
+            VdbeOp::with_p4(Opcode::String8, 0, 2, 0, P4::Text(" world".to_string())),
             VdbeOp::new(Opcode::Concat, 2, 1, 3),
             VdbeOp::new(Opcode::ResultRow, 3, 1, 0),
             VdbeOp::new(Opcode::Halt, 0, 0, 0),

@@ -130,11 +130,7 @@ impl TraceInfo {
                 self.sql,
                 self.elapsed_ns.unwrap_or(0)
             ),
-            TraceEvent::Row => format!(
-                "ROW: {} (row {})",
-                self.sql,
-                self.row_count.unwrap_or(0)
-            ),
+            TraceEvent::Row => format!("ROW: {} (row {})", self.sql, self.row_count.unwrap_or(0)),
             TraceEvent::Close => format!("CLOSE: {}", self.sql),
         }
     }

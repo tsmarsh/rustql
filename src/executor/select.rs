@@ -7,12 +7,11 @@ use std::collections::HashMap;
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::parser::ast::{
-    BinaryOp, CompoundOp, Distinct, Expr, FromClause, JoinType,
-    LimitClause, OrderingTerm, ResultColumn, SelectBody, SelectCore,
-    SelectStmt, TableRef, WithClause,
+    BinaryOp, CompoundOp, Distinct, Expr, FromClause, JoinType, LimitClause, OrderingTerm,
+    ResultColumn, SelectBody, SelectCore, SelectStmt, TableRef, WithClause,
 };
-use crate::schema::{Table, Affinity};
-use crate::vdbe::ops::{Opcode, P4, VdbeOp};
+use crate::schema::{Affinity, Table};
+use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
 // ============================================================================
 // Select Destination
@@ -243,13 +242,29 @@ impl SelectCompiler {
             let skip_label = self.alloc_label();
             // Make record for lookup
             let record_reg = self.alloc_reg();
-            self.emit(Opcode::MakeRecord, result_regs.0, result_regs.1 as i32,
-                      record_reg, P4::Unused);
+            self.emit(
+                Opcode::MakeRecord,
+                result_regs.0,
+                result_regs.1 as i32,
+                record_reg,
+                P4::Unused,
+            );
             // Check if row exists in distinct table (skip output if found)
-            self.emit(Opcode::IdxGE, distinct_cursor, skip_label, record_reg,
-                      P4::Int64(result_regs.1 as i64));
+            self.emit(
+                Opcode::IdxGE,
+                distinct_cursor,
+                skip_label,
+                record_reg,
+                P4::Int64(result_regs.1 as i64),
+            );
             // Insert into distinct table
-            self.emit(Opcode::IdxInsert, distinct_cursor, record_reg, 0, P4::Unused);
+            self.emit(
+                Opcode::IdxInsert,
+                distinct_cursor,
+                record_reg,
+                0,
+                P4::Unused,
+            );
         }
 
         // Output the row
@@ -345,7 +360,13 @@ impl SelectCompiler {
         // Open sorter for grouping
         let sorter_cursor = self.alloc_cursor();
         let num_group_cols = group_by.len();
-        self.emit(Opcode::OpenEphemeral, sorter_cursor, num_group_cols as i32, 0, P4::Unused);
+        self.emit(
+            Opcode::OpenEphemeral,
+            sorter_cursor,
+            num_group_cols as i32,
+            0,
+            P4::Unused,
+        );
 
         // Collect table cursors to avoid borrow checker issues
         let table_cursors: Vec<i32> = self.tables.iter().map(|t| t.cursor).collect();
@@ -378,8 +399,20 @@ impl SelectCompiler {
         // Make record and insert into sorter
         let total_cols = group_regs.1 + agg_arg_regs.1;
         let record_reg = self.alloc_reg();
-        self.emit(Opcode::MakeRecord, group_regs.0, total_cols as i32, record_reg, P4::Unused);
-        self.emit(Opcode::SorterInsert, sorter_cursor, record_reg, 0, P4::Unused);
+        self.emit(
+            Opcode::MakeRecord,
+            group_regs.0,
+            total_cols as i32,
+            record_reg,
+            P4::Unused,
+        );
+        self.emit(
+            Opcode::SorterInsert,
+            sorter_cursor,
+            record_reg,
+            0,
+            P4::Unused,
+        );
 
         // WHERE skip target
         if let Some(label) = where_skip_label {
@@ -399,35 +432,71 @@ impl SelectCompiler {
 
         // Sort the results
         let sort_done_label = self.alloc_label();
-        self.emit(Opcode::SorterSort, sorter_cursor, sort_done_label, 0, P4::Unused);
+        self.emit(
+            Opcode::SorterSort,
+            sorter_cursor,
+            sort_done_label,
+            0,
+            P4::Unused,
+        );
 
         // Initialize aggregates
         let agg_regs = self.init_aggregates(&core.columns)?;
 
         // Previous group key registers
         let prev_group_regs = self.alloc_regs(num_group_cols);
-        self.emit(Opcode::Null, 0, prev_group_regs, prev_group_regs + num_group_cols as i32 - 1, P4::Unused);
+        self.emit(
+            Opcode::Null,
+            0,
+            prev_group_regs,
+            prev_group_regs + num_group_cols as i32 - 1,
+            P4::Unused,
+        );
 
         let sorter_loop_start = self.current_addr();
 
         // Get current row from sorter
         let sorter_data_reg = self.alloc_reg();
-        self.emit(Opcode::SorterData, sorter_cursor, sorter_data_reg, 0, P4::Unused);
+        self.emit(
+            Opcode::SorterData,
+            sorter_cursor,
+            sorter_data_reg,
+            0,
+            P4::Unused,
+        );
 
         // Extract group columns
         let curr_group_regs = self.alloc_regs(num_group_cols);
         for i in 0..num_group_cols {
-            self.emit(Opcode::Column, sorter_cursor, i as i32, curr_group_regs + i as i32, P4::Unused);
+            self.emit(
+                Opcode::Column,
+                sorter_cursor,
+                i as i32,
+                curr_group_regs + i as i32,
+                P4::Unused,
+            );
         }
 
         // Compare with previous group
         let same_group_label = self.alloc_label();
-        self.emit(Opcode::Compare, prev_group_regs, curr_group_regs, num_group_cols as i32, P4::Unused);
+        self.emit(
+            Opcode::Compare,
+            prev_group_regs,
+            curr_group_regs,
+            num_group_cols as i32,
+            P4::Unused,
+        );
         self.emit(Opcode::Jump, same_group_label, 0, 0, P4::Unused);
 
         // New group - output previous group if not first
         let first_group_label = self.alloc_label();
-        self.emit(Opcode::If, prev_group_regs, first_group_label, 0, P4::Unused);
+        self.emit(
+            Opcode::If,
+            prev_group_regs,
+            first_group_label,
+            0,
+            P4::Unused,
+        );
 
         // Finalize and output previous group
         let result_regs = self.finalize_aggregates(&core.columns, &agg_regs)?;
@@ -449,7 +518,13 @@ impl SelectCompiler {
 
         // Copy current group to previous
         for i in 0..num_group_cols {
-            self.emit(Opcode::Copy, curr_group_regs + i as i32, prev_group_regs + i as i32, 0, P4::Unused);
+            self.emit(
+                Opcode::Copy,
+                curr_group_regs + i as i32,
+                prev_group_regs + i as i32,
+                0,
+                P4::Unused,
+            );
         }
 
         self.resolve_label(same_group_label, self.current_addr());
@@ -459,7 +534,13 @@ impl SelectCompiler {
         self.accumulate_from_sorter(sorter_cursor, &core.columns, &agg_regs, agg_col_start)?;
 
         // Next sorter row
-        self.emit(Opcode::SorterNext, sorter_cursor, sorter_loop_start as i32, 0, P4::Unused);
+        self.emit(
+            Opcode::SorterNext,
+            sorter_cursor,
+            sorter_loop_start as i32,
+            0,
+            P4::Unused,
+        );
 
         // Output final group
         let result_regs = self.finalize_aggregates(&core.columns, &agg_regs)?;
@@ -495,7 +576,9 @@ impl SelectCompiler {
         self.emit(Opcode::OpenEphemeral, result_cursor, 0, 0, P4::Unused);
 
         // Compile left side into ephemeral table
-        let left_dest = SelectDest::EphemTable { cursor: result_cursor };
+        let left_dest = SelectDest::EphemTable {
+            cursor: result_cursor,
+        };
         self.compile_body(left, &left_dest)?;
 
         match op {
@@ -507,7 +590,9 @@ impl SelectCompiler {
                 // Right side goes to separate table, then merge with distinct
                 let right_cursor = self.alloc_cursor();
                 self.emit(Opcode::OpenEphemeral, right_cursor, 0, 0, P4::Unused);
-                let right_dest = SelectDest::EphemTable { cursor: right_cursor };
+                let right_dest = SelectDest::EphemTable {
+                    cursor: right_cursor,
+                };
                 self.compile_body(right, &right_dest)?;
 
                 // Merge with distinct
@@ -518,7 +603,9 @@ impl SelectCompiler {
                 // Keep only rows that appear in both
                 let right_cursor = self.alloc_cursor();
                 self.emit(Opcode::OpenEphemeral, right_cursor, 0, 0, P4::Unused);
-                let right_dest = SelectDest::EphemTable { cursor: right_cursor };
+                let right_dest = SelectDest::EphemTable {
+                    cursor: right_cursor,
+                };
                 self.compile_body(right, &right_dest)?;
 
                 self.intersect_tables(result_cursor, right_cursor)?;
@@ -528,7 +615,9 @@ impl SelectCompiler {
                 // Remove rows that appear in right
                 let right_cursor = self.alloc_cursor();
                 self.emit(Opcode::OpenEphemeral, right_cursor, 0, 0, P4::Unused);
-                let right_dest = SelectDest::EphemTable { cursor: right_cursor };
+                let right_dest = SelectDest::EphemTable {
+                    cursor: right_cursor,
+                };
                 self.compile_body(right, &right_dest)?;
 
                 self.except_tables(result_cursor, right_cursor)?;
@@ -593,7 +682,9 @@ impl SelectCompiler {
                 self.next_cursor = subcompiler.next_cursor;
 
                 self.tables.push(TableInfo {
-                    name: alias.clone().unwrap_or_else(|| format!("subquery_{}", cursor)),
+                    name: alias
+                        .clone()
+                        .unwrap_or_else(|| format!("subquery_{}", cursor)),
                     table_name: String::new(),
                     cursor,
                     schema_table: None,
@@ -601,7 +692,12 @@ impl SelectCompiler {
                     join_type,
                 });
             }
-            TableRef::Join { left, join_type: jt, right, constraint: _ } => {
+            TableRef::Join {
+                left,
+                join_type: jt,
+                right,
+                constraint: _,
+            } => {
                 // Compile left side
                 self.compile_table_ref(left, JoinType::Inner)?;
                 // Compile right side with join type
@@ -611,7 +707,11 @@ impl SelectCompiler {
             TableRef::Parens(inner) => {
                 self.compile_table_ref(inner, join_type)?;
             }
-            TableRef::TableFunction { name, args: _, alias: _ } => {
+            TableRef::TableFunction {
+                name,
+                args: _,
+                alias: _,
+            } => {
                 // Table-valued functions are more complex
                 // For now, treat as error
                 return Err(Error::with_message(
@@ -644,7 +744,11 @@ impl SelectCompiler {
                 }
                 ResultColumn::TableStar(table_name) => {
                     // All columns from specific table
-                    let cursor = self.tables.iter().find(|t| t.name == *table_name).map(|t| t.cursor);
+                    let cursor = self
+                        .tables
+                        .iter()
+                        .find(|t| t.name == *table_name)
+                        .map(|t| t.cursor);
                     if let Some(c) = cursor {
                         let reg = self.alloc_reg();
                         self.emit(Opcode::Column, c, -1, reg, P4::Unused);
@@ -696,16 +800,28 @@ impl SelectCompiler {
                         self.emit(Opcode::String8, 0, dest_reg, 0, P4::Text(s.clone()));
                     }
                     crate::parser::ast::Literal::Blob(b) => {
-                        self.emit(Opcode::Blob, b.len() as i32, dest_reg, 0, P4::Blob(b.clone()));
+                        self.emit(
+                            Opcode::Blob,
+                            b.len() as i32,
+                            dest_reg,
+                            0,
+                            P4::Blob(b.clone()),
+                        );
                     }
-                    crate::parser::ast::Literal::CurrentTime |
-                    crate::parser::ast::Literal::CurrentDate |
-                    crate::parser::ast::Literal::CurrentTimestamp => {
+                    crate::parser::ast::Literal::CurrentTime
+                    | crate::parser::ast::Literal::CurrentDate
+                    | crate::parser::ast::Literal::CurrentTimestamp => {
                         // These would call built-in functions
                         self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
                     }
                     crate::parser::ast::Literal::Bool(b) => {
-                        self.emit(Opcode::Integer, if *b { 1 } else { 0 }, dest_reg, 0, P4::Unused);
+                        self.emit(
+                            Opcode::Integer,
+                            if *b { 1 } else { 0 },
+                            dest_reg,
+                            0,
+                            P4::Unused,
+                        );
                     }
                 }
             }
@@ -714,14 +830,24 @@ impl SelectCompiler {
                 if let Some(table) = &col_ref.table {
                     if let Some(tinfo) = self.tables.iter().find(|t| t.name == *table) {
                         // Column index would come from schema
-                        self.emit(Opcode::Column, tinfo.cursor, 0, dest_reg,
-                                  P4::Text(col_ref.column.clone()));
+                        self.emit(
+                            Opcode::Column,
+                            tinfo.cursor,
+                            0,
+                            dest_reg,
+                            P4::Text(col_ref.column.clone()),
+                        );
                     }
                 } else {
                     // Search all tables for column
                     if let Some(tinfo) = self.tables.first() {
-                        self.emit(Opcode::Column, tinfo.cursor, 0, dest_reg,
-                                  P4::Text(col_ref.column.clone()));
+                        self.emit(
+                            Opcode::Column,
+                            tinfo.cursor,
+                            0,
+                            dest_reg,
+                            P4::Text(col_ref.column.clone()),
+                        );
                     }
                 }
             }
@@ -788,10 +914,18 @@ impl SelectCompiler {
                     crate::parser::ast::FunctionArgs::Star => 0,
                 };
 
-                self.emit(Opcode::Function, argc as i32, arg_base, dest_reg,
-                          P4::Text(func_call.name.clone()));
+                self.emit(
+                    Opcode::Function,
+                    argc as i32,
+                    arg_base,
+                    dest_reg,
+                    P4::Text(func_call.name.clone()),
+                );
             }
-            Expr::IsNull { expr: inner, negated } => {
+            Expr::IsNull {
+                expr: inner,
+                negated,
+            } => {
                 self.compile_expr(inner, dest_reg)?;
                 if *negated {
                     self.emit(Opcode::NotNull, dest_reg, dest_reg, 0, P4::Unused);
@@ -799,7 +933,11 @@ impl SelectCompiler {
                     self.emit(Opcode::IsNull, dest_reg, dest_reg, 0, P4::Unused);
                 }
             }
-            Expr::Case { operand, when_clauses, else_clause } => {
+            Expr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => {
                 let end_label = self.alloc_label();
 
                 if let Some(op_expr) = operand {
@@ -885,18 +1023,36 @@ impl SelectCompiler {
             }
             SelectDest::Mem { base_reg: dest_reg } => {
                 for i in 0..count {
-                    self.emit(Opcode::Copy, base_reg + i as i32, *dest_reg + i as i32, 0, P4::Unused);
+                    self.emit(
+                        Opcode::Copy,
+                        base_reg + i as i32,
+                        *dest_reg + i as i32,
+                        0,
+                        P4::Unused,
+                    );
                 }
             }
             SelectDest::Table { cursor } | SelectDest::EphemTable { cursor } => {
                 let record_reg = self.alloc_reg();
-                self.emit(Opcode::MakeRecord, base_reg, count as i32, record_reg, P4::Unused);
+                self.emit(
+                    Opcode::MakeRecord,
+                    base_reg,
+                    count as i32,
+                    record_reg,
+                    P4::Unused,
+                );
                 self.emit(Opcode::NewRowid, *cursor, base_reg, 0, P4::Unused);
                 self.emit(Opcode::Insert, *cursor, record_reg, base_reg, P4::Unused);
             }
             SelectDest::Coroutine { reg } => {
                 for i in 0..count {
-                    self.emit(Opcode::Copy, base_reg + i as i32, *reg + i as i32, 0, P4::Unused);
+                    self.emit(
+                        Opcode::Copy,
+                        base_reg + i as i32,
+                        *reg + i as i32,
+                        0,
+                        P4::Unused,
+                    );
                 }
                 self.emit(Opcode::Yield, *reg, 0, 0, P4::Unused);
             }
@@ -908,7 +1064,13 @@ impl SelectCompiler {
             }
             SelectDest::Sorter { cursor } => {
                 let record_reg = self.alloc_reg();
-                self.emit(Opcode::MakeRecord, base_reg, count as i32, record_reg, P4::Unused);
+                self.emit(
+                    Opcode::MakeRecord,
+                    base_reg,
+                    count as i32,
+                    record_reg,
+                    P4::Unused,
+                );
                 self.emit(Opcode::SorterInsert, *cursor, record_reg, 0, P4::Unused);
             }
             SelectDest::Discard => {
@@ -938,9 +1100,10 @@ impl SelectCompiler {
         match expr {
             Expr::Function(func_call) => {
                 let name_upper = func_call.name.to_uppercase();
-                matches!(name_upper.as_str(),
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" |
-                    "GROUP_CONCAT" | "TOTAL")
+                matches!(
+                    name_upper.as_str(),
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
+                )
             }
             Expr::Binary { left, right, .. } => {
                 self.expr_has_aggregate(left) || self.expr_has_aggregate(right)
@@ -969,7 +1132,10 @@ impl SelectCompiler {
             if let ResultColumn::Expr { expr, .. } = col {
                 if let Expr::Function(func_call) = expr {
                     let name_upper = func_call.name.to_uppercase();
-                    if matches!(name_upper.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL") {
+                    if matches!(
+                        name_upper.as_str(),
+                        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
+                    ) {
                         let reg = agg_regs[agg_idx];
 
                         // Compile argument
@@ -990,7 +1156,11 @@ impl SelectCompiler {
         Ok(())
     }
 
-    fn finalize_aggregates(&mut self, columns: &[ResultColumn], agg_regs: &[i32]) -> Result<(i32, usize)> {
+    fn finalize_aggregates(
+        &mut self,
+        columns: &[ResultColumn],
+        agg_regs: &[i32],
+    ) -> Result<(i32, usize)> {
         let base_reg = self.next_reg;
         let mut count = 0;
         let mut agg_idx = 0;
@@ -1000,7 +1170,10 @@ impl SelectCompiler {
             if let ResultColumn::Expr { expr, .. } = col {
                 if let Expr::Function(func_call) = expr {
                     let name_upper = func_call.name.to_uppercase();
-                    if matches!(name_upper.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL") {
+                    if matches!(
+                        name_upper.as_str(),
+                        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
+                    ) {
                         let agg_reg = agg_regs[agg_idx];
                         self.emit(Opcode::AggFinal, agg_reg, dest_reg, 0, P4::Text(name_upper));
                         agg_idx += 1;
@@ -1043,18 +1216,32 @@ impl SelectCompiler {
         Ok((base_reg, count))
     }
 
-    fn accumulate_from_sorter(&mut self, cursor: i32, columns: &[ResultColumn],
-                               agg_regs: &[i32], col_offset: usize) -> Result<()> {
+    fn accumulate_from_sorter(
+        &mut self,
+        cursor: i32,
+        columns: &[ResultColumn],
+        agg_regs: &[i32],
+        col_offset: usize,
+    ) -> Result<()> {
         let mut agg_idx = 0;
         let mut col_idx = col_offset;
         for col in columns {
             if let ResultColumn::Expr { expr, .. } = col {
                 if let Expr::Function(func_call) = expr {
                     let name_upper = func_call.name.to_uppercase();
-                    if matches!(name_upper.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL") {
+                    if matches!(
+                        name_upper.as_str(),
+                        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
+                    ) {
                         let arg_reg = self.alloc_reg();
                         self.emit(Opcode::Column, cursor, col_idx as i32, arg_reg, P4::Unused);
-                        self.emit(Opcode::AggStep, arg_reg, agg_regs[agg_idx], 0, P4::Text(name_upper));
+                        self.emit(
+                            Opcode::AggStep,
+                            arg_reg,
+                            agg_regs[agg_idx],
+                            0,
+                            P4::Text(name_upper),
+                        );
                         agg_idx += 1;
                         col_idx += 1;
                     }
@@ -1197,12 +1384,10 @@ mod tests {
 
     #[test]
     fn test_compile_simple_select() {
-        let select = SelectStmt::simple(vec![
-            ResultColumn::Expr {
-                expr: Expr::Literal(Literal::Integer(1)),
-                alias: None,
-            },
-        ]);
+        let select = SelectStmt::simple(vec![ResultColumn::Expr {
+            expr: Expr::Literal(Literal::Integer(1)),
+            alias: None,
+        }]);
 
         let ops = compile_select(&select).unwrap();
         assert!(!ops.is_empty());
@@ -1291,12 +1476,10 @@ mod tests {
 
     #[test]
     fn test_select_dest_variants() {
-        let select = SelectStmt::simple(vec![
-            ResultColumn::Expr {
-                expr: Expr::Literal(Literal::Integer(42)),
-                alias: None,
-            },
-        ]);
+        let select = SelectStmt::simple(vec![ResultColumn::Expr {
+            expr: Expr::Literal(Literal::Integer(42)),
+            alias: None,
+        }]);
 
         // Test Output destination
         let ops = compile_select_to(&select, &SelectDest::Output).unwrap();
@@ -1305,7 +1488,9 @@ mod tests {
 
         // Test Exists destination
         let ops = compile_select_to(&select, &SelectDest::Exists { reg: 1 }).unwrap();
-        let has_integer = ops.iter().any(|op| op.opcode == Opcode::Integer && op.p1 == 1);
+        let has_integer = ops
+            .iter()
+            .any(|op| op.opcode == Opcode::Integer && op.p1 == 1);
         assert!(has_integer);
     }
 

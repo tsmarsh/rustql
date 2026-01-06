@@ -6,10 +6,8 @@
 use std::collections::HashMap;
 
 use crate::error::Result;
-use crate::parser::ast::{
-    Assignment, ConflictAction, Expr, ResultColumn, UpdateStmt,
-};
-use crate::vdbe::ops::{Opcode, P4, VdbeOp};
+use crate::parser::ast::{ConflictAction, Expr, ResultColumn, UpdateStmt};
+use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
 // ============================================================================
 // UpdateCompiler
@@ -116,10 +114,22 @@ impl UpdateCompiler {
         // For now, we do a full table scan
         if update.where_clause.is_some() {
             // Rewind to start of table
-            self.emit(Opcode::Rewind, self.table_cursor, loop_end_label, 0, P4::Unused);
+            self.emit(
+                Opcode::Rewind,
+                self.table_cursor,
+                loop_end_label,
+                0,
+                P4::Unused,
+            );
         } else {
             // No WHERE - update all rows
-            self.emit(Opcode::Rewind, self.table_cursor, loop_end_label, 0, P4::Unused);
+            self.emit(
+                Opcode::Rewind,
+                self.table_cursor,
+                loop_end_label,
+                0,
+                P4::Unused,
+            );
         }
 
         // Loop start
@@ -141,7 +151,13 @@ impl UpdateCompiler {
         }
 
         // Move to next row
-        self.emit(Opcode::Next, self.table_cursor, loop_start_label, 0, P4::Unused);
+        self.emit(
+            Opcode::Next,
+            self.table_cursor,
+            loop_start_label,
+            0,
+            P4::Unused,
+        );
 
         // Loop end
         self.resolve_label(loop_end_label, self.current_addr() as i32);
@@ -214,7 +230,13 @@ impl UpdateCompiler {
 
         // Insert the updated row with same rowid
         let flags = self.conflict_flags(conflict_action);
-        self.emit(Opcode::Insert, self.table_cursor, record_reg, rowid_reg, P4::Int64(flags));
+        self.emit(
+            Opcode::Insert,
+            self.table_cursor,
+            record_reg,
+            rowid_reg,
+            P4::Int64(flags),
+        );
 
         Ok(())
     }
@@ -257,7 +279,13 @@ impl UpdateCompiler {
         }
 
         // Output the row
-        self.emit(Opcode::ResultRow, base_reg, returning.len() as i32, 0, P4::Unused);
+        self.emit(
+            Opcode::ResultRow,
+            base_reg,
+            returning.len() as i32,
+            0,
+            P4::Unused,
+        );
 
         Ok(())
     }
@@ -298,38 +326,60 @@ impl UpdateCompiler {
     /// Compile an expression
     fn compile_expr(&mut self, expr: &Expr, dest_reg: i32) -> Result<()> {
         match expr {
-            Expr::Literal(lit) => {
-                match lit {
-                    crate::parser::ast::Literal::Null => {
-                        self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
-                    }
-                    crate::parser::ast::Literal::Integer(n) => {
-                        self.emit(Opcode::Integer, *n as i32, dest_reg, 0, P4::Unused);
-                    }
-                    crate::parser::ast::Literal::Float(f) => {
-                        self.emit(Opcode::Real, 0, dest_reg, 0, P4::Real(*f));
-                    }
-                    crate::parser::ast::Literal::String(s) => {
-                        self.emit(Opcode::String8, 0, dest_reg, 0, P4::Text(s.clone()));
-                    }
-                    crate::parser::ast::Literal::Blob(b) => {
-                        self.emit(Opcode::Blob, b.len() as i32, dest_reg, 0, P4::Blob(b.clone()));
-                    }
-                    crate::parser::ast::Literal::Bool(b) => {
-                        self.emit(Opcode::Integer, if *b { 1 } else { 0 }, dest_reg, 0, P4::Unused);
-                    }
-                    _ => {
-                        self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
-                    }
+            Expr::Literal(lit) => match lit {
+                crate::parser::ast::Literal::Null => {
+                    self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
                 }
-            }
+                crate::parser::ast::Literal::Integer(n) => {
+                    self.emit(Opcode::Integer, *n as i32, dest_reg, 0, P4::Unused);
+                }
+                crate::parser::ast::Literal::Float(f) => {
+                    self.emit(Opcode::Real, 0, dest_reg, 0, P4::Real(*f));
+                }
+                crate::parser::ast::Literal::String(s) => {
+                    self.emit(Opcode::String8, 0, dest_reg, 0, P4::Text(s.clone()));
+                }
+                crate::parser::ast::Literal::Blob(b) => {
+                    self.emit(
+                        Opcode::Blob,
+                        b.len() as i32,
+                        dest_reg,
+                        0,
+                        P4::Blob(b.clone()),
+                    );
+                }
+                crate::parser::ast::Literal::Bool(b) => {
+                    self.emit(
+                        Opcode::Integer,
+                        if *b { 1 } else { 0 },
+                        dest_reg,
+                        0,
+                        P4::Unused,
+                    );
+                }
+                _ => {
+                    self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                }
+            },
             Expr::Column(col_ref) => {
                 // Column reference - look up in current row
                 if let Some(&col_idx) = self.column_map.get(&col_ref.column) {
-                    self.emit(Opcode::Column, self.table_cursor, col_idx as i32, dest_reg, P4::Unused);
+                    self.emit(
+                        Opcode::Column,
+                        self.table_cursor,
+                        col_idx as i32,
+                        dest_reg,
+                        P4::Unused,
+                    );
                 } else {
                     let col_idx = self.get_column_index(&col_ref.column);
-                    self.emit(Opcode::Column, self.table_cursor, col_idx as i32, dest_reg, P4::Unused);
+                    self.emit(
+                        Opcode::Column,
+                        self.table_cursor,
+                        col_idx as i32,
+                        dest_reg,
+                        P4::Unused,
+                    );
                 }
             }
             Expr::Binary { op, left, right } => {
@@ -401,7 +451,10 @@ impl UpdateCompiler {
                     P4::Text(func_call.name.clone()),
                 );
             }
-            Expr::IsNull { expr: inner, negated } => {
+            Expr::IsNull {
+                expr: inner,
+                negated,
+            } => {
                 self.compile_expr(inner, dest_reg)?;
                 if *negated {
                     // IS NOT NULL
@@ -413,7 +466,11 @@ impl UpdateCompiler {
                     self.emit(Opcode::IsNull, dest_reg, 0, dest_reg, P4::Unused);
                 }
             }
-            Expr::Case { operand, when_clauses, else_clause } => {
+            Expr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => {
                 self.compile_case(operand, when_clauses, else_clause, dest_reg)?;
             }
             _ => {
@@ -553,7 +610,7 @@ pub fn compile_update(update: &UpdateStmt) -> Result<Vec<VdbeOp>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::ast::{BinaryOp, ColumnRef, Literal, QualifiedName};
+    use crate::parser::ast::{Assignment, BinaryOp, ColumnRef, Literal, QualifiedName};
 
     #[test]
     fn test_update_compiler_new() {

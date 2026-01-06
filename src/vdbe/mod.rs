@@ -1,52 +1,39 @@
 //! Virtual Database Engine (VDBE)
 
-pub mod engine;
-pub mod ops;
-pub mod mem;
-pub mod sort;
-pub mod expr;
-pub mod value;
 pub mod aux;
-pub mod types;
-pub mod trace;
 pub mod bytecode;
+pub mod engine;
+pub mod expr;
+pub mod mem;
+pub mod ops;
+pub mod sort;
+pub mod trace;
+pub mod types;
+pub mod value;
 
 pub use value::{
-    SqliteValue, FunctionContext,
-    sqlite3_value_type, sqlite3_value_int, sqlite3_value_int64,
-    sqlite3_value_double, sqlite3_value_text, sqlite3_value_blob,
-    sqlite3_value_bytes, sqlite3_value_dup,
-    sqlite3_result_null, sqlite3_result_int, sqlite3_result_int64,
-    sqlite3_result_double, sqlite3_result_text, sqlite3_result_blob,
-    sqlite3_result_error, sqlite3_result_value,
-    sqlite3_aggregate_context,
+    sqlite3_aggregate_context, sqlite3_result_blob, sqlite3_result_double, sqlite3_result_error,
+    sqlite3_result_int, sqlite3_result_int64, sqlite3_result_null, sqlite3_result_text,
+    sqlite3_result_value, sqlite3_value_blob, sqlite3_value_bytes, sqlite3_value_double,
+    sqlite3_value_dup, sqlite3_value_int, sqlite3_value_int64, sqlite3_value_text,
+    sqlite3_value_type, FunctionContext, SqliteValue,
 };
 
 pub use aux::{
-    SerialType, VdbeBuilder, Label,
-    get_varint, put_varint, varint_len,
-    decode_record_header, make_record, deserialize_value,
-    explain_program,
+    decode_record_header, deserialize_value, explain_program, get_varint, make_record, put_varint,
+    varint_len, Label, SerialType, VdbeBuilder,
 };
 
 pub use types::{
-    CursorType, CollSeq, Encoding, TypeClass,
-    VDBE_MAGIC_INIT, VDBE_MAGIC_RUN, VDBE_MAGIC_HALT,
-    VDBE_MAGIC_RESET, VDBE_MAGIC_DEAD,
-    SQLITE_MAX_VARIABLE_NUMBER,
-    compare_flags, seek_flags, insert_flags,
+    compare_flags, insert_flags, seek_flags, CollSeq, CursorType, Encoding, TypeClass,
+    SQLITE_MAX_VARIABLE_NUMBER, VDBE_MAGIC_DEAD, VDBE_MAGIC_HALT, VDBE_MAGIC_INIT,
+    VDBE_MAGIC_RESET, VDBE_MAGIC_RUN,
 };
 
-pub use sort::{
-    VdbeSorter, SorterState, SorterRecord,
-};
+pub use sort::{SorterRecord, SorterState, VdbeSorter};
 
-pub use trace::{
-    TraceFlags, TraceEvent, TraceInfo, TraceCallback, Tracer,
-    expand_sql,
-};
+pub use trace::{expand_sql, TraceCallback, TraceEvent, TraceFlags, TraceInfo, Tracer};
 
 pub use bytecode::{
-    BytecodeRow, BytecodeIterator,
-    explain_bytecode, explain_query_plan, bytecode_schema,
+    bytecode_schema, explain_bytecode, explain_query_plan, BytecodeIterator, BytecodeRow,
 };

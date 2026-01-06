@@ -157,7 +157,7 @@ pub struct WhereTerm {
     pub flags: WhereTermFlags,
 
     /// Left column index (for equality/range)
-    pub left_col: Option<(i32, i32)>,  // (table_idx, column_idx)
+    pub left_col: Option<(i32, i32)>, // (table_idx, column_idx)
 
     /// Selectivity estimate (0.0-1.0)
     pub selectivity: f64,
@@ -169,18 +169,18 @@ pub struct WhereTerm {
 /// Operator type for a WHERE term
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TermOp {
-    Eq,      // =
-    Lt,      // <
-    Le,      // <=
-    Gt,      // >
-    Ge,      // >=
-    Ne,      // != or <>
-    Like,    // LIKE
-    Glob,    // GLOB
-    In,      // IN
-    IsNull,  // IS NULL
+    Eq,        // =
+    Lt,        // <
+    Le,        // <=
+    Gt,        // >
+    Ge,        // >=
+    Ne,        // != or <>
+    Like,      // LIKE
+    Glob,      // GLOB
+    In,        // IN
+    IsNull,    // IS NULL
     IsNotNull, // IS NOT NULL
-    Between, // BETWEEN
+    Between,   // BETWEEN
 }
 
 impl WhereTerm {
@@ -202,8 +202,12 @@ impl WhereTerm {
     pub fn is_index_usable(&self) -> bool {
         matches!(
             self.op,
-            Some(TermOp::Eq) | Some(TermOp::Lt) | Some(TermOp::Le) |
-            Some(TermOp::Gt) | Some(TermOp::Ge) | Some(TermOp::In)
+            Some(TermOp::Eq)
+                | Some(TermOp::Lt)
+                | Some(TermOp::Le)
+                | Some(TermOp::Gt)
+                | Some(TermOp::Ge)
+                | Some(TermOp::In)
         )
     }
 
@@ -495,13 +499,19 @@ impl QueryPlanner {
     fn split_where_expr(&mut self, expr: &Expr, depth: i32) -> Result<()> {
         match expr {
             // AND splits into multiple terms
-            Expr::Binary { op: BinaryOp::And, left, right } => {
+            Expr::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => {
                 self.split_where_expr(left, depth + 1)?;
                 self.split_where_expr(right, depth + 1)?;
             }
 
             // OR creates a single term (more complex handling needed)
-            Expr::Binary { op: BinaryOp::Or, .. } => {
+            Expr::Binary {
+                op: BinaryOp::Or, ..
+            } => {
                 let idx = self.where_clause.terms.len() as i32;
                 let mut term = WhereTerm::new(expr.clone(), idx);
                 term.flags |= WhereTermFlags::OR_INFO;
@@ -521,7 +531,9 @@ impl QueryPlanner {
     /// Analyze all terms to extract table references and operator types
     fn analyze_terms(&mut self) -> Result<()> {
         // Collect table info needed for analysis
-        let table_info: Vec<_> = self.tables.iter()
+        let table_info: Vec<_> = self
+            .tables
+            .iter()
             .map(|t| (t.name.clone(), t.alias.clone(), t.mask))
             .collect();
 
@@ -555,8 +567,8 @@ impl QueryPlanner {
 
                 // Set selectivity based on operator
                 term.selectivity = match term.op {
-                    Some(TermOp::Eq) => 0.1,     // 10% for equality
-                    Some(TermOp::Ne) => 0.9,     // 90% for not-equal
+                    Some(TermOp::Eq) => 0.1, // 10% for equality
+                    Some(TermOp::Ne) => 0.9, // 90% for not-equal
                     Some(TermOp::Lt | TermOp::Le | TermOp::Gt | TermOp::Ge) => 0.33,
                     Some(TermOp::Like | TermOp::Glob) => 0.25,
                     _ => 0.25,
@@ -567,7 +579,11 @@ impl QueryPlanner {
             }
 
             Expr::IsNull { negated, .. } => {
-                term.op = Some(if *negated { TermOp::IsNotNull } else { TermOp::IsNull });
+                term.op = Some(if *negated {
+                    TermOp::IsNotNull
+                } else {
+                    TermOp::IsNull
+                });
                 term.selectivity = if *negated { 0.95 } else { 0.05 };
             }
 
@@ -584,7 +600,9 @@ impl QueryPlanner {
                 Self::analyze_column_ref_static(table_info, term, inner)?;
             }
 
-            Expr::Like { expr: inner, op, .. } => {
+            Expr::Like {
+                expr: inner, op, ..
+            } => {
                 term.op = Some(match op {
                     LikeOp::Like | LikeOp::Regexp | LikeOp::Match => TermOp::Like,
                     LikeOp::Glob => TermOp::Glob,
@@ -594,7 +612,9 @@ impl QueryPlanner {
                 Self::analyze_column_ref_static(table_info, term, inner)?;
             }
 
-            Expr::Unary { op: UnaryOp::Not, .. } => {
+            Expr::Unary {
+                op: UnaryOp::Not, ..
+            } => {
                 // NOT expression - invert selectivity
                 let inner_selectivity = 0.25;
                 term.selectivity = 1.0 - inner_selectivity;
@@ -703,11 +723,7 @@ impl QueryPlanner {
                     continue; // Already used
                 }
 
-                let (add_cost, level) = self.evaluate_table_access(
-                    i,
-                    used_tables,
-                    rows_so_far,
-                )?;
+                let (add_cost, level) = self.evaluate_table_access(i, used_tables, rows_so_far)?;
 
                 if add_cost < best_add_cost {
                     best_add_cost = add_cost;
@@ -742,11 +758,8 @@ impl QueryPlanner {
         let mut rows_so_far = 1.0;
 
         for &table_idx in order {
-            let (add_cost, level) = self.evaluate_table_access(
-                table_idx,
-                used_tables,
-                rows_so_far,
-            )?;
+            let (add_cost, level) =
+                self.evaluate_table_access(table_idx, used_tables, rows_so_far)?;
 
             used_tables |= self.tables[table_idx].mask;
             total_cost += add_cost;
@@ -780,8 +793,8 @@ impl QueryPlanner {
         for term in self.where_clause.iter() {
             // Check if term references this table and prereqs are satisfied
             if term.mask & table.mask != 0 {
-                let prereqs_satisfied = (term.prereq & !prereq_mask) == 0 ||
-                                       term.prereq & table.mask != 0;
+                let prereqs_satisfied =
+                    (term.prereq & !prereq_mask) == 0 || term.prereq & table.mask != 0;
 
                 if prereqs_satisfied && term.is_index_usable() {
                     if term.is_equality() {
@@ -800,7 +813,10 @@ impl QueryPlanner {
         let mut best_cost = table.estimated_rows as f64 * FULL_SCAN_COST_MULT;
 
         // Check rowid equality
-        if usable_eq_terms.iter().any(|t| t.left_col == Some((table_idx as i32, -1))) {
+        if usable_eq_terms
+            .iter()
+            .any(|t| t.left_col == Some((table_idx as i32, -1)))
+        {
             let cost = INDEX_SEEK_COST + ROW_READ_COST;
             if cost < best_cost {
                 best_cost = cost;
@@ -813,8 +829,8 @@ impl QueryPlanner {
             let eq_match_count = self.count_index_eq_matches(index, &usable_eq_terms, table_idx);
 
             if eq_match_count > 0 {
-                let rows = (table.estimated_rows as f64 *
-                           0.1f64.powi(eq_match_count as i32)).max(1.0);
+                let rows =
+                    (table.estimated_rows as f64 * 0.1f64.powi(eq_match_count as i32)).max(1.0);
                 let cost = INDEX_SEEK_COST + rows * ROW_READ_COST;
 
                 if cost < best_cost {
@@ -834,15 +850,21 @@ impl QueryPlanner {
 
         // Check primary key
         if table.has_rowid {
-            let pk_eq_count = usable_eq_terms.iter()
-                .filter(|t| t.left_col.map_or(false, |(ti, ci)| ti == table_idx as i32 && ci == -1))
+            let pk_eq_count = usable_eq_terms
+                .iter()
+                .filter(|t| {
+                    t.left_col
+                        .map_or(false, |(ti, ci)| ti == table_idx as i32 && ci == -1)
+                })
                 .count();
 
             if pk_eq_count > 0 {
                 let cost = INDEX_SEEK_COST + ROW_READ_COST;
                 if cost < best_cost {
                     best_cost = cost;
-                    best_plan = WherePlan::PrimaryKey { eq_cols: pk_eq_count as i32 };
+                    best_plan = WherePlan::PrimaryKey {
+                        eq_cols: pk_eq_count as i32,
+                    };
                     level.flags |= WhereLevelFlags::UNIQUE;
                 }
             }
@@ -874,7 +896,8 @@ impl QueryPlanner {
         let mut count = 0;
         for (i, &col_idx) in index.columns.iter().enumerate() {
             let has_eq = eq_terms.iter().any(|t| {
-                t.left_col.map_or(false, |(ti, ci)| ti == table_idx as i32 && ci == col_idx)
+                t.left_col
+                    .map_or(false, |(ti, ci)| ti == table_idx as i32 && ci == col_idx)
             });
 
             if has_eq {
@@ -934,8 +957,8 @@ fn next_permutation<T: Ord>(arr: &mut [T]) -> bool {
 
 /// Analyze a WHERE clause and produce an optimized query plan
 pub fn analyze_where(
-    tables: &[(String, Option<String>, i64)],  // (name, alias, estimated_rows)
-    indexes: &[(usize, IndexInfo)],             // (table_idx, index_info)
+    tables: &[(String, Option<String>, i64)], // (name, alias, estimated_rows)
+    indexes: &[(usize, IndexInfo)],           // (table_idx, index_info)
     where_expr: Option<&Expr>,
 ) -> Result<WhereInfo> {
     let mut planner = QueryPlanner::new();
@@ -998,13 +1021,16 @@ mod tests {
     fn test_query_planner_with_index() {
         let mut planner = QueryPlanner::new();
         planner.add_table("users".to_string(), None, 1000);
-        planner.add_index(0, IndexInfo {
-            name: "idx_users_email".to_string(),
-            columns: vec![1],
-            is_primary: false,
-            is_unique: true,
-            is_covering: false,
-        });
+        planner.add_index(
+            0,
+            IndexInfo {
+                name: "idx_users_email".to_string(),
+                columns: vec![1],
+                is_primary: false,
+                is_unique: true,
+                is_covering: false,
+            },
+        );
 
         let result = planner.find_best_plan().unwrap();
         assert_eq!(result.levels.len(), 1);
@@ -1056,10 +1082,7 @@ mod tests {
 
     #[test]
     fn test_selectivity_estimates() {
-        let mut term = WhereTerm::new(
-            Expr::Literal(crate::parser::ast::Literal::Integer(1)),
-            0,
-        );
+        let mut term = WhereTerm::new(Expr::Literal(crate::parser::ast::Literal::Integer(1)), 0);
         term.op = Some(TermOp::Eq);
         term.selectivity = 0.1;
         assert!(term.is_equality());

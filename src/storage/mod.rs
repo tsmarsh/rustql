@@ -2,5 +2,5 @@
 
 pub mod btree;
 pub mod pager;
-pub mod wal;
 pub mod pcache;
+pub mod wal;

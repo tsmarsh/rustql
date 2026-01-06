@@ -5,11 +5,9 @@
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::parser::ast::{BinaryOp, Expr};
-use crate::vdbe::ops::{Opcode, P4, VdbeOp};
+use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
-use super::where_clause::{
-    IndexInfo, QueryPlanner, TermOp, WhereLevelFlags, WherePlan, WhereInfo, WhereTerm,
-};
+use super::where_clause::{TermOp, WhereInfo, WhereLevelFlags, WherePlan, WhereTerm};
 
 // ============================================================================
 // Constants
@@ -40,15 +38,11 @@ impl Affinity {
 
         if upper.contains("INT") {
             Affinity::Integer
-        } else if upper.contains("CHAR") ||
-                  upper.contains("CLOB") ||
-                  upper.contains("TEXT") {
+        } else if upper.contains("CHAR") || upper.contains("CLOB") || upper.contains("TEXT") {
             Affinity::Text
         } else if upper.contains("BLOB") || upper.is_empty() {
             Affinity::Blob
-        } else if upper.contains("REAL") ||
-                  upper.contains("FLOA") ||
-                  upper.contains("DOUB") {
+        } else if upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB") {
             Affinity::Real
         } else {
             Affinity::Numeric
@@ -142,7 +136,11 @@ impl WhereCodeGen {
             WherePlan::FullScan => {
                 self.code_full_scan(level_idx, level)?;
             }
-            WherePlan::IndexScan { index_name, eq_cols, covering } => {
+            WherePlan::IndexScan {
+                index_name,
+                eq_cols,
+                covering,
+            } => {
                 self.code_index_scan(level_idx, level, index_name, *eq_cols, *covering)?;
             }
             WherePlan::PrimaryKey { eq_cols } => {
@@ -159,7 +157,10 @@ impl WhereCodeGen {
         // Generate code for remaining WHERE terms at this level
         for &term_idx in &level.used_terms {
             if let Some(term) = terms.get(term_idx as usize) {
-                if !term.flags.contains(super::where_clause::WhereTermFlags::CODED) {
+                if !term
+                    .flags
+                    .contains(super::where_clause::WhereTermFlags::CODED)
+                {
                     self.code_term_filter(term, exit_label)?;
                 }
             }
@@ -178,7 +179,13 @@ impl WhereCodeGen {
         let cont_label = *self.loop_cont_addrs.last().unwrap();
 
         // Open table
-        self.emit(Opcode::OpenRead, cursor, 0, 0, P4::Text(level.table_name.clone()));
+        self.emit(
+            Opcode::OpenRead,
+            cursor,
+            0,
+            0,
+            P4::Text(level.table_name.clone()),
+        );
 
         // Rewind to start
         self.emit(Opcode::Rewind, cursor, cont_label, 0, P4::Unused);
@@ -199,7 +206,13 @@ impl WhereCodeGen {
         let cont_label = *self.loop_cont_addrs.last().unwrap();
 
         // Open index
-        self.emit(Opcode::OpenRead, cursor + 100, 0, 0, P4::Text(index_name.to_string()));
+        self.emit(
+            Opcode::OpenRead,
+            cursor + 100,
+            0,
+            0,
+            P4::Text(index_name.to_string()),
+        );
 
         if eq_cols > 0 {
             // Build key from equality constraints
@@ -210,7 +223,13 @@ impl WhereCodeGen {
             self.emit(Opcode::Null, 0, key_reg, 0, P4::Unused);
 
             // Seek to key
-            self.emit(Opcode::SeekGE, cursor + 100, cont_label, key_reg, P4::Int64(eq_cols as i64));
+            self.emit(
+                Opcode::SeekGE,
+                cursor + 100,
+                cont_label,
+                key_reg,
+                P4::Int64(eq_cols as i64),
+            );
         } else {
             // Rewind to start
             self.emit(Opcode::Rewind, cursor + 100, cont_label, 0, P4::Unused);
@@ -230,14 +249,26 @@ impl WhereCodeGen {
         let cont_label = *self.loop_cont_addrs.last().unwrap();
 
         // Open table
-        self.emit(Opcode::OpenRead, cursor, 0, 0, P4::Text(level.table_name.clone()));
+        self.emit(
+            Opcode::OpenRead,
+            cursor,
+            0,
+            0,
+            P4::Text(level.table_name.clone()),
+        );
 
         // Build key
         let key_reg = self.alloc_reg();
         self.emit(Opcode::Null, 0, key_reg, 0, P4::Unused);
 
         // Seek to key
-        self.emit(Opcode::SeekGE, cursor, cont_label, key_reg, P4::Int64(eq_cols as i64));
+        self.emit(
+            Opcode::SeekGE,
+            cursor,
+            cont_label,
+            key_reg,
+            P4::Int64(eq_cols as i64),
+        );
 
         // Mark as unique scan if appropriate
         if level.flags.contains(WhereLevelFlags::UNIQUE) {
@@ -257,7 +288,13 @@ impl WhereCodeGen {
         let cont_label = *self.loop_cont_addrs.last().unwrap();
 
         // Open table
-        self.emit(Opcode::OpenRead, cursor, 0, 0, P4::Text(level.table_name.clone()));
+        self.emit(
+            Opcode::OpenRead,
+            cursor,
+            0,
+            0,
+            P4::Text(level.table_name.clone()),
+        );
 
         // Rowid is in a register (to be filled by caller)
         let rowid_reg = self.alloc_reg();
@@ -281,7 +318,13 @@ impl WhereCodeGen {
         let cont_label = *self.loop_cont_addrs.last().unwrap();
 
         // Open table
-        self.emit(Opcode::OpenRead, cursor, 0, 0, P4::Text(level.table_name.clone()));
+        self.emit(
+            Opcode::OpenRead,
+            cursor,
+            0,
+            0,
+            P4::Text(level.table_name.clone()),
+        );
 
         if has_start {
             // Seek to start rowid
@@ -374,7 +417,13 @@ impl WhereCodeGen {
 
     /// Generate code for an IN filter
     fn code_in_filter(&mut self, term: &WhereTerm, skip_label: i32) -> Result<()> {
-        if let Expr::In { expr, list, negated, .. } = term.expr.as_ref() {
+        if let Expr::In {
+            expr,
+            list,
+            negated,
+            ..
+        } = term.expr.as_ref()
+        {
             let val_reg = self.alloc_reg();
             self.code_expression(expr, val_reg)?;
 
@@ -425,7 +474,13 @@ impl WhereCodeGen {
                         } else {
                             // IN: skip if key is not found
                             let found_label = self.alloc_label();
-                            self.emit(Opcode::IdxGE, eph_cursor, found_label, key_reg, P4::Int64(1));
+                            self.emit(
+                                Opcode::IdxGE,
+                                eph_cursor,
+                                found_label,
+                                key_reg,
+                                P4::Int64(1),
+                            );
                             self.emit(Opcode::Goto, 0, skip_label, 0, P4::Unused);
                             self.resolve_label(found_label, self.current_addr() as i32);
                         }
@@ -451,34 +506,50 @@ impl WhereCodeGen {
     /// Generate code to evaluate an expression into a register
     fn code_expression(&mut self, expr: &Expr, dest_reg: i32) -> Result<()> {
         match expr {
-            Expr::Literal(lit) => {
-                match lit {
-                    crate::parser::ast::Literal::Null => {
-                        self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
-                    }
-                    crate::parser::ast::Literal::Integer(n) => {
-                        self.emit(Opcode::Integer, *n as i32, dest_reg, 0, P4::Unused);
-                    }
-                    crate::parser::ast::Literal::Float(f) => {
-                        self.emit(Opcode::Real, 0, dest_reg, 0, P4::Real(*f));
-                    }
-                    crate::parser::ast::Literal::String(s) => {
-                        self.emit(Opcode::String8, 0, dest_reg, 0, P4::Text(s.clone()));
-                    }
-                    crate::parser::ast::Literal::Blob(b) => {
-                        self.emit(Opcode::Blob, b.len() as i32, dest_reg, 0, P4::Blob(b.clone()));
-                    }
-                    crate::parser::ast::Literal::Bool(b) => {
-                        self.emit(Opcode::Integer, if *b { 1 } else { 0 }, dest_reg, 0, P4::Unused);
-                    }
-                    _ => {
-                        self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
-                    }
+            Expr::Literal(lit) => match lit {
+                crate::parser::ast::Literal::Null => {
+                    self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
                 }
-            }
+                crate::parser::ast::Literal::Integer(n) => {
+                    self.emit(Opcode::Integer, *n as i32, dest_reg, 0, P4::Unused);
+                }
+                crate::parser::ast::Literal::Float(f) => {
+                    self.emit(Opcode::Real, 0, dest_reg, 0, P4::Real(*f));
+                }
+                crate::parser::ast::Literal::String(s) => {
+                    self.emit(Opcode::String8, 0, dest_reg, 0, P4::Text(s.clone()));
+                }
+                crate::parser::ast::Literal::Blob(b) => {
+                    self.emit(
+                        Opcode::Blob,
+                        b.len() as i32,
+                        dest_reg,
+                        0,
+                        P4::Blob(b.clone()),
+                    );
+                }
+                crate::parser::ast::Literal::Bool(b) => {
+                    self.emit(
+                        Opcode::Integer,
+                        if *b { 1 } else { 0 },
+                        dest_reg,
+                        0,
+                        P4::Unused,
+                    );
+                }
+                _ => {
+                    self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                }
+            },
             Expr::Column(col_ref) => {
                 // Column access - would need cursor and column index from schema
-                self.emit(Opcode::Column, 0, 0, dest_reg, P4::Text(col_ref.column.clone()));
+                self.emit(
+                    Opcode::Column,
+                    0,
+                    0,
+                    dest_reg,
+                    P4::Text(col_ref.column.clone()),
+                );
             }
             Expr::Binary { op, left, right } => {
                 let left_reg = self.alloc_reg();
@@ -546,8 +617,13 @@ impl WhereCodeGen {
                     crate::parser::ast::FunctionArgs::Star => 0,
                 };
 
-                self.emit(Opcode::Function, argc as i32, arg_base, dest_reg,
-                          P4::Text(func_call.name.clone()));
+                self.emit(
+                    Opcode::Function,
+                    argc as i32,
+                    arg_base,
+                    dest_reg,
+                    P4::Text(func_call.name.clone()),
+                );
             }
             _ => {
                 // Default: null
@@ -576,7 +652,11 @@ impl WhereCodeGen {
     }
 
     /// Generate Next opcode for a level
-    pub fn code_next(&mut self, level: &super::where_clause::WhereLevel, loop_start: i32) -> Result<()> {
+    pub fn code_next(
+        &mut self,
+        level: &super::where_clause::WhereLevel,
+        loop_start: i32,
+    ) -> Result<()> {
         let cursor = level.from_idx;
         let cont_label = self.loop_cont_addrs.last().copied().unwrap_or(0);
 

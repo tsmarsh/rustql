@@ -1,29 +1,22 @@
 //! Query execution: SELECT, INSERT, UPDATE, DELETE
 
-pub mod select;
-pub mod insert;
-pub mod update;
 pub mod delete;
+pub mod insert;
 pub mod planner;
+pub mod prepare;
+pub mod select;
+pub mod update;
 pub mod where_clause;
 pub mod wherecode;
-pub mod prepare;
 
 pub use where_clause::{
-    WhereInfo, WhereTerm, WhereLevel, WherePlan, WhereClause,
-    QueryPlanner, TableInfo, IndexInfo, TermOp,
-    analyze_where, estimate_simple_cost,
+    analyze_where, estimate_simple_cost, IndexInfo, QueryPlanner, TableInfo, TermOp, WhereClause,
+    WhereInfo, WhereLevel, WherePlan, WhereTerm,
 };
 
-pub use wherecode::{
-    WhereCodeGen, Affinity,
-    generate_where_code, apply_affinity,
-};
+pub use wherecode::{apply_affinity, generate_where_code, Affinity, WhereCodeGen};
 
-pub use insert::{InsertCompiler, compile_insert};
-pub use update::{UpdateCompiler, compile_update};
-pub use delete::{DeleteCompiler, compile_delete};
-pub use prepare::{
-    StatementCompiler, CompiledStmt, StmtType,
-    compile_sql, parse_sql,
-};
+pub use delete::{compile_delete, DeleteCompiler};
+pub use insert::{compile_insert, InsertCompiler};
+pub use prepare::{compile_sql, parse_sql, CompiledStmt, StatementCompiler, StmtType};
+pub use update::{compile_update, UpdateCompiler};

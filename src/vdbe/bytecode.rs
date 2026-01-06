@@ -8,7 +8,7 @@
 //! SELECT * FROM bytecode('SELECT * FROM users WHERE id = 5');
 //! ```
 
-use crate::vdbe::ops::{VdbeOp, Opcode, P4};
+use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
 // ============================================================================
 // Bytecode Row
@@ -232,8 +232,8 @@ pub fn bytecode_schema() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use crate::vdbe::ops::KeyInfo;
+    use std::sync::Arc;
 
     #[test]
     fn test_bytecode_row_from_op() {
@@ -260,7 +260,10 @@ mod tests {
         assert_eq!(format_p4(&P4::Unused), "");
         assert_eq!(format_p4(&P4::Int64(42)), "42");
         assert_eq!(format_p4(&P4::Text("hello".to_string())), "'hello'");
-        assert_eq!(format_p4(&P4::Collation("BINARY".to_string())), "collseq(BINARY)");
+        assert_eq!(
+            format_p4(&P4::Collation("BINARY".to_string())),
+            "collseq(BINARY)"
+        );
 
         let key_info = Arc::new(KeyInfo::new(3));
         assert_eq!(format_p4(&P4::KeyInfo(key_info)), "k(3)");

@@ -39,13 +39,9 @@ impl<'a> Parser<'a> {
 
         let stmt = match self.current().kind {
             TokenKind::Explain => self.parse_explain(),
-            TokenKind::Select | TokenKind::Values => {
-                Ok(Stmt::Select(self.parse_select_stmt()?))
-            }
+            TokenKind::Select | TokenKind::Values => Ok(Stmt::Select(self.parse_select_stmt()?)),
             TokenKind::With => self.parse_with_stmt(),
-            TokenKind::Insert | TokenKind::Replace => {
-                Ok(Stmt::Insert(self.parse_insert_stmt()?))
-            }
+            TokenKind::Insert | TokenKind::Replace => Ok(Stmt::Insert(self.parse_insert_stmt()?)),
             TokenKind::Update => Ok(Stmt::Update(self.parse_update_stmt()?)),
             TokenKind::Delete => Ok(Stmt::Delete(self.parse_delete_stmt()?)),
             TokenKind::Create => self.parse_create(),
@@ -322,7 +318,10 @@ impl<'a> Parser<'a> {
                 .next()
                 .unwrap_or_default()
                 .into_iter()
-                .map(|e| ResultColumn::Expr { expr: e, alias: None })
+                .map(|e| ResultColumn::Expr {
+                    expr: e,
+                    alias: None,
+                })
                 .collect(),
             from: None,
             where_clause: None,
@@ -2288,20 +2287,19 @@ impl<'a> Parser<'a> {
             TokenKind::Integer => {
                 let text = token.text(self.source);
                 let value = if text.starts_with("0x") || text.starts_with("0X") {
-                    i64::from_str_radix(&text[2..], 16).map_err(|_| {
-                        Error::with_message(ErrorCode::Error, "invalid hex integer")
-                    })?
+                    i64::from_str_radix(&text[2..], 16)
+                        .map_err(|_| Error::with_message(ErrorCode::Error, "invalid hex integer"))?
                 } else {
-                    text.parse().map_err(|_| {
-                        Error::with_message(ErrorCode::Error, "invalid integer")
-                    })?
+                    text.parse()
+                        .map_err(|_| Error::with_message(ErrorCode::Error, "invalid integer"))?
                 };
                 Ok(Literal::Integer(value))
             }
             TokenKind::Float => {
-                let value = token.text(self.source).parse().map_err(|_| {
-                    Error::with_message(ErrorCode::Error, "invalid float")
-                })?;
+                let value = token
+                    .text(self.source)
+                    .parse()
+                    .map_err(|_| Error::with_message(ErrorCode::Error, "invalid float"))?;
                 Ok(Literal::Float(value))
             }
             TokenKind::String => {
@@ -2340,9 +2338,9 @@ impl<'a> Parser<'a> {
             if num_part.is_empty() {
                 return Ok(Variable::Numbered(None));
             }
-            let num: i32 = num_part.parse().map_err(|_| {
-                Error::with_message(ErrorCode::Error, "invalid parameter number")
-            })?;
+            let num: i32 = num_part
+                .parse()
+                .map_err(|_| Error::with_message(ErrorCode::Error, "invalid parameter number"))?;
             return Ok(Variable::Numbered(Some(num)));
         }
 
@@ -2598,9 +2596,7 @@ impl<'a> Parser<'a> {
     }
 
     fn expect_keyword(&mut self, keyword: &str) -> Result<()> {
-        if self.check(TokenKind::Identifier)
-            && self.current_text().eq_ignore_ascii_case(keyword)
-        {
+        if self.check(TokenKind::Identifier) && self.current_text().eq_ignore_ascii_case(keyword) {
             self.advance();
             Ok(())
         } else {
@@ -2623,9 +2619,9 @@ impl<'a> Parser<'a> {
     fn expect_integer(&mut self) -> Result<i64> {
         if self.check(TokenKind::Integer) {
             let text = self.current_text();
-            let value = text.parse().map_err(|_| {
-                Error::with_message(ErrorCode::Error, "invalid integer")
-            })?;
+            let value = text
+                .parse()
+                .map_err(|_| Error::with_message(ErrorCode::Error, "invalid integer"))?;
             self.advance();
             Ok(value)
         } else {
@@ -2774,7 +2770,8 @@ mod tests {
 
     #[test]
     fn test_parse_create_table() {
-        let stmt = parse("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)").unwrap();
+        let stmt =
+            parse("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)").unwrap();
         assert!(matches!(stmt, Stmt::CreateTable(_)));
     }
 

@@ -808,12 +808,18 @@ pub fn sqlite3_stmt_status(stmt: &mut PreparedStmt, op: i32, reset: bool) -> i32
     let value = if let Some(vdbe) = &stmt.vdbe {
         match op {
             StmtStatusOp::FullscanStep => 0, // Would track full scans
-            StmtStatusOp::Sort => 0,          // Would track sorts
-            StmtStatusOp::AutoIndex => 0,     // Would track auto-index
+            StmtStatusOp::Sort => 0,         // Would track sorts
+            StmtStatusOp::AutoIndex => 0,    // Would track auto-index
             StmtStatusOp::VmStep => vdbe.get_pc() as i32, // Approximate VM steps
-            StmtStatusOp::Reprepare => 0,     // Would track reprepares
-            StmtStatusOp::Run => if stmt.stepped { 1 } else { 0 },
-            StmtStatusOp::MemUsed => 0,       // Would track memory
+            StmtStatusOp::Reprepare => 0,    // Would track reprepares
+            StmtStatusOp::Run => {
+                if stmt.stepped {
+                    1
+                } else {
+                    0
+                }
+            }
+            StmtStatusOp::MemUsed => 0, // Would track memory
         }
     } else {
         0
@@ -1089,7 +1095,13 @@ mod tests {
         assert_eq!(value_to_sql_literal(&Value::Integer(42)), "42");
         assert_eq!(value_to_sql_literal(&Value::Real(3.14)), "3.14");
         assert_eq!(value_to_sql_literal(&Value::Real(5.0)), "5.0");
-        assert_eq!(value_to_sql_literal(&Value::Text("test".to_string())), "'test'");
-        assert_eq!(value_to_sql_literal(&Value::Blob(vec![1, 2, 3])), "X'010203'");
+        assert_eq!(
+            value_to_sql_literal(&Value::Text("test".to_string())),
+            "'test'"
+        );
+        assert_eq!(
+            value_to_sql_literal(&Value::Blob(vec![1, 2, 3])),
+            "X'010203'"
+        );
     }
 }

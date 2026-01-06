@@ -68,7 +68,10 @@ pub fn get_scalar_function(name: &str) -> Option<ScalarFunc> {
 /// abs(X) - Return the absolute value of X
 pub fn func_abs(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "abs() requires exactly 1 argument"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "abs() requires exactly 1 argument",
+        ));
     }
 
     match &args[0] {
@@ -122,7 +125,10 @@ pub fn func_min(args: &[Value]) -> Result<Value> {
 /// round(X) or round(X, Y) - Round X to Y decimal places
 pub fn func_round(args: &[Value]) -> Result<Value> {
     if args.is_empty() || args.len() > 2 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "round() requires 1 or 2 arguments"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "round() requires 1 or 2 arguments",
+        ));
     }
 
     let precision = if args.len() == 2 {
@@ -155,7 +161,10 @@ pub fn func_round(args: &[Value]) -> Result<Value> {
 /// sign(X) - Return -1, 0, or 1 for negative, zero, or positive
 pub fn func_sign(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "sign() requires exactly 1 argument"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "sign() requires exactly 1 argument",
+        ));
     }
 
     match &args[0] {
@@ -196,7 +205,10 @@ pub fn func_sign(args: &[Value]) -> Result<Value> {
 /// length(X) - Return the length of X in characters (or bytes for blobs)
 pub fn func_length(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "length() requires exactly 1 argument"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "length() requires exactly 1 argument",
+        ));
     }
 
     match &args[0] {
@@ -211,7 +223,10 @@ pub fn func_length(args: &[Value]) -> Result<Value> {
 /// substr(X, Y) or substr(X, Y, Z) - Extract substring
 pub fn func_substr(args: &[Value]) -> Result<Value> {
     if args.len() < 2 || args.len() > 3 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "substr() requires 2 or 3 arguments"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "substr() requires 2 or 3 arguments",
+        ));
     }
 
     let s = value_to_string(&args[0]);
@@ -237,7 +252,7 @@ pub fn func_substr(args: &[Value]) -> Result<Value> {
 
     let actual_len = match len {
         Some(l) if l >= 0 => l as usize,
-        Some(l) => {
+        Some(_) => {
             // Negative length in SQLite means characters before the position
             let end_pos = (start - 1).max(0) as usize;
             if end_pos > actual_start {
@@ -249,11 +264,7 @@ pub fn func_substr(args: &[Value]) -> Result<Value> {
         None => chars.len().saturating_sub(actual_start),
     };
 
-    let result: String = chars
-        .iter()
-        .skip(actual_start)
-        .take(actual_len)
-        .collect();
+    let result: String = chars.iter().skip(actual_start).take(actual_len).collect();
 
     Ok(Value::Text(result))
 }
@@ -261,7 +272,10 @@ pub fn func_substr(args: &[Value]) -> Result<Value> {
 /// instr(X, Y) - Find first occurrence of Y in X
 pub fn func_instr(args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "instr() requires exactly 2 arguments"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "instr() requires exactly 2 arguments",
+        ));
     }
 
     if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
@@ -284,7 +298,10 @@ pub fn func_instr(args: &[Value]) -> Result<Value> {
 /// upper(X) - Convert to uppercase
 pub fn func_upper(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "upper() requires exactly 1 argument"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "upper() requires exactly 1 argument",
+        ));
     }
 
     match &args[0] {
@@ -297,7 +314,10 @@ pub fn func_upper(args: &[Value]) -> Result<Value> {
 /// lower(X) - Convert to lowercase
 pub fn func_lower(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "lower() requires exactly 1 argument"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "lower() requires exactly 1 argument",
+        ));
     }
 
     match &args[0] {
@@ -310,7 +330,10 @@ pub fn func_lower(args: &[Value]) -> Result<Value> {
 /// trim(X) or trim(X, Y) - Remove characters from both ends
 pub fn func_trim(args: &[Value]) -> Result<Value> {
     if args.is_empty() || args.len() > 2 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "trim() requires 1 or 2 arguments"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "trim() requires 1 or 2 arguments",
+        ));
     }
 
     if matches!(args[0], Value::Null) {
@@ -331,7 +354,10 @@ pub fn func_trim(args: &[Value]) -> Result<Value> {
 /// ltrim(X) or ltrim(X, Y) - Remove characters from left
 pub fn func_ltrim(args: &[Value]) -> Result<Value> {
     if args.is_empty() || args.len() > 2 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "ltrim() requires 1 or 2 arguments"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "ltrim() requires 1 or 2 arguments",
+        ));
     }
 
     if matches!(args[0], Value::Null) {
@@ -352,7 +378,10 @@ pub fn func_ltrim(args: &[Value]) -> Result<Value> {
 /// rtrim(X) or rtrim(X, Y) - Remove characters from right
 pub fn func_rtrim(args: &[Value]) -> Result<Value> {
     if args.is_empty() || args.len() > 2 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "rtrim() requires 1 or 2 arguments"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "rtrim() requires 1 or 2 arguments",
+        ));
     }
 
     if matches!(args[0], Value::Null) {
@@ -373,7 +402,10 @@ pub fn func_rtrim(args: &[Value]) -> Result<Value> {
 /// replace(X, Y, Z) - Replace all occurrences of Y with Z in X
 pub fn func_replace(args: &[Value]) -> Result<Value> {
     if args.len() != 3 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "replace() requires exactly 3 arguments"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "replace() requires exactly 3 arguments",
+        ));
     }
 
     if matches!(args[0], Value::Null) {
@@ -394,7 +426,10 @@ pub fn func_replace(args: &[Value]) -> Result<Value> {
 /// reverse(X) - Reverse the characters in string X
 pub fn func_reverse(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "reverse() requires exactly 1 argument"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "reverse() requires exactly 1 argument",
+        ));
     }
 
     match &args[0] {
@@ -411,7 +446,10 @@ pub fn func_reverse(args: &[Value]) -> Result<Value> {
 /// typeof(X) - Return the type of X as a string
 pub fn func_typeof(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "typeof() requires exactly 1 argument"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "typeof() requires exactly 1 argument",
+        ));
     }
 
     let type_str = match &args[0] {
@@ -438,7 +476,10 @@ pub fn func_coalesce(args: &[Value]) -> Result<Value> {
 /// nullif(X, Y) - Return NULL if X equals Y, otherwise return X
 pub fn func_nullif(args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "nullif() requires exactly 2 arguments"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "nullif() requires exactly 2 arguments",
+        ));
     }
 
     if compare_values(&args[0], &args[1]) == 0 {
@@ -451,7 +492,10 @@ pub fn func_nullif(args: &[Value]) -> Result<Value> {
 /// ifnull(X, Y) - Return X if not NULL, otherwise return Y
 pub fn func_ifnull(args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "ifnull() requires exactly 2 arguments"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "ifnull() requires exactly 2 arguments",
+        ));
     }
 
     if matches!(args[0], Value::Null) {
@@ -464,7 +508,10 @@ pub fn func_ifnull(args: &[Value]) -> Result<Value> {
 /// iif(X, Y, Z) - If X is true, return Y, else return Z
 pub fn func_iif(args: &[Value]) -> Result<Value> {
     if args.len() != 3 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "iif() requires exactly 3 arguments"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "iif() requires exactly 3 arguments",
+        ));
     }
 
     let condition = value_is_true(&args[0]);
@@ -482,7 +529,10 @@ pub fn func_iif(args: &[Value]) -> Result<Value> {
 /// hex(X) - Convert X to hexadecimal string
 pub fn func_hex(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "hex() requires exactly 1 argument"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "hex() requires exactly 1 argument",
+        ));
     }
 
     let bytes: Vec<u8> = match &args[0] {
@@ -500,7 +550,10 @@ pub fn func_hex(args: &[Value]) -> Result<Value> {
 /// unhex(X) - Convert hexadecimal string to blob
 pub fn func_unhex(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "unhex() requires exactly 1 argument"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "unhex() requires exactly 1 argument",
+        ));
     }
 
     if matches!(args[0], Value::Null) {
@@ -516,7 +569,7 @@ pub fn func_unhex(args: &[Value]) -> Result<Value> {
 
     let mut bytes = Vec::with_capacity(hex.len() / 2);
     for i in (0..hex.len()).step_by(2) {
-        match u8::from_str_radix(&hex[i..i+2], 16) {
+        match u8::from_str_radix(&hex[i..i + 2], 16) {
             Ok(b) => bytes.push(b),
             Err(_) => return Ok(Value::Null),
         }
@@ -528,12 +581,18 @@ pub fn func_unhex(args: &[Value]) -> Result<Value> {
 /// zeroblob(N) - Return a blob of N zero bytes
 pub fn func_zeroblob(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "zeroblob() requires exactly 1 argument"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "zeroblob() requires exactly 1 argument",
+        ));
     }
 
     let n = value_to_i64(&args[0]);
     if n < 0 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "zeroblob() size must be non-negative"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "zeroblob() size must be non-negative",
+        ));
     }
 
     // Limit size to prevent memory exhaustion
@@ -544,7 +603,10 @@ pub fn func_zeroblob(args: &[Value]) -> Result<Value> {
 /// quote(X) - Return SQL literal representation of X
 pub fn func_quote(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "quote() requires exactly 1 argument"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "quote() requires exactly 1 argument",
+        ));
     }
 
     let quoted = match &args[0] {
@@ -578,7 +640,10 @@ pub fn func_quote(args: &[Value]) -> Result<Value> {
 /// random() - Return a random 64-bit integer
 pub fn func_random(args: &[Value]) -> Result<Value> {
     if !args.is_empty() {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "random() takes no arguments"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "random() takes no arguments",
+        ));
     }
 
     // Simple LCG random number generator
@@ -601,12 +666,18 @@ pub fn func_random(args: &[Value]) -> Result<Value> {
 /// randomblob(N) - Return N bytes of random data
 pub fn func_randomblob(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "randomblob() requires exactly 1 argument"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "randomblob() requires exactly 1 argument",
+        ));
     }
 
     let n = value_to_i64(&args[0]);
     if n < 0 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "randomblob() size must be non-negative"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "randomblob() size must be non-negative",
+        ));
     }
 
     let n = n.min(1_000_000_000) as usize;
@@ -630,7 +701,10 @@ pub fn func_randomblob(args: &[Value]) -> Result<Value> {
 /// unicode(X) - Return Unicode code point of first character
 pub fn func_unicode(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "unicode() requires exactly 1 argument"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "unicode() requires exactly 1 argument",
+        ));
     }
 
     if matches!(args[0], Value::Null) {
@@ -663,7 +737,10 @@ pub fn func_char(args: &[Value]) -> Result<Value> {
 /// printf(FORMAT, ...) - Format values according to format string
 pub fn func_printf(args: &[Value]) -> Result<Value> {
     if args.is_empty() {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "printf() requires at least 1 argument"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "printf() requires at least 1 argument",
+        ));
     }
 
     let format = value_to_string(&args[0]);
@@ -725,7 +802,10 @@ pub fn func_printf(args: &[Value]) -> Result<Value> {
 /// like(X, Y) or like(X, Y, Z) - Pattern matching
 pub fn func_like(args: &[Value]) -> Result<Value> {
     if args.len() < 2 || args.len() > 3 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "like() requires 2 or 3 arguments"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "like() requires 2 or 3 arguments",
+        ));
     }
 
     if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
@@ -748,7 +828,10 @@ pub fn func_like(args: &[Value]) -> Result<Value> {
 /// glob(X, Y) - Unix-style glob pattern matching (case-sensitive)
 pub fn func_glob(args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(Error::with_message(crate::error::ErrorCode::Error, "glob() requires exactly 2 arguments"));
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "glob() requires exactly 2 arguments",
+        ));
     }
 
     if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
@@ -826,15 +909,33 @@ fn compare_values(a: &Value, b: &Value) -> i32 {
         (_, Value::Null) => 1,
         (Value::Integer(x), Value::Integer(y)) => x.cmp(y) as i32,
         (Value::Real(x), Value::Real(y)) => {
-            if x < y { -1 } else if x > y { 1 } else { 0 }
+            if x < y {
+                -1
+            } else if x > y {
+                1
+            } else {
+                0
+            }
         }
         (Value::Integer(x), Value::Real(y)) => {
             let fx = *x as f64;
-            if fx < *y { -1 } else if fx > *y { 1 } else { 0 }
+            if fx < *y {
+                -1
+            } else if fx > *y {
+                1
+            } else {
+                0
+            }
         }
         (Value::Real(x), Value::Integer(y)) => {
             let fy = *y as f64;
-            if *x < fy { -1 } else if *x > fy { 1 } else { 0 }
+            if *x < fy {
+                -1
+            } else if *x > fy {
+                1
+            } else {
+                0
+            }
         }
         (Value::Text(x), Value::Text(y)) => x.cmp(y) as i32,
         (Value::Blob(x), Value::Blob(y)) => x.cmp(y) as i32,
@@ -843,7 +944,6 @@ fn compare_values(a: &Value, b: &Value) -> i32 {
         (Value::Text(_), Value::Integer(_)) | (Value::Text(_), Value::Real(_)) => 1,
         (Value::Blob(_), _) => 1,
         (_, Value::Blob(_)) => -1,
-        _ => 0,
     }
 }
 
@@ -1030,78 +1130,184 @@ mod tests {
 
     #[test]
     fn test_length() {
-        assert_eq!(func_length(&[Value::Text("hello".to_string())]).unwrap(), Value::Integer(5));
-        assert_eq!(func_length(&[Value::Text("héllo".to_string())]).unwrap(), Value::Integer(5));
-        assert_eq!(func_length(&[Value::Blob(vec![1, 2, 3])]).unwrap(), Value::Integer(3));
+        assert_eq!(
+            func_length(&[Value::Text("hello".to_string())]).unwrap(),
+            Value::Integer(5)
+        );
+        assert_eq!(
+            func_length(&[Value::Text("héllo".to_string())]).unwrap(),
+            Value::Integer(5)
+        );
+        assert_eq!(
+            func_length(&[Value::Blob(vec![1, 2, 3])]).unwrap(),
+            Value::Integer(3)
+        );
         assert_eq!(func_length(&[Value::Null]).unwrap(), Value::Null);
     }
 
     #[test]
     fn test_substr() {
         let s = Value::Text("hello".to_string());
-        assert_eq!(func_substr(&[s.clone(), Value::Integer(2)]).unwrap(), Value::Text("ello".to_string()));
-        assert_eq!(func_substr(&[s.clone(), Value::Integer(2), Value::Integer(3)]).unwrap(), Value::Text("ell".to_string()));
+        assert_eq!(
+            func_substr(&[s.clone(), Value::Integer(2)]).unwrap(),
+            Value::Text("ello".to_string())
+        );
+        assert_eq!(
+            func_substr(&[s.clone(), Value::Integer(2), Value::Integer(3)]).unwrap(),
+            Value::Text("ell".to_string())
+        );
     }
 
     #[test]
     fn test_upper_lower() {
-        assert_eq!(func_upper(&[Value::Text("hello".to_string())]).unwrap(), Value::Text("HELLO".to_string()));
-        assert_eq!(func_lower(&[Value::Text("HELLO".to_string())]).unwrap(), Value::Text("hello".to_string()));
+        assert_eq!(
+            func_upper(&[Value::Text("hello".to_string())]).unwrap(),
+            Value::Text("HELLO".to_string())
+        );
+        assert_eq!(
+            func_lower(&[Value::Text("HELLO".to_string())]).unwrap(),
+            Value::Text("hello".to_string())
+        );
     }
 
     #[test]
     fn test_trim() {
-        assert_eq!(func_trim(&[Value::Text("  hello  ".to_string())]).unwrap(), Value::Text("hello".to_string()));
-        assert_eq!(func_ltrim(&[Value::Text("  hello  ".to_string())]).unwrap(), Value::Text("hello  ".to_string()));
-        assert_eq!(func_rtrim(&[Value::Text("  hello  ".to_string())]).unwrap(), Value::Text("  hello".to_string()));
+        assert_eq!(
+            func_trim(&[Value::Text("  hello  ".to_string())]).unwrap(),
+            Value::Text("hello".to_string())
+        );
+        assert_eq!(
+            func_ltrim(&[Value::Text("  hello  ".to_string())]).unwrap(),
+            Value::Text("hello  ".to_string())
+        );
+        assert_eq!(
+            func_rtrim(&[Value::Text("  hello  ".to_string())]).unwrap(),
+            Value::Text("  hello".to_string())
+        );
     }
 
     #[test]
     fn test_typeof() {
-        assert_eq!(func_typeof(&[Value::Null]).unwrap(), Value::Text("null".to_string()));
-        assert_eq!(func_typeof(&[Value::Integer(42)]).unwrap(), Value::Text("integer".to_string()));
-        assert_eq!(func_typeof(&[Value::Real(3.14)]).unwrap(), Value::Text("real".to_string()));
-        assert_eq!(func_typeof(&[Value::Text("hi".to_string())]).unwrap(), Value::Text("text".to_string()));
+        assert_eq!(
+            func_typeof(&[Value::Null]).unwrap(),
+            Value::Text("null".to_string())
+        );
+        assert_eq!(
+            func_typeof(&[Value::Integer(42)]).unwrap(),
+            Value::Text("integer".to_string())
+        );
+        assert_eq!(
+            func_typeof(&[Value::Real(3.14)]).unwrap(),
+            Value::Text("real".to_string())
+        );
+        assert_eq!(
+            func_typeof(&[Value::Text("hi".to_string())]).unwrap(),
+            Value::Text("text".to_string())
+        );
     }
 
     #[test]
     fn test_coalesce() {
-        assert_eq!(func_coalesce(&[Value::Null, Value::Integer(1)]).unwrap(), Value::Integer(1));
-        assert_eq!(func_coalesce(&[Value::Null, Value::Null]).unwrap(), Value::Null);
-        assert_eq!(func_coalesce(&[Value::Integer(5), Value::Integer(1)]).unwrap(), Value::Integer(5));
+        assert_eq!(
+            func_coalesce(&[Value::Null, Value::Integer(1)]).unwrap(),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            func_coalesce(&[Value::Null, Value::Null]).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            func_coalesce(&[Value::Integer(5), Value::Integer(1)]).unwrap(),
+            Value::Integer(5)
+        );
     }
 
     #[test]
     fn test_hex_unhex() {
-        assert_eq!(func_hex(&[Value::Text("ABC".to_string())]).unwrap(), Value::Text("414243".to_string()));
-        assert_eq!(func_unhex(&[Value::Text("414243".to_string())]).unwrap(), Value::Blob(vec![0x41, 0x42, 0x43]));
+        assert_eq!(
+            func_hex(&[Value::Text("ABC".to_string())]).unwrap(),
+            Value::Text("414243".to_string())
+        );
+        assert_eq!(
+            func_unhex(&[Value::Text("414243".to_string())]).unwrap(),
+            Value::Blob(vec![0x41, 0x42, 0x43])
+        );
     }
 
     #[test]
     fn test_quote() {
-        assert_eq!(func_quote(&[Value::Null]).unwrap(), Value::Text("NULL".to_string()));
-        assert_eq!(func_quote(&[Value::Integer(42)]).unwrap(), Value::Text("42".to_string()));
-        assert_eq!(func_quote(&[Value::Text("it's".to_string())]).unwrap(), Value::Text("'it''s'".to_string()));
+        assert_eq!(
+            func_quote(&[Value::Null]).unwrap(),
+            Value::Text("NULL".to_string())
+        );
+        assert_eq!(
+            func_quote(&[Value::Integer(42)]).unwrap(),
+            Value::Text("42".to_string())
+        );
+        assert_eq!(
+            func_quote(&[Value::Text("it's".to_string())]).unwrap(),
+            Value::Text("'it''s'".to_string())
+        );
     }
 
     #[test]
     fn test_like() {
-        assert_eq!(func_like(&[Value::Text("%ello".to_string()), Value::Text("hello".to_string())]).unwrap(), Value::Integer(1));
-        assert_eq!(func_like(&[Value::Text("h_llo".to_string()), Value::Text("hello".to_string())]).unwrap(), Value::Integer(1));
-        assert_eq!(func_like(&[Value::Text("world".to_string()), Value::Text("hello".to_string())]).unwrap(), Value::Integer(0));
+        assert_eq!(
+            func_like(&[
+                Value::Text("%ello".to_string()),
+                Value::Text("hello".to_string())
+            ])
+            .unwrap(),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            func_like(&[
+                Value::Text("h_llo".to_string()),
+                Value::Text("hello".to_string())
+            ])
+            .unwrap(),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            func_like(&[
+                Value::Text("world".to_string()),
+                Value::Text("hello".to_string())
+            ])
+            .unwrap(),
+            Value::Integer(0)
+        );
     }
 
     #[test]
     fn test_replace() {
         assert_eq!(
-            func_replace(&[Value::Text("hello world".to_string()), Value::Text("world".to_string()), Value::Text("rust".to_string())]).unwrap(),
+            func_replace(&[
+                Value::Text("hello world".to_string()),
+                Value::Text("world".to_string()),
+                Value::Text("rust".to_string())
+            ])
+            .unwrap(),
             Value::Text("hello rust".to_string())
         );
     }
 
     #[test]
     fn test_instr() {
-        assert_eq!(func_instr(&[Value::Text("hello".to_string()), Value::Text("l".to_string())]).unwrap(), Value::Integer(3));
-        assert_eq!(func_instr(&[Value::Text("hello".to_string()), Value::Text("x".to_string())]).unwrap(), Value::Integer(0));
+        assert_eq!(
+            func_instr(&[
+                Value::Text("hello".to_string()),
+                Value::Text("l".to_string())
+            ])
+            .unwrap(),
+            Value::Integer(3)
+        );
+        assert_eq!(
+            func_instr(&[
+                Value::Text("hello".to_string()),
+                Value::Text("x".to_string())
+            ])
+            .unwrap(),
+            Value::Integer(0)
+        );
     }
 }

@@ -613,17 +613,13 @@ impl Wal {
             return Ok(false);
         }
 
-        // Find an available read lock slot
-        for i in 0..WAL_NREADER {
-            // Try to acquire read lock on slot i
-            // In a real implementation, this would use shared memory locks
-            self.read_lock = i as i16;
-            self.shm.read_marks[i] = self.max_frame;
-            return Ok(true);
-        }
-
-        // No slots available
-        Err(Error::new(ErrorCode::Busy))
+        // Acquire read lock on first slot
+        // In a real implementation, this would use shared memory locks
+        // and try multiple slots if one is busy
+        let slot = 0;
+        self.read_lock = slot;
+        self.shm.read_marks[slot as usize] = self.max_frame;
+        Ok(true)
     }
 
     /// End a read transaction (sqlite3WalEndReadTransaction)
@@ -1002,12 +998,7 @@ impl Wal {
 
             // Initialize checksum with salt
             self.checksum = [0, 0];
-            let (c1, c2) = wal_checksum(
-                self.big_endian_cksum,
-                &hdr_buf[0..24],
-                0,
-                0,
-            );
+            let (c1, c2) = wal_checksum(self.big_endian_cksum, &hdr_buf[0..24], 0, 0);
             self.checksum = [c1, c2];
 
             // Read and validate frames

@@ -173,37 +173,37 @@ pub enum TokenKind {
     Without,
 
     // Operators
-    Plus,         // +
-    Minus,        // -
-    Star,         // *
-    Slash,        // /
-    Percent,      // %
-    Eq,           // =
-    EqEq,         // ==
-    Ne,           // <>
-    BangEq,       // !=
-    Lt,           // <
-    Le,           // <=
-    Gt,           // >
-    Ge,           // >=
-    Ampersand,    // &
-    Pipe,         // |
-    DoublePipe,   // ||
-    LtLt,         // <<
-    GtGt,         // >>
-    Tilde,        // ~
-    Bang,         // !
+    Plus,       // +
+    Minus,      // -
+    Star,       // *
+    Slash,      // /
+    Percent,    // %
+    Eq,         // =
+    EqEq,       // ==
+    Ne,         // <>
+    BangEq,     // !=
+    Lt,         // <
+    Le,         // <=
+    Gt,         // >
+    Ge,         // >=
+    Ampersand,  // &
+    Pipe,       // |
+    DoublePipe, // ||
+    LtLt,       // <<
+    GtGt,       // >>
+    Tilde,      // ~
+    Bang,       // !
 
     // JSON operators
-    Ptr,          // ->
-    PtrPtr,       // ->>
+    Ptr,    // ->
+    PtrPtr, // ->>
 
     // Punctuation
-    LParen,       // (
-    RParen,       // )
-    Comma,        // ,
-    Semicolon,    // ;
-    Dot,          // .
+    LParen,    // (
+    RParen,    // )
+    Comma,     // ,
+    Semicolon, // ;
+    Dot,       // .
 
     // Variables (?NNN, :name, @name, $name)
     Variable,
@@ -463,7 +463,13 @@ impl<'a> Tokenizer<'a> {
         self.skip_whitespace_and_comments();
 
         if self.is_eof() {
-            return Ok(Token::new(TokenKind::Eof, self.pos, self.pos, self.line, self.column));
+            return Ok(Token::new(
+                TokenKind::Eof,
+                self.pos,
+                self.pos,
+                self.line,
+                self.column,
+            ));
         }
 
         let start = self.pos;

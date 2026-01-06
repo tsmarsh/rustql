@@ -118,10 +118,7 @@ pub enum Expr {
         right: Box<Expr>,
     },
     /// Unary operation
-    UnaryOp {
-        op: UnaryOp,
-        operand: Box<Expr>,
-    },
+    UnaryOp { op: UnaryOp, operand: Box<Expr> },
     /// Function call
     Function {
         name: String,
@@ -135,10 +132,7 @@ pub enum Expr {
         else_clause: Option<Box<Expr>>,
     },
     /// CAST expression
-    Cast {
-        expr: Box<Expr>,
-        type_name: String,
-    },
+    Cast { expr: Box<Expr>, type_name: String },
     /// IN expression
     In {
         expr: Box<Expr>,
@@ -160,10 +154,7 @@ pub enum Expr {
         negated: bool,
     },
     /// IS NULL / IS NOT NULL
-    IsNull {
-        expr: Box<Expr>,
-        negated: bool,
-    },
+    IsNull { expr: Box<Expr>, negated: bool },
     /// Subquery
     Subquery(Box<Select>),
     /// EXISTS subquery
@@ -172,10 +163,7 @@ pub enum Expr {
         negated: bool,
     },
     /// Collate
-    Collate {
-        expr: Box<Expr>,
-        collation: String,
-    },
+    Collate { expr: Box<Expr>, collation: String },
     /// Parameter placeholder (?N or :name)
     Parameter {
         index: Option<i32>,
@@ -1163,7 +1151,11 @@ impl Schema {
         Ok(())
     }
 
-    fn apply_table_constraint(&self, table: &mut Table, constraint: &TableConstraint) -> Result<()> {
+    fn apply_table_constraint(
+        &self,
+        table: &mut Table,
+        constraint: &TableConstraint,
+    ) -> Result<()> {
         match constraint {
             TableConstraint::PrimaryKey { columns, conflict } => {
                 if table.primary_key.is_some() {
@@ -1187,7 +1179,10 @@ impl Schema {
                 }
                 table.primary_key = Some(pk_indices);
             }
-            TableConstraint::Unique { columns: _, conflict: _ } => {
+            TableConstraint::Unique {
+                columns: _,
+                conflict: _,
+            } => {
                 // Unique constraint creates an implicit index
                 // Will be handled during index creation
             }
@@ -1276,12 +1271,9 @@ impl Schema {
         }
 
         // Find table
-        let table = self
-            .tables
-            .get(&stmt.table.to_lowercase())
-            .ok_or_else(|| {
-                Error::with_message(ErrorCode::Error, format!("no such table: {}", stmt.table))
-            })?;
+        let table = self.tables.get(&stmt.table.to_lowercase()).ok_or_else(|| {
+            Error::with_message(ErrorCode::Error, format!("no such table: {}", stmt.table))
+        })?;
 
         // Build index structure
         let mut index = Index {
@@ -1467,11 +1459,7 @@ mod tests {
     fn test_table_find_column() {
         let table = Table {
             name: "users".to_string(),
-            columns: vec![
-                Column::new("id"),
-                Column::new("name"),
-                Column::new("email"),
-            ],
+            columns: vec![Column::new("id"), Column::new("name"), Column::new("email")],
             ..Default::default()
         };
 

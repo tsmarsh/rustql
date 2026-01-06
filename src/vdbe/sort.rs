@@ -12,7 +12,7 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use crate::error::{Error, ErrorCode, Result};
-use crate::vdbe::aux::{get_varint, put_varint, SerialType, decode_record_header};
+use crate::vdbe::aux::{decode_record_header, get_varint, put_varint, SerialType};
 use crate::vdbe::mem::Mem;
 use crate::vdbe::ops::KeyInfo;
 
@@ -144,10 +144,7 @@ impl VdbeSorter {
             ));
         }
 
-        let record = SorterRecord::new(
-            key.to_vec(),
-            data.map(|d| d.to_vec()),
-        );
+        let record = SorterRecord::new(key.to_vec(), data.map(|d| d.to_vec()));
 
         let size = record.size();
         self.mem_used += size as i64;
@@ -165,9 +162,8 @@ impl VdbeSorter {
     fn sort_in_memory(&mut self) {
         let key_info = Arc::clone(&self.key_info);
 
-        self.records.sort_by(|a, b| {
-            compare_records(&a.key, &b.key, &key_info)
-        });
+        self.records
+            .sort_by(|a, b| compare_records(&a.key, &b.key, &key_info));
     }
 
     /// Flush in-memory records to a PMA (sorted run)
@@ -269,9 +265,7 @@ impl VdbeSorter {
         match self.state {
             SorterState::Building => true,
             SorterState::Sorted => self.current_idx >= self.records.len(),
-            SorterState::Merging => {
-                self.merge.as_ref().map_or(true, |m| m.eof())
-            }
+            SorterState::Merging => self.merge.as_ref().map_or(true, |m| m.eof()),
         }
     }
 
@@ -279,12 +273,8 @@ impl VdbeSorter {
     pub fn key(&self) -> Option<&[u8]> {
         match self.state {
             SorterState::Building => None,
-            SorterState::Sorted => {
-                self.records.get(self.current_idx).map(|r| r.key())
-            }
-            SorterState::Merging => {
-                self.merge.as_ref().and_then(|m| m.key())
-            }
+            SorterState::Sorted => self.records.get(self.current_idx).map(|r| r.key()),
+            SorterState::Merging => self.merge.as_ref().and_then(|m| m.key()),
         }
     }
 
@@ -292,12 +282,8 @@ impl VdbeSorter {
     pub fn data(&self) -> Option<&[u8]> {
         match self.state {
             SorterState::Building => None,
-            SorterState::Sorted => {
-                self.records.get(self.current_idx).and_then(|r| r.data())
-            }
-            SorterState::Merging => {
-                self.merge.as_ref().and_then(|m| m.data())
-            }
+            SorterState::Sorted => self.records.get(self.current_idx).and_then(|r| r.data()),
+            SorterState::Merging => self.merge.as_ref().and_then(|m| m.data()),
         }
     }
 
@@ -403,10 +389,7 @@ impl PmaReader {
         // Read key
         let key_len = key_len as usize;
         if self.pos + key_len > self.data.len() {
-            return Err(Error::with_message(
-                ErrorCode::Corrupt,
-                "truncated PMA key",
-            ));
+            return Err(Error::with_message(ErrorCode::Corrupt, "truncated PMA key"));
         }
         let key = self.data[self.pos..self.pos + key_len].to_vec();
         self.pos += key_len;
@@ -568,7 +551,11 @@ impl MergeEngine {
             };
 
             // Ensure we compare in consistent order
-            let (a, b) = if pos % 2 == 0 { (left, right) } else { (right, left) };
+            let (a, b) = if pos % 2 == 0 {
+                (left, right)
+            } else {
+                (right, left)
+            };
             self.tree[parent] = self.winner(a, b)?;
 
             pos = parent;
@@ -643,16 +630,16 @@ fn compare_records(key_a: &[u8], key_b: &[u8], key_info: &KeyInfo) -> Ordering {
 
     for i in 0..n_fields {
         let desc = key_info.sort_orders.get(i).copied().unwrap_or(false);
-        let coll_name = key_info.collations.get(i).map(|s| s.as_str()).unwrap_or("BINARY");
+        let coll_name = key_info
+            .collations
+            .get(i)
+            .map(|s| s.as_str())
+            .unwrap_or("BINARY");
 
         let cmp = compare_mem(&fields_a[i], &fields_b[i], coll_name);
 
         if cmp != Ordering::Equal {
-            return if desc {
-                cmp.reverse()
-            } else {
-                cmp
-            };
+            return if desc { cmp.reverse() } else { cmp };
         }
     }
 
@@ -729,10 +716,20 @@ fn deserialize_mem(data: &[u8], st: &SerialType) -> (Mem, usize) {
             if data.len() < 6 {
                 return (Mem::from_int(0), 0);
             }
-            let sign_extend = if data[0] & 0x80 != 0 { [0xFF, 0xFF] } else { [0x00, 0x00] };
+            let sign_extend = if data[0] & 0x80 != 0 {
+                [0xFF, 0xFF]
+            } else {
+                [0x00, 0x00]
+            };
             let val = i64::from_be_bytes([
-                sign_extend[0], sign_extend[1],
-                data[0], data[1], data[2], data[3], data[4], data[5],
+                sign_extend[0],
+                sign_extend[1],
+                data[0],
+                data[1],
+                data[2],
+                data[3],
+                data[4],
+                data[5],
             ]);
             (Mem::from_int(val), 6)
         }
@@ -741,8 +738,7 @@ fn deserialize_mem(data: &[u8], st: &SerialType) -> (Mem, usize) {
                 return (Mem::from_int(0), 0);
             }
             let val = i64::from_be_bytes([
-                data[0], data[1], data[2], data[3],
-                data[4], data[5], data[6], data[7],
+                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
             ]);
             (Mem::from_int(val), 8)
         }
@@ -751,8 +747,7 @@ fn deserialize_mem(data: &[u8], st: &SerialType) -> (Mem, usize) {
                 return (Mem::from_real(0.0), 0);
             }
             let val = f64::from_be_bytes([
-                data[0], data[1], data[2], data[3],
-                data[4], data[5], data[6], data[7],
+                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
             ]);
             (Mem::from_real(val), 8)
         }

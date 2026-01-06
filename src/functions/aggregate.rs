@@ -17,7 +17,11 @@ pub enum AggregateState {
     Count { count: i64 },
 
     /// SUM(x) state
-    Sum { sum: f64, has_value: bool, is_integer: bool },
+    Sum {
+        sum: f64,
+        has_value: bool,
+        is_integer: bool,
+    },
 
     /// AVG(x) state
     Avg { sum: f64, count: i64 },
@@ -32,7 +36,10 @@ pub enum AggregateState {
     Total { sum: f64 },
 
     /// GROUP_CONCAT(x) or GROUP_CONCAT(x, sep) state
-    GroupConcat { values: Vec<String>, separator: String },
+    GroupConcat {
+        values: Vec<String>,
+        separator: String,
+    },
 }
 
 impl AggregateState {
@@ -40,12 +47,19 @@ impl AggregateState {
     pub fn new(func_name: &str) -> Option<Self> {
         match func_name.to_uppercase().as_str() {
             "COUNT" => Some(AggregateState::Count { count: 0 }),
-            "SUM" => Some(AggregateState::Sum { sum: 0.0, has_value: false, is_integer: true }),
+            "SUM" => Some(AggregateState::Sum {
+                sum: 0.0,
+                has_value: false,
+                is_integer: true,
+            }),
             "AVG" => Some(AggregateState::Avg { sum: 0.0, count: 0 }),
             "MIN" => Some(AggregateState::Min { value: None }),
             "MAX" => Some(AggregateState::Max { value: None }),
             "TOTAL" => Some(AggregateState::Total { sum: 0.0 }),
-            "GROUP_CONCAT" => Some(AggregateState::GroupConcat { values: Vec::new(), separator: ",".to_string() }),
+            "GROUP_CONCAT" => Some(AggregateState::GroupConcat {
+                values: Vec::new(),
+                separator: ",".to_string(),
+            }),
             _ => None,
         }
     }
@@ -60,7 +74,11 @@ impl AggregateState {
                 }
             }
 
-            AggregateState::Sum { sum, has_value, is_integer } => {
+            AggregateState::Sum {
+                sum,
+                has_value,
+                is_integer,
+            } => {
                 if let Some(val) = args.first() {
                     if !matches!(val, Value::Null) {
                         *has_value = true;
@@ -169,7 +187,11 @@ impl AggregateState {
         match self {
             AggregateState::Count { count } => Ok(Value::Integer(*count)),
 
-            AggregateState::Sum { sum, has_value, is_integer } => {
+            AggregateState::Sum {
+                sum,
+                has_value,
+                is_integer,
+            } => {
                 if !has_value {
                     Ok(Value::Null)
                 } else if *is_integer && *sum >= i64::MIN as f64 && *sum <= i64::MAX as f64 {
@@ -187,13 +209,9 @@ impl AggregateState {
                 }
             }
 
-            AggregateState::Min { value } => {
-                Ok(value.clone().unwrap_or(Value::Null))
-            }
+            AggregateState::Min { value } => Ok(value.clone().unwrap_or(Value::Null)),
 
-            AggregateState::Max { value } => {
-                Ok(value.clone().unwrap_or(Value::Null))
-            }
+            AggregateState::Max { value } => Ok(value.clone().unwrap_or(Value::Null)),
 
             AggregateState::Total { sum } => Ok(Value::Real(*sum)),
 
@@ -224,13 +242,41 @@ pub fn is_aggregate_function(name: &str) -> bool {
 pub fn get_aggregate_function(name: &str) -> Option<AggregateInfo> {
     let name_upper = name.to_uppercase();
     match name_upper.as_str() {
-        "COUNT" => Some(AggregateInfo { name: name_upper, min_args: 0, max_args: 1 }),
-        "SUM" => Some(AggregateInfo { name: name_upper, min_args: 1, max_args: 1 }),
-        "AVG" => Some(AggregateInfo { name: name_upper, min_args: 1, max_args: 1 }),
-        "MIN" => Some(AggregateInfo { name: name_upper, min_args: 1, max_args: 1 }),
-        "MAX" => Some(AggregateInfo { name: name_upper, min_args: 1, max_args: 1 }),
-        "TOTAL" => Some(AggregateInfo { name: name_upper, min_args: 1, max_args: 1 }),
-        "GROUP_CONCAT" => Some(AggregateInfo { name: name_upper, min_args: 1, max_args: 2 }),
+        "COUNT" => Some(AggregateInfo {
+            name: name_upper,
+            min_args: 0,
+            max_args: 1,
+        }),
+        "SUM" => Some(AggregateInfo {
+            name: name_upper,
+            min_args: 1,
+            max_args: 1,
+        }),
+        "AVG" => Some(AggregateInfo {
+            name: name_upper,
+            min_args: 1,
+            max_args: 1,
+        }),
+        "MIN" => Some(AggregateInfo {
+            name: name_upper,
+            min_args: 1,
+            max_args: 1,
+        }),
+        "MAX" => Some(AggregateInfo {
+            name: name_upper,
+            min_args: 1,
+            max_args: 1,
+        }),
+        "TOTAL" => Some(AggregateInfo {
+            name: name_upper,
+            min_args: 1,
+            max_args: 1,
+        }),
+        "GROUP_CONCAT" => Some(AggregateInfo {
+            name: name_upper,
+            min_args: 1,
+            max_args: 2,
+        }),
         _ => None,
     }
 }
@@ -266,15 +312,33 @@ fn compare_values(a: &Value, b: &Value) -> i32 {
         (_, Value::Null) => 1,
         (Value::Integer(x), Value::Integer(y)) => x.cmp(y) as i32,
         (Value::Real(x), Value::Real(y)) => {
-            if x < y { -1 } else if x > y { 1 } else { 0 }
+            if x < y {
+                -1
+            } else if x > y {
+                1
+            } else {
+                0
+            }
         }
         (Value::Integer(x), Value::Real(y)) => {
             let fx = *x as f64;
-            if fx < *y { -1 } else if fx > *y { 1 } else { 0 }
+            if fx < *y {
+                -1
+            } else if fx > *y {
+                1
+            } else {
+                0
+            }
         }
         (Value::Real(x), Value::Integer(y)) => {
             let fy = *y as f64;
-            if *x < fy { -1 } else if *x > fy { 1 } else { 0 }
+            if *x < fy {
+                -1
+            } else if *x > fy {
+                1
+            } else {
+                0
+            }
         }
         (Value::Text(x), Value::Text(y)) => x.cmp(y) as i32,
         (Value::Blob(x), Value::Blob(y)) => x.cmp(y) as i32,
@@ -282,7 +346,6 @@ fn compare_values(a: &Value, b: &Value) -> i32 {
         (Value::Text(_), Value::Integer(_)) | (Value::Text(_), Value::Real(_)) => 1,
         (Value::Blob(_), _) => 1,
         (_, Value::Blob(_)) => -1,
-        _ => 0,
     }
 }
 
@@ -386,10 +449,19 @@ mod tests {
     #[test]
     fn test_group_concat_custom_separator() {
         let mut state = AggregateState::new("GROUP_CONCAT").unwrap();
-        state.step(&[Value::Text("a".to_string()), Value::Text("; ".to_string())]).unwrap();
-        state.step(&[Value::Text("b".to_string()), Value::Text("; ".to_string())]).unwrap();
-        state.step(&[Value::Text("c".to_string()), Value::Text("; ".to_string())]).unwrap();
-        assert_eq!(state.finalize().unwrap(), Value::Text("a; b; c".to_string()));
+        state
+            .step(&[Value::Text("a".to_string()), Value::Text("; ".to_string())])
+            .unwrap();
+        state
+            .step(&[Value::Text("b".to_string()), Value::Text("; ".to_string())])
+            .unwrap();
+        state
+            .step(&[Value::Text("c".to_string()), Value::Text("; ".to_string())])
+            .unwrap();
+        assert_eq!(
+            state.finalize().unwrap(),
+            Value::Text("a; b; c".to_string())
+        );
     }
 
     #[test]

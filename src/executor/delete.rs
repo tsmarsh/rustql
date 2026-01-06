@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use crate::error::Result;
 use crate::parser::ast::{DeleteStmt, Expr, ResultColumn};
-use crate::vdbe::ops::{Opcode, P4, VdbeOp};
+use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
 // ============================================================================
 // DeleteCompiler
@@ -110,7 +110,13 @@ impl DeleteCompiler {
         let loop_end_label = self.alloc_label();
 
         // Rewind to start of table
-        self.emit(Opcode::Rewind, self.table_cursor, loop_end_label, 0, P4::Unused);
+        self.emit(
+            Opcode::Rewind,
+            self.table_cursor,
+            loop_end_label,
+            0,
+            P4::Unused,
+        );
 
         // Loop start
         self.resolve_label(loop_start_label, self.current_addr() as i32);
@@ -131,7 +137,13 @@ impl DeleteCompiler {
         }
 
         // Move to next row
-        self.emit(Opcode::Next, self.table_cursor, loop_start_label, 0, P4::Unused);
+        self.emit(
+            Opcode::Next,
+            self.table_cursor,
+            loop_start_label,
+            0,
+            P4::Unused,
+        );
 
         // Loop end
         self.resolve_label(loop_end_label, self.current_addr() as i32);
@@ -154,7 +166,13 @@ impl DeleteCompiler {
         let collect_loop_start = self.alloc_label();
         let collect_loop_end = self.alloc_label();
 
-        self.emit(Opcode::Rewind, self.table_cursor, collect_loop_end, 0, P4::Unused);
+        self.emit(
+            Opcode::Rewind,
+            self.table_cursor,
+            collect_loop_end,
+            0,
+            P4::Unused,
+        );
         self.resolve_label(collect_loop_start, self.current_addr() as i32);
 
         // Check WHERE clause
@@ -170,7 +188,13 @@ impl DeleteCompiler {
             // For now, just store the rowid
             let record_reg = self.alloc_reg();
             self.emit(Opcode::MakeRecord, rowid_reg, 1, record_reg, P4::Unused);
-            self.emit(Opcode::IdxInsert, ephemeral_cursor, record_reg, 0, P4::Unused);
+            self.emit(
+                Opcode::IdxInsert,
+                ephemeral_cursor,
+                record_reg,
+                0,
+                P4::Unused,
+            );
 
             self.resolve_label(skip_label, self.current_addr() as i32);
         } else {
@@ -179,10 +203,22 @@ impl DeleteCompiler {
             self.emit(Opcode::Rowid, self.table_cursor, rowid_reg, 0, P4::Unused);
             let record_reg = self.alloc_reg();
             self.emit(Opcode::MakeRecord, rowid_reg, 1, record_reg, P4::Unused);
-            self.emit(Opcode::IdxInsert, ephemeral_cursor, record_reg, 0, P4::Unused);
+            self.emit(
+                Opcode::IdxInsert,
+                ephemeral_cursor,
+                record_reg,
+                0,
+                P4::Unused,
+            );
         }
 
-        self.emit(Opcode::Next, self.table_cursor, collect_loop_start, 0, P4::Unused);
+        self.emit(
+            Opcode::Next,
+            self.table_cursor,
+            collect_loop_start,
+            0,
+            P4::Unused,
+        );
         self.resolve_label(collect_loop_end, self.current_addr() as i32);
 
         // Second pass: delete collected rowids
@@ -202,12 +238,24 @@ impl DeleteCompiler {
         let counter_reg = self.alloc_reg();
         self.emit(Opcode::Integer, 0, counter_reg, 0, P4::Unused);
 
-        self.emit(Opcode::Rewind, ephemeral_cursor, delete_loop_end, 0, P4::Unused);
+        self.emit(
+            Opcode::Rewind,
+            ephemeral_cursor,
+            delete_loop_end,
+            0,
+            P4::Unused,
+        );
         self.resolve_label(delete_loop_start, self.current_addr() as i32);
 
         // Check limit
         if let Some(limit_reg) = limit_reg {
-            self.emit(Opcode::Ge, counter_reg, delete_loop_end, limit_reg, P4::Unused);
+            self.emit(
+                Opcode::Ge,
+                counter_reg,
+                delete_loop_end,
+                limit_reg,
+                P4::Unused,
+            );
         }
 
         // Get rowid from ephemeral table
@@ -215,7 +263,13 @@ impl DeleteCompiler {
         self.emit(Opcode::Column, ephemeral_cursor, 0, rowid_reg, P4::Unused);
 
         // Seek to the row and delete it
-        self.emit(Opcode::NotExists, self.table_cursor, delete_loop_start, rowid_reg, P4::Unused);
+        self.emit(
+            Opcode::NotExists,
+            self.table_cursor,
+            delete_loop_start,
+            rowid_reg,
+            P4::Unused,
+        );
         self.emit(Opcode::Delete, self.table_cursor, 0, 0, P4::Unused);
 
         // Increment counter
@@ -223,7 +277,13 @@ impl DeleteCompiler {
         self.emit(Opcode::Integer, 1, one_reg, 0, P4::Unused);
         self.emit(Opcode::Add, counter_reg, one_reg, counter_reg, P4::Unused);
 
-        self.emit(Opcode::Next, ephemeral_cursor, delete_loop_start, 0, P4::Unused);
+        self.emit(
+            Opcode::Next,
+            ephemeral_cursor,
+            delete_loop_start,
+            0,
+            P4::Unused,
+        );
         self.resolve_label(delete_loop_end, self.current_addr() as i32);
 
         // Close ephemeral cursor
@@ -281,7 +341,13 @@ impl DeleteCompiler {
         }
 
         // Output the row
-        self.emit(Opcode::ResultRow, base_reg, returning.len() as i32, 0, P4::Unused);
+        self.emit(
+            Opcode::ResultRow,
+            base_reg,
+            returning.len() as i32,
+            0,
+            P4::Unused,
+        );
 
         Ok(())
     }
@@ -289,38 +355,54 @@ impl DeleteCompiler {
     /// Compile an expression
     fn compile_expr(&mut self, expr: &Expr, dest_reg: i32) -> Result<()> {
         match expr {
-            Expr::Literal(lit) => {
-                match lit {
-                    crate::parser::ast::Literal::Null => {
-                        self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
-                    }
-                    crate::parser::ast::Literal::Integer(n) => {
-                        self.emit(Opcode::Integer, *n as i32, dest_reg, 0, P4::Unused);
-                    }
-                    crate::parser::ast::Literal::Float(f) => {
-                        self.emit(Opcode::Real, 0, dest_reg, 0, P4::Real(*f));
-                    }
-                    crate::parser::ast::Literal::String(s) => {
-                        self.emit(Opcode::String8, 0, dest_reg, 0, P4::Text(s.clone()));
-                    }
-                    crate::parser::ast::Literal::Blob(b) => {
-                        self.emit(Opcode::Blob, b.len() as i32, dest_reg, 0, P4::Blob(b.clone()));
-                    }
-                    crate::parser::ast::Literal::Bool(b) => {
-                        self.emit(Opcode::Integer, if *b { 1 } else { 0 }, dest_reg, 0, P4::Unused);
-                    }
-                    _ => {
-                        self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
-                    }
+            Expr::Literal(lit) => match lit {
+                crate::parser::ast::Literal::Null => {
+                    self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
                 }
-            }
+                crate::parser::ast::Literal::Integer(n) => {
+                    self.emit(Opcode::Integer, *n as i32, dest_reg, 0, P4::Unused);
+                }
+                crate::parser::ast::Literal::Float(f) => {
+                    self.emit(Opcode::Real, 0, dest_reg, 0, P4::Real(*f));
+                }
+                crate::parser::ast::Literal::String(s) => {
+                    self.emit(Opcode::String8, 0, dest_reg, 0, P4::Text(s.clone()));
+                }
+                crate::parser::ast::Literal::Blob(b) => {
+                    self.emit(
+                        Opcode::Blob,
+                        b.len() as i32,
+                        dest_reg,
+                        0,
+                        P4::Blob(b.clone()),
+                    );
+                }
+                crate::parser::ast::Literal::Bool(b) => {
+                    self.emit(
+                        Opcode::Integer,
+                        if *b { 1 } else { 0 },
+                        dest_reg,
+                        0,
+                        P4::Unused,
+                    );
+                }
+                _ => {
+                    self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                }
+            },
             Expr::Column(col_ref) => {
                 let col_idx = if let Some(&idx) = self.column_map.get(&col_ref.column) {
                     idx
                 } else {
                     self.get_column_index(&col_ref.column)
                 };
-                self.emit(Opcode::Column, self.table_cursor, col_idx as i32, dest_reg, P4::Unused);
+                self.emit(
+                    Opcode::Column,
+                    self.table_cursor,
+                    col_idx as i32,
+                    dest_reg,
+                    P4::Unused,
+                );
             }
             Expr::Binary { op, left, right } => {
                 let left_reg = self.alloc_reg();
@@ -390,7 +472,10 @@ impl DeleteCompiler {
                     P4::Text(func_call.name.clone()),
                 );
             }
-            Expr::IsNull { expr: inner, negated } => {
+            Expr::IsNull {
+                expr: inner,
+                negated,
+            } => {
                 self.compile_expr(inner, dest_reg)?;
                 if *negated {
                     let is_null_reg = self.alloc_reg();

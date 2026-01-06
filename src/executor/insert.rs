@@ -5,12 +5,11 @@
 
 use std::collections::HashMap;
 
-use crate::error::{Error, ErrorCode, Result};
+use crate::error::Result;
 use crate::parser::ast::{
-    ConflictAction, DefaultValue, Expr, InsertSource, InsertStmt,
-    ResultColumn, SelectStmt,
+    ConflictAction, Expr, InsertSource, InsertStmt, ResultColumn, SelectStmt,
 };
-use crate::vdbe::ops::{Opcode, P4, VdbeOp};
+use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
 // ============================================================================
 // InsertCompiler
@@ -125,7 +124,13 @@ impl InsertCompiler {
             let rowid_reg = self.alloc_reg();
 
             // Generate new rowid (autoincrement)
-            self.emit(Opcode::NewRowid, self.table_cursor, rowid_reg, 0, P4::Unused);
+            self.emit(
+                Opcode::NewRowid,
+                self.table_cursor,
+                rowid_reg,
+                0,
+                P4::Unused,
+            );
 
             // Allocate registers for column values
             let data_base = self.next_reg;
@@ -162,7 +167,13 @@ impl InsertCompiler {
 
             // Insert the record
             let flags = self.conflict_flags(conflict_action);
-            self.emit(Opcode::Insert, self.table_cursor, record_reg, rowid_reg, P4::Int64(flags));
+            self.emit(
+                Opcode::Insert,
+                self.table_cursor,
+                record_reg,
+                rowid_reg,
+                P4::Int64(flags),
+            );
         }
 
         Ok(())
@@ -172,7 +183,7 @@ impl InsertCompiler {
     fn compile_select(
         &mut self,
         insert: &InsertStmt,
-        select: &SelectStmt,
+        _select: &SelectStmt,
         conflict_action: ConflictAction,
     ) -> Result<()> {
         // Build column index map
@@ -184,7 +195,13 @@ impl InsertCompiler {
 
         // Open ephemeral table for SELECT results
         let select_cursor = self.alloc_cursor();
-        self.emit(Opcode::OpenEphemeral, select_cursor, self.num_columns as i32, 0, P4::Unused);
+        self.emit(
+            Opcode::OpenEphemeral,
+            select_cursor,
+            self.num_columns as i32,
+            0,
+            P4::Unused,
+        );
 
         // TODO: Actually compile the SELECT and populate ephemeral table
         // For now, emit placeholder
@@ -198,7 +215,13 @@ impl InsertCompiler {
 
         // Allocate rowid register
         let rowid_reg = self.alloc_reg();
-        self.emit(Opcode::NewRowid, self.table_cursor, rowid_reg, 0, P4::Unused);
+        self.emit(
+            Opcode::NewRowid,
+            self.table_cursor,
+            rowid_reg,
+            0,
+            P4::Unused,
+        );
 
         // Get data from SELECT row
         let data_base = self.next_reg;
@@ -206,7 +229,13 @@ impl InsertCompiler {
 
         for (i, col_idx) in col_indices.iter().enumerate() {
             let dest_reg = data_base + *col_idx as i32;
-            self.emit(Opcode::Column, select_cursor, i as i32, dest_reg, P4::Unused);
+            self.emit(
+                Opcode::Column,
+                select_cursor,
+                i as i32,
+                dest_reg,
+                P4::Unused,
+            );
         }
 
         // Fill NULLs for unspecified columns
@@ -231,7 +260,13 @@ impl InsertCompiler {
         );
 
         let flags = self.conflict_flags(conflict_action);
-        self.emit(Opcode::Insert, self.table_cursor, record_reg, rowid_reg, P4::Int64(flags));
+        self.emit(
+            Opcode::Insert,
+            self.table_cursor,
+            record_reg,
+            rowid_reg,
+            P4::Int64(flags),
+        );
 
         // Next row
         self.emit(Opcode::Next, select_cursor, loop_start_label, 0, P4::Unused);
@@ -251,7 +286,13 @@ impl InsertCompiler {
     ) -> Result<()> {
         // Allocate rowid
         let rowid_reg = self.alloc_reg();
-        self.emit(Opcode::NewRowid, self.table_cursor, rowid_reg, 0, P4::Unused);
+        self.emit(
+            Opcode::NewRowid,
+            self.table_cursor,
+            rowid_reg,
+            0,
+            P4::Unused,
+        );
 
         // All columns get default values (NULL if no default specified)
         let data_base = self.next_reg;
@@ -277,7 +318,13 @@ impl InsertCompiler {
         );
 
         let flags = self.conflict_flags(conflict_action);
-        self.emit(Opcode::Insert, self.table_cursor, record_reg, rowid_reg, P4::Int64(flags));
+        self.emit(
+            Opcode::Insert,
+            self.table_cursor,
+            record_reg,
+            rowid_reg,
+            P4::Int64(flags),
+        );
 
         Ok(())
     }
@@ -303,7 +350,13 @@ impl InsertCompiler {
         }
 
         // Output the row
-        self.emit(Opcode::ResultRow, base_reg, returning.len() as i32, 0, P4::Unused);
+        self.emit(
+            Opcode::ResultRow,
+            base_reg,
+            returning.len() as i32,
+            0,
+            P4::Unused,
+        );
 
         Ok(())
     }
@@ -368,34 +421,50 @@ impl InsertCompiler {
     /// Compile an expression
     fn compile_expr(&mut self, expr: &Expr, dest_reg: i32) -> Result<()> {
         match expr {
-            Expr::Literal(lit) => {
-                match lit {
-                    crate::parser::ast::Literal::Null => {
-                        self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
-                    }
-                    crate::parser::ast::Literal::Integer(n) => {
-                        self.emit(Opcode::Integer, *n as i32, dest_reg, 0, P4::Unused);
-                    }
-                    crate::parser::ast::Literal::Float(f) => {
-                        self.emit(Opcode::Real, 0, dest_reg, 0, P4::Real(*f));
-                    }
-                    crate::parser::ast::Literal::String(s) => {
-                        self.emit(Opcode::String8, 0, dest_reg, 0, P4::Text(s.clone()));
-                    }
-                    crate::parser::ast::Literal::Blob(b) => {
-                        self.emit(Opcode::Blob, b.len() as i32, dest_reg, 0, P4::Blob(b.clone()));
-                    }
-                    crate::parser::ast::Literal::Bool(b) => {
-                        self.emit(Opcode::Integer, if *b { 1 } else { 0 }, dest_reg, 0, P4::Unused);
-                    }
-                    _ => {
-                        self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
-                    }
+            Expr::Literal(lit) => match lit {
+                crate::parser::ast::Literal::Null => {
+                    self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
                 }
-            }
+                crate::parser::ast::Literal::Integer(n) => {
+                    self.emit(Opcode::Integer, *n as i32, dest_reg, 0, P4::Unused);
+                }
+                crate::parser::ast::Literal::Float(f) => {
+                    self.emit(Opcode::Real, 0, dest_reg, 0, P4::Real(*f));
+                }
+                crate::parser::ast::Literal::String(s) => {
+                    self.emit(Opcode::String8, 0, dest_reg, 0, P4::Text(s.clone()));
+                }
+                crate::parser::ast::Literal::Blob(b) => {
+                    self.emit(
+                        Opcode::Blob,
+                        b.len() as i32,
+                        dest_reg,
+                        0,
+                        P4::Blob(b.clone()),
+                    );
+                }
+                crate::parser::ast::Literal::Bool(b) => {
+                    self.emit(
+                        Opcode::Integer,
+                        if *b { 1 } else { 0 },
+                        dest_reg,
+                        0,
+                        P4::Unused,
+                    );
+                }
+                _ => {
+                    self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                }
+            },
             Expr::Column(col_ref) => {
                 // Column reference - would need to resolve from schema
-                self.emit(Opcode::Column, 0, 0, dest_reg, P4::Text(col_ref.column.clone()));
+                self.emit(
+                    Opcode::Column,
+                    0,
+                    0,
+                    dest_reg,
+                    P4::Text(col_ref.column.clone()),
+                );
             }
             Expr::Binary { op, left, right } => {
                 let left_reg = self.alloc_reg();
@@ -621,9 +690,7 @@ mod tests {
             table: QualifiedName::new("users"),
             alias: None,
             columns: None,
-            source: InsertSource::Values(vec![vec![
-                Expr::Literal(Literal::Integer(1)),
-            ]]),
+            source: InsertSource::Values(vec![vec![Expr::Literal(Literal::Integer(1))]]),
             on_conflict: None,
             returning: None,
         };

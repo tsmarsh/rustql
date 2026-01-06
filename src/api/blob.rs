@@ -11,6 +11,7 @@ use crate::error::{Error, ErrorCode, Result};
 /// Blob handle for incremental I/O
 ///
 /// This corresponds to SQLite's `sqlite3_blob` / `Incrblob` structure.
+#[allow(dead_code)]
 pub struct Blob {
     /// Database name (e.g., "main", "temp")
     db_name: String,
@@ -91,14 +92,12 @@ impl Blob {
 /// # SQLite Equivalent
 /// `sqlite3_blob_open()`
 pub fn sqlite3_blob_open(
-    db_name: &str,
-    table: &str,
-    column: &str,
-    rowid: i64,
-    flags: i32,
+    _db_name: &str,
+    _table: &str,
+    _column: &str,
+    _rowid: i64,
+    _flags: i32,
 ) -> Result<Blob> {
-    let writable = flags != 0;
-
     // This is a stub implementation - in a real implementation we would:
     // 1. Look up the database by name
     // 2. Find the table in the schema

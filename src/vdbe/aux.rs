@@ -234,7 +234,7 @@ fn put_varint_at(buf: &mut [u8], value: u64) -> usize {
     if len == 9 {
         buf[0] = 0xFF;
         for i in 1..9 {
-            buf[i] = ((value >> (8 - i) * 8) & 0xFF) as u8;
+            buf[i] = ((value >> ((8 - i) * 8)) & 0xFF) as u8;
         }
     } else {
         let mut v = value;
@@ -410,11 +410,7 @@ pub fn deserialize_value(data: &[u8], serial_type: &SerialType) -> Result<Mem> {
             }
             let v = ((data[0] as i32) << 16) | ((data[1] as i32) << 8) | (data[2] as i32);
             // Sign extend from 24-bit
-            let v = if v & 0x800000 != 0 {
-                v | !0xFFFFFF
-            } else {
-                v
-            };
+            let v = if v & 0x800000 != 0 { v | !0xFFFFFF } else { v };
             mem.set_int(v as i64);
         }
         SerialType::Int32 => {
@@ -640,7 +636,8 @@ impl VdbeBuilder {
         let addr = self.ops.len() as i32;
         self.ops.push(VdbeOp::new(opcode, p1, label.value(), p3));
         if !label.is_resolved() {
-            self.pending_labels.push((-label.value() - 1, addr as usize));
+            self.pending_labels
+                .push((-label.value() - 1, addr as usize));
         }
         addr
     }

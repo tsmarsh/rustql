@@ -10,7 +10,7 @@ use crate::error::Result;
 use crate::parser::ast::*;
 use crate::parser::grammar::Parser;
 use crate::types::ColumnType;
-use crate::vdbe::ops::{Opcode, P4, VdbeOp};
+use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
 use super::delete::compile_delete;
 use super::insert::compile_insert;
@@ -143,7 +143,10 @@ impl StatementCompiler {
     }
 
     /// Compile a parsed statement
-    fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(Vec<VdbeOp>, StmtType, Vec<String>, Vec<ColumnType>)> {
+    fn compile_stmt(
+        &mut self,
+        stmt: &Stmt,
+    ) -> Result<(Vec<VdbeOp>, StmtType, Vec<String>, Vec<ColumnType>)> {
         match stmt {
             Stmt::Select(select) => {
                 let mut compiler = SelectCompiler::new();
@@ -396,7 +399,12 @@ impl StatementCompiler {
             TableRef::Subquery { query, .. } => {
                 self.extract_params_select(query);
             }
-            TableRef::Join { left, right, constraint, .. } => {
+            TableRef::Join {
+                left,
+                right,
+                constraint,
+                ..
+            } => {
                 self.extract_params_table_ref(left);
                 self.extract_params_table_ref(right);
                 if let Some(JoinConstraint::On(on_expr)) = constraint {
@@ -432,7 +440,11 @@ impl StatementCompiler {
 
         // ON CONFLICT DO UPDATE
         if let Some(on_conflict) = &insert.on_conflict {
-            if let ConflictResolution::Update { assignments, where_clause } = &on_conflict.action {
+            if let ConflictResolution::Update {
+                assignments,
+                where_clause,
+            } = &on_conflict.action
+            {
                 for assign in assignments {
                     self.extract_params_expr(&assign.expr);
                 }
@@ -521,7 +533,9 @@ impl StatementCompiler {
                 self.extract_params_expr(expr);
             }
 
-            Expr::Between { expr, low, high, .. } => {
+            Expr::Between {
+                expr, low, high, ..
+            } => {
                 self.extract_params_expr(expr);
                 self.extract_params_expr(low);
                 self.extract_params_expr(high);
@@ -542,7 +556,12 @@ impl StatementCompiler {
                 }
             }
 
-            Expr::Like { expr, pattern, escape, .. } => {
+            Expr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => {
                 self.extract_params_expr(expr);
                 self.extract_params_expr(pattern);
                 if let Some(escape) = escape {
@@ -550,7 +569,11 @@ impl StatementCompiler {
                 }
             }
 
-            Expr::Case { operand, when_clauses, else_clause } => {
+            Expr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => {
                 if let Some(op) = operand {
                     self.extract_params_expr(op);
                 }
@@ -680,25 +703,21 @@ impl StatementCompiler {
                     ColumnType::Text
                 }
             },
-            Expr::Function(func) => {
-                match func.name.to_uppercase().as_str() {
-                    "COUNT" | "LENGTH" | "INSTR" | "UNICODE" => ColumnType::Integer,
-                    "SUM" | "AVG" | "TOTAL" | "ABS" | "ROUND" => ColumnType::Float,
-                    "UPPER" | "LOWER" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE" | "SUBSTR"
-                    | "TYPEOF" | "HEX" | "QUOTE" | "GROUP_CONCAT" => ColumnType::Text,
-                    "ZEROBLOB" | "RANDOMBLOB" => ColumnType::Blob,
-                    _ => ColumnType::Null,
-                }
-            }
-            Expr::Cast { type_name, .. } => {
-                match type_name.name.to_uppercase().as_str() {
-                    "INTEGER" | "INT" => ColumnType::Integer,
-                    "REAL" | "FLOAT" | "DOUBLE" => ColumnType::Float,
-                    "TEXT" | "VARCHAR" | "CHAR" => ColumnType::Text,
-                    "BLOB" => ColumnType::Blob,
-                    _ => ColumnType::Null,
-                }
-            }
+            Expr::Function(func) => match func.name.to_uppercase().as_str() {
+                "COUNT" | "LENGTH" | "INSTR" | "UNICODE" => ColumnType::Integer,
+                "SUM" | "AVG" | "TOTAL" | "ABS" | "ROUND" => ColumnType::Float,
+                "UPPER" | "LOWER" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE" | "SUBSTR"
+                | "TYPEOF" | "HEX" | "QUOTE" | "GROUP_CONCAT" => ColumnType::Text,
+                "ZEROBLOB" | "RANDOMBLOB" => ColumnType::Blob,
+                _ => ColumnType::Null,
+            },
+            Expr::Cast { type_name, .. } => match type_name.name.to_uppercase().as_str() {
+                "INTEGER" | "INT" => ColumnType::Integer,
+                "REAL" | "FLOAT" | "DOUBLE" => ColumnType::Float,
+                "TEXT" | "VARCHAR" | "CHAR" => ColumnType::Text,
+                "BLOB" => ColumnType::Blob,
+                _ => ColumnType::Null,
+            },
             _ => ColumnType::Null,
         }
     }
@@ -726,7 +745,13 @@ impl StatementCompiler {
     fn compile_create_table(&mut self, create: &CreateTableStmt) -> Result<Vec<VdbeOp>> {
         let mut ops = Vec::new();
         ops.push(Self::make_op(Opcode::Init, 0, 1, 0, P4::Unused));
-        ops.push(Self::make_op(Opcode::Noop, 0, 0, 0, P4::Text(format!("CREATE TABLE {}", create.name))));
+        ops.push(Self::make_op(
+            Opcode::Noop,
+            0,
+            0,
+            0,
+            P4::Text(format!("CREATE TABLE {}", create.name)),
+        ));
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
         Ok(ops)
     }
@@ -734,7 +759,13 @@ impl StatementCompiler {
     fn compile_create_index(&mut self, create: &CreateIndexStmt) -> Result<Vec<VdbeOp>> {
         let mut ops = Vec::new();
         ops.push(Self::make_op(Opcode::Init, 0, 1, 0, P4::Unused));
-        ops.push(Self::make_op(Opcode::Noop, 0, 0, 0, P4::Text(format!("CREATE INDEX {}", create.name))));
+        ops.push(Self::make_op(
+            Opcode::Noop,
+            0,
+            0,
+            0,
+            P4::Text(format!("CREATE INDEX {}", create.name)),
+        ));
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
         Ok(ops)
     }
@@ -742,7 +773,13 @@ impl StatementCompiler {
     fn compile_create_view(&mut self, create: &CreateViewStmt) -> Result<Vec<VdbeOp>> {
         let mut ops = Vec::new();
         ops.push(Self::make_op(Opcode::Init, 0, 1, 0, P4::Unused));
-        ops.push(Self::make_op(Opcode::Noop, 0, 0, 0, P4::Text(format!("CREATE VIEW {}", create.name))));
+        ops.push(Self::make_op(
+            Opcode::Noop,
+            0,
+            0,
+            0,
+            P4::Text(format!("CREATE VIEW {}", create.name)),
+        ));
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
         Ok(ops)
     }
@@ -750,7 +787,13 @@ impl StatementCompiler {
     fn compile_create_trigger(&mut self, create: &CreateTriggerStmt) -> Result<Vec<VdbeOp>> {
         let mut ops = Vec::new();
         ops.push(Self::make_op(Opcode::Init, 0, 1, 0, P4::Unused));
-        ops.push(Self::make_op(Opcode::Noop, 0, 0, 0, P4::Text(format!("CREATE TRIGGER {}", create.name))));
+        ops.push(Self::make_op(
+            Opcode::Noop,
+            0,
+            0,
+            0,
+            P4::Text(format!("CREATE TRIGGER {}", create.name)),
+        ));
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
         Ok(ops)
     }
@@ -758,7 +801,13 @@ impl StatementCompiler {
     fn compile_drop(&mut self, drop: &DropStmt, kind: &str) -> Result<Vec<VdbeOp>> {
         let mut ops = Vec::new();
         ops.push(Self::make_op(Opcode::Init, 0, 1, 0, P4::Unused));
-        ops.push(Self::make_op(Opcode::Noop, 0, 0, 0, P4::Text(format!("DROP {} {}", kind.to_uppercase(), drop.name))));
+        ops.push(Self::make_op(
+            Opcode::Noop,
+            0,
+            0,
+            0,
+            P4::Text(format!("DROP {} {}", kind.to_uppercase(), drop.name)),
+        ));
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
         Ok(ops)
     }
@@ -766,7 +815,13 @@ impl StatementCompiler {
     fn compile_alter_table(&mut self, alter: &AlterTableStmt) -> Result<Vec<VdbeOp>> {
         let mut ops = Vec::new();
         ops.push(Self::make_op(Opcode::Init, 0, 1, 0, P4::Unused));
-        ops.push(Self::make_op(Opcode::Noop, 0, 0, 0, P4::Text(format!("ALTER TABLE {}", alter.table))));
+        ops.push(Self::make_op(
+            Opcode::Noop,
+            0,
+            0,
+            0,
+            P4::Text(format!("ALTER TABLE {}", alter.table)),
+        ));
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
         Ok(ops)
     }
@@ -803,7 +858,13 @@ impl StatementCompiler {
         ops.push(Self::make_op(Opcode::Init, 0, 1, 0, P4::Unused));
 
         if let Some(savepoint) = &rollback.savepoint {
-            ops.push(Self::make_op(Opcode::Savepoint, 2, 0, 0, P4::Text(savepoint.clone())));
+            ops.push(Self::make_op(
+                Opcode::Savepoint,
+                2,
+                0,
+                0,
+                P4::Text(savepoint.clone()),
+            ));
         } else {
             ops.push(Self::make_op(Opcode::AutoCommit, 2, 0, 0, P4::Unused));
         }
@@ -815,7 +876,13 @@ impl StatementCompiler {
     fn compile_savepoint(&mut self, name: &str) -> Result<Vec<VdbeOp>> {
         let mut ops = Vec::new();
         ops.push(Self::make_op(Opcode::Init, 0, 1, 0, P4::Unused));
-        ops.push(Self::make_op(Opcode::Savepoint, 0, 0, 0, P4::Text(name.to_string())));
+        ops.push(Self::make_op(
+            Opcode::Savepoint,
+            0,
+            0,
+            0,
+            P4::Text(name.to_string()),
+        ));
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
         Ok(ops)
     }
@@ -823,7 +890,13 @@ impl StatementCompiler {
     fn compile_release(&mut self, name: &str) -> Result<Vec<VdbeOp>> {
         let mut ops = Vec::new();
         ops.push(Self::make_op(Opcode::Init, 0, 1, 0, P4::Unused));
-        ops.push(Self::make_op(Opcode::Savepoint, 1, 0, 0, P4::Text(name.to_string())));
+        ops.push(Self::make_op(
+            Opcode::Savepoint,
+            1,
+            0,
+            0,
+            P4::Text(name.to_string()),
+        ));
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
         Ok(ops)
     }
@@ -832,7 +905,10 @@ impl StatementCompiler {
     // PRAGMA Compilation
     // ========================================================================
 
-    fn compile_pragma(&mut self, pragma: &PragmaStmt) -> Result<(Vec<VdbeOp>, Vec<String>, Vec<ColumnType>)> {
+    fn compile_pragma(
+        &mut self,
+        pragma: &PragmaStmt,
+    ) -> Result<(Vec<VdbeOp>, Vec<String>, Vec<ColumnType>)> {
         let mut ops = Vec::new();
         let mut names = Vec::new();
         let mut types = Vec::new();
@@ -879,7 +955,11 @@ impl StatementCompiler {
             0,
             P4::Text(format!(
                 "VACUUM{}",
-                vacuum.schema.as_ref().map(|s| format!(" {}", s)).unwrap_or_default()
+                vacuum
+                    .schema
+                    .as_ref()
+                    .map(|s| format!(" {}", s))
+                    .unwrap_or_default()
             )),
         ));
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
@@ -937,7 +1017,13 @@ impl StatementCompiler {
     fn compile_detach(&mut self, name: &str) -> Result<Vec<VdbeOp>> {
         let mut ops = Vec::new();
         ops.push(Self::make_op(Opcode::Init, 0, 1, 0, P4::Unused));
-        ops.push(Self::make_op(Opcode::Noop, 0, 0, 0, P4::Text(format!("DETACH {}", name))));
+        ops.push(Self::make_op(
+            Opcode::Noop,
+            0,
+            0,
+            0,
+            P4::Text(format!("DETACH {}", name)),
+        ));
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
         Ok(ops)
     }
@@ -953,19 +1039,67 @@ impl StatementCompiler {
         let base_reg = 1;
         for (i, op) in inner_ops.iter().enumerate() {
             // addr
-            ops.push(Self::make_op(Opcode::Integer, i as i32, base_reg, 0, P4::Unused));
+            ops.push(Self::make_op(
+                Opcode::Integer,
+                i as i32,
+                base_reg,
+                0,
+                P4::Unused,
+            ));
             // opcode name
-            ops.push(Self::make_op(Opcode::String8, 0, base_reg + 1, 0, P4::Text(format!("{:?}", op.opcode))));
+            ops.push(Self::make_op(
+                Opcode::String8,
+                0,
+                base_reg + 1,
+                0,
+                P4::Text(format!("{:?}", op.opcode)),
+            ));
             // p1, p2, p3
-            ops.push(Self::make_op(Opcode::Integer, op.p1, base_reg + 2, 0, P4::Unused));
-            ops.push(Self::make_op(Opcode::Integer, op.p2, base_reg + 3, 0, P4::Unused));
-            ops.push(Self::make_op(Opcode::Integer, op.p3, base_reg + 4, 0, P4::Unused));
+            ops.push(Self::make_op(
+                Opcode::Integer,
+                op.p1,
+                base_reg + 2,
+                0,
+                P4::Unused,
+            ));
+            ops.push(Self::make_op(
+                Opcode::Integer,
+                op.p2,
+                base_reg + 3,
+                0,
+                P4::Unused,
+            ));
+            ops.push(Self::make_op(
+                Opcode::Integer,
+                op.p3,
+                base_reg + 4,
+                0,
+                P4::Unused,
+            ));
             // p4
-            ops.push(Self::make_op(Opcode::String8, 0, base_reg + 5, 0, P4::Text(format!("{:?}", op.p4))));
+            ops.push(Self::make_op(
+                Opcode::String8,
+                0,
+                base_reg + 5,
+                0,
+                P4::Text(format!("{:?}", op.p4)),
+            ));
             // p5
-            ops.push(Self::make_op(Opcode::Integer, op.p5 as i32, base_reg + 6, 0, P4::Unused));
+            ops.push(Self::make_op(
+                Opcode::Integer,
+                op.p5 as i32,
+                base_reg + 6,
+                0,
+                P4::Unused,
+            ));
             // comment
-            ops.push(Self::make_op(Opcode::String8, 0, base_reg + 7, 0, P4::Text(op.comment.clone().unwrap_or_default())));
+            ops.push(Self::make_op(
+                Opcode::String8,
+                0,
+                base_reg + 7,
+                0,
+                P4::Text(op.comment.clone().unwrap_or_default()),
+            ));
             // Result row
             ops.push(Self::make_op(Opcode::ResultRow, base_reg, 8, 0, P4::Unused));
         }
@@ -980,9 +1114,27 @@ impl StatementCompiler {
 
         let base_reg = 1;
         ops.push(Self::make_op(Opcode::Integer, 0, base_reg, 0, P4::Unused));
-        ops.push(Self::make_op(Opcode::Integer, 0, base_reg + 1, 0, P4::Unused));
-        ops.push(Self::make_op(Opcode::Integer, 0, base_reg + 2, 0, P4::Unused));
-        ops.push(Self::make_op(Opcode::String8, 0, base_reg + 3, 0, P4::Text("SCAN TABLE".to_string())));
+        ops.push(Self::make_op(
+            Opcode::Integer,
+            0,
+            base_reg + 1,
+            0,
+            P4::Unused,
+        ));
+        ops.push(Self::make_op(
+            Opcode::Integer,
+            0,
+            base_reg + 2,
+            0,
+            P4::Unused,
+        ));
+        ops.push(Self::make_op(
+            Opcode::String8,
+            0,
+            base_reg + 3,
+            0,
+            P4::Text("SCAN TABLE".to_string()),
+        ));
         ops.push(Self::make_op(Opcode::ResultRow, base_reg, 4, 0, P4::Unused));
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
 
@@ -1092,8 +1244,14 @@ mod tests {
     fn test_named_parameters() {
         let (compiled, _) = compile_sql("SELECT :name WHERE x = :value").unwrap();
         assert_eq!(compiled.param_count, 2);
-        assert!(compiled.param_names.iter().any(|n| n.as_deref() == Some(":name")));
-        assert!(compiled.param_names.iter().any(|n| n.as_deref() == Some(":value")));
+        assert!(compiled
+            .param_names
+            .iter()
+            .any(|n| n.as_deref() == Some(":name")));
+        assert!(compiled
+            .param_names
+            .iter()
+            .any(|n| n.as_deref() == Some(":value")));
     }
 
     #[test]

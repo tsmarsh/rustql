@@ -526,12 +526,13 @@ impl Mem {
             (ColumnType::Float, ColumnType::Float) => {
                 self.r.partial_cmp(&other.r).unwrap_or(Ordering::Equal)
             }
-            (ColumnType::Integer, ColumnType::Float) => {
-                (self.i as f64).partial_cmp(&other.r).unwrap_or(Ordering::Equal)
-            }
-            (ColumnType::Float, ColumnType::Integer) => {
-                self.r.partial_cmp(&(other.i as f64)).unwrap_or(Ordering::Equal)
-            }
+            (ColumnType::Integer, ColumnType::Float) => (self.i as f64)
+                .partial_cmp(&other.r)
+                .unwrap_or(Ordering::Equal),
+            (ColumnType::Float, ColumnType::Integer) => self
+                .r
+                .partial_cmp(&(other.i as f64))
+                .unwrap_or(Ordering::Equal),
 
             // Both text
             (ColumnType::Text, ColumnType::Text) => self.data.cmp(&other.data),
@@ -1057,7 +1058,10 @@ mod tests {
         );
 
         // Blob
-        assert_eq!(Mem::from_blob(&[0xDE, 0xAD, 0xBE, 0xEF]).to_sql_literal(), "X'DEADBEEF'");
+        assert_eq!(
+            Mem::from_blob(&[0xDE, 0xAD, 0xBE, 0xEF]).to_sql_literal(),
+            "X'DEADBEEF'"
+        );
         assert_eq!(Mem::from_blob(&[]).to_sql_literal(), "X''");
 
         // Zeroblob

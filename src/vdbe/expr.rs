@@ -5,7 +5,7 @@
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::schema::{BinaryOp, Expr, UnaryOp};
-use crate::vdbe::ops::{Opcode, P4, VdbeOp};
+use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
 // ============================================================================
 // Expression Compiler
@@ -158,7 +158,10 @@ impl ExprCompiler {
                 self.add_op4(Opcode::Blob, b.len() as i32, target, 0, P4::Blob(b.clone()));
             }
 
-            Expr::Column { table: _, column: _ } => {
+            Expr::Column {
+                table: _,
+                column: _,
+            } => {
                 // Column references need cursor context
                 // For now, this will be handled by the query compiler
                 return Err(Error::with_message(
@@ -228,7 +231,13 @@ impl ExprCompiler {
             Expr::Collate { expr, collation } => {
                 // Compile the expression, then apply collation
                 self.compile_expr_target(expr, target)?;
-                self.add_op4(Opcode::Affinity, target, 0, 0, P4::Collation(collation.clone()));
+                self.add_op4(
+                    Opcode::Affinity,
+                    target,
+                    0,
+                    0,
+                    P4::Collation(collation.clone()),
+                );
             }
 
             Expr::Parameter { index, name: _ } => {
@@ -532,7 +541,13 @@ impl ExprCompiler {
 
         // Determine affinity from type name
         let affinity = type_name_to_affinity(type_name);
-        self.add_op4(Opcode::Cast, target, affinity as i32, 0, P4::Text(type_name.to_string()));
+        self.add_op4(
+            Opcode::Cast,
+            target,
+            affinity as i32,
+            0,
+            P4::Text(type_name.to_string()),
+        );
 
         Ok(())
     }
@@ -541,13 +556,7 @@ impl ExprCompiler {
     // IN Expression
     // ========================================================================
 
-    fn compile_in(
-        &mut self,
-        expr: &Expr,
-        list: &[Expr],
-        negated: bool,
-        target: i32,
-    ) -> Result<()> {
+    fn compile_in(&mut self, expr: &Expr, list: &[Expr], negated: bool, target: i32) -> Result<()> {
         if list.is_empty() {
             // Empty IN list is always false (or true if negated)
             self.add_op(Opcode::Integer, if negated { 1 } else { 0 }, target, 0);

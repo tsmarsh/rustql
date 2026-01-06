@@ -151,9 +151,7 @@ impl Mem {
 
         match (&self.value, &other.value) {
             (MemValue::Int(a), MemValue::Int(b)) => a.cmp(b),
-            (MemValue::Real(a), MemValue::Real(b)) => {
-                a.partial_cmp(b).unwrap_or(Ordering::Equal)
-            }
+            (MemValue::Real(a), MemValue::Real(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
             (MemValue::Int(a), MemValue::Real(b)) => {
                 (*a as f64).partial_cmp(b).unwrap_or(Ordering::Equal)
             }
@@ -224,9 +222,7 @@ impl CollSeq {
         Self {
             name: "NOCASE".to_string(),
             encoding: Encoding::Utf8,
-            cmp: Arc::new(|a: &str, b: &str| {
-                a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase())
-            }),
+            cmp: Arc::new(|a: &str, b: &str| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase())),
         }
     }
 
@@ -382,12 +378,12 @@ impl Affinity {
     /// Create affinity from character code
     pub fn from_code(code: u8) -> Option<Self> {
         match code {
-            0x41 | b'A' => Some(Affinity::Blob),
-            0x42 | b'B' => Some(Affinity::Text),
-            0x43 | b'C' => Some(Affinity::Numeric),
-            0x44 | b'D' => Some(Affinity::Integer),
-            0x45 | b'E' => Some(Affinity::Real),
-            0x46 | b'F' => Some(Affinity::Flexnum),
+            b'A' => Some(Affinity::Blob),
+            b'B' => Some(Affinity::Text),
+            b'C' => Some(Affinity::Numeric),
+            b'D' => Some(Affinity::Integer),
+            b'E' => Some(Affinity::Real),
+            b'F' => Some(Affinity::Flexnum),
             _ => None,
         }
     }
@@ -402,10 +398,7 @@ impl Affinity {
         }
 
         // TEXT affinity
-        if upper.contains("CHAR")
-            || upper.contains("CLOB")
-            || upper.contains("TEXT")
-        {
+        if upper.contains("CHAR") || upper.contains("CLOB") || upper.contains("TEXT") {
             return Affinity::Text;
         }
 
@@ -415,10 +408,7 @@ impl Affinity {
         }
 
         // REAL affinity
-        if upper.contains("REAL")
-            || upper.contains("FLOA")
-            || upper.contains("DOUB")
-        {
+        if upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB") {
             return Affinity::Real;
         }
 

@@ -202,10 +202,7 @@ pub enum ResultColumn {
     /// Table.* (table.*)
     TableStar(String),
     /// Expression with optional alias
-    Expr {
-        expr: Expr,
-        alias: Option<String>,
-    },
+    Expr { expr: Expr, alias: Option<String> },
 }
 
 /// FROM clause

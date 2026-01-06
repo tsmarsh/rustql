@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::error::{Error, ErrorCode, Result};
-use crate::schema::{Schema, Encoding};
+use crate::schema::{Encoding, Schema};
 use crate::types::{OpenFlags, RowId};
 
 use super::config::{sqlite3_initialize, DbConfigOption};
@@ -115,7 +115,8 @@ pub type UpdateHook = Box<dyn Fn(i32, &str, &str, i64) + Send + Sync>;
 
 /// Authorizer callback type
 /// Returns SQLITE_OK (0), SQLITE_DENY (1), or SQLITE_IGNORE (2)
-pub type Authorizer = Box<dyn Fn(i32, Option<&str>, Option<&str>, Option<&str>, Option<&str>) -> i32 + Send + Sync>;
+pub type Authorizer =
+    Box<dyn Fn(i32, Option<&str>, Option<&str>, Option<&str>, Option<&str>) -> i32 + Send + Sync>;
 
 // ============================================================================
 // Connection
@@ -267,17 +268,13 @@ impl SqliteConnection {
     /// Register built-in collation sequences
     fn register_builtin_collations(&mut self) {
         // BINARY - bytewise comparison (default)
-        self.collations.insert(
-            "BINARY".to_string(),
-            Arc::new(|a: &str, b: &str| a.cmp(b)),
-        );
+        self.collations
+            .insert("BINARY".to_string(), Arc::new(|a: &str, b: &str| a.cmp(b)));
 
         // NOCASE - case-insensitive for ASCII
         self.collations.insert(
             "NOCASE".to_string(),
-            Arc::new(|a: &str, b: &str| {
-                a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase())
-            }),
+            Arc::new(|a: &str, b: &str| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase())),
         );
 
         // RTRIM - ignore trailing spaces
@@ -302,12 +299,16 @@ impl SqliteConnection {
 
     /// Find database by name
     pub fn find_db(&self, name: &str) -> Option<&DbInfo> {
-        self.dbs.iter().find(|db| db.name.eq_ignore_ascii_case(name))
+        self.dbs
+            .iter()
+            .find(|db| db.name.eq_ignore_ascii_case(name))
     }
 
     /// Find database by name (mutable)
     pub fn find_db_mut(&mut self, name: &str) -> Option<&mut DbInfo> {
-        self.dbs.iter_mut().find(|db| db.name.eq_ignore_ascii_case(name))
+        self.dbs
+            .iter_mut()
+            .find(|db| db.name.eq_ignore_ascii_case(name))
     }
 
     /// Get the main database
@@ -512,8 +513,7 @@ pub fn sqlite3_get_autocommit(conn: &SqliteConnection) -> bool {
 
 /// sqlite3_db_filename - Get filename for database
 pub fn sqlite3_db_filename<'a>(conn: &'a SqliteConnection, db_name: &str) -> Option<&'a str> {
-    conn.find_db(db_name)
-        .and_then(|db| db.path.as_deref())
+    conn.find_db(db_name).and_then(|db| db.path.as_deref())
 }
 
 /// sqlite3_db_readonly - Check if database is read-only
@@ -564,18 +564,12 @@ pub fn sqlite3_busy_timeout(conn: &mut SqliteConnection, ms: i32) -> Result<()> 
 // ============================================================================
 
 /// sqlite3_trace - Set trace callback (deprecated)
-pub fn sqlite3_trace(
-    conn: &mut SqliteConnection,
-    callback: Option<TraceCallback>,
-) {
+pub fn sqlite3_trace(conn: &mut SqliteConnection, callback: Option<TraceCallback>) {
     conn.trace = callback;
 }
 
 /// sqlite3_profile - Set profile callback (deprecated)
-pub fn sqlite3_profile(
-    conn: &mut SqliteConnection,
-    callback: Option<ProfileCallback>,
-) {
+pub fn sqlite3_profile(conn: &mut SqliteConnection, callback: Option<ProfileCallback>) {
     conn.profile = callback;
 }
 

@@ -205,7 +205,9 @@ pub fn sqlite3_config(option: ConfigOption, value: i64) -> Result<()> {
             config.uri.store(value != 0, Ordering::SeqCst);
         }
         ConfigOption::CoveringIndexScan => {
-            config.covering_index_scan.store(value != 0, Ordering::SeqCst);
+            config
+                .covering_index_scan
+                .store(value != 0, Ordering::SeqCst);
         }
         ConfigOption::MmapSize => {
             config.mmap_size.store(value, Ordering::SeqCst);

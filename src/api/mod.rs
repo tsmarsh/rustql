@@ -4,11 +4,11 @@
 //! It corresponds to SQLite's main.c.
 
 mod blob;
-mod connection;
 mod config;
+mod connection;
 mod stmt;
 
 pub use blob::*;
-pub use connection::*;
 pub use config::*;
+pub use connection::*;
 pub use stmt::*;

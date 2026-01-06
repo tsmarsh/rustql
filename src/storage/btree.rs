@@ -1,7 +1,7 @@
 //! B-tree implementation
 
 use std::ptr::NonNull;
-use std::sync::{Arc, Weak, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 
 use bitflags::bitflags;
 
@@ -231,7 +231,8 @@ impl BtShared {
     }
 
     pub fn min_local_payload(&self, _is_leaf: bool) -> u32 {
-        (self.usable_size
+        (self
+            .usable_size
             .saturating_sub(12)
             .saturating_mul(MIN_EMBEDDED as u32)
             / 255)
@@ -464,9 +465,8 @@ fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
 }
 
 fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
-    data.get(offset..offset + 4).map(|bytes| {
-        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-    })
+    data.get(offset..offset + 4)
+        .map(|bytes| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 fn write_u32(data: &mut [u8], offset: usize, value: u32) -> Result<()> {
@@ -520,7 +520,10 @@ fn build_cell(
     }
 
     let mut cell = Vec::new();
-    let mut overflow = OverflowChain { first: None, pages: Vec::new() };
+    let mut overflow = OverflowChain {
+        first: None,
+        pages: Vec::new(),
+    };
     let mut needs_overflow_ptr = false;
     if page.is_intkey && page.is_leafdata {
         let data = payload.data.as_deref().unwrap_or(&[]);
@@ -551,7 +554,10 @@ fn build_cell(
     }
 
     if page.is_zerodata {
-        let key = payload.key.as_deref().ok_or(Error::new(ErrorCode::Misuse))?;
+        let key = payload
+            .key
+            .as_deref()
+            .ok_or(Error::new(ErrorCode::Misuse))?;
         let payload_size = key.len();
         write_varint(payload_size as u64, &mut cell);
         let local = page.payload_to_local(payload_size as i64, limits)? as usize;
@@ -627,15 +633,18 @@ fn collapse_root_if_empty(shared: &mut BtShared, root_pgno: Pgno) -> Result<()> 
         PageLimits::new(shared.page_size, shared.usable_size)
     };
     let root_page = shared.pager.get(root_pgno, PagerGetFlags::empty())?;
-    let mem_page = MemPage::parse_with_shared(root_pgno, root_page.data.clone(), limits, Some(shared))?;
+    let mem_page =
+        MemPage::parse_with_shared(root_pgno, root_page.data.clone(), limits, Some(shared))?;
     if mem_page.is_leaf {
         return Ok(());
     }
     if mem_page.n_cell > 0 {
         return Ok(());
     }
-    let child_pgno = mem_page.rightmost_ptr.ok_or(Error::new(ErrorCode::Corrupt))?;
-    let child_limits = if child_pgno == 1 {
+    let child_pgno = mem_page
+        .rightmost_ptr
+        .ok_or(Error::new(ErrorCode::Corrupt))?;
+    let _child_limits = if child_pgno == 1 {
         PageLimits::for_page1(shared.page_size, shared.usable_size)
     } else {
         PageLimits::new(shared.page_size, shared.usable_size)
@@ -648,11 +657,7 @@ fn collapse_root_if_empty(shared: &mut BtShared, root_pgno: Pgno) -> Result<()> 
     Ok(())
 }
 
-fn build_leaf_page_data(
-    limits: PageLimits,
-    flags: u8,
-    cells: &[Vec<u8>],
-) -> Result<Vec<u8>> {
+fn build_leaf_page_data(limits: PageLimits, flags: u8, cells: &[Vec<u8>]) -> Result<Vec<u8>> {
     let mut data = vec![0u8; limits.page_size as usize];
     let header_start = limits.header_start();
     data[header_start] = flags;
@@ -681,7 +686,10 @@ fn build_internal_cell(child_pgno: Pgno, key: &CellInfo, is_index: bool) -> Resu
     let mut cell = Vec::new();
     cell.extend_from_slice(&child_pgno.to_be_bytes());
     if is_index {
-        let payload = key.payload.as_ref().ok_or(Error::new(ErrorCode::Internal))?;
+        let payload = key
+            .payload
+            .as_ref()
+            .ok_or(Error::new(ErrorCode::Internal))?;
         write_varint(payload.len() as u64, &mut cell);
         cell.extend_from_slice(payload);
     } else {
@@ -785,7 +793,10 @@ fn rebuild_internal_children(
         if parent.is_intkey {
             keys.push(InternalKey::Int(info.n_key));
         } else {
-            let payload = info.payload.clone().ok_or(Error::new(ErrorCode::Internal))?;
+            let payload = info
+                .payload
+                .clone()
+                .ok_or(Error::new(ErrorCode::Internal))?;
             keys.push(InternalKey::Blob(payload));
         }
     }
@@ -962,7 +973,11 @@ fn merge_leaf_with_sibling(
     }
 
     let use_left = child_index > 0;
-    let sibling_index = if use_left { child_index - 1 } else { child_index + 1 };
+    let sibling_index = if use_left {
+        child_index - 1
+    } else {
+        child_index + 1
+    };
     let sibling_pgno = parent.child_pgno_for_index(sibling_index, parent_limits)?;
     let (sibling_page, sibling_limits) = {
         let page = shared.pager.get(sibling_pgno, PagerGetFlags::empty())?;
@@ -1115,11 +1130,19 @@ fn merge_leaf_with_sibling(
     left_db_page.data = new_left_data;
 
     let (mut keys, mut children) = rebuild_internal_children(parent, parent_limits)?;
-    let key_remove = if use_left { child_index - 1 } else { child_index };
+    let key_remove = if use_left {
+        child_index - 1
+    } else {
+        child_index
+    };
     if (key_remove as usize) < keys.len() {
         keys.remove(key_remove as usize);
     }
-    let child_remove = if use_left { child_index } else { child_index + 1 };
+    let child_remove = if use_left {
+        child_index
+    } else {
+        child_index + 1
+    };
     if (child_remove as usize) < children.len() {
         children.remove(child_remove as usize);
     }
@@ -1155,7 +1178,11 @@ fn merge_internal_with_sibling(
     }
 
     let use_left = child_index > 0;
-    let sibling_index = if use_left { child_index - 1 } else { child_index + 1 };
+    let sibling_index = if use_left {
+        child_index - 1
+    } else {
+        child_index + 1
+    };
     let sibling_pgno = parent.child_pgno_for_index(sibling_index, parent_limits)?;
     let (sibling_page, sibling_limits) = {
         let page = shared.pager.get(sibling_pgno, PagerGetFlags::empty())?;
@@ -1193,14 +1220,22 @@ fn merge_internal_with_sibling(
     };
 
     let (mut left_keys, mut left_children) = rebuild_internal_children(&left_page, left_limits)?;
-    let (mut right_keys, mut right_children) = rebuild_internal_children(&right_page, right_limits)?;
-    let sep_index = if use_left { child_index - 1 } else { child_index };
+    let (mut right_keys, mut right_children) =
+        rebuild_internal_children(&right_page, right_limits)?;
+    let sep_index = if use_left {
+        child_index - 1
+    } else {
+        child_index
+    };
     let sep_offset = parent.cell_ptr(sep_index, parent_limits)?;
     let sep_info = parent.parse_cell(sep_offset, parent_limits)?;
     let sep_key = if left_page.is_intkey {
         InternalKey::Int(sep_info.n_key)
     } else {
-        let payload = sep_info.payload.clone().ok_or(Error::new(ErrorCode::Internal))?;
+        let payload = sep_info
+            .payload
+            .clone()
+            .ok_or(Error::new(ErrorCode::Internal))?;
         InternalKey::Blob(payload)
     };
 
@@ -1212,7 +1247,7 @@ fn merge_internal_with_sibling(
             right_children.insert(0, borrowed_child);
             right_keys.insert(0, sep_key.clone());
 
-            let (mut pkeys, mut pchildren) = rebuild_internal_children(parent, parent_limits)?;
+            let (mut pkeys, pchildren) = rebuild_internal_children(parent, parent_limits)?;
             let sep_pos = sep_index as usize;
             if sep_pos < pkeys.len() {
                 pkeys[sep_pos] = new_sep.clone();
@@ -1225,7 +1260,8 @@ fn merge_internal_with_sibling(
             parent_page.data = parent_data;
 
             let flags = left_page.data[left_limits.header_start()];
-            let left_data = build_internal_page_data(left_limits, flags, &left_keys, &left_children)?;
+            let left_data =
+                build_internal_page_data(left_limits, flags, &left_keys, &left_children)?;
             let mut left_db_page = shared.pager.get(left_pgno, PagerGetFlags::empty())?;
             shared.pager.write(&mut left_db_page)?;
             left_db_page.data = left_data;
@@ -1243,7 +1279,7 @@ fn merge_internal_with_sibling(
             left_children.push(borrowed_child);
             left_keys.push(sep_key.clone());
 
-            let (mut pkeys, mut pchildren) = rebuild_internal_children(parent, parent_limits)?;
+            let (mut pkeys, pchildren) = rebuild_internal_children(parent, parent_limits)?;
             let sep_pos = sep_index as usize;
             if sep_pos < pkeys.len() {
                 pkeys[sep_pos] = new_sep.clone();
@@ -1256,7 +1292,8 @@ fn merge_internal_with_sibling(
             parent_page.data = parent_data;
 
             let flags = left_page.data[left_limits.header_start()];
-            let left_data = build_internal_page_data(left_limits, flags, &left_keys, &left_children)?;
+            let left_data =
+                build_internal_page_data(left_limits, flags, &left_keys, &left_children)?;
             let mut left_db_page = shared.pager.get(left_pgno, PagerGetFlags::empty())?;
             shared.pager.write(&mut left_db_page)?;
             left_db_page.data = left_data;
@@ -1288,7 +1325,11 @@ fn merge_internal_with_sibling(
     if key_remove < pkeys.len() {
         pkeys.remove(key_remove);
     }
-    let child_remove = if use_left { child_index } else { child_index + 1 };
+    let child_remove = if use_left {
+        child_index
+    } else {
+        child_index + 1
+    };
     if (child_remove as usize) < pchildren.len() {
         pchildren.remove(child_remove as usize);
     }
@@ -1322,7 +1363,9 @@ fn parse_cell_from_bytes(page: &MemPage, limits: PageLimits, cell: &[u8]) -> Res
     }
 
     let (payload_size, n1) = read_varint32(cell, cursor)?;
-    cursor = cursor.checked_add(n1).ok_or(Error::new(ErrorCode::Corrupt))?;
+    cursor = cursor
+        .checked_add(n1)
+        .ok_or(Error::new(ErrorCode::Corrupt))?;
 
     let (n_key, n2) = if page.is_intkey {
         read_varint(cell, cursor)?
@@ -1332,7 +1375,9 @@ fn parse_cell_from_bytes(page: &MemPage, limits: PageLimits, cell: &[u8]) -> Res
         let (key_bytes, bytes) = read_varint32(cell, cursor)?;
         (key_bytes as u64, bytes)
     };
-    cursor = cursor.checked_add(n2).ok_or(Error::new(ErrorCode::Corrupt))?;
+    cursor = cursor
+        .checked_add(n2)
+        .ok_or(Error::new(ErrorCode::Corrupt))?;
 
     let mut info = CellInfo::default();
     info.n_key = n_key as i64;
@@ -1392,8 +1437,16 @@ fn split_root_leaf(
     let left_pgno = allocate_page(shared);
     let right_pgno = allocate_page(shared);
     let flags = mem_page.data[limits.header_start()];
-    let left_data = build_leaf_page_data(PageLimits::new(shared.page_size, shared.usable_size), flags, &left_cells)?;
-    let right_data = build_leaf_page_data(PageLimits::new(shared.page_size, shared.usable_size), flags, &right_cells)?;
+    let left_data = build_leaf_page_data(
+        PageLimits::new(shared.page_size, shared.usable_size),
+        flags,
+        &left_cells,
+    )?;
+    let right_data = build_leaf_page_data(
+        PageLimits::new(shared.page_size, shared.usable_size),
+        flags,
+        &right_cells,
+    )?;
 
     let mut left_page = shared.pager.get(left_pgno, PagerGetFlags::empty())?;
     shared.pager.write(&mut left_page)?;
@@ -1463,8 +1516,16 @@ fn split_leaf_with_parent(
     }
 
     let flags = mem_page.data[limits.header_start()];
-    let left_data = build_leaf_page_data(PageLimits::new(shared.page_size, shared.usable_size), flags, &left_cells)?;
-    let right_data = build_leaf_page_data(PageLimits::new(shared.page_size, shared.usable_size), flags, &right_cells)?;
+    let left_data = build_leaf_page_data(
+        PageLimits::new(shared.page_size, shared.usable_size),
+        flags,
+        &left_cells,
+    )?;
+    let right_data = build_leaf_page_data(
+        PageLimits::new(shared.page_size, shared.usable_size),
+        flags,
+        &right_cells,
+    )?;
 
     let mut left_page = shared.pager.get(leaf_pgno, PagerGetFlags::empty())?;
     shared.pager.write(&mut left_page)?;
@@ -1571,7 +1632,7 @@ fn put_varint_at(buf: &mut [u8], value: u64) -> usize {
     if len == 9 {
         buf[0] = 0xFF;
         for i in 1..9 {
-            buf[i] = ((value >> (8 - i) * 8) & 0xFF) as u8;
+            buf[i] = ((value >> ((8 - i) * 8)) & 0xFF) as u8;
         }
     } else {
         let mut v = value;
@@ -1617,7 +1678,8 @@ impl MemPage {
         let first_freeblock =
             read_u16(&data, header_start + 1).ok_or(Error::new(ErrorCode::Corrupt))?;
         let n_cell = read_u16(&data, header_start + 3).ok_or(Error::new(ErrorCode::Corrupt))?;
-        let cell_offset = read_u16(&data, header_start + 5).ok_or(Error::new(ErrorCode::Corrupt))?;
+        let cell_offset =
+            read_u16(&data, header_start + 5).ok_or(Error::new(ErrorCode::Corrupt))?;
         let free_bytes = data[header_start + 7] as u16;
         let rightmost_ptr = if is_leaf {
             None
@@ -1752,13 +1814,25 @@ impl MemPage {
 
     fn apply_shared(&mut self, shared: &BtShared) -> Result<()> {
         let flag_byte = (if self.is_leaf { BTREE_PAGEFLAG_LEAF } else { 0 })
-            | (if self.is_intkey { BTREE_PAGEFLAG_INTKEY } else { 0 })
-            | (if self.is_leafdata { BTREE_PAGEFLAG_LEAFDATA } else { 0 })
-            | (if self.is_zerodata { BTREE_PAGEFLAG_ZERODATA } else { 0 });
+            | (if self.is_intkey {
+                BTREE_PAGEFLAG_INTKEY
+            } else {
+                0
+            })
+            | (if self.is_leafdata {
+                BTREE_PAGEFLAG_LEAFDATA
+            } else {
+                0
+            })
+            | (if self.is_zerodata {
+                BTREE_PAGEFLAG_ZERODATA
+            } else {
+                0
+            });
 
-        let is_table = (flag_byte & BTREE_PAGEFLAG_INTKEY != 0)
-            && (flag_byte & BTREE_PAGEFLAG_LEAFDATA != 0);
-        let is_index = (flag_byte & BTREE_PAGEFLAG_ZERODATA != 0);
+        let is_table =
+            (flag_byte & BTREE_PAGEFLAG_INTKEY != 0) && (flag_byte & BTREE_PAGEFLAG_LEAFDATA != 0);
+        let is_index = flag_byte & BTREE_PAGEFLAG_ZERODATA != 0;
 
         if self.is_leaf {
             self.child_ptr_size = 0;
@@ -1795,14 +1869,18 @@ impl MemPage {
 
         let mut cursor = start;
         if !self.is_leaf {
-            cursor = cursor.checked_add(4).ok_or(Error::new(ErrorCode::Corrupt))?;
+            cursor = cursor
+                .checked_add(4)
+                .ok_or(Error::new(ErrorCode::Corrupt))?;
         }
 
         let mut info = CellInfo::default();
 
         if self.is_intkey && !self.is_leaf && self.is_leafdata {
             let (n_key, n_bytes) = read_varint(&self.data, cursor)?;
-            cursor = cursor.checked_add(n_bytes).ok_or(Error::new(ErrorCode::Corrupt))?;
+            cursor = cursor
+                .checked_add(n_bytes)
+                .ok_or(Error::new(ErrorCode::Corrupt))?;
             info.n_key = n_key as i64;
             info.n_payload = 0;
             info.n_local = 0;
@@ -1818,7 +1896,9 @@ impl MemPage {
             let (payload, bytes) = read_varint32(&self.data, cursor)?;
             (payload, bytes)
         };
-        cursor = cursor.checked_add(n1).ok_or(Error::new(ErrorCode::Corrupt))?;
+        cursor = cursor
+            .checked_add(n1)
+            .ok_or(Error::new(ErrorCode::Corrupt))?;
 
         let (n_key, n2) = if self.is_intkey {
             read_varint(&self.data, cursor)?
@@ -1828,7 +1908,9 @@ impl MemPage {
             let (key_bytes, bytes) = read_varint32(&self.data, cursor)?;
             (key_bytes as u64, bytes)
         };
-        cursor = cursor.checked_add(n2).ok_or(Error::new(ErrorCode::Corrupt))?;
+        cursor = cursor
+            .checked_add(n2)
+            .ok_or(Error::new(ErrorCode::Corrupt))?;
 
         info.n_key = n_key as i64;
         info.n_payload = payload_size;
@@ -2018,7 +2100,9 @@ impl Btree {
         if let Ok(page) = shared.pager.get(1, PagerGetFlags::empty()) {
             if let Ok(header) = DbHeader::parse(&page.data) {
                 if header.page_size != shared.page_size {
-                    let _ = shared.pager.set_page_size(header.page_size, header.reserve as i32);
+                    let _ = shared
+                        .pager
+                        .set_page_size(header.page_size, header.reserve as i32);
                     shared.page_size = shared.pager.page_size;
                     shared.usable_size = shared.pager.usable_size;
                 }
@@ -2033,7 +2117,7 @@ impl Btree {
 
         let page1_limits = PageLimits::for_page1(shared.page_size, shared.usable_size);
         if let Ok(page) = shared.pager.get(1, PagerGetFlags::empty()) {
-            if let Ok(mut mem_page) =
+            if let Ok(mem_page) =
                 MemPage::parse_with_shared(1, page.data.clone(), page1_limits, Some(&shared))
             {
                 let _ = mem_page.validate_layout(page1_limits);
@@ -2112,7 +2196,10 @@ impl Btree {
 
     /// sqlite3BtreeClose
     pub fn close(&mut self) -> Result<()> {
-        let mut shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut shared = self
+            .shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
         shared.pager.close()?;
         Ok(())
     }
@@ -2148,7 +2235,10 @@ impl Btree {
 
     /// sqlite3BtreeSetPageSize
     pub fn set_page_size(&mut self, page_size: u32, reserve: i32, fix: bool) -> Result<()> {
-        let mut shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut shared = self
+            .shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
         shared.pager.set_page_size(page_size, reserve)?;
         shared.page_size = shared.pager.page_size;
         shared.usable_size = shared.pager.usable_size;
@@ -2193,7 +2283,9 @@ impl Btree {
             if on {
                 shared.bts_flags.insert(BtsFlags::SECURE_DELETE);
             } else {
-                shared.bts_flags.remove(BtsFlags::SECURE_DELETE | BtsFlags::OVERWRITE);
+                shared
+                    .bts_flags
+                    .remove(BtsFlags::SECURE_DELETE | BtsFlags::OVERWRITE);
             }
             return was;
         }
@@ -2233,7 +2325,10 @@ impl Btree {
 
     /// sqlite3BtreeBeginTrans
     pub fn begin_trans(&mut self, write: bool) -> Result<()> {
-        let mut shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut shared = self
+            .shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
         if write {
             shared.pager.begin(false)?;
             shared.in_transaction = TransState::Write;
@@ -2246,20 +2341,30 @@ impl Btree {
     }
 
     /// sqlite3BtreeBeginTrans with schema flag
-    pub fn begin_trans_with_schema(&mut self, write: bool, _schema_modified: &mut i32) -> Result<()> {
+    pub fn begin_trans_with_schema(
+        &mut self,
+        write: bool,
+        _schema_modified: &mut i32,
+    ) -> Result<()> {
         self.begin_trans(write)
     }
 
     /// sqlite3BtreeCommitPhaseOne
     pub fn commit_phase_one(&mut self, super_journal: Option<&str>) -> Result<()> {
-        let mut shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut shared = self
+            .shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
         shared.pager.commit_phase_one(super_journal)?;
         Ok(())
     }
 
     /// sqlite3BtreeCommitPhaseTwo
     pub fn commit_phase_two(&mut self, _cleanup: bool) -> Result<()> {
-        let mut shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut shared = self
+            .shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
         shared.pager.commit_phase_two()?;
         shared.in_transaction = TransState::None;
         self.in_trans = TransState::None;
@@ -2274,7 +2379,10 @@ impl Btree {
 
     /// sqlite3BtreeRollback
     pub fn rollback(&mut self, _trip_code: i32, _write_only: bool) -> Result<()> {
-        let mut shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut shared = self
+            .shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
         shared.pager.rollback()?;
         shared.in_transaction = TransState::None;
         self.in_trans = TransState::None;
@@ -2340,7 +2448,10 @@ impl Btree {
         if _flags.contains(BtreeInsertFlags::PREFORMAT) {
             return Err(Error::new(ErrorCode::Internal));
         }
-        let shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let shared = self
+            .shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
         let mut shared_guard = shared;
         let root_pgno = _cursor.root_page;
         let mut mem_page = _cursor.load_page(&mut shared_guard, root_pgno)?.0;
@@ -2367,8 +2478,7 @@ impl Btree {
             }
         }
 
-        let (mut cell, mut overflow, needs_overflow_ptr) =
-            build_cell(&mem_page, limits, _payload)?;
+        let (mut cell, mut overflow, needs_overflow_ptr) = build_cell(&mem_page, limits, _payload)?;
         if !overflow.pages.is_empty() {
             let pages_len = overflow.pages.len();
             let mut pgno_list = Vec::with_capacity(pages_len);
@@ -2402,11 +2512,12 @@ impl Btree {
         }
 
         // Calculate insert_index before checking if split is needed
-        let insert_index = if _flags.contains(BtreeInsertFlags::APPEND) || _cursor.state != CursorState::Valid {
-            mem_page.n_cell
-        } else {
-            _cursor.ix.min(mem_page.n_cell)
-        };
+        let insert_index =
+            if _flags.contains(BtreeInsertFlags::APPEND) || _cursor.state != CursorState::Valid {
+                mem_page.n_cell
+            } else {
+                _cursor.ix.min(mem_page.n_cell)
+            };
 
         let header_start = limits.header_start();
         let header_size = mem_page.header_size();
@@ -2446,10 +2557,14 @@ impl Btree {
                     )?;
                     return Ok(());
                 }
-            } else if let (Some(parent), Some(child_index)) =
-                (_cursor.page_stack.get(_cursor.page_stack.len().saturating_sub(2)),
-                 _cursor.idx_stack.get(_cursor.idx_stack.len().saturating_sub(2)))
-            {
+            } else if let (Some(parent), Some(child_index)) = (
+                _cursor
+                    .page_stack
+                    .get(_cursor.page_stack.len().saturating_sub(2)),
+                _cursor
+                    .idx_stack
+                    .get(_cursor.idx_stack.len().saturating_sub(2)),
+            ) {
                 let parent_limits = if parent.pgno == 1 {
                     PageLimits::for_page1(shared_guard.page_size, shared_guard.usable_size)
                 } else {
@@ -2497,7 +2612,10 @@ impl Btree {
 
     /// sqlite3BtreeDelete
     pub fn delete(&mut self, _cursor: &mut BtCursor, _flags: BtreeInsertFlags) -> Result<()> {
-        let shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let shared = self
+            .shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
         let mut shared_guard = shared;
         let root_pgno = _cursor.root_page;
         let (mem_page, limits) = _cursor.load_page(&mut shared_guard, root_pgno)?;
@@ -2520,7 +2638,7 @@ impl Btree {
         if let Some(overflow_pgno) = info.overflow_pgno {
             free_overflow_chain(&mut shared_guard, overflow_pgno)?;
         }
-        let cell_size = info.n_size as i32;
+        let _cell_size = info.n_size as i32;
 
         let from = ptr_array_start + ((_cursor.ix as usize + 1) * 2);
         let to = ptr_array_start + (_cursor.ix as usize * 2);
@@ -2575,7 +2693,10 @@ impl Btree {
 
     /// sqlite3BtreeCreateTable
     pub fn create_table(&mut self, _flags: u8) -> Result<Pgno> {
-        let mut shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut shared = self
+            .shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
         let new_pgno = allocate_page(&mut shared);
         let mut page = shared.pager.get(new_pgno, PagerGetFlags::empty())?;
         shared.pager.write(&mut page)?;
@@ -2603,7 +2724,10 @@ impl Btree {
             return Err(Error::new(ErrorCode::Range));
         }
         if _root_page != 1 {
-            let mut shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+            let mut shared = self
+                .shared
+                .write()
+                .map_err(|_| Error::new(ErrorCode::Internal))?;
             shared.free_pages.push(_root_page);
             update_free_page_count(&mut shared, 1)?;
         }
@@ -2612,7 +2736,10 @@ impl Btree {
 
     /// sqlite3BtreeClearTable
     pub fn clear_table(&mut self, _root_page: Pgno) -> Result<i64> {
-        let mut shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut shared = self
+            .shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
         let mut page = shared.pager.get(_root_page, PagerGetFlags::empty())?;
         shared.pager.write(&mut page)?;
         let limits = if _root_page == 1 {
@@ -2620,7 +2747,8 @@ impl Btree {
         } else {
             PageLimits::new(shared.page_size, shared.usable_size)
         };
-        let mem_page = MemPage::parse_with_shared(_root_page, page.data.clone(), limits, Some(&shared))?;
+        let mem_page =
+            MemPage::parse_with_shared(_root_page, page.data.clone(), limits, Some(&shared))?;
         for i in 0..mem_page.n_cell {
             let cell_offset = mem_page.cell_ptr(i, limits)?;
             let info = mem_page.parse_cell(cell_offset, limits)?;
@@ -2681,7 +2809,10 @@ impl Btree {
 
     /// sqlite3BtreeSavepoint
     pub fn savepoint(&mut self, op: SavepointOp, index: i32) -> Result<()> {
-        let mut shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut shared = self
+            .shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
         shared.pager.savepoint(op, index)
     }
 
@@ -2724,15 +2855,24 @@ impl Btree {
         if _idx == BTREE_DATA_VERSION {
             return Ok(0);
         }
-        let shared = self.shared.read().map_err(|_| Error::new(ErrorCode::Internal))?;
-        let page1 = shared.page1.as_ref().ok_or(Error::new(ErrorCode::Corrupt))?;
+        let shared = self
+            .shared
+            .read()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
+        let page1 = shared
+            .page1
+            .as_ref()
+            .ok_or(Error::new(ErrorCode::Corrupt))?;
         let offset = 36usize + (_idx * 4);
         read_u32(&page1.data, offset).ok_or(Error::new(ErrorCode::Corrupt))
     }
 
     /// sqlite3BtreeUpdateMeta
     pub fn update_meta(&mut self, _idx: usize, _value: u32) -> Result<()> {
-        let mut shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut shared = self
+            .shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
         if _idx >= SQLITE_N_BTREE_META {
             return Err(Error::new(ErrorCode::Range));
         }
@@ -2751,7 +2891,10 @@ impl Btree {
 
     /// sqlite3BtreeNewDb
     pub fn new_db(&mut self) -> Result<()> {
-        let mut shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut shared = self
+            .shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
         let mut page = shared.pager.get(1, PagerGetFlags::empty())?;
         shared.pager.write(&mut page)?;
         page.data.fill(0);
@@ -2775,7 +2918,9 @@ impl Btree {
         shared.schema_cookie = 0;
         shared.file_format = 1;
         let limits = PageLimits::for_page1(shared.page_size, shared.usable_size);
-        if let Ok(mem_page) = MemPage::parse_with_shared(1, page.data.clone(), limits, Some(&shared)) {
+        if let Ok(mem_page) =
+            MemPage::parse_with_shared(1, page.data.clone(), limits, Some(&shared))
+        {
             shared.page1 = Some(mem_page);
         }
         Ok(())
@@ -2783,7 +2928,10 @@ impl Btree {
 
     /// sqlite3BtreeSetVersion
     pub fn set_version(&mut self, _version: i32) -> Result<()> {
-        let mut shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut shared = self
+            .shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
         let mut page = shared.pager.get(1, PagerGetFlags::empty())?;
         shared.pager.write(&mut page)?;
         let version = if _version < 0 { 0 } else { _version as u8 };
@@ -2823,7 +2971,12 @@ impl Btree {
     }
 
     /// sqlite3BtreeTransferRow
-    pub fn transfer_row(&mut self, _source: &mut BtCursor, _dest: &mut BtCursor, _i_rowid: i64) -> Result<()> {
+    pub fn transfer_row(
+        &mut self,
+        _source: &mut BtCursor,
+        _dest: &mut BtCursor,
+        _i_rowid: i64,
+    ) -> Result<()> {
         Err(Error::new(ErrorCode::Internal))
     }
 }
@@ -2845,7 +2998,9 @@ impl BtCursor {
             .bt_shared
             .upgrade()
             .ok_or(Error::new(ErrorCode::Internal))?;
-        let mut shared_guard = shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut shared_guard = shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
         let pgno = self.root_page;
         let limits = if pgno == 1 {
             PageLimits::for_page1(shared_guard.page_size, shared_guard.usable_size)
@@ -2853,7 +3008,7 @@ impl BtCursor {
             PageLimits::new(shared_guard.page_size, shared_guard.usable_size)
         };
         let page = shared_guard.pager.get(pgno, PagerGetFlags::empty())?;
-        let mut mem_page =
+        let mem_page =
             MemPage::parse_with_shared(pgno, page.data.clone(), limits, Some(&shared_guard))?;
         mem_page.validate_layout(limits)?;
         Ok((mem_page, limits))
@@ -2867,24 +3022,23 @@ impl BtCursor {
         Ok((mem_page, limits))
     }
 
-    fn load_page(
-        &self,
-        shared: &mut BtShared,
-        pgno: Pgno,
-    ) -> Result<(MemPage, PageLimits)> {
+    fn load_page(&self, shared: &mut BtShared, pgno: Pgno) -> Result<(MemPage, PageLimits)> {
         let limits = if pgno == 1 {
             PageLimits::for_page1(shared.page_size, shared.usable_size)
         } else {
             PageLimits::new(shared.page_size, shared.usable_size)
         };
         let page = shared.pager.get(pgno, PagerGetFlags::empty())?;
-        let mut mem_page =
-            MemPage::parse_with_shared(pgno, page.data.clone(), limits, Some(shared))?;
+        let mem_page = MemPage::parse_with_shared(pgno, page.data.clone(), limits, Some(shared))?;
         mem_page.validate_layout(limits)?;
         Ok((mem_page, limits))
     }
 
-    fn descend_leftmost(&mut self, shared: &mut BtShared, pgno: Pgno) -> Result<(MemPage, PageLimits)> {
+    fn descend_leftmost(
+        &mut self,
+        shared: &mut BtShared,
+        pgno: Pgno,
+    ) -> Result<(MemPage, PageLimits)> {
         let mut current_pgno = pgno;
         loop {
             let (page, limits) = self.load_page(shared, current_pgno)?;
@@ -2893,12 +3047,20 @@ impl BtCursor {
             }
             self.page_stack.push(page);
             self.idx_stack.push(0);
-            let child = self.page_stack.last().unwrap().child_pgno_for_index(0, limits)?;
+            let child = self
+                .page_stack
+                .last()
+                .unwrap()
+                .child_pgno_for_index(0, limits)?;
             current_pgno = child;
         }
     }
 
-    fn descend_rightmost(&mut self, shared: &mut BtShared, pgno: Pgno) -> Result<(MemPage, PageLimits)> {
+    fn descend_rightmost(
+        &mut self,
+        shared: &mut BtShared,
+        pgno: Pgno,
+    ) -> Result<(MemPage, PageLimits)> {
         let mut current_pgno = pgno;
         loop {
             let (page, limits) = self.load_page(shared, current_pgno)?;
@@ -2947,7 +3109,9 @@ impl BtCursor {
             .bt_shared
             .upgrade()
             .ok_or(Error::new(ErrorCode::Internal))?;
-        let mut shared_guard = shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut shared_guard = shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
         self.page_stack.clear();
         self.idx_stack.clear();
         let (mem_page, limits) = self.descend_leftmost(&mut shared_guard, self.root_page)?;
@@ -2965,7 +3129,9 @@ impl BtCursor {
             .bt_shared
             .upgrade()
             .ok_or(Error::new(ErrorCode::Internal))?;
-        let mut shared_guard = shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut shared_guard = shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
         self.page_stack.clear();
         self.idx_stack.clear();
         let (mem_page, limits) = self.descend_rightmost(&mut shared_guard, self.root_page)?;
@@ -2989,7 +3155,9 @@ impl BtCursor {
             .bt_shared
             .upgrade()
             .ok_or(Error::new(ErrorCode::Internal))?;
-        let mut shared_guard = shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut shared_guard = shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
         let limits = if page.pgno == 1 {
             PageLimits::for_page1(shared_guard.page_size, shared_guard.usable_size)
         } else {
@@ -3012,8 +3180,7 @@ impl BtCursor {
                     PageLimits::new(shared_guard.page_size, shared_guard.usable_size)
                 };
                 let child_pgno = parent_ref.child_pgno_for_index(next_child, parent_limits)?;
-                let (leaf, leaf_limits) =
-                    self.descend_leftmost(&mut shared_guard, child_pgno)?;
+                let (leaf, leaf_limits) = self.descend_leftmost(&mut shared_guard, child_pgno)?;
                 if leaf.n_cell == 0 {
                     self.state = CursorState::Invalid;
                     return Ok(());
@@ -3036,7 +3203,9 @@ impl BtCursor {
             .bt_shared
             .upgrade()
             .ok_or(Error::new(ErrorCode::Internal))?;
-        let mut shared_guard = shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut shared_guard = shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
         let limits = if page.pgno == 1 {
             PageLimits::for_page1(shared_guard.page_size, shared_guard.usable_size)
         } else {
@@ -3060,8 +3229,7 @@ impl BtCursor {
                     PageLimits::new(shared_guard.page_size, shared_guard.usable_size)
                 };
                 let child_pgno = parent_ref.child_pgno_for_index(prev_child, parent_limits)?;
-                let (leaf, leaf_limits) =
-                    self.descend_rightmost(&mut shared_guard, child_pgno)?;
+                let (leaf, leaf_limits) = self.descend_rightmost(&mut shared_guard, child_pgno)?;
                 if leaf.n_cell == 0 {
                     self.state = CursorState::Invalid;
                     return Ok(());
@@ -3081,7 +3249,9 @@ impl BtCursor {
             .bt_shared
             .upgrade()
             .ok_or(Error::new(ErrorCode::Internal))?;
-        let mut shared_guard = shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut shared_guard = shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
         self.page_stack.clear();
         self.idx_stack.clear();
         let (mem_page, _) = self.descend_leftmost(&mut shared_guard, self.root_page)?;
@@ -3128,10 +3298,15 @@ impl BtCursor {
         let payload = if self.info.overflow_pgno.is_some() {
             self.read_overflow_payload()?
         } else {
-            self.info.payload.clone().ok_or(Error::new(ErrorCode::Corrupt))?
+            self.info
+                .payload
+                .clone()
+                .ok_or(Error::new(ErrorCode::Corrupt))?
         };
         let start = offset as usize;
-        let end = start.checked_add(amount as usize).ok_or(Error::new(ErrorCode::Corrupt))?;
+        let end = start
+            .checked_add(amount as usize)
+            .ok_or(Error::new(ErrorCode::Corrupt))?;
         if end > payload.len() {
             return Err(Error::new(ErrorCode::Corrupt));
         }
@@ -3143,10 +3318,15 @@ impl BtCursor {
             .bt_shared
             .upgrade()
             .ok_or(Error::new(ErrorCode::Internal))?;
-        let mut shared_guard = shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut shared_guard = shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
         let mut result = self.info.payload.clone().unwrap_or_default();
         let mut remaining = self.info.n_payload.saturating_sub(self.info.n_local as u32);
-        let mut next = self.info.overflow_pgno.ok_or(Error::new(ErrorCode::Corrupt))?;
+        let mut next = self
+            .info
+            .overflow_pgno
+            .ok_or(Error::new(ErrorCode::Corrupt))?;
         let ovfl_size = shared_guard.usable_size.saturating_sub(4) as usize;
 
         while remaining > 0 {
@@ -3190,7 +3370,9 @@ impl BtCursor {
             .bt_shared
             .upgrade()
             .ok_or(Error::new(ErrorCode::Internal))?;
-        let mut shared_guard = shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut shared_guard = shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
         let limits = if page.pgno == 1 {
             PageLimits::for_page1(shared_guard.page_size, shared_guard.usable_size)
         } else {
@@ -3260,7 +3442,9 @@ impl BtCursor {
             .bt_shared
             .upgrade()
             .ok_or(Error::new(ErrorCode::Internal))?;
-        let mut shared_guard = shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut shared_guard = shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
         let mut pgno = self.root_page;
         self.page_stack.clear();
         self.idx_stack.clear();
@@ -3328,7 +3512,9 @@ impl BtCursor {
             .bt_shared
             .upgrade()
             .ok_or(Error::new(ErrorCode::Internal))?;
-        let mut shared_guard = shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut shared_guard = shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
         let mut pgno = self.root_page;
         self.page_stack.clear();
         self.idx_stack.clear();

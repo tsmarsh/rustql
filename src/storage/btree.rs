@@ -41,6 +41,7 @@ pub const PTRMAP_FREEPAGE: u8 = 2;
 pub const PTRMAP_OVERFLOW1: u8 = 3;
 pub const PTRMAP_OVERFLOW2: u8 = 4;
 pub const PTRMAP_BTREE: u8 = 5;
+pub const SQLITE_FILE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 
 bitflags! {
     #[derive(Clone, Copy)]
@@ -399,6 +400,15 @@ fn write_u32(data: &mut [u8], offset: usize, value: u32) -> Result<()> {
     let bytes = value.to_be_bytes();
     let target = data
         .get_mut(offset..offset + 4)
+        .ok_or(Error::new(ErrorCode::Corrupt))?;
+    target.copy_from_slice(&bytes);
+    Ok(())
+}
+
+fn write_u16(data: &mut [u8], offset: usize, value: u16) -> Result<()> {
+    let bytes = value.to_be_bytes();
+    let target = data
+        .get_mut(offset..offset + 2)
         .ok_or(Error::new(ErrorCode::Corrupt))?;
     target.copy_from_slice(&bytes);
     Ok(())
@@ -1239,12 +1249,52 @@ impl Btree {
 
     /// sqlite3BtreeNewDb
     pub fn new_db(&mut self) -> Result<()> {
-        Err(Error::new(ErrorCode::Internal))
+        let mut shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut page = shared.pager.get(1, PagerGetFlags::empty())?;
+        shared.pager.write(&mut page)?;
+        page.data.fill(0);
+        page.data[..SQLITE_FILE_HEADER.len()].copy_from_slice(SQLITE_FILE_HEADER);
+        let page_size = if shared.page_size == 65536 {
+            1
+        } else {
+            shared.page_size as u16
+        };
+        write_u16(&mut page.data, 16, page_size)?;
+        page.data[18] = 1;
+        page.data[19] = 1;
+        page.data[20] = shared.reserve_wanted;
+        page.data[21] = 64;
+        page.data[22] = 32;
+        page.data[23] = 32;
+        write_u32(&mut page.data, 24, 1)?;
+        write_u32(&mut page.data, 28, 1)?;
+        write_u32(&mut page.data, 32, 0)?;
+        write_u32(&mut page.data, 36, 0)?;
+        shared.schema_cookie = 0;
+        shared.file_format = 1;
+        let limits = PageLimits::for_page1(shared.page_size, shared.usable_size);
+        if let Ok(mem_page) = MemPage::parse_with_shared(1, page.data.clone(), limits, Some(&shared)) {
+            shared.page1 = Some(mem_page);
+        }
+        Ok(())
     }
 
     /// sqlite3BtreeSetVersion
     pub fn set_version(&mut self, _version: i32) -> Result<()> {
-        Err(Error::new(ErrorCode::Internal))
+        let mut shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut page = shared.pager.get(1, PagerGetFlags::empty())?;
+        shared.pager.write(&mut page)?;
+        let version = if _version < 0 { 0 } else { _version as u8 };
+        page.data[18] = version;
+        page.data[19] = version;
+        shared.file_format = version;
+        if let Some(ref mut page1) = shared.page1 {
+            if page1.data.len() >= 20 {
+                page1.data[18] = version;
+                page1.data[19] = version;
+            }
+        }
+        Ok(())
     }
 
     /// sqlite3BtreeIsReadonly

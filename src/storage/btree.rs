@@ -591,6 +591,7 @@ fn build_internal_root_data(
     Ok(data)
 }
 
+#[derive(Clone)]
 enum InternalKey {
     Int(i64),
     Blob(Vec<u8>),
@@ -642,6 +643,106 @@ fn build_internal_page_data(
     }
     write_u16(&mut data, header_start + 5, content_start as u16)?;
     Ok(data)
+}
+
+fn rebuild_internal_children(
+    parent: &MemPage,
+    parent_limits: PageLimits,
+) -> Result<(Vec<InternalKey>, Vec<Pgno>)> {
+    let mut keys = Vec::with_capacity(parent.n_cell as usize);
+    let mut children = Vec::with_capacity(parent.n_cell as usize + 1);
+    for i in 0..parent.n_cell {
+        let cell_offset = parent.cell_ptr(i, parent_limits)?;
+        let info = parent.parse_cell(cell_offset, parent_limits)?;
+        let child = parent.child_pgno(cell_offset)?;
+        children.push(child);
+        if parent.is_intkey {
+            keys.push(InternalKey::Int(info.n_key));
+        } else {
+            let payload = info.payload.clone().ok_or(Error::new(ErrorCode::Internal))?;
+            keys.push(InternalKey::Blob(payload));
+        }
+    }
+    let rightmost = parent.rightmost_ptr.ok_or(Error::new(ErrorCode::Corrupt))?;
+    children.push(rightmost);
+    Ok((keys, children))
+}
+
+fn split_internal_root(
+    shared: &mut BtShared,
+    root_pgno: Pgno,
+    parent: &MemPage,
+    parent_limits: PageLimits,
+) -> Result<()> {
+    let (keys, children) = rebuild_internal_children(parent, parent_limits)?;
+    let mid = keys.len() / 2;
+    let left_keys = keys[..mid].to_vec();
+    let right_keys = keys[mid + 1..].to_vec();
+    let sep_key = keys[mid].clone();
+    let left_children = children[..mid + 1].to_vec();
+    let right_children = children[mid + 1..].to_vec();
+
+    let left_pgno = shared.pager.db_size + 1;
+    let right_pgno = shared.pager.db_size + 2;
+    let flags = parent.data[parent_limits.header_start()];
+    let left_data = build_internal_page_data(
+        PageLimits::new(shared.page_size, shared.usable_size),
+        flags,
+        &left_keys,
+        &left_children,
+    )?;
+    let right_data = build_internal_page_data(
+        PageLimits::new(shared.page_size, shared.usable_size),
+        flags,
+        &right_keys,
+        &right_children,
+    )?;
+
+    let mut left_page = shared.pager.get(left_pgno, PagerGetFlags::empty())?;
+    shared.pager.write(&mut left_page)?;
+    left_page.data = left_data;
+
+    let mut right_page = shared.pager.get(right_pgno, PagerGetFlags::empty())?;
+    shared.pager.write(&mut right_page)?;
+    right_page.data = right_data;
+
+    shared.pager.db_size = right_pgno.max(shared.pager.db_size);
+    shared.n_page = shared.pager.db_size;
+
+    let sep_info = match sep_key {
+        InternalKey::Int(key) => CellInfo {
+            n_key: key,
+            ..CellInfo::default()
+        },
+        InternalKey::Blob(payload) => CellInfo {
+            payload: Some(payload),
+            n_payload: 0,
+            ..CellInfo::default()
+        },
+    };
+
+    let root_flags = if parent.is_intkey {
+        BTREE_PAGEFLAG_LEAFDATA | BTREE_PAGEFLAG_INTKEY
+    } else {
+        BTREE_PAGEFLAG_ZERODATA
+    };
+    let root_limits = if root_pgno == 1 {
+        PageLimits::for_page1(shared.page_size, shared.usable_size)
+    } else {
+        PageLimits::new(shared.page_size, shared.usable_size)
+    };
+    let root_data = build_internal_root_data(
+        root_limits,
+        root_flags,
+        left_pgno,
+        right_pgno,
+        &sep_info,
+        !parent.is_intkey,
+    )?;
+    let mut root_page = shared.pager.get(root_pgno, PagerGetFlags::empty())?;
+    shared.pager.write(&mut root_page)?;
+    root_page.data = root_data;
+    Ok(())
 }
 
 fn parse_cell_from_bytes(page: &MemPage, limits: PageLimits, cell: &[u8]) -> Result<CellInfo> {
@@ -814,22 +915,7 @@ fn split_leaf_with_parent(
     shared.n_page = shared.pager.db_size;
 
     let sep_info = parse_cell_from_bytes(mem_page, limits, &right_cells[0])?;
-    let mut keys = Vec::with_capacity(parent.n_cell as usize + 1);
-    let mut children = Vec::with_capacity(parent.n_cell as usize + 2);
-    for i in 0..parent.n_cell {
-        let cell_offset = parent.cell_ptr(i, parent_limits)?;
-        let info = parent.parse_cell(cell_offset, parent_limits)?;
-        let child = parent.child_pgno(cell_offset)?;
-        children.push(child);
-        if parent.is_intkey {
-            keys.push(InternalKey::Int(info.n_key));
-        } else {
-            let payload = info.payload.clone().ok_or(Error::new(ErrorCode::Internal))?;
-            keys.push(InternalKey::Blob(payload));
-        }
-    }
-    let rightmost = parent.rightmost_ptr.ok_or(Error::new(ErrorCode::Corrupt))?;
-    children.push(rightmost);
+    let (mut keys, mut children) = rebuild_internal_children(parent, parent_limits)?;
 
     let insert_pos = child_index as usize;
     children[insert_pos] = leaf_pgno;
@@ -842,11 +928,16 @@ fn split_leaf_with_parent(
     }
 
     let parent_flags = parent.data[parent_limits.header_start()];
-    let parent_data = build_internal_page_data(parent_limits, parent_flags, &keys, &children)?;
+    let parent_data = build_internal_page_data(parent_limits, parent_flags, &keys, &children);
     let mut parent_page = shared.pager.get(parent.pgno, PagerGetFlags::empty())?;
     shared.pager.write(&mut parent_page)?;
-    parent_page.data = parent_data;
-    Ok(())
+    match parent_data {
+        Ok(data) => {
+            parent_page.data = data;
+            Ok(())
+        }
+        Err(_) => split_internal_root(shared, parent.pgno, parent, parent_limits),
+    }
 }
 
 fn read_varint(data: &[u8], offset: usize) -> Result<(u64, usize)> {

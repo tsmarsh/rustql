@@ -896,7 +896,7 @@ fn merge_leaf_with_sibling(
     let use_left = child_index > 0;
     let sibling_index = if use_left { child_index - 1 } else { child_index + 1 };
     let sibling_pgno = parent.child_pgno_for_index(sibling_index, parent_limits)?;
-    let (sibling_page, _) = {
+    let (sibling_page, sibling_limits) = {
         let page = shared.pager.get(sibling_pgno, PagerGetFlags::empty())?;
         let limits = if sibling_pgno == 1 {
             PageLimits::for_page1(shared.page_size, shared.usable_size)
@@ -911,16 +911,30 @@ fn merge_leaf_with_sibling(
         return Err(Error::new(ErrorCode::Misuse));
     }
 
-    let (left_page, right_page, left_pgno, right_pgno) = if use_left {
-        (sibling_page, leaf.clone(), sibling_pgno, leaf_pgno)
+    let (left_page, right_page, left_pgno, right_pgno, left_limits, right_limits) = if use_left {
+        (
+            sibling_page,
+            leaf.clone(),
+            sibling_pgno,
+            leaf_pgno,
+            sibling_limits,
+            leaf_limits,
+        )
     } else {
-        (leaf.clone(), sibling_page, leaf_pgno, sibling_pgno)
+        (
+            leaf.clone(),
+            sibling_page,
+            leaf_pgno,
+            sibling_pgno,
+            leaf_limits,
+            sibling_limits,
+        )
     };
 
     let mut cells = Vec::new();
     for i in 0..left_page.n_cell {
-        let cell_offset = left_page.cell_ptr(i, leaf_limits)?;
-        let info = left_page.parse_cell(cell_offset, leaf_limits)?;
+        let cell_offset = left_page.cell_ptr(i, left_limits)?;
+        let info = left_page.parse_cell(cell_offset, left_limits)?;
         let start = cell_offset as usize;
         let end = start + info.n_size as usize;
         if end > left_page.data.len() {
@@ -929,8 +943,8 @@ fn merge_leaf_with_sibling(
         cells.push(left_page.data[start..end].to_vec());
     }
     for i in 0..right_page.n_cell {
-        let cell_offset = right_page.cell_ptr(i, leaf_limits)?;
-        let info = right_page.parse_cell(cell_offset, leaf_limits)?;
+        let cell_offset = right_page.cell_ptr(i, right_limits)?;
+        let info = right_page.parse_cell(cell_offset, right_limits)?;
         let start = cell_offset as usize;
         let end = start + info.n_size as usize;
         if end > right_page.data.len() {
@@ -939,8 +953,8 @@ fn merge_leaf_with_sibling(
         cells.push(right_page.data[start..end].to_vec());
     }
 
-    let flags = left_page.data[leaf_limits.header_start()];
-    let new_left_data = build_leaf_page_data(leaf_limits, flags, &cells)?;
+    let flags = left_page.data[left_limits.header_start()];
+    let new_left_data = build_leaf_page_data(left_limits, flags, &cells)?;
     let mut left_db_page = shared.pager.get(left_pgno, PagerGetFlags::empty())?;
     shared.pager.write(&mut left_db_page)?;
     left_db_page.data = new_left_data;

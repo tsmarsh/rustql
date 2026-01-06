@@ -216,25 +216,25 @@ impl BtShared {
     pub fn max_local_payload(&self, is_leaf: bool) -> u32 {
         let usable = self.usable_size;
         if is_leaf {
-            usable
+            (usable
                 .saturating_sub(35)
                 .saturating_mul(MAX_EMBEDDED as u32)
-                / 255
+                / 255)
                 .saturating_sub(23)
         } else {
-            usable
+            (usable
                 .saturating_sub(12)
                 .saturating_mul(MAX_EMBEDDED as u32)
-                / 255
+                / 255)
                 .saturating_sub(23)
         }
     }
 
     pub fn min_local_payload(&self, _is_leaf: bool) -> u32 {
-        self.usable_size
+        (self.usable_size
             .saturating_sub(12)
             .saturating_mul(MIN_EMBEDDED as u32)
-            / 255
+            / 255)
             .saturating_sub(23)
     }
 

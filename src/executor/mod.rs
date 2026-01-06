@@ -21,3 +21,4 @@ pub use wherecode::{
 
 pub use insert::{InsertCompiler, compile_insert};
 pub use update::{UpdateCompiler, compile_update};
+pub use delete::{DeleteCompiler, compile_delete};

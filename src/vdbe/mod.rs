@@ -7,6 +7,7 @@ pub mod sort;
 pub mod expr;
 pub mod value;
 pub mod aux;
+pub mod types;
 
 pub use value::{
     SqliteValue, FunctionContext,
@@ -24,4 +25,12 @@ pub use aux::{
     get_varint, put_varint, varint_len,
     decode_record_header, make_record, deserialize_value,
     explain_program,
+};
+
+pub use types::{
+    CursorType, CollSeq, Encoding, TypeClass,
+    VDBE_MAGIC_INIT, VDBE_MAGIC_RUN, VDBE_MAGIC_HALT,
+    VDBE_MAGIC_RESET, VDBE_MAGIC_DEAD,
+    SQLITE_MAX_VARIABLE_NUMBER,
+    compare_flags, seek_flags, insert_flags,
 };

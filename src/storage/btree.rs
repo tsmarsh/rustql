@@ -2056,6 +2056,60 @@ impl Btree {
         }))
     }
 
+    /// sqlite3BtreeEnter
+    pub fn enter(&mut self) {
+        if !self.sharable {
+            return;
+        }
+        self.want_to_lock += 1;
+        if self.locked {
+            return;
+        }
+        self.lock_carefully();
+    }
+
+    /// sqlite3BtreeLeave
+    pub fn leave(&mut self) {
+        if !self.sharable {
+            return;
+        }
+        if self.want_to_lock > 0 {
+            self.want_to_lock -= 1;
+        }
+        if self.want_to_lock == 0 {
+            self.unlock_btree_mutex();
+        }
+    }
+
+    /// sqlite3BtreeHoldsMutex (debug helper)
+    pub fn holds_mutex(&self) -> bool {
+        !self.sharable || self.locked
+    }
+
+    fn lock_carefully(&mut self) {
+        // No shared-cache mutexes are modeled; lock immediately.
+        self.lock_btree_mutex();
+    }
+
+    fn lock_btree_mutex(&mut self) {
+        if self.locked {
+            return;
+        }
+        if let Ok(mut shared) = self.shared.write() {
+            if let Some(db) = self.db.as_ref() {
+                shared.db = Some(Arc::downgrade(db));
+            }
+        }
+        self.locked = true;
+    }
+
+    fn unlock_btree_mutex(&mut self) {
+        if !self.locked {
+            return;
+        }
+        self.locked = false;
+    }
+
     /// sqlite3BtreeClose
     pub fn close(&mut self) -> Result<()> {
         let mut shared = self.shared.write().map_err(|_| Error::new(ErrorCode::Internal))?;

@@ -233,6 +233,7 @@ pub struct MemPage {
     pub mask_page: u16,
     pub n_free: i32,
     pub parent: Option<Pgno>,
+    pub usable_space: u16,
 }
 
 pub struct BtreePayload {
@@ -1363,6 +1364,7 @@ impl MemPage {
             mask_page,
             n_free: -1,
             parent: None,
+            usable_space: limits.usable_size as u16,
         };
 
         if let Some(shared) = shared {
@@ -1664,6 +1666,11 @@ impl MemPage {
         }
 
         Ok(n_free)
+    }
+
+    fn is_underfull(&self, limits: PageLimits) -> Result<bool> {
+        let free = self.compute_free_space(limits)? as i32;
+        Ok(free > (limits.usable_size as i32 / 2))
     }
 }
 
@@ -2183,7 +2190,7 @@ impl Btree {
         let new_n_cell = mem_page.n_cell - 1;
         write_u16(data, header_start + 3, new_n_cell)?;
 
-        if new_n_cell == 0 {
+        if mem_page.is_underfull(leaf_limits).unwrap_or(false) {
             if let (Some(parent), Some(child_index)) =
                 (_cursor.page_stack.last(), _cursor.idx_stack.last())
             {

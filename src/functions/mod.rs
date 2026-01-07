@@ -3,6 +3,7 @@
 pub mod aggregate;
 pub mod datetime;
 pub mod json;
+pub mod printf;
 pub mod scalar;
 
 pub use aggregate::{get_aggregate_function, is_aggregate_function, AggregateInfo, AggregateState};

@@ -10,6 +10,7 @@ use super::datetime::{
     func_current_date, func_current_time, func_current_timestamp, func_date, func_datetime,
     func_julianday, func_strftime, func_time, func_unixepoch,
 };
+use super::printf::printf_format;
 
 // ============================================================================
 // Function Registry
@@ -758,61 +759,9 @@ pub fn func_printf(args: &[Value]) -> Result<Value> {
             "printf() requires at least 1 argument",
         ));
     }
-
     let format = value_to_string(&args[0]);
     let format_args = &args[1..];
-
-    // Simple printf implementation
-    let mut result = String::new();
-    let mut chars = format.chars().peekable();
-    let mut arg_idx = 0;
-
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            match chars.next() {
-                Some('%') => result.push('%'),
-                Some('s') => {
-                    if arg_idx < format_args.len() {
-                        result.push_str(&value_to_string(&format_args[arg_idx]));
-                        arg_idx += 1;
-                    }
-                }
-                Some('d') | Some('i') => {
-                    if arg_idx < format_args.len() {
-                        result.push_str(&value_to_i64(&format_args[arg_idx]).to_string());
-                        arg_idx += 1;
-                    }
-                }
-                Some('f') => {
-                    if arg_idx < format_args.len() {
-                        result.push_str(&value_to_f64(&format_args[arg_idx]).to_string());
-                        arg_idx += 1;
-                    }
-                }
-                Some('x') => {
-                    if arg_idx < format_args.len() {
-                        result.push_str(&format!("{:x}", value_to_i64(&format_args[arg_idx])));
-                        arg_idx += 1;
-                    }
-                }
-                Some('X') => {
-                    if arg_idx < format_args.len() {
-                        result.push_str(&format!("{:X}", value_to_i64(&format_args[arg_idx])));
-                        arg_idx += 1;
-                    }
-                }
-                Some(other) => {
-                    result.push('%');
-                    result.push(other);
-                }
-                None => result.push('%'),
-            }
-        } else {
-            result.push(c);
-        }
-    }
-
-    Ok(Value::Text(result))
+    Ok(Value::Text(printf_format(&format, format_args)?))
 }
 
 /// like(X, Y) or like(X, Y, Z) - Pattern matching

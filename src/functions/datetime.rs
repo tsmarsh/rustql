@@ -743,7 +743,7 @@ impl DateTime {
         }
         #[cfg(unix)]
         {
-            use libc::{mktime, time_t, tm};
+            use libc::{mktime, tm};
             let mut tm_in: tm = unsafe { std::mem::zeroed() };
             tm_in.tm_year = self.year - 1900;
             tm_in.tm_mon = self.month - 1;

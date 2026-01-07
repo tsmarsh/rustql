@@ -14,6 +14,7 @@ pub mod mem;
 pub mod os;
 pub mod parser;
 pub mod random;
+pub mod rtree;
 pub mod schema;
 pub mod storage;
 pub mod types;
@@ -48,3 +49,5 @@ pub use api::{
     sqlite3_step, sqlite3_total_changes, Backup, BackupStepResult, DbStatusOp, PreparedStmt,
     SqliteConnection,
 };
+
+pub use rtree::{RtreeBbox, RtreeConstraint, RtreeResult, RtreeTable};

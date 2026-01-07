@@ -9,10 +9,116 @@ use std::sync::{Arc, RwLock};
 use crate::error::{Error, ErrorCode, Result};
 use crate::functions::{get_aggregate_function, get_scalar_function, AggregateInfo, ScalarFunc};
 use crate::schema::{Encoding, Schema};
+use crate::storage::btree::{Btree, BtreeOpenFlags};
 use crate::storage::pager::{JournalMode, LockingMode, DEFAULT_PAGE_SIZE};
-use crate::types::{OpenFlags, RowId, Value};
+use crate::types::{
+    AccessFlags, DbOffset, DeviceCharacteristics, LockLevel, OpenFlags, RowId, SyncFlags, Value,
+    Vfs, VfsFile,
+};
 
 use super::config::{sqlite3_initialize, DbConfigOption};
+
+// ============================================================================
+// Stub VFS Implementation
+// ============================================================================
+
+/// Stub VFS file for pager/btree (temporary until full VFS integration)
+pub struct StubVfsFile;
+
+impl VfsFile for StubVfsFile {
+    fn read(&mut self, buf: &mut [u8], _offset: DbOffset) -> Result<usize> {
+        buf.fill(0);
+        Ok(buf.len())
+    }
+
+    fn write(&mut self, _buf: &[u8], _offset: DbOffset) -> Result<()> {
+        Ok(())
+    }
+
+    fn truncate(&mut self, _size: DbOffset) -> Result<()> {
+        Ok(())
+    }
+
+    fn sync(&mut self, _flags: SyncFlags) -> Result<()> {
+        Ok(())
+    }
+
+    fn file_size(&self) -> Result<DbOffset> {
+        Ok(0)
+    }
+
+    fn lock(&mut self, _level: LockLevel) -> Result<()> {
+        Ok(())
+    }
+
+    fn unlock(&mut self, _level: LockLevel) -> Result<()> {
+        Ok(())
+    }
+
+    fn check_reserved_lock(&self) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn sector_size(&self) -> i32 {
+        4096
+    }
+
+    fn device_characteristics(&self) -> DeviceCharacteristics {
+        DeviceCharacteristics::empty()
+    }
+}
+
+/// Stub VFS for btree/pager (temporary until full VFS integration)
+pub struct StubVfs;
+
+impl Vfs for StubVfs {
+    type File = StubVfsFile;
+
+    fn open(&self, _path: &str, _flags: OpenFlags) -> Result<Self::File> {
+        Ok(StubVfsFile)
+    }
+
+    fn delete(&self, _path: &str, _sync_dir: bool) -> Result<()> {
+        Ok(())
+    }
+
+    fn access(&self, _path: &str, _flags: AccessFlags) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn full_pathname(&self, path: &str) -> Result<String> {
+        Ok(path.to_string())
+    }
+
+    fn randomness(&self, buf: &mut [u8]) -> i32 {
+        for (i, byte) in buf.iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(17).wrapping_add(3);
+        }
+        buf.len() as i32
+    }
+
+    fn sleep(&self, microseconds: i32) -> i32 {
+        std::thread::sleep(std::time::Duration::from_micros(microseconds as u64));
+        microseconds
+    }
+
+    fn current_time(&self) -> f64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let duration = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        // Convert to Julian day number (days since -4713-11-24 12:00:00)
+        2440587.5 + (duration.as_secs_f64() / 86400.0)
+    }
+
+    fn current_time_i64(&self) -> i64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let duration = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        duration.as_millis() as i64
+    }
+}
 
 // ============================================================================
 // Transaction State
@@ -160,7 +266,6 @@ pub enum SafetyLevel {
 // ============================================================================
 
 /// Information about an attached database
-#[derive(Debug)]
 pub struct DbInfo {
     /// Schema name ("main", "temp", or attached name)
     pub name: String,
@@ -180,6 +285,8 @@ pub struct DbInfo {
     pub journal_mode: JournalMode,
     /// Locking mode
     pub locking_mode: LockingMode,
+    /// B-tree storage
+    pub btree: Option<Arc<Btree>>,
 }
 
 impl DbInfo {
@@ -195,6 +302,7 @@ impl DbInfo {
             cache_size: 0,
             journal_mode: JournalMode::Delete,
             locking_mode: LockingMode::Normal,
+            btree: None,
         }
     }
 }
@@ -721,17 +829,38 @@ pub fn sqlite3_open_v2(
     let mut conn = Box::new(SqliteConnection::new());
     conn.flags = final_flags;
 
-    // Set up main database path
+    // Set up main database path and open btree
     if let Some(main_db) = conn.find_db_mut("main") {
-        if path == ":memory:" || final_flags.contains(OpenFlags::MEMORY) {
+        let is_memory = path == ":memory:" || final_flags.contains(OpenFlags::MEMORY);
+        if is_memory {
             main_db.path = None; // In-memory database
         } else if !path.is_empty() {
-            main_db.path = Some(path);
+            main_db.path = Some(path.clone());
+        }
+
+        // Create btree open flags
+        let mut btree_flags = BtreeOpenFlags::empty();
+        if is_memory {
+            btree_flags |= BtreeOpenFlags::MEMORY;
+        }
+
+        // Open the btree
+        let vfs = StubVfs;
+        let btree_path = if is_memory { "" } else { &path };
+        match Btree::open(&vfs, btree_path, None, btree_flags, final_flags) {
+            Ok(btree) => {
+                main_db.btree = Some(btree);
+            }
+            Err(e) => {
+                // For new/empty databases, continue without btree for now
+                // The btree will be created when the first table is created
+                if !is_memory && !path.is_empty() {
+                    // Log error but continue - allows creating new databases
+                    eprintln!("Warning: Failed to open btree: {}", e);
+                }
+            }
         }
     }
-
-    // TODO: Actually open the database file via Btree
-    // For now, we just set up the connection structure
 
     Ok(conn)
 }
@@ -753,6 +882,7 @@ pub fn sqlite3_close(mut conn: Box<SqliteConnection>) -> Result<()> {
     // Close all databases
     for db in &mut conn.dbs {
         // Close btree connections
+        db.btree = None;
         db.schema = None;
     }
 

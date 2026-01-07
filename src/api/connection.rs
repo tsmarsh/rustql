@@ -17,6 +17,10 @@ use super::config::{sqlite3_initialize, DbConfigOption};
 // Transaction State
 // ============================================================================
 
+const SQLITE_OK: i32 = 0;
+const SQLITE_ATTACH: i32 = 24;
+const SQLITE_DETACH: i32 = 25;
+
 /// Transaction state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TransactionState {
@@ -335,6 +339,102 @@ impl SqliteConnection {
     /// Get autocommit state
     pub fn get_autocommit(&self) -> bool {
         self.autocommit.load(Ordering::SeqCst)
+    }
+
+    /// Attach a database file under a schema name
+    pub fn attach_database(&mut self, filename: &str, schema_name: &str) -> Result<()> {
+        let schema_lower = schema_name.to_lowercase();
+        if schema_lower.is_empty() || schema_lower == "main" || schema_lower == "temp" {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                format!("cannot attach database {}", schema_name),
+            ));
+        }
+        if schema_lower.starts_with("sqlite_") {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                format!("cannot attach database {}", schema_name),
+            ));
+        }
+        if self
+            .dbs
+            .iter()
+            .any(|db| db.name.eq_ignore_ascii_case(schema_name))
+        {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                format!("database {} is already in use", schema_name),
+            ));
+        }
+
+        if self.dbs.len() >= crate::schema::MAX_ATTACHED + 2 {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                format!(
+                    "too many attached databases - max {}",
+                    crate::schema::MAX_ATTACHED
+                ),
+            ));
+        }
+
+        if self.transaction_state != TransactionState::None {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                "cannot ATTACH database within transaction",
+            ));
+        }
+
+        if let Some(authorizer) = &self.authorizer {
+            let rc = authorizer(SQLITE_ATTACH, Some(filename), None, Some(schema_name), None);
+            if rc != SQLITE_OK {
+                return Err(Error::with_message(ErrorCode::Auth, "authorization denied"));
+            }
+        }
+
+        let mut db = DbInfo::new(schema_name);
+        if !filename.is_empty() && filename != ":memory:" {
+            db.path = Some(filename.to_string());
+        }
+        self.dbs.push(db);
+        Ok(())
+    }
+
+    /// Detach a database by schema name
+    pub fn detach_database(&mut self, schema_name: &str) -> Result<()> {
+        if schema_name.eq_ignore_ascii_case("main") || schema_name.eq_ignore_ascii_case("temp") {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                format!("cannot detach database {}", schema_name),
+            ));
+        }
+
+        let idx = self
+            .dbs
+            .iter()
+            .position(|db| db.name.eq_ignore_ascii_case(schema_name))
+            .ok_or_else(|| {
+                Error::with_message(
+                    ErrorCode::Error,
+                    format!("no such database: {}", schema_name),
+                )
+            })?;
+
+        if self.dbs[idx].busy || self.transaction_state != TransactionState::None {
+            return Err(Error::with_message(
+                ErrorCode::Busy,
+                format!("database {} is locked", schema_name),
+            ));
+        }
+
+        if let Some(authorizer) = &self.authorizer {
+            let rc = authorizer(SQLITE_DETACH, Some(schema_name), None, None, None);
+            if rc != SQLITE_OK {
+                return Err(Error::with_message(ErrorCode::Auth, "authorization denied"));
+            }
+        }
+
+        self.dbs.remove(idx);
+        Ok(())
     }
 }
 

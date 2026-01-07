@@ -318,6 +318,7 @@ impl StatementCompiler {
             Stmt::Insert(i) => self.extract_params_insert(i),
             Stmt::Update(u) => self.extract_params_update(u),
             Stmt::Delete(d) => self.extract_params_delete(d),
+            Stmt::Attach(a) => self.extract_params_expr(&a.expr),
             Stmt::Explain(inner) | Stmt::ExplainQueryPlan(inner) => {
                 self.extract_parameters(inner);
             }

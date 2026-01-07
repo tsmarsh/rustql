@@ -6,7 +6,7 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::executor::analyze::execute_analyze;
 use crate::executor::pragma::{execute_pragma, pragma_columns};
 use crate::executor::prepare::{compile_sql, CompiledStmt, StmtType};
-use crate::parser::ast::QualifiedName;
+use crate::parser::ast::{AttachStmt, Expr, Literal, QualifiedName, Variable};
 use crate::types::{ColumnType, StepResult, Value};
 use crate::vdbe::engine::Vdbe;
 use crate::vdbe::ops::VdbeOp;
@@ -57,6 +57,10 @@ pub struct PreparedStmt {
     pragma_state: Option<PragmaState>,
     /// ANALYZE target (if applicable)
     analyze_target: Option<QualifiedName>,
+    /// ATTACH statement (if applicable)
+    attach_stmt: Option<AttachStmt>,
+    /// DETACH schema name (if applicable)
+    detach_name: Option<String>,
     /// Connection pointer for PRAGMA/ANALYZE execution
     conn_ptr: Option<*mut SqliteConnection>,
 }
@@ -84,6 +88,8 @@ impl PreparedStmt {
             pragma: None,
             pragma_state: None,
             analyze_target: None,
+            attach_stmt: None,
+            detach_name: None,
             conn_ptr: None,
         }
     }
@@ -114,6 +120,8 @@ impl PreparedStmt {
             pragma: None,
             pragma_state: None,
             analyze_target: None,
+            attach_stmt: None,
+            detach_name: None,
             conn_ptr: None,
         }
     }
@@ -259,6 +267,14 @@ pub fn sqlite3_prepare_v2<'a>(
         crate::parser::ast::Stmt::Analyze(target) => Some(target.clone()),
         _ => None,
     });
+    let parsed_attach = parsed_stmt.as_ref().and_then(|stmt| match stmt {
+        crate::parser::ast::Stmt::Attach(attach) => Some(attach.clone()),
+        _ => None,
+    });
+    let parsed_detach = parsed_stmt.as_ref().and_then(|stmt| match stmt {
+        crate::parser::ast::Stmt::Detach(name) => Some(name.clone()),
+        _ => None,
+    });
 
     // Compile the SQL to VDBE bytecode
     match compile_sql(sql) {
@@ -275,6 +291,14 @@ pub fn sqlite3_prepare_v2<'a>(
             }
             if let Some(analyze_target) = parsed_analyze {
                 stmt.analyze_target = analyze_target;
+                stmt.conn_ptr = Some(conn as *mut SqliteConnection);
+            }
+            if let Some(attach_stmt) = parsed_attach {
+                stmt.attach_stmt = Some(attach_stmt);
+                stmt.conn_ptr = Some(conn as *mut SqliteConnection);
+            }
+            if let Some(detach_name) = parsed_detach {
+                stmt.detach_name = Some(detach_name);
                 stmt.conn_ptr = Some(conn as *mut SqliteConnection);
             }
             let stmt = Box::new(stmt);
@@ -334,6 +358,12 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
     }
     if stmt.stmt_type == Some(StmtType::Analyze) {
         return analyze_step(stmt);
+    }
+    if stmt.stmt_type == Some(StmtType::Attach) {
+        return attach_step(stmt);
+    }
+    if stmt.stmt_type == Some(StmtType::Detach) {
+        return detach_step(stmt);
     }
 
     // Create VDBE if not already created
@@ -438,6 +468,85 @@ fn analyze_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
     execute_analyze(conn, target)?;
     stmt.set_done();
     Ok(StepResult::Done)
+}
+
+fn attach_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
+    let conn_ptr = stmt
+        .conn_ptr
+        .ok_or_else(|| Error::with_message(ErrorCode::Error, "missing connection".to_string()))?;
+    let attach = stmt
+        .attach_stmt
+        .clone()
+        .ok_or_else(|| Error::with_message(ErrorCode::Error, "missing attach".to_string()))?;
+    let filename_val = eval_attach_expr(stmt, &attach.expr)?;
+    let filename = filename_val.to_text();
+    let conn = unsafe { &mut *conn_ptr };
+    conn.attach_database(&filename, &attach.schema)?;
+    stmt.set_done();
+    Ok(StepResult::Done)
+}
+
+fn detach_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
+    let conn_ptr = stmt
+        .conn_ptr
+        .ok_or_else(|| Error::with_message(ErrorCode::Error, "missing connection".to_string()))?;
+    let detach_name = stmt
+        .detach_name
+        .clone()
+        .ok_or_else(|| Error::with_message(ErrorCode::Error, "missing detach".to_string()))?;
+    let conn = unsafe { &mut *conn_ptr };
+    conn.detach_database(&detach_name)?;
+    stmt.set_done();
+    Ok(StepResult::Done)
+}
+
+fn eval_attach_expr(stmt: &PreparedStmt, expr: &Expr) -> Result<Value> {
+    match expr {
+        Expr::Literal(literal) => literal_to_value(literal),
+        Expr::Variable(var) => resolve_attach_param(stmt, var),
+        _ => Err(Error::with_message(
+            ErrorCode::Error,
+            "unsupported ATTACH expression",
+        )),
+    }
+}
+
+fn literal_to_value(literal: &Literal) -> Result<Value> {
+    Ok(match literal {
+        Literal::Null => Value::Null,
+        Literal::Integer(i) => Value::Integer(*i),
+        Literal::Float(f) => Value::Real(*f),
+        Literal::String(s) => Value::Text(s.clone()),
+        Literal::Blob(b) => Value::Blob(b.clone()),
+        Literal::Bool(b) => Value::Integer(i64::from(*b)),
+        Literal::CurrentTime => Value::Text("12:00:00".to_string()),
+        Literal::CurrentDate => Value::Text("2024-01-01".to_string()),
+        Literal::CurrentTimestamp => Value::Text("2024-01-01 12:00:00".to_string()),
+    })
+}
+
+fn resolve_attach_param(stmt: &PreparedStmt, var: &Variable) -> Result<Value> {
+    let idx = match var {
+        Variable::Numbered(Some(num)) => (*num - 1) as usize,
+        Variable::Numbered(None) => stmt
+            .param_names
+            .iter()
+            .position(|name| name.is_none())
+            .ok_or_else(|| Error::with_message(ErrorCode::Range, "parameter index out of range"))?,
+        Variable::Named { prefix, name } => {
+            let full_name = format!("{}{}", prefix, name);
+            stmt.param_names
+                .iter()
+                .position(|param| param.as_deref() == Some(full_name.as_str()))
+                .ok_or_else(|| {
+                    Error::with_message(ErrorCode::Range, "parameter index out of range")
+                })?
+        }
+    };
+    stmt.params
+        .get(idx)
+        .cloned()
+        .ok_or_else(|| Error::with_message(ErrorCode::Range, "parameter index out of range"))
 }
 
 /// sqlite3_reset - Reset statement for re-execution
@@ -1024,6 +1133,25 @@ mod tests {
         let mut conn = SqliteConnection::new();
         let (_, tail) = sqlite3_prepare_v2(&mut conn, "SELECT 1; SELECT 2").unwrap();
         assert_eq!(tail.trim(), "SELECT 2");
+    }
+
+    #[test]
+    fn test_attach_detach_statement() {
+        let mut conn = SqliteConnection::new();
+        let (mut attach_stmt, _) =
+            sqlite3_prepare_v2(&mut conn, "ATTACH ':memory:' AS aux").unwrap();
+        assert!(matches!(
+            sqlite3_step(&mut attach_stmt).unwrap(),
+            StepResult::Done
+        ));
+        assert!(conn.find_db("aux").is_some());
+
+        let (mut detach_stmt, _) = sqlite3_prepare_v2(&mut conn, "DETACH aux").unwrap();
+        assert!(matches!(
+            sqlite3_step(&mut detach_stmt).unwrap(),
+            StepResult::Done
+        ));
+        assert!(conn.find_db("aux").is_none());
     }
 
     #[test]

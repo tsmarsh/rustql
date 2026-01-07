@@ -3,6 +3,7 @@
 //! This module implements sqlite3_stmt (prepared statement) and related functions.
 
 use crate::error::{Error, ErrorCode, Result};
+use crate::executor::pragma::{execute_pragma, pragma_columns};
 use crate::executor::prepare::{compile_sql, CompiledStmt, StmtType};
 use crate::types::{ColumnType, StepResult, Value};
 use crate::vdbe::engine::Vdbe;
@@ -48,6 +49,12 @@ pub struct PreparedStmt {
     stmt_type: Option<StmtType>,
     /// VDBE virtual machine (created on first step)
     vdbe: Option<Vdbe>,
+    /// PRAGMA statement (if applicable)
+    pragma: Option<crate::parser::ast::PragmaStmt>,
+    /// PRAGMA execution state
+    pragma_state: Option<PragmaState>,
+    /// Connection pointer for PRAGMA execution
+    conn_ptr: Option<*mut SqliteConnection>,
 }
 
 impl PreparedStmt {
@@ -70,6 +77,9 @@ impl PreparedStmt {
             ops: Vec::new(),
             stmt_type: None,
             vdbe: None,
+            pragma: None,
+            pragma_state: None,
+            conn_ptr: None,
         }
     }
 
@@ -96,6 +106,9 @@ impl PreparedStmt {
             ops: compiled.ops,
             stmt_type: Some(compiled.stmt_type),
             vdbe: None,
+            pragma: None,
+            pragma_state: None,
+            conn_ptr: None,
         }
     }
 
@@ -196,6 +209,12 @@ impl PreparedStmt {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PragmaState {
+    rows: Vec<Vec<Value>>,
+    idx: usize,
+}
+
 // ============================================================================
 // Prepare Functions
 // ============================================================================
@@ -225,10 +244,27 @@ pub fn sqlite3_prepare_v2<'a>(
         return Ok((Box::new(PreparedStmt::new("")), ""));
     }
 
+    let parsed_pragma = crate::executor::prepare::parse_sql(sql)
+        .ok()
+        .and_then(|stmt| match stmt {
+            crate::parser::ast::Stmt::Pragma(pragma) => Some(pragma),
+            _ => None,
+        });
+
     // Compile the SQL to VDBE bytecode
     match compile_sql(sql) {
         Ok((compiled, tail)) => {
-            let stmt = Box::new(PreparedStmt::from_compiled(sql, compiled, tail));
+            let mut stmt = PreparedStmt::from_compiled(sql, compiled, tail);
+            if let Some(pragma) = parsed_pragma {
+                if let Some((names, types)) = pragma_columns(&pragma) {
+                    stmt.set_columns(names, types);
+                } else {
+                    stmt.set_columns(vec![pragma.name.clone()], vec![ColumnType::Text]);
+                }
+                stmt.pragma = Some(pragma);
+                stmt.conn_ptr = Some(conn as *mut SqliteConnection);
+            }
+            let stmt = Box::new(stmt);
             // Calculate actual tail position in original string
             let tail_start = if tail.is_empty() {
                 sql.len()
@@ -278,6 +314,10 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
 
     if stmt.done {
         return Ok(StepResult::Done);
+    }
+
+    if stmt.stmt_type == Some(StmtType::Pragma) && stmt.pragma.is_some() {
+        return pragma_step(stmt);
     }
 
     // Create VDBE if not already created
@@ -330,6 +370,47 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
             Err(e)
         }
     }
+}
+
+fn pragma_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
+    let conn_ptr = stmt
+        .conn_ptr
+        .ok_or_else(|| Error::with_message(ErrorCode::Error, "missing connection".to_string()))?;
+    let pragma = stmt
+        .pragma
+        .clone()
+        .ok_or_else(|| Error::with_message(ErrorCode::Error, "missing pragma".to_string()))?;
+
+    if stmt.pragma_state.is_none() {
+        let conn = unsafe { &mut *conn_ptr };
+        let result = execute_pragma(conn, &pragma)?;
+        stmt.pragma_state = Some(PragmaState {
+            rows: result.rows,
+            idx: 0,
+        });
+        if !result.columns.is_empty() {
+            stmt.column_names = result.columns;
+            stmt.column_types = result.types;
+        } else if !result.types.is_empty() {
+            stmt.column_names = vec![pragma.name.clone()];
+            stmt.column_types = result.types;
+        }
+    }
+
+    let state = stmt
+        .pragma_state
+        .as_mut()
+        .ok_or_else(|| Error::with_message(ErrorCode::Error, "pragma state missing".to_string()))?;
+
+    if state.idx >= state.rows.len() {
+        stmt.set_done();
+        return Ok(StepResult::Done);
+    }
+
+    let row = state.rows[state.idx].clone();
+    state.idx += 1;
+    stmt.set_row(row);
+    Ok(StepResult::Row)
 }
 
 /// sqlite3_reset - Reset statement for re-execution

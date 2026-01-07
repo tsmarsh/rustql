@@ -8,6 +8,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::schema::{Encoding, Schema};
+use crate::storage::pager::{JournalMode, LockingMode, DEFAULT_PAGE_SIZE};
 use crate::types::{OpenFlags, RowId};
 
 use super::config::{sqlite3_initialize, DbConfigOption};
@@ -73,6 +74,14 @@ pub struct DbInfo {
     pub safety_level: SafetyLevel,
     /// Is database busy (exclusive lock held)
     pub busy: bool,
+    /// Page size in bytes
+    pub page_size: u32,
+    /// Cache size in pages
+    pub cache_size: i64,
+    /// Journal mode
+    pub journal_mode: JournalMode,
+    /// Locking mode
+    pub locking_mode: LockingMode,
 }
 
 impl DbInfo {
@@ -84,6 +93,10 @@ impl DbInfo {
             schema: Some(Arc::new(RwLock::new(Schema::new()))),
             safety_level: SafetyLevel::Normal,
             busy: false,
+            page_size: DEFAULT_PAGE_SIZE,
+            cache_size: 0,
+            journal_mode: JournalMode::Delete,
+            locking_mode: LockingMode::Normal,
         }
     }
 }
@@ -185,6 +198,8 @@ pub struct DbConfigFlags {
     pub enable_fkey: bool,
     /// Enable triggers
     pub enable_trigger: bool,
+    /// Enable recursive triggers
+    pub recursive_triggers: bool,
     /// Enable views
     pub enable_view: bool,
     /// Defensive mode (restrict dangerous operations)
@@ -243,6 +258,7 @@ impl SqliteConnection {
             db_config: DbConfigFlags {
                 enable_fkey: false,
                 enable_trigger: true,
+                recursive_triggers: false,
                 enable_view: true,
                 defensive: false,
                 writable_schema: false,

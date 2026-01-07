@@ -3,6 +3,7 @@
 pub mod delete;
 pub mod insert;
 pub mod planner;
+pub mod pragma;
 pub mod prepare;
 pub mod select;
 pub mod update;

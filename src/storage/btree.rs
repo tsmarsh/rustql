@@ -2847,6 +2847,46 @@ impl Btree {
         Err(Error::new(ErrorCode::Internal))
     }
 
+    // ========================================================================
+    // Backup Support
+    // ========================================================================
+
+    /// Get the total number of pages in the database
+    pub fn page_count(&self) -> Result<u32> {
+        let shared = self
+            .shared
+            .read()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
+        Ok(shared.pager.page_count())
+    }
+
+    /// Get the raw data for a page (for backup operations)
+    ///
+    /// Returns a copy of the page data.
+    pub fn get_page_data(&self, pgno: Pgno) -> Result<Vec<u8>> {
+        let mut shared = self
+            .shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
+        let page = shared.pager.get(pgno, PagerGetFlags::empty())?;
+        Ok(page.data.clone())
+    }
+
+    /// Write raw data to a page (for backup operations)
+    ///
+    /// This should only be used during backup operations.
+    pub fn put_page_data(&self, pgno: Pgno, data: &[u8]) -> Result<()> {
+        let mut shared = self
+            .shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
+        let mut page = shared.pager.get(pgno, PagerGetFlags::empty())?;
+        shared.pager.write(&mut page)?;
+        let copy_len = data.len().min(page.data.len());
+        page.data[..copy_len].copy_from_slice(&data[..copy_len]);
+        Ok(())
+    }
+
     /// sqlite3BtreeGetMeta
     pub fn get_meta(&self, _idx: usize) -> Result<u32> {
         if _idx >= SQLITE_N_BTREE_META {

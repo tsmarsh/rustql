@@ -1,6 +1,7 @@
 //! B-tree implementation
 
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 
 use bitflags::bitflags;
@@ -157,7 +158,7 @@ pub struct Btree {
     pub locked: bool,
     pub has_incrblob_cur: bool,
     pub want_to_lock: i32,
-    pub n_backup: i32,
+    pub n_backup: AtomicI32,
     pub data_version: u32,
     pub next: Option<NonNull<Btree>>,
     pub prev: Option<NonNull<Btree>>,
@@ -2133,7 +2134,7 @@ impl Btree {
             locked: false,
             has_incrblob_cur: false,
             want_to_lock: 0,
-            n_backup: 0,
+            n_backup: AtomicI32::new(0),
             data_version: 0,
             next: None,
             prev: None,
@@ -2234,7 +2235,7 @@ impl Btree {
     }
 
     /// sqlite3BtreeSetPageSize
-    pub fn set_page_size(&mut self, page_size: u32, reserve: i32, fix: bool) -> Result<()> {
+    pub fn set_page_size(&self, page_size: u32, reserve: i32, fix: bool) -> Result<()> {
         let mut shared = self
             .shared
             .write()
@@ -2786,7 +2787,20 @@ impl Btree {
 
     /// sqlite3BtreeIsInBackup
     pub fn is_in_backup(&self) -> bool {
-        self.n_backup > 0
+        self.n_backup.load(Ordering::SeqCst) > 0
+    }
+
+    /// Track a backup starting on this btree.
+    pub fn backup_started(&self) {
+        self.n_backup.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Track a backup finishing on this btree.
+    pub fn backup_finished(&self) {
+        let prev = self.n_backup.fetch_sub(1, Ordering::SeqCst);
+        if prev <= 0 {
+            self.n_backup.store(0, Ordering::SeqCst);
+        }
     }
 
     /// sqlite3BtreeSchema

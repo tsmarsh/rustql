@@ -6,6 +6,11 @@
 use crate::error::{Error, Result};
 use crate::types::Value;
 
+use super::datetime::{
+    func_current_date, func_current_time, func_current_timestamp, func_date, func_datetime,
+    func_julianday, func_strftime, func_time, func_unixepoch,
+};
+
 // ============================================================================
 // Function Registry
 // ============================================================================
@@ -56,6 +61,17 @@ pub fn get_scalar_function(name: &str) -> Option<ScalarFunc> {
         "PRINTF" | "FORMAT" => Some(func_printf),
         "LIKE" => Some(func_like),
         "GLOB" => Some(func_glob),
+
+        // Date/time functions
+        "DATE" => Some(func_date),
+        "TIME" => Some(func_time),
+        "DATETIME" => Some(func_datetime),
+        "JULIANDAY" => Some(func_julianday),
+        "UNIXEPOCH" => Some(func_unixepoch),
+        "STRFTIME" => Some(func_strftime),
+        "CURRENT_DATE" => Some(func_current_date),
+        "CURRENT_TIME" => Some(func_current_time),
+        "CURRENT_TIMESTAMP" => Some(func_current_timestamp),
 
         _ => None,
     }

@@ -1,0 +1,212 @@
+//! SQLite Compatibility Test Suite
+//!
+//! Run with: cargo test --test sqlite_compat_test
+//!
+//! This test suite runs SQLite's TCL tests against rustql to measure
+//! compatibility and track progress.
+
+mod sqlite_compat;
+
+use sqlite_compat::runner::{SuiteStats, TestRunner};
+use sqlite_compat::rustql_adapter::RustqlTestDb;
+use sqlite_compat::{analyze_test_suite, load_test_file, PRIORITY_TEST_FILES, SQLITE_TEST_DIR};
+use std::path::Path;
+
+/// Analyze the SQLite test suite (without running)
+#[test]
+fn test_analyze_sqlite_suite() {
+    let test_dir = Path::new(SQLITE_TEST_DIR);
+    if !test_dir.exists() {
+        println!("SQLite test directory not found at: {}", SQLITE_TEST_DIR);
+        println!("Skipping test suite analysis");
+        return;
+    }
+
+    match analyze_test_suite(test_dir) {
+        Ok(analysis) => {
+            analysis.print_summary();
+        }
+        Err(e) => {
+            println!("Failed to analyze test suite: {}", e);
+        }
+    }
+}
+
+/// Run a single priority test file
+fn run_test_file(file_name: &str) -> Option<sqlite_compat::runner::TestFileStats> {
+    let test_dir = Path::new(SQLITE_TEST_DIR);
+    let path = test_dir.join(file_name);
+
+    if !path.exists() {
+        println!("Test file not found: {}", path.display());
+        return None;
+    }
+
+    let parsed = match load_test_file(&path) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("Failed to parse {}: {}", file_name, e);
+            return None;
+        }
+    };
+
+    println!(
+        "\nRunning {} ({} tests, {} setup commands)",
+        file_name,
+        parsed.tests.len(),
+        parsed.setup_commands.len()
+    );
+
+    // Create a fresh database for each test file
+    let db_path = format!(
+        "/tmp/rustql_sqlite_compat_{}.db",
+        file_name.replace('.', "_")
+    );
+    let db = match RustqlTestDb::new(&db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            println!("Failed to create database: {}", e);
+            return None;
+        }
+    };
+
+    let mut runner = TestRunner::new(db);
+    runner.set_verbose(true);
+
+    let (stats, results) = runner.run_file(&parsed);
+
+    // Print detailed results for failed tests
+    let failed: Vec<_> = results.iter().filter(|r| !r.passed && !r.skipped).collect();
+    if !failed.is_empty() {
+        println!("\nFailed tests:");
+        for result in failed.iter().take(10) {
+            println!("  {} (line {})", result.name, result.line);
+            if let Some(ref err) = result.error {
+                println!("    Error: {}", err);
+            } else {
+                println!("    Expected: {:?}", result.expected);
+                println!("    Actual:   {:?}", result.actual);
+            }
+        }
+        if failed.len() > 10 {
+            println!("  ... and {} more", failed.len() - 10);
+        }
+    }
+
+    let skipped: Vec<_> = results.iter().filter(|r| r.skipped).collect();
+    if !skipped.is_empty() {
+        println!("\nSkipped {} tests (unimplemented features)", skipped.len());
+    }
+
+    println!(
+        "\n{}: {} total, {} passed, {} failed, {} skipped ({:.1}%)",
+        file_name,
+        stats.total,
+        stats.passed,
+        stats.failed,
+        stats.skipped,
+        stats.pass_rate()
+    );
+
+    Some(stats)
+}
+
+/// Run all priority test files and report overall progress
+/// NOTE: This test is currently disabled because SELECT queries hang
+/// until VDBE execution is complete. Run manually when ready.
+#[test]
+#[ignore = "SELECT queries hang until VDBE is complete"]
+fn test_sqlite_compatibility_progress() {
+    let test_dir = Path::new(SQLITE_TEST_DIR);
+    if !test_dir.exists() {
+        println!("SQLite test directory not found at: {}", SQLITE_TEST_DIR);
+        println!("Skipping compatibility tests");
+        return;
+    }
+
+    println!("\n{}", "=".repeat(60));
+    println!("SQLite Compatibility Test Suite");
+    println!("{}", "=".repeat(60));
+
+    let mut suite_stats = SuiteStats::default();
+
+    for file_name in PRIORITY_TEST_FILES {
+        if let Some(stats) = run_test_file(file_name) {
+            suite_stats.add_file(stats);
+        }
+    }
+
+    suite_stats.print_summary();
+
+    // Don't fail the test - this is for measuring progress
+    println!("\nNote: This test measures compatibility progress, not pass/fail.");
+}
+
+/// Test individual test files (for debugging)
+/// NOTE: Currently disabled because SELECT queries hang
+#[test]
+#[ignore = "SELECT queries hang until VDBE is complete"]
+fn test_table_basic() {
+    if let Some(stats) = run_test_file("table.test") {
+        println!("table.test: {:.1}% pass rate", stats.pass_rate());
+    }
+}
+
+#[test]
+#[ignore = "SELECT queries hang until VDBE is complete"]
+fn test_select1_basic() {
+    if let Some(stats) = run_test_file("select1.test") {
+        println!("select1.test: {:.1}% pass rate", stats.pass_rate());
+    }
+}
+
+/// Quick smoke test with simple SQL
+/// NOTE: Currently disabled because SELECT queries hang
+#[test]
+#[ignore = "SELECT queries hang until VDBE is complete"]
+fn test_basic_sql_execution() {
+    let db = match RustqlTestDb::new("/tmp/rustql_smoke_test.db") {
+        Ok(db) => db,
+        Err(e) => {
+            println!("Failed to create database: {}", e);
+            return;
+        }
+    };
+
+    let mut db = db;
+
+    // Test basic operations
+    let tests = [
+        ("CREATE TABLE", "CREATE TABLE t1(a, b)", vec![]),
+        ("INSERT", "INSERT INTO t1 VALUES(1, 2)", vec![]),
+        ("SELECT", "SELECT * FROM t1", vec!["1", "2"]),
+    ];
+
+    for (name, sql, expected) in &tests {
+        match db.exec_sql(sql) {
+            Ok(result) => {
+                let expected_strs: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+                if result == expected_strs {
+                    println!("PASS: {}", name);
+                } else {
+                    println!("FAIL: {} - expected {:?}, got {:?}", name, expected, result);
+                }
+            }
+            Err(e) => {
+                println!("ERROR: {} - {}", name, e);
+            }
+        }
+    }
+}
+
+/// Generate and print a progress report
+#[test]
+fn test_progress_report() {
+    let test_dir = Path::new(SQLITE_TEST_DIR);
+
+    let report = sqlite_compat::progress::generate_progress_report(test_dir);
+    report.print_report();
+}
+
+// Re-export for use by other test modules
+pub use sqlite_compat::runner::TestDatabase;

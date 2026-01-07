@@ -24,7 +24,9 @@ pub use error::{Error, Result};
 
 // Re-export API types and functions
 pub use api::{
-    sqlite3_changes, sqlite3_close, sqlite3_errcode, sqlite3_errmsg, sqlite3_errstr,
+    sqlite3_changes, sqlite3_close, sqlite3_column_count, sqlite3_column_double,
+    sqlite3_column_int, sqlite3_column_int64, sqlite3_column_name, sqlite3_column_text,
+    sqlite3_column_type, sqlite3_column_value, sqlite3_errcode, sqlite3_errmsg, sqlite3_errstr,
     sqlite3_finalize, sqlite3_initialize, sqlite3_last_insert_rowid, sqlite3_libversion,
     sqlite3_libversion_number, sqlite3_open, sqlite3_open_v2, sqlite3_prepare_v2, sqlite3_reset,
     sqlite3_shutdown, sqlite3_step, sqlite3_total_changes, PreparedStmt, SqliteConnection,

@@ -328,6 +328,15 @@ pub enum Opcode {
     SorterCompare,
 
     // ========================================================================
+    // Schema Operations
+    // ========================================================================
+    /// Create a new btree table, store root page in P2
+    CreateBtree,
+
+    /// Parse a CREATE statement and add to schema
+    ParseSchema,
+
+    // ========================================================================
     // Transaction Operations
     // ========================================================================
     /// Begin transaction
@@ -554,6 +563,8 @@ impl Opcode {
             Opcode::SorterNext => "SorterNext",
             Opcode::SorterData => "SorterData",
             Opcode::SorterCompare => "SorterCompare",
+            Opcode::CreateBtree => "CreateBtree",
+            Opcode::ParseSchema => "ParseSchema",
             Opcode::Transaction => "Transaction",
             Opcode::AutoCommit => "AutoCommit",
             Opcode::Savepoint => "Savepoint",

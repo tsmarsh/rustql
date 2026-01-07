@@ -743,17 +743,75 @@ impl StatementCompiler {
     // ========================================================================
 
     fn compile_create_table(&mut self, create: &CreateTableStmt) -> Result<Vec<VdbeOp>> {
+        use crate::storage::btree::BTREE_INTKEY;
+
         let mut ops = Vec::new();
-        ops.push(Self::make_op(Opcode::Init, 0, 1, 0, P4::Unused));
-        ops.push(Self::make_op(
-            Opcode::Noop,
-            0,
-            0,
-            0,
-            P4::Text(format!("CREATE TABLE {}", create.name)),
-        ));
+
+        // Register allocation
+        let reg_root_page = 1; // root page number for new table
+
+        // 0: Init - jump to start of program
+        ops.push(Self::make_op(Opcode::Init, 0, 2, 0, P4::Unused));
+
+        // 1: Halt - end of program
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
+
+        // 2: CreateBtree - create the table's root page
+        // P1=0 (main database), P2=register for root page, P3=BTREE_INTKEY for table
+        ops.push(Self::make_op(
+            Opcode::CreateBtree,
+            0,
+            reg_root_page,
+            BTREE_INTKEY as i32,
+            P4::Unused,
+        ));
+
+        // Build the CREATE TABLE SQL for the schema
+        let create_sql = self.build_create_table_sql(create);
+
+        // 3: ParseSchema - parse the CREATE statement and add to schema
+        // P4 contains the SQL text
+        ops.push(Self::make_op(
+            Opcode::ParseSchema,
+            0,
+            reg_root_page, // root page register
+            0,
+            P4::Text(create_sql),
+        ));
+
+        // 4: Goto end
+        ops.push(Self::make_op(Opcode::Goto, 0, 1, 0, P4::Unused));
+
         Ok(ops)
+    }
+
+    /// Build CREATE TABLE SQL from AST for storage in schema
+    fn build_create_table_sql(&self, create: &CreateTableStmt) -> String {
+        use crate::parser::ast::TableDefinition;
+
+        let mut sql = String::from("CREATE TABLE ");
+        if create.if_not_exists {
+            sql.push_str("IF NOT EXISTS ");
+        }
+        sql.push_str(&create.name.name);
+        sql.push_str(" (");
+
+        if let TableDefinition::Columns { columns, .. } = &create.definition {
+            let col_defs: Vec<String> = columns
+                .iter()
+                .map(|col| {
+                    let mut col_sql = col.name.clone();
+                    if let Some(ref type_name) = col.type_name {
+                        col_sql.push(' ');
+                        col_sql.push_str(&type_name.name);
+                    }
+                    col_sql
+                })
+                .collect();
+            sql.push_str(&col_defs.join(", "));
+        }
+        sql.push(')');
+        sql
     }
 
     fn compile_create_index(&mut self, create: &CreateIndexStmt) -> Result<Vec<VdbeOp>> {

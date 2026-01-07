@@ -5,9 +5,12 @@
 //! loop and manages the virtual machine state.
 
 use std::cmp::Ordering;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use crate::error::{Error, ErrorCode, Result};
+use crate::schema::Schema;
+use crate::storage::btree::{BtCursor, Btree, BtreeCursorFlags};
 use crate::types::{ColumnType, Pgno, Value};
 use crate::vdbe::mem::Mem;
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
@@ -73,7 +76,6 @@ pub enum CursorState {
 }
 
 /// A cursor for iterating over table/index rows
-#[derive(Debug)]
 pub struct VdbeCursor {
     /// Cursor ID
     pub id: i32,
@@ -99,6 +101,21 @@ pub struct VdbeCursor {
     pub null_row: bool,
     /// Deferred seek key
     pub seek_key: Option<Vec<Mem>>,
+    /// B-tree cursor for actual storage operations
+    pub btree_cursor: Option<BtCursor>,
+}
+
+impl std::fmt::Debug for VdbeCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VdbeCursor")
+            .field("id", &self.id)
+            .field("root_page", &self.root_page)
+            .field("writable", &self.writable)
+            .field("state", &self.state)
+            .field("n_field", &self.n_field)
+            .field("has_btree_cursor", &self.btree_cursor.is_some())
+            .finish()
+    }
 }
 
 impl VdbeCursor {
@@ -117,6 +134,7 @@ impl VdbeCursor {
             n_field: 0,
             null_row: false,
             seek_key: None,
+            btree_cursor: None,
         }
     }
 
@@ -215,6 +233,12 @@ pub struct Vdbe {
 
     /// Column names for result
     column_names: Vec<String>,
+
+    /// B-tree for main database (for storage operations)
+    btree: Option<Arc<Btree>>,
+
+    /// Schema for main database (for DDL operations)
+    schema: Option<Arc<RwLock<Schema>>>,
 }
 
 impl Default for Vdbe {
@@ -246,7 +270,19 @@ impl Vdbe {
             result_start: 0,
             result_count: 0,
             column_names: Vec::new(),
+            btree: None,
+            schema: None,
         }
+    }
+
+    /// Set the database btree for storage operations
+    pub fn set_btree(&mut self, btree: Arc<Btree>) {
+        self.btree = Some(btree);
+    }
+
+    /// Set the schema for DDL operations
+    pub fn set_schema(&mut self, schema: Arc<RwLock<Schema>>) {
+        self.schema = Some(schema);
     }
 
     /// Create from a list of operations
@@ -888,20 +924,56 @@ impl Vdbe {
             }
 
             // ================================================================
-            // Cursor Operations (placeholder - needs btree integration)
+            // Cursor Operations
             // ================================================================
             Opcode::OpenRead => {
-                // P1 = cursor, P2 = root page, P3 = num columns
-                self.open_cursor(op.p1, op.p2 as Pgno, false)?;
+                // P1 = cursor, P2 = root page (or register if P5 has OPFLAG_P2ISREG)
+                // P3 = num columns, P4 = table name
+                let root_page = if op.p5 & 0x02 != 0 {
+                    // P2 is a register containing the root page
+                    self.mem(op.p2).to_int() as Pgno
+                } else {
+                    // P2 is the root page directly
+                    op.p2 as Pgno
+                };
+
+                // Clone btree Arc to avoid borrow issues
+                let btree = self.btree.clone();
+                self.open_cursor(op.p1, root_page, false)?;
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     cursor.n_field = op.p3;
+                    // Create a real BtCursor if we have a btree
+                    if let Some(ref btree) = btree {
+                        let flags = BtreeCursorFlags::empty();
+                        match btree.cursor(root_page, flags, None) {
+                            Ok(bt_cursor) => cursor.btree_cursor = Some(bt_cursor),
+                            Err(_) => {} // Failed to create cursor, use placeholder
+                        }
+                    }
                 }
             }
 
             Opcode::OpenWrite => {
-                self.open_cursor(op.p1, op.p2 as Pgno, true)?;
+                // P1 = cursor, P2 = root page, P3 = num columns
+                let root_page = if op.p5 & 0x02 != 0 {
+                    self.mem(op.p2).to_int() as Pgno
+                } else {
+                    op.p2 as Pgno
+                };
+
+                // Clone btree Arc to avoid borrow issues
+                let btree = self.btree.clone();
+                self.open_cursor(op.p1, root_page, true)?;
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     cursor.n_field = op.p3;
+                    // Create a writable BtCursor if we have a btree
+                    if let Some(ref btree) = btree {
+                        let flags = BtreeCursorFlags::WRCSR;
+                        match btree.cursor(root_page, flags, None) {
+                            Ok(bt_cursor) => cursor.btree_cursor = Some(bt_cursor),
+                            Err(_) => {} // Failed to create cursor
+                        }
+                    }
                 }
             }
 
@@ -919,53 +991,150 @@ impl Vdbe {
 
             Opcode::Rewind => {
                 // Move cursor to first row, jump to P2 if empty
+                let mut is_empty = true;
                 if let Some(cursor) = self.cursor_mut(op.p1) {
-                    // Placeholder: In real implementation, this would call btree
-                    cursor.state = CursorState::AtEnd; // Assume empty for now
+                    if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                        match bt_cursor.first() {
+                            Ok(empty) => {
+                                is_empty = empty;
+                                if !empty {
+                                    cursor.state = CursorState::Valid;
+                                } else {
+                                    cursor.state = CursorState::AtEnd;
+                                }
+                            }
+                            Err(_) => cursor.state = CursorState::AtEnd,
+                        }
+                    } else {
+                        // No btree cursor - assume empty
+                        cursor.state = CursorState::AtEnd;
+                    }
                 }
                 // Jump if no rows
-                if self
-                    .cursor(op.p1)
-                    .map_or(true, |c| c.state == CursorState::AtEnd)
-                {
+                if is_empty {
                     self.pc = op.p2;
                 }
             }
 
             Opcode::Next => {
-                // Move cursor to next row, jump to P2 if done
+                // Move cursor to next row, jump to P2 if has more rows
+                let mut has_more = false;
                 if let Some(cursor) = self.cursor_mut(op.p1) {
-                    // Placeholder: In real implementation, this would call btree
-                    cursor.state = CursorState::AtEnd;
+                    if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                        match bt_cursor.next(0) {
+                            Ok(()) => {
+                                // Check if cursor is still valid
+                                has_more =
+                                    bt_cursor.state == crate::storage::btree::CursorState::Valid;
+                                cursor.state = if has_more {
+                                    CursorState::Valid
+                                } else {
+                                    CursorState::AtEnd
+                                };
+                            }
+                            Err(_) => cursor.state = CursorState::AtEnd,
+                        }
+                    } else {
+                        cursor.state = CursorState::AtEnd;
+                    }
                 }
-                if self
-                    .cursor(op.p1)
-                    .map_or(true, |c| c.state == CursorState::AtEnd)
-                {
+                // Jump to P2 if there are more rows
+                if has_more {
                     self.pc = op.p2;
                 }
             }
 
             Opcode::Prev => {
-                // Move cursor to previous row, jump to P2 if done
+                // Move cursor to previous row, jump to P2 if has more rows
+                let mut has_more = false;
                 if let Some(cursor) = self.cursor_mut(op.p1) {
-                    cursor.state = CursorState::AtEnd;
+                    if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                        match bt_cursor.previous(0) {
+                            Ok(()) => {
+                                has_more =
+                                    bt_cursor.state == crate::storage::btree::CursorState::Valid;
+                                cursor.state = if has_more {
+                                    CursorState::Valid
+                                } else {
+                                    CursorState::AtEnd
+                                };
+                            }
+                            Err(_) => cursor.state = CursorState::AtEnd,
+                        }
+                    } else {
+                        cursor.state = CursorState::AtEnd;
+                    }
                 }
-                if self
-                    .cursor(op.p1)
-                    .map_or(true, |c| c.state == CursorState::AtEnd)
-                {
+                // Jump to P2 if there are more rows
+                if has_more {
                     self.pc = op.p2;
                 }
             }
 
             Opcode::Column => {
                 // Read column P2 from cursor P1 into register P3
+                let col_idx = op.p2 as usize;
                 if let Some(cursor) = self.cursor(op.p1) {
                     if cursor.null_row {
                         self.mem_mut(op.p3).set_null();
+                    } else if let Some(ref bt_cursor) = cursor.btree_cursor {
+                        // Read payload from BtCursor
+                        if let Some(ref payload) = bt_cursor.info.payload {
+                            // Decode the record to get the column value
+                            match crate::vdbe::aux::decode_record_header(payload) {
+                                Ok((types, header_size)) => {
+                                    if col_idx < types.len() {
+                                        // Calculate offset to this column's data
+                                        let mut data_offset = header_size;
+                                        for i in 0..col_idx {
+                                            data_offset += types[i].size();
+                                        }
+                                        // Deserialize the value
+                                        let col_data = &payload[data_offset..];
+                                        match crate::vdbe::aux::deserialize_value(
+                                            col_data,
+                                            &types[col_idx],
+                                        ) {
+                                            Ok(mem) => {
+                                                *self.mem_mut(op.p3) = mem;
+                                            }
+                                            Err(_) => self.mem_mut(op.p3).set_null(),
+                                        }
+                                    } else {
+                                        self.mem_mut(op.p3).set_null();
+                                    }
+                                }
+                                Err(_) => self.mem_mut(op.p3).set_null(),
+                            }
+                        } else {
+                            self.mem_mut(op.p3).set_null();
+                        }
+                    } else if let Some(ref row_data) = cursor.row_data {
+                        // Fallback: read from cached row_data
+                        match crate::vdbe::aux::decode_record_header(row_data) {
+                            Ok((types, header_size)) => {
+                                if col_idx < types.len() {
+                                    let mut data_offset = header_size;
+                                    for i in 0..col_idx {
+                                        data_offset += types[i].size();
+                                    }
+                                    let col_data = &row_data[data_offset..];
+                                    match crate::vdbe::aux::deserialize_value(
+                                        col_data,
+                                        &types[col_idx],
+                                    ) {
+                                        Ok(mem) => {
+                                            *self.mem_mut(op.p3) = mem;
+                                        }
+                                        Err(_) => self.mem_mut(op.p3).set_null(),
+                                    }
+                                } else {
+                                    self.mem_mut(op.p3).set_null();
+                                }
+                            }
+                            Err(_) => self.mem_mut(op.p3).set_null(),
+                        }
                     } else {
-                        // Placeholder: In real implementation, decode from row_data
                         self.mem_mut(op.p3).set_null();
                     }
                 } else {
@@ -998,10 +1167,9 @@ impl Vdbe {
             // ================================================================
             Opcode::MakeRecord => {
                 // Make record from P1..P1+P2-1, store in P3
-                let _start = op.p1;
-                let _count = op.p2;
-                // Placeholder: Would encode registers into record format
-                self.mem_mut(op.p3).set_blob(&[]);
+                // Uses SQLite record format with varint header and serial types
+                let record = crate::vdbe::aux::make_record(&self.mem, op.p1, op.p2);
+                self.mem_mut(op.p3).set_blob(&record);
             }
 
             // ================================================================
@@ -1058,6 +1226,37 @@ impl Vdbe {
             }
 
             // ================================================================
+            // Rowid and Insert Operations
+            // ================================================================
+            Opcode::NewRowid => {
+                // NewRowid P1 P2 P3
+                // Generate a new unique rowid for cursor P1, store in register P2
+                // P3 is the previous rowid if updating
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    // Simple rowid generation - increment from last known rowid
+                    let new_rowid = cursor.rowid.map_or(1, |r| r + 1);
+                    cursor.rowid = Some(new_rowid);
+                    self.mem_mut(op.p2).set_int(new_rowid);
+                } else {
+                    self.mem_mut(op.p2).set_int(1);
+                }
+            }
+
+            Opcode::Insert | Opcode::InsertInt => {
+                // Insert P1 P2 P3
+                // Insert record P2 with rowid P3 into cursor P1
+                // P4 = table name (for debug)
+                // P5 = flags (conflict resolution)
+                let _record_reg = op.p2;
+                let rowid = self.mem(op.p3).to_int();
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    cursor.rowid = Some(rowid);
+                    // TODO: Actually insert into btree when btree.insert takes &self
+                    // For now, we track the rowid for basic operation
+                }
+            }
+
+            // ================================================================
             // Other opcodes (placeholder implementations)
             // ================================================================
             Opcode::Last
@@ -1069,9 +1268,6 @@ impl Vdbe {
             | Opcode::SeekNull
             | Opcode::NotExists
             | Opcode::Delete
-            | Opcode::Insert
-            | Opcode::InsertInt
-            | Opcode::NewRowid
             | Opcode::IdxGE
             | Opcode::IdxGT
             | Opcode::IdxLE
@@ -1121,6 +1317,38 @@ impl Vdbe {
                 // These are typically handled inline by the compiler
             }
 
+            Opcode::CreateBtree => {
+                // CreateBtree P1 P2 P3
+                // Create a new btree root page, store page number in register P2
+                // P1 = database index (0 for main)
+                // P3 = flags (BTREE_INTKEY for tables, 0 for indexes)
+                let flags = op.p3 as u8;
+                if let Some(ref btree) = self.btree {
+                    let root_pgno = btree.create_table(flags)?;
+                    self.mem_mut(op.p2).set_int(root_pgno as i64);
+                }
+            }
+
+            Opcode::ParseSchema => {
+                // ParseSchema P1 P2 P3 P4
+                // Parse a CREATE TABLE/INDEX statement and add to schema
+                // P2 = register containing root page number
+                // P4 = SQL text of the CREATE statement
+                let root_page = self.mem(op.p2).to_int() as u32;
+                if let P4::Text(sql) = &op.p4 {
+                    if let Some(ref schema) = self.schema {
+                        if let Ok(mut schema_guard) = schema.write() {
+                            // Parse CREATE TABLE SQL and register the table
+                            if let Some(table) = self.parse_create_table_sql(sql, root_page) {
+                                schema_guard
+                                    .tables
+                                    .insert(table.name.clone(), std::sync::Arc::new(table));
+                            }
+                        }
+                    }
+                }
+            }
+
             Opcode::Trace | Opcode::Explain | Opcode::SqlExec => {
                 // Debug/explain operations
             }
@@ -1139,6 +1367,105 @@ impl Vdbe {
         }
 
         Ok(ExecResult::Continue)
+    }
+
+    /// Parse CREATE TABLE SQL and build a Table struct
+    fn parse_create_table_sql(&self, sql: &str, root_page: u32) -> Option<crate::schema::Table> {
+        use crate::schema::{Affinity, Column, Table};
+
+        // Simple parser for CREATE TABLE name (col1 type, col2 type, ...)
+        let sql_upper = sql.to_uppercase();
+        if !sql_upper.starts_with("CREATE TABLE") {
+            return None;
+        }
+
+        // Extract table name
+        let after_create = sql[12..].trim(); // Skip "CREATE TABLE"
+        let after_create = if after_create.to_uppercase().starts_with("IF NOT EXISTS") {
+            after_create[13..].trim()
+        } else {
+            after_create
+        };
+
+        let paren_pos = after_create.find('(')?;
+        let table_name = after_create[..paren_pos].trim().to_string();
+        let columns_str = after_create[paren_pos + 1..].trim();
+        let columns_str = columns_str.strip_suffix(')')?;
+
+        // Parse columns
+        let mut columns = Vec::new();
+        for col_def in columns_str.split(',') {
+            let col_def = col_def.trim();
+            if col_def.is_empty() {
+                continue;
+            }
+
+            let parts: Vec<&str> = col_def.split_whitespace().collect();
+            if parts.is_empty() {
+                continue;
+            }
+
+            let name = parts[0].to_string();
+            let type_name = if parts.len() > 1 {
+                Some(parts[1].to_string())
+            } else {
+                None
+            };
+
+            // Determine affinity from type name
+            let affinity = if let Some(ref tn) = type_name {
+                let tn_upper = tn.to_uppercase();
+                if tn_upper.contains("INT") {
+                    Affinity::Integer
+                } else if tn_upper.contains("CHAR")
+                    || tn_upper.contains("CLOB")
+                    || tn_upper.contains("TEXT")
+                {
+                    Affinity::Text
+                } else if tn_upper.contains("BLOB") || tn_upper.is_empty() {
+                    Affinity::Blob
+                } else if tn_upper.contains("REAL")
+                    || tn_upper.contains("FLOA")
+                    || tn_upper.contains("DOUB")
+                {
+                    Affinity::Real
+                } else {
+                    Affinity::Numeric
+                }
+            } else {
+                Affinity::Blob
+            };
+
+            columns.push(Column {
+                name,
+                type_name,
+                affinity,
+                not_null: false,
+                not_null_conflict: None,
+                default_value: None,
+                collation: "BINARY".to_string(),
+                is_primary_key: false,
+                is_hidden: false,
+                generated: None,
+            });
+        }
+
+        Some(Table {
+            name: table_name,
+            db_idx: 0, // main database
+            root_page,
+            columns,
+            primary_key: None,
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            checks: Vec::new(),
+            without_rowid: false,
+            strict: false,
+            is_virtual: false,
+            autoincrement: false,
+            sql: Some(sql.to_string()),
+            row_estimate: 0,
+        })
     }
 }
 

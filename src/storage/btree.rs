@@ -2692,7 +2692,7 @@ impl Btree {
     }
 
     /// sqlite3BtreeCreateTable
-    pub fn create_table(&mut self, _flags: u8) -> Result<Pgno> {
+    pub fn create_table(&self, _flags: u8) -> Result<Pgno> {
         let mut shared = self
             .shared
             .write()

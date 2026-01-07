@@ -377,6 +377,20 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
         // Create VDBE from compiled bytecode
         let mut vdbe = Vdbe::from_ops(stmt.ops.clone());
 
+        // Set up btree and schema from connection
+        if let Some(conn_ptr) = stmt.conn_ptr {
+            // SAFETY: conn_ptr is valid for the lifetime of the statement
+            let conn = unsafe { &*conn_ptr };
+            if let Some(main_db) = conn.find_db("main") {
+                if let Some(ref btree) = main_db.btree {
+                    vdbe.set_btree(btree.clone());
+                }
+                if let Some(ref schema) = main_db.schema {
+                    vdbe.set_schema(schema.clone());
+                }
+            }
+        }
+
         // Set up parameters
         vdbe.ensure_vars(stmt.param_count);
         for (i, param) in stmt.params.iter().enumerate() {

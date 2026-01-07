@@ -13,6 +13,7 @@ pub mod update;
 pub mod where_clause;
 pub mod where_expr;
 pub mod wherecode;
+pub mod window;
 
 pub use where_clause::{
     analyze_where, estimate_simple_cost, IndexInfo, QueryPlanner, TableInfo, TermOp, WhereClause,
@@ -37,3 +38,7 @@ pub use trigger::{
     TriggerContext, TriggerMask,
 };
 pub use update::{compile_update, UpdateCompiler};
+pub use window::{
+    default_frame_for_function, has_window_function, select_has_window_functions, WindowCompiler,
+    WindowFunc, WindowFuncType, WindowInfo,
+};

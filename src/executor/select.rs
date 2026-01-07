@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use crate::error::{Error, ErrorCode, Result};
+use crate::executor::window::{select_has_window_functions, WindowCompiler};
 use crate::parser::ast::{
     BinaryOp, CompoundOp, Distinct, Expr, FromClause, JoinType, LimitClause, OrderingTerm,
     ResultColumn, SelectBody, SelectCore, SelectStmt, TableRef, WithClause,
@@ -110,6 +111,8 @@ pub struct SelectCompiler {
     is_compound: bool,
     /// Has aggregates?
     has_aggregates: bool,
+    /// Has window functions?
+    has_window_functions: bool,
     /// GROUP BY expressions
     group_by_regs: Vec<i32>,
 }
@@ -128,6 +131,7 @@ impl SelectCompiler {
             ctes: HashMap::new(),
             is_compound: false,
             has_aggregates: false,
+            has_window_functions: false,
             group_by_regs: Vec::new(),
         }
     }
@@ -181,8 +185,9 @@ impl SelectCompiler {
 
     /// Compile a simple SELECT (not compound)
     fn compile_select_core(&mut self, core: &SelectCore, dest: &SelectDest) -> Result<()> {
-        // Check for aggregates
+        // Check for aggregates and window functions
         self.has_aggregates = self.check_for_aggregates(core);
+        self.has_window_functions = select_has_window_functions(core);
 
         // Process FROM clause - open cursors
         if let Some(from) = &core.from {
@@ -190,7 +195,9 @@ impl SelectCompiler {
         }
 
         // Generate the main query loop
-        if self.has_aggregates && core.group_by.is_some() {
+        if self.has_window_functions {
+            self.compile_with_window_functions(core, dest)
+        } else if self.has_aggregates && core.group_by.is_some() {
             self.compile_grouped_aggregate(core, dest)
         } else if self.has_aggregates {
             self.compile_simple_aggregate(core, dest)
@@ -296,6 +303,211 @@ impl SelectCompiler {
         }
 
         Ok(())
+    }
+
+    /// Compile SELECT with window functions
+    ///
+    /// Window functions require special handling:
+    /// 1. First compile the base query into an ephemeral table
+    /// 2. Sort by PARTITION BY + ORDER BY
+    /// 3. Process each partition, computing window function values
+    /// 4. Output rows with window function results
+    fn compile_with_window_functions(
+        &mut self,
+        core: &SelectCore,
+        dest: &SelectDest,
+    ) -> Result<()> {
+        // Create a WindowCompiler to analyze and compile window functions
+        let mut window_compiler = WindowCompiler::new(self.next_reg, self.next_cursor);
+
+        // Collect window function information
+        let window_funcs = window_compiler.collect_window_functions(core)?;
+
+        if window_funcs.is_empty() {
+            // No window functions after all, fall back to regular compilation
+            return self.compile_simple_select(core, dest);
+        }
+
+        // Group by window specification
+        let windows = window_compiler.group_by_window(window_funcs)?;
+
+        // Update our register/cursor counters
+        self.next_reg = window_compiler.next_reg();
+        self.next_cursor = window_compiler.next_cursor();
+
+        // Step 1: Open ephemeral table to store intermediate results
+        let eph_cursor = self.alloc_cursor();
+        self.emit(Opcode::OpenEphemeral, eph_cursor, 0, 0, P4::Unused);
+
+        // Step 2: Collect table cursors
+        let table_cursors: Vec<i32> = self.tables.iter().map(|t| t.cursor).collect();
+
+        // Generate Rewind for each table cursor
+        let mut rewind_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
+        for cursor in &table_cursors {
+            let label = self.alloc_label();
+            self.emit(Opcode::Rewind, *cursor, label, 0, P4::Unused);
+            rewind_labels.push(label);
+        }
+
+        let loop_start = self.current_addr();
+
+        // Evaluate WHERE clause
+        let where_skip_label = if let Some(where_expr) = &core.where_clause {
+            let label = self.alloc_label();
+            self.compile_where_condition(where_expr, label)?;
+            Some(label)
+        } else {
+            None
+        };
+
+        // Evaluate all result columns (except window functions get placeholders)
+        let (result_base, result_count) = self.compile_result_columns_for_window(core)?;
+
+        // Store into ephemeral table
+        let record_reg = self.alloc_reg();
+        self.emit(
+            Opcode::MakeRecord,
+            result_base,
+            result_count as i32,
+            record_reg,
+            P4::Unused,
+        );
+        self.emit(Opcode::NewRowid, eph_cursor, result_base, 0, P4::Unused);
+        self.emit(
+            Opcode::Insert,
+            eph_cursor,
+            record_reg,
+            result_base,
+            P4::Unused,
+        );
+
+        // WHERE skip target
+        if let Some(label) = where_skip_label {
+            self.resolve_label(label, self.current_addr());
+        }
+
+        // Next loop
+        for (i, cursor) in table_cursors.iter().enumerate().rev() {
+            self.emit(Opcode::Next, *cursor, loop_start as i32, 0, P4::Unused);
+            self.resolve_label(rewind_labels[i], self.current_addr());
+        }
+
+        // Step 3: Now process window functions
+        // For each window group, sort by PARTITION BY + ORDER BY, then compute
+        let _window_ops = window_compiler.take_ops();
+        window_compiler.compile_window_functions(&windows, result_base, result_count)?;
+        let window_ops = window_compiler.take_ops();
+
+        // Add window operations to our ops
+        for op in window_ops {
+            self.ops.push(op);
+        }
+
+        // Step 4: Read from ephemeral table and output with window results
+        let done_label = self.alloc_label();
+        self.emit(Opcode::Rewind, eph_cursor, done_label, 0, P4::Unused);
+
+        let read_loop = self.current_addr();
+
+        // Read column values
+        for i in 0..result_count {
+            self.emit(
+                Opcode::Column,
+                eph_cursor,
+                i as i32,
+                result_base + i as i32,
+                P4::Unused,
+            );
+        }
+
+        // Output the row
+        self.output_row(dest, result_base, result_count)?;
+
+        // Next row
+        self.emit(Opcode::Next, eph_cursor, read_loop as i32, 0, P4::Unused);
+
+        self.resolve_label(done_label, self.current_addr());
+
+        // Close cursors
+        self.emit(Opcode::Close, eph_cursor, 0, 0, P4::Unused);
+        for cursor in &table_cursors {
+            self.emit(Opcode::Close, *cursor, 0, 0, P4::Unused);
+        }
+
+        Ok(())
+    }
+
+    /// Compile result columns for window function processing
+    ///
+    /// For window function columns, just allocate a register (value computed later)
+    /// For non-window columns, compile normally
+    fn compile_result_columns_for_window(&mut self, core: &SelectCore) -> Result<(i32, usize)> {
+        use crate::executor::window::has_window_function;
+
+        let base_reg = self.next_reg;
+        let mut count = 0;
+
+        for col in &core.columns {
+            match col {
+                ResultColumn::Star => {
+                    // Expand * to all columns from all tables
+                    let tables_snapshot: Vec<_> = self.tables.clone();
+                    for table in &tables_snapshot {
+                        if let Some(schema_table) = &table.schema_table {
+                            for (col_idx, _) in schema_table.columns.iter().enumerate() {
+                                let reg = self.alloc_reg();
+                                self.emit(
+                                    Opcode::Column,
+                                    table.cursor,
+                                    col_idx as i32,
+                                    reg,
+                                    P4::Unused,
+                                );
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+                ResultColumn::TableStar(table_name) => {
+                    // Expand table.* to columns from specific table
+                    let tables_snapshot: Vec<_> = self.tables.clone();
+                    for table in &tables_snapshot {
+                        if table.name.eq_ignore_ascii_case(table_name)
+                            || table.table_name.eq_ignore_ascii_case(table_name)
+                        {
+                            if let Some(schema_table) = &table.schema_table {
+                                for (col_idx, _) in schema_table.columns.iter().enumerate() {
+                                    let reg = self.alloc_reg();
+                                    self.emit(
+                                        Opcode::Column,
+                                        table.cursor,
+                                        col_idx as i32,
+                                        reg,
+                                        P4::Unused,
+                                    );
+                                    count += 1;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                ResultColumn::Expr { expr, .. } => {
+                    let reg = self.alloc_reg();
+                    if has_window_function(expr) {
+                        // Window function - will be filled in later
+                        self.emit(Opcode::Null, 0, reg, 0, P4::Unused);
+                    } else {
+                        // Regular expression
+                        self.compile_expr(expr, reg)?;
+                    }
+                    count += 1;
+                }
+            }
+        }
+
+        Ok((base_reg, count))
     }
 
     /// Compile SELECT with aggregates but no GROUP BY

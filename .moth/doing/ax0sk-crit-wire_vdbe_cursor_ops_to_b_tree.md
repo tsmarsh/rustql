@@ -29,6 +29,37 @@ Opcode::Next => {
 - CREATE TABLE and INSERT work (don't need cursor iteration)
 - This is the #1 blocker for SQLite compatibility testing
 
+## Progress
+
+### Completed
+- [x] Added `btree: Option<Arc<Btree>>` to `DbInfo` struct
+- [x] Created `StubVfs` implementation for `types::Vfs` trait
+- [x] Modified `sqlite3_open_v2` to create Btree on database open
+- [x] Updated `sqlite3_close` to clean up btree
+
+### Remaining
+- [ ] Wire CREATE TABLE to register schema and create btree root pages
+- [ ] Wire INSERT to encode records and write to btree
+- [ ] Wire OpenRead/OpenWrite to create real BtreeCursor from connection
+- [ ] Wire Rewind to use BtCursor::first()
+- [ ] Wire Next to use BtCursor::next()
+- [ ] Wire Column to decode record data
+- [ ] Wire MakeRecord to encode column data
+
+## Architecture Notes
+
+The B-tree cursor API exists in `src/storage/btree.rs`:
+- `BtCursor::first() -> Result<bool>` - Move to first row
+- `BtCursor::next(flags) -> Result<()>` - Move to next row
+- `BtCursor.state` - CursorState::Valid when positioned
+- `BtCursor.info` - CellInfo with payload data
+
+The VDBE needs to:
+1. Get the Btree from the connection when opening a cursor
+2. Create a BtCursor via `Btree::cursor(root_page, flags, key_info)`
+3. Use BtCursor methods for navigation (first, next, previous)
+4. Decode record data from `BtCursor.info.payload`
+
 ## Required Changes
 
 ### 1. Wire `Rewind` to B-tree
@@ -67,9 +98,11 @@ Opcode::Column => {
 The cursor should get a real BtreeCursor from the pager/btree layer.
 
 ## Files to Modify
+- `src/api/connection.rs` - DbInfo now has btree field (DONE)
 - `src/vdbe/engine.rs` - Fix Rewind, Next, Prev, Column, OpenRead, OpenWrite, Close
 - `src/vdbe/cursor.rs` - Add BtreeCursor integration (if needed)
 - `src/storage/btree.rs` - May need cursor iteration methods
+- `src/executor/prepare.rs` - CREATE TABLE needs real bytecode
 
 ## Testing
 After this fix:

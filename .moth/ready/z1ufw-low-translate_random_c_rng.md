@@ -331,3 +331,7 @@ mod tests {
 - [ ] Deterministic seeding for testing
 - [ ] Thread-safe global instance
 - [ ] Initial bytes discarded for quality
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `random.test` - Random number generation

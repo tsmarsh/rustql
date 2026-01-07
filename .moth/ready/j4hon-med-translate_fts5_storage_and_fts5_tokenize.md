@@ -440,3 +440,14 @@ impl Fts5Storage {
 - [ ] Case folding
 - [ ] Tokenizer options parsing
 - [ ] Position tracking
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `fts5content.test` - FTS5 content storage modes
+- `fts5contentless.test` - FTS5 contentless tables
+- `fts5tok1.test` - FTS5 basic tokenization
+- `fts5tokenize.test` - FTS5 tokenizer interface
+- `fts5unicode.test` - FTS5 Unicode tokenizer
+- `fts5porter.test` - FTS5 Porter stemmer
+- `fts5trigram.test` - FTS5 trigram tokenizer
+- `fts5vocab.test` - FTS5 vocabulary table

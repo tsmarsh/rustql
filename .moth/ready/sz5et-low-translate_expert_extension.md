@@ -540,3 +540,8 @@ impl SqliteExpert {
 - [ ] CREATE INDEX SQL generation
 - [ ] Report generation
 - [ ] Cost estimation
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `expert1.test` - Basic expert functionality
+- `expert2.test` - Index recommendations

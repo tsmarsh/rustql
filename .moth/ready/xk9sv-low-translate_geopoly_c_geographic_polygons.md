@@ -451,3 +451,8 @@ pub fn geopoly_init(db: &mut Connection) -> Result<()> {
 - [ ] geopoly_ccw() winding order
 - [ ] Geopoly virtual table
 - [ ] R-tree integration for spatial queries
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `geopoly.test` - Geopoly extension tests
+- `geopoly1.test` - Basic geopoly operations

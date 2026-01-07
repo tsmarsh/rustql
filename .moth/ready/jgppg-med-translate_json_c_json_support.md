@@ -536,3 +536,17 @@ impl Cursor for JsonEachCursor {
 - [ ] JSON path syntax ($.key, $[0], etc.)
 - [ ] Proper Unicode handling
 - [ ] Error handling for malformed JSON
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `json101.test` - Basic JSON functions
+- `json102.test` - JSON extraction and path queries
+- `json103.test` - JSON modification functions
+- `json104.test` - JSON array/object construction
+- `json105.test` - JSON type checking
+- `json106.test` - JSON table-valued functions
+- `json107.test` - JSON edge cases
+- `json108.test` - JSON performance tests
+- `json501.test` - JSON5 extended syntax
+- `json502.test` - Additional JSON5 tests
+- `jsonb01.test` - JSONB binary format

@@ -425,3 +425,9 @@ SELECT
 - [ ] Handles nested subqueries
 - [ ] Public API functions
 - [ ] Clean output formatting
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `select1.test` - Basic SELECT parsing (for tree correctness)
+- `select2.test` - Complex SELECT parsing
+- `expr.test` - Expression parsing verification

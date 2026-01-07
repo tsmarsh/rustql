@@ -379,3 +379,13 @@ pub fn expr_depth(expr: &Expr) -> i32 {
 - [ ] Support early termination (Abort)
 - [ ] Support pruning (Prune)
 - [ ] Utility functions (count_aggregates, find_columns, etc.)
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `select1.test` - Basic SELECT with complex expressions
+- `select2.test` - SELECT with subqueries
+- `select3.test` - SELECT with joins
+- `select4.test` - SELECT with aggregates
+- `select5.test` - SELECT with compound queries
+- `expr.test` - Expression parsing and evaluation
+- `subquery.test` - Subquery handling

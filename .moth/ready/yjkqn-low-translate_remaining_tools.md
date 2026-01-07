@@ -584,3 +584,9 @@ pub fn dbhash_main(args: &[String]) -> Result<i32> {
 - [ ] dbhash comparison
 - [ ] CLI argument handling
 - [ ] Error handling for corrupt files
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `showdb.test` - Database inspector tests (if exists)
+- `showwal.test` - WAL inspector tests (if exists)
+- `dbhash.test` - Database hash tests (if exists)

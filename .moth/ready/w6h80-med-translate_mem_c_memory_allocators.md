@@ -547,3 +547,26 @@ pub fn sqlite3_memory_highwater(reset: bool) -> i64 {
 - [ ] Soft heap limit support
 - [ ] Thread-safe allocation
 - [ ] Memory leak detection in debug mode
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `malloc.test` - Basic memory allocation
+- `malloc3.test` - Memory allocation stress tests
+- `malloc4.test` - Additional malloc tests
+- `malloc5.test` - Malloc with soft heap limit
+- `malloc6.test` - Memory subsystem tests
+- `malloc7.test` - Additional malloc scenarios
+- `malloc8.test` - Malloc failure recovery
+- `malloc9.test` - Memory allocation edge cases
+- `mallocA.test` - Malloc fault injection
+- `mallocB.test` - More malloc fault tests
+- `mallocC.test` - Malloc and prepared statements
+- `mallocD.test` - Malloc with various operations
+- `mallocE.test` - Malloc in expressions
+- `mallocF.test` - Malloc with foreign keys
+- `mallocG.test` - Malloc with triggers
+- `mallocH.test` - Malloc with indices
+- `mallocI.test` - Malloc with views
+- `mallocJ.test` - Malloc with virtual tables
+- `mallocK.test` - Malloc stress test
+- `mem5.test` - Memsys5 pool allocator tests

@@ -371,3 +371,13 @@ pub fn fts5_create_aux(
 - [ ] Detail mode (full/column/none)
 - [ ] Auxiliary function API
 - [ ] Custom auxiliary function registration
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `fts5vocab.test` - FTS5 vocabulary virtual table
+- `fts5vocab2.test` - Additional vocab tests
+- `fts5config.test` - FTS5 configuration parsing
+- `fts5config2.test` - Additional config tests
+- `fts5aux.test` - FTS5 auxiliary functions
+- `fts5hash.test` - FTS5 hash table tests
+- `fts5detail.test` - FTS5 detail modes

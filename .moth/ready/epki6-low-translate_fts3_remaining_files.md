@@ -476,3 +476,13 @@ impl Fts3Hash {
 - [ ] Tokenizer virtual table
 - [ ] Hash table for term storage
 - [ ] ICU tokenizer (optional, depends on ICU library)
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `fts3tok1.test` - FTS3 tokenizer basics
+- `fts3tok2.test` - Additional tokenizer tests
+- `fts3tokenize.test` - FTS3 tokenize virtual table
+- `fts3unicode.test` - FTS3 Unicode tokenizer
+- `fts3unicode2.test` - Unicode tokenizer edge cases
+- `fts3porter.test` - FTS3 Porter stemmer
+- `fts3_common.test` - Common FTS3 utilities

@@ -494,3 +494,10 @@ fn decode_value(data: &[u8], pos: &mut usize) -> Result<Value> {
 - [ ] Empty check utility
 - [ ] Size calculation
 - [ ] Changeset diff between databases
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `session1.test` - Basic session tests
+- `sessionrebase.test` - Session rebase tests
+- `sessiongroup.test` - Changegroup tests (if exists)
+- `changeset.test` - Changeset utility tests (if exists)

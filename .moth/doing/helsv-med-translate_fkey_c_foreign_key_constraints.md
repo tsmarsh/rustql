@@ -459,5 +459,18 @@ impl<'a> Parse<'a> {
 - [ ] PRAGMA foreign_keys enable/disable
 - [ ] PRAGMA foreign_key_check
 - [ ] PRAGMA foreign_key_list
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `fkey1.test` - Basic foreign key constraints
+- `fkey2.test` - Foreign key actions (CASCADE, SET NULL, etc.)
+- `fkey3.test` - Deferred foreign keys
+- `fkey4.test` - Foreign key edge cases
+- `fkey5.test` - Foreign key with indexes
+- `fkey6.test` - Self-referential foreign keys
+- `fkey7.test` - Foreign key and triggers interaction
+- `fkey8.test` - Foreign key additional scenarios
+- `fkey_malloc.test` - Foreign key memory allocation
+- `e_fkey.test` - Foreign key expression tests
 - [ ] Multi-column foreign keys
 - [ ] Self-referencing foreign keys

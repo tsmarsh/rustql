@@ -618,3 +618,20 @@ impl Changeset {
 - [ ] Patchset generation
 - [ ] Changeset inversion
 - [ ] Indirect change tracking
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `session1.test` - Basic session functionality
+- `session2.test` - Session change tracking
+- `session3.test` - Changeset generation
+- `session4.test` - Changeset application
+- `session5.test` - Conflict handling
+- `session6.test` - Patchset operations
+- `session7.test` - Changeset inversion
+- `session8.test` - Session with transactions
+- `session9.test` - Session edge cases
+- `sessionA.test` - Session with triggers
+- `sessionB.test` - Session with foreign keys
+- `sessionfault.test` - Session error handling
+- `sessionrebase.test` - Session rebase operations
+- `sessionstat1.test` - Session statistics

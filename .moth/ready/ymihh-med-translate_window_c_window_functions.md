@@ -225,3 +225,18 @@ Any aggregate can be used as window function:
 - [ ] FIRST_VALUE, LAST_VALUE, NTH_VALUE
 - [ ] Aggregate functions over windows
 - [ ] Named windows (WINDOW clause)
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `window1.test` - Basic window function syntax
+- `window2.test` - PARTITION BY and ORDER BY
+- `window3.test` - Frame specifications (ROWS/RANGE/GROUPS)
+- `window4.test` - Frame bounds (PRECEDING/FOLLOWING)
+- `window5.test` - EXCLUDE clause
+- `window6.test` - Ranking functions (ROW_NUMBER, RANK, DENSE_RANK)
+- `window7.test` - Navigation functions (LAG, LEAD)
+- `window8.test` - Value functions (FIRST_VALUE, LAST_VALUE, NTH_VALUE)
+- `window9.test` - Aggregate functions as window functions
+- `windowA.test` - Named windows (WINDOW clause)
+- `windowB.test` - Window function edge cases
+- `windowfault.test` - Window function error handling

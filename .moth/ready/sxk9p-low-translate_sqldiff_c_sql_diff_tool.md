@@ -519,3 +519,7 @@ pub fn sqldiff_main(args: &[String]) -> Result<i32> {
 - [ ] Transaction wrapper
 - [ ] WITHOUT ROWID table support
 - [ ] CLI argument parsing
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `sqldiff.test` - SQL diff tool tests

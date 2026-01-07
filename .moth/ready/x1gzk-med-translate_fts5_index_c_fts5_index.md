@@ -377,3 +377,13 @@ impl Fts5Iter {
 - [ ] Incremental indexing
 - [ ] Rebuild/optimize
 - [ ] Integrity check
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `fts5aa.test` - FTS5 basic functionality
+- `fts5ab.test` - FTS5 index operations
+- `fts5ac.test` - FTS5 segment merging
+- `fts5ad.test` - FTS5 prefix indexes
+- `fts5ae.test` - FTS5 delete operations
+- `fts5corrupt.test` - FTS5 corruption handling
+- `fts5fault.test` - FTS5 fault injection

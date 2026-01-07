@@ -382,3 +382,15 @@ pub fn sqlite3_config_log(callback: impl Fn(LogLevel, &str) + Send + Sync + 'sta
 - [ ] Safe memory operations
 - [ ] Logging infrastructure
 - [ ] Error code to string mapping
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `instr.test` - String operations (instr function)
+- `atof1.test` - String to float conversion
+- `numcast.test` - Numeric type casting
+- `printf.test` - Printf-style formatting
+- `printf2.test` - Additional printf tests
+- `cast.test` - Type casting operations
+- `types.test` - Type affinity tests
+- `types2.test` - Additional type tests
+- `types3.test` - Type coercion edge cases

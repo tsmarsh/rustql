@@ -502,3 +502,9 @@ impl SqliteRecover {
 - [ ] Error handling for corrupt data
 - [ ] Progress reporting
 - [ ] Configuration options
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `recover.test` - Database recovery tests
+- `recover2.test` - Additional recovery tests
+- `dbdata.test` - Raw database data access

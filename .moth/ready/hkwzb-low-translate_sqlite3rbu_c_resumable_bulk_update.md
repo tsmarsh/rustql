@@ -500,3 +500,11 @@ impl Rbu {
 - [ ] Error handling and recovery
 - [ ] Vacuum mode support
 - [ ] FTS table support
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `rbu.test` - Core RBU functionality
+- `rbu2.test` - Additional RBU tests
+- `rbu3.test` - RBU edge cases
+- `rbufault.test` - RBU error handling
+- `rbuvacuum.test` - RBU vacuum mode

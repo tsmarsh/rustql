@@ -418,3 +418,14 @@ impl Fts3Table {
 - [ ] Segment merging
 - [ ] Prefix indexes
 - [ ] Content table option
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `fts3.test` - Core FTS3 functionality
+- `fts3a.test` - FTS3 basic queries
+- `fts3b.test` - FTS3 boolean operators
+- `fts3c.test` - FTS3 phrase queries
+- `fts3d.test` - FTS3 prefix queries
+- `fts3e.test` - FTS3 NEAR queries
+- `fts3f.test` - FTS3 advanced features
+- `fts3_write.test` - FTS3 write operations

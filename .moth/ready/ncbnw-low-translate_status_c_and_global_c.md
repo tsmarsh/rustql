@@ -427,3 +427,10 @@ pub fn sqlite3_threadsafe() -> i32 {
 - [ ] Memory status tracking
 - [ ] Cache hit/miss statistics
 - [ ] Atomic counter updates
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `dbstatus.test` - Database status tests
+- `dbstatus2.test` - Additional status tests
+- `status.test` - Global status tests
+- `config.test` - Configuration tests (if exists)

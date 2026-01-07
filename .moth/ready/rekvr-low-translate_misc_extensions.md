@@ -477,3 +477,15 @@ pub fn sqlar_uncompress_func(ctx: &mut Context, args: &[&Value]) -> Result<()> {
 - [ ] File mode functions (lsmode)
 - [ ] SQLAR compression functions
 - [ ] Database dump utility
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `spellfix.test` - Spellfix extension
+- `spellfix2.test` - Additional spellfix tests
+- `zipfile.test` - Zipfile virtual table
+- `zipfile2.test` - Additional zipfile tests
+- `series.test` - generate_series virtual table
+- `uuid.test` - UUID functions
+- `fileio.test` - File I/O functions
+- `sqlar.test` - SQL archive functions
+- `dbdump.test` - Database dump utility

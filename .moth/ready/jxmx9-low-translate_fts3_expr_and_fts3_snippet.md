@@ -486,3 +486,13 @@ pub fn fts3_matchinfo(cursor: &Fts3Cursor, format: &str) -> Result<Vec<u8>> {
 - [ ] Highlight tags customization
 - [ ] Ellipsis handling
 - [ ] Window optimization for snippets
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `fts3expr.test` - FTS3 expression parsing
+- `fts3expr2.test` - Additional expression tests
+- `fts3snippet.test` - FTS3 snippet function
+- `fts3snippet2.test` - Additional snippet tests
+- `fts3offsets.test` - FTS3 offsets function
+- `fts3matchinfo.test` - FTS3 matchinfo function
+- `fts3near.test` - FTS3 NEAR queries

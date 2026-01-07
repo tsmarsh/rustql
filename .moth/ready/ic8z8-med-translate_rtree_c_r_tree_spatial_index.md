@@ -556,3 +556,24 @@ impl VirtualTable for RtreeTable {
 - [ ] Node splitting (quadratic algorithm)
 - [ ] Tree condensing on delete
 - [ ] Nearest neighbor queries (optional)
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `rtree.test` - Core R-tree functionality
+- `rtree1.test` - R-tree basic operations
+- `rtree2.test` - R-tree queries
+- `rtree3.test` - R-tree insert/delete
+- `rtree4.test` - R-tree constraints
+- `rtree5.test` - R-tree geometry callbacks
+- `rtree6.test` - R-tree multiple dimensions
+- `rtree7.test` - R-tree edge cases
+- `rtree8.test` - R-tree performance
+- `rtree9.test` - R-tree with transactions
+- `rtreeA.test` - R-tree auxiliary columns
+- `rtreeB.test` - R-tree boundary conditions
+- `rtreeC.test` - R-tree corruption handling
+- `rtreeD.test` - R-tree nearest neighbor
+- `rtreeE.test` - R-tree expression handling
+- `rtreeF.test` - R-tree fault injection
+- `rtreeG.test` - R-tree geometry functions
+- `rtreefault.test` - R-tree error handling

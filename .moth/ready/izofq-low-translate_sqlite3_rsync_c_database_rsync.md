@@ -527,3 +527,7 @@ pub fn rsync_main(args: &[String]) -> Result<i32> {
 - [ ] Dry run mode
 - [ ] CLI argument parsing
 - [ ] Progress reporting
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `rsync.test` - Database rsync tests (if exists)

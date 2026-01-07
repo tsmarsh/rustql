@@ -284,3 +284,12 @@ backup_finish(backup)?;
 - [ ] Handle concurrent source modifications
 - [ ] Handle page size differences
 - [ ] Proper locking during operations
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `backup.test` - Core backup functionality
+- `backup2.test` - Additional backup scenarios
+- `backup4.test` - Backup edge cases
+- `backup5.test` - Backup with concurrent access
+- `backup_ioerr.test` - Backup I/O error handling
+- `backup_malloc.test` - Backup memory allocation failures

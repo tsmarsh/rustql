@@ -196,3 +196,22 @@ impl<'a> Parse<'a> {
 - [ ] Recursive trigger prevention
 - [ ] DROP TRIGGER
 - [ ] RAISE() function
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `trigger1.test` - Basic trigger functionality
+- `trigger2.test` - Trigger timing (BEFORE/AFTER)
+- `trigger3.test` - INSTEAD OF triggers on views
+- `trigger4.test` - Trigger body statements
+- `trigger5.test` - OLD/NEW row access
+- `trigger6.test` - Nested triggers
+- `trigger7.test` - Trigger and transactions
+- `trigger8.test` - Trigger edge cases
+- `trigger9.test` - Recursive triggers
+- `triggerA.test` - RAISE function
+- `triggerB.test` - Trigger and constraints
+- `triggerC.test` - Additional trigger tests
+- `triggerD.test` - Trigger performance
+- `altertrig.test` - ALTER TABLE with triggers
+- `droptrig.test` - DROP TRIGGER tests
+- `e_droptrigger.test` - DROP TRIGGER expressions

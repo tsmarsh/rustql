@@ -431,3 +431,14 @@ fn snippet_func(ctx: &mut Context, aux: &Fts5AuxContext, args: &[&Value]) -> Res
 - [ ] snippet() function
 - [ ] Custom auxiliary function registration
 - [ ] xFilter/xNext/xColumn implementation
+
+## TCL Tests That Should Pass
+After completion, the following SQLite TCL test files should pass:
+- `fts5.test` - FTS5 core virtual table
+- `fts5aa.test` - FTS5 basic queries
+- `fts5expr.test` - FTS5 expression parsing
+- `fts5near.test` - FTS5 NEAR queries
+- `fts5phrase.test` - FTS5 phrase queries
+- `fts5prefix.test` - FTS5 prefix queries
+- `fts5rank.test` - FTS5 ranking (bm25)
+- `fts5snippet.test` - FTS5 snippet/highlight functions

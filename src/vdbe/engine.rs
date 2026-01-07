@@ -245,6 +245,25 @@ pub struct Vdbe {
 
     /// Foreign key enforcement enabled
     fk_enabled: bool,
+
+    // ========================================================================
+    // Trigger Context
+    // ========================================================================
+    /// OLD row values for DELETE/UPDATE triggers
+    trigger_old_row: Option<Vec<Mem>>,
+
+    /// NEW row values for INSERT/UPDATE triggers
+    trigger_new_row: Option<Vec<Mem>>,
+
+    /// Trigger recursion depth
+    trigger_depth: u32,
+
+    /// Maximum trigger recursion depth (default 1000)
+    max_trigger_depth: u32,
+
+    /// Saved program state for subprogram execution
+    /// (parent ops, parent pc) - allows returning from trigger
+    subprogram_stack: Vec<(Vec<VdbeOp>, i32, i32)>, // (ops, pc, mem_base)
 }
 
 impl Default for Vdbe {
@@ -280,6 +299,11 @@ impl Vdbe {
             schema: None,
             deferred_fk_counter: 0,
             fk_enabled: true,
+            trigger_old_row: None,
+            trigger_new_row: None,
+            trigger_depth: 0,
+            max_trigger_depth: 1000,
+            subprogram_stack: Vec::new(),
         }
     }
 
@@ -291,6 +315,36 @@ impl Vdbe {
     /// Get deferred FK violation count
     pub fn deferred_fk_count(&self) -> i64 {
         self.deferred_fk_counter
+    }
+
+    // ========================================================================
+    // Trigger Context Methods
+    // ========================================================================
+
+    /// Set OLD row for DELETE/UPDATE triggers
+    pub fn set_trigger_old_row(&mut self, row: Vec<Mem>) {
+        self.trigger_old_row = Some(row);
+    }
+
+    /// Set NEW row for INSERT/UPDATE triggers
+    pub fn set_trigger_new_row(&mut self, row: Vec<Mem>) {
+        self.trigger_new_row = Some(row);
+    }
+
+    /// Clear trigger context
+    pub fn clear_trigger_context(&mut self) {
+        self.trigger_old_row = None;
+        self.trigger_new_row = None;
+    }
+
+    /// Get trigger recursion depth
+    pub fn trigger_depth(&self) -> u32 {
+        self.trigger_depth
+    }
+
+    /// Check if we're inside a trigger
+    pub fn in_trigger(&self) -> bool {
+        self.trigger_depth > 0
     }
 
     /// Set the database btree for storage operations
@@ -677,7 +731,23 @@ impl Vdbe {
                 if let P4::Text(ref msg) = op.p4 {
                     self.error_msg = Some(msg.clone());
                 }
-                return Ok(ExecResult::Done);
+
+                // Check if we're in a subprogram (trigger)
+                if let Some((parent_ops, return_pc, _parent_pc)) = self.subprogram_stack.pop() {
+                    // Return from subprogram to parent
+                    self.ops = parent_ops;
+                    self.pc = return_pc - 1; // -1 because it will be incremented
+                    self.trigger_depth = self.trigger_depth.saturating_sub(1);
+
+                    // If halt was due to error, propagate it
+                    if self.rc != ErrorCode::Ok {
+                        return Ok(ExecResult::Done);
+                    }
+                    // Otherwise continue execution in parent
+                } else {
+                    // Top-level halt - execution is done
+                    return Ok(ExecResult::Done);
+                }
             }
 
             Opcode::If => {
@@ -1458,14 +1528,43 @@ impl Vdbe {
             Opcode::Program => {
                 // Program P1 P2 P3 P4
                 // Execute a trigger subprogram
-                // P1 = subprogram context register
+                // P1 = subprogram context register (unused currently)
                 // P2 = return address (jump here when subprogram finishes)
                 // P3 = trigger mask/flags
                 // P4 = SubProgram containing trigger bytecode
-                //
-                // For now, triggers are a placeholder - full implementation
-                // requires nested VDBE execution infrastructure
-                // TODO: Implement trigger execution
+
+                // Check recursion depth
+                if self.trigger_depth >= self.max_trigger_depth {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        format!(
+                            "too many levels of trigger recursion (max {})",
+                            self.max_trigger_depth
+                        ),
+                    ));
+                }
+
+                // Get the subprogram from P4
+                if let P4::Subprogram(ref subprog) = op.p4 {
+                    // Save current execution state
+                    let return_pc = op.p2;
+                    let current_ops = std::mem::take(&mut self.ops);
+                    let current_pc = self.pc;
+
+                    // Push state onto subprogram stack
+                    self.subprogram_stack
+                        .push((current_ops, return_pc, current_pc));
+
+                    // Load subprogram
+                    self.ops = subprog.ops.clone();
+                    self.pc = -1; // Will be incremented to 0
+
+                    // Increment trigger depth
+                    self.trigger_depth += 1;
+                } else {
+                    // No subprogram - this is an error or no-op
+                    // Just continue to next instruction
+                }
             }
 
             Opcode::Param => {
@@ -1474,10 +1573,27 @@ impl Vdbe {
                 // P1 = which parameter (0 = OLD row, 1 = NEW row)
                 // P2 = column index (-1 for rowid)
                 // P3 = destination register
-                //
-                // For now, return NULL - full implementation requires
-                // trigger context with OLD/NEW row values
-                self.mem_mut(op.p3).set_null();
+
+                let row = if op.p1 == 0 {
+                    &self.trigger_old_row
+                } else {
+                    &self.trigger_new_row
+                };
+
+                if let Some(ref row_data) = row {
+                    let col_idx = op.p2;
+                    if col_idx >= 0 && (col_idx as usize) < row_data.len() {
+                        // Copy value from trigger row to destination register
+                        let value = row_data[col_idx as usize].clone();
+                        *self.mem_mut(op.p3) = value;
+                    } else {
+                        // Column index out of range - return NULL
+                        self.mem_mut(op.p3).set_null();
+                    }
+                } else {
+                    // No trigger context (not in a trigger) - return NULL
+                    self.mem_mut(op.p3).set_null();
+                }
             }
 
             Opcode::TriggerTest => {

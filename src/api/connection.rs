@@ -7,9 +7,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::error::{Error, ErrorCode, Result};
+use crate::functions::{get_aggregate_function, get_scalar_function, AggregateInfo, ScalarFunc};
 use crate::schema::{Encoding, Schema};
 use crate::storage::pager::{JournalMode, LockingMode, DEFAULT_PAGE_SIZE};
-use crate::types::{OpenFlags, RowId};
+use crate::types::{OpenFlags, RowId, Value};
 
 use super::config::{sqlite3_initialize, DbConfigOption};
 
@@ -17,9 +18,102 @@ use super::config::{sqlite3_initialize, DbConfigOption};
 // Transaction State
 // ============================================================================
 
-const SQLITE_OK: i32 = 0;
-const SQLITE_ATTACH: i32 = 24;
-const SQLITE_DETACH: i32 = 25;
+// ============================================================================
+// Authorization
+// ============================================================================
+
+/// Authorization actions
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthAction {
+    CreateIndex = 1,
+    CreateTable = 2,
+    CreateTempIndex = 3,
+    CreateTempTable = 4,
+    CreateTempTrigger = 5,
+    CreateTempView = 6,
+    CreateTrigger = 7,
+    CreateView = 8,
+    Delete = 9,
+    DropIndex = 10,
+    DropTable = 11,
+    DropTempIndex = 12,
+    DropTempTable = 13,
+    DropTempTrigger = 14,
+    DropTempView = 15,
+    DropTrigger = 16,
+    DropView = 17,
+    Insert = 18,
+    Pragma = 19,
+    Read = 20,
+    Select = 21,
+    Transaction = 22,
+    Update = 23,
+    Attach = 24,
+    Detach = 25,
+    AlterTable = 26,
+    Reindex = 27,
+    Analyze = 28,
+    CreateVtable = 29,
+    DropVtable = 30,
+    Function = 31,
+    Savepoint = 32,
+    Recursive = 33,
+}
+
+/// Authorization callback result
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthResult {
+    Ok = 0,
+    Deny = 1,
+    Ignore = 2,
+}
+
+impl AuthResult {
+    fn from_code(code: i32) -> Self {
+        match code {
+            1 => AuthResult::Deny,
+            2 => AuthResult::Ignore,
+            _ => AuthResult::Ok,
+        }
+    }
+}
+
+// ============================================================================
+// Function Registry
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FuncKey {
+    pub name: String,
+    pub n_arg: i32,
+    pub encoding: Encoding,
+}
+
+impl FuncKey {
+    pub fn new(name: &str, n_arg: i32, encoding: Encoding) -> Self {
+        Self {
+            name: name.to_lowercase(),
+            n_arg,
+            encoding,
+        }
+    }
+}
+
+pub struct AggregateContext;
+
+pub type AggStep = fn(&mut AggregateContext, &[Value]) -> Result<()>;
+pub type AggFinal = fn(&AggregateContext) -> Result<Value>;
+
+#[derive(Clone)]
+pub struct FunctionDef {
+    pub name: String,
+    pub n_arg: i32,
+    pub x_func: Option<ScalarFunc>,
+    pub x_step: Option<AggStep>,
+    pub x_final: Option<AggFinal>,
+    pub x_inverse: Option<AggStep>,
+    pub x_value: Option<AggFinal>,
+}
 
 /// Transaction state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -135,6 +229,9 @@ pub type UpdateHook = Box<dyn Fn(i32, &str, &str, i64) + Send + Sync>;
 pub type Authorizer =
     Box<dyn Fn(i32, Option<&str>, Option<&str>, Option<&str>, Option<&str>) -> i32 + Send + Sync>;
 
+/// Collation needed callback type
+pub type CollationNeeded = Box<dyn Fn(&mut SqliteConnection, &str) + Send + Sync>;
+
 // ============================================================================
 // Connection
 // ============================================================================
@@ -165,6 +262,8 @@ pub struct SqliteConnection {
     pub progress_interval: i32,
     /// Authorizer callback
     pub authorizer: Option<Authorizer>,
+    /// Function registry (user-defined)
+    pub functions: HashMap<FuncKey, FunctionDef>,
     /// Commit hook
     pub commit_hook: Option<CommitHook>,
     /// Rollback hook
@@ -173,6 +272,8 @@ pub struct SqliteConnection {
     pub update_hook: Option<UpdateHook>,
     /// Registered collations
     pub collations: HashMap<String, Arc<dyn Fn(&str, &str) -> std::cmp::Ordering + Send + Sync>>,
+    /// Collation needed callback
+    pub collation_needed: Option<CollationNeeded>,
     /// Auto-vacuum mode
     pub auto_vacuum: AutoVacuum,
     /// Transaction state
@@ -246,10 +347,12 @@ impl SqliteConnection {
             progress_handler: None,
             progress_interval: 0,
             authorizer: None,
+            functions: HashMap::new(),
             commit_hook: None,
             rollback_hook: None,
             update_hook: None,
             collations: HashMap::new(),
+            collation_needed: None,
             auto_vacuum: AutoVacuum::None,
             transaction_state: TransactionState::None,
             savepoints: Vec::new(),
@@ -288,20 +391,154 @@ impl SqliteConnection {
     /// Register built-in collation sequences
     fn register_builtin_collations(&mut self) {
         // BINARY - bytewise comparison (default)
-        self.collations
-            .insert("BINARY".to_string(), Arc::new(|a: &str, b: &str| a.cmp(b)));
+        self.create_collation("BINARY", |a, b| a.cmp(b));
 
         // NOCASE - case-insensitive for ASCII
-        self.collations.insert(
-            "NOCASE".to_string(),
-            Arc::new(|a: &str, b: &str| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase())),
-        );
+        self.create_collation("NOCASE", |a, b| {
+            a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase())
+        });
 
         // RTRIM - ignore trailing spaces
-        self.collations.insert(
-            "RTRIM".to_string(),
-            Arc::new(|a: &str, b: &str| a.trim_end().cmp(b.trim_end())),
-        );
+        self.create_collation("RTRIM", |a, b| a.trim_end().cmp(b.trim_end()));
+    }
+
+    /// Register a collation sequence
+    pub fn create_collation<F>(&mut self, name: &str, cmp: F)
+    where
+        F: Fn(&str, &str) -> std::cmp::Ordering + Send + Sync + 'static,
+    {
+        self.collations.insert(name.to_uppercase(), Arc::new(cmp));
+    }
+
+    /// Find a collation by name, invoking the collation-needed callback if set.
+    pub fn find_collation(
+        &mut self,
+        name: &str,
+    ) -> Option<Arc<dyn Fn(&str, &str) -> std::cmp::Ordering + Send + Sync>> {
+        if let Some(collation) = self.collations.get(&name.to_uppercase()) {
+            return Some(Arc::clone(collation));
+        }
+
+        if self.collation_needed.is_some() {
+            let callback = self.collation_needed.take().unwrap();
+            callback(self, name);
+            self.collation_needed = Some(callback);
+            return self.collations.get(&name.to_uppercase()).map(Arc::clone);
+        }
+
+        None
+    }
+
+    /// Set the collation-needed callback
+    pub fn set_collation_needed(&mut self, callback: Option<CollationNeeded>) {
+        self.collation_needed = callback;
+    }
+
+    /// Register a scalar function
+    pub fn create_function(&mut self, name: &str, n_arg: i32, func: ScalarFunc) {
+        let key = FuncKey::new(name, n_arg, self.encoding);
+        let def = FunctionDef {
+            name: name.to_string(),
+            n_arg,
+            x_func: Some(func),
+            x_step: None,
+            x_final: None,
+            x_inverse: None,
+            x_value: None,
+        };
+        self.functions.insert(key, def);
+    }
+
+    /// Register an aggregate function
+    pub fn create_aggregate(&mut self, name: &str, n_arg: i32, step: AggStep, finalizer: AggFinal) {
+        let key = FuncKey::new(name, n_arg, self.encoding);
+        let def = FunctionDef {
+            name: name.to_string(),
+            n_arg,
+            x_func: None,
+            x_step: Some(step),
+            x_final: Some(finalizer),
+            x_inverse: None,
+            x_value: None,
+        };
+        self.functions.insert(key, def);
+    }
+
+    /// Register a window function
+    pub fn create_window_function(
+        &mut self,
+        name: &str,
+        n_arg: i32,
+        step: AggStep,
+        finalizer: AggFinal,
+        value: AggFinal,
+        inverse: AggStep,
+    ) {
+        let key = FuncKey::new(name, n_arg, self.encoding);
+        let def = FunctionDef {
+            name: name.to_string(),
+            n_arg,
+            x_func: None,
+            x_step: Some(step),
+            x_final: Some(finalizer),
+            x_inverse: Some(inverse),
+            x_value: Some(value),
+        };
+        self.functions.insert(key, def);
+    }
+
+    /// Find a function by name and argument count
+    pub fn find_function(&self, name: &str, n_arg: i32) -> Option<FunctionDef> {
+        let key = FuncKey::new(name, n_arg, self.encoding);
+        if let Some(def) = self.functions.get(&key) {
+            return Some(def.clone());
+        }
+        let any_key = FuncKey::new(name, -1, self.encoding);
+        if let Some(def) = self.functions.get(&any_key) {
+            return Some(def.clone());
+        }
+        if let Some(func) = get_scalar_function(name) {
+            return Some(FunctionDef {
+                name: name.to_string(),
+                n_arg,
+                x_func: Some(func),
+                x_step: None,
+                x_final: None,
+                x_inverse: None,
+                x_value: None,
+            });
+        }
+        if let Some(aggregate) = get_aggregate_function(name) {
+            if matches_arg_count(&aggregate, n_arg) {
+                return Some(FunctionDef {
+                    name: aggregate.name,
+                    n_arg,
+                    x_func: None,
+                    x_step: None,
+                    x_final: None,
+                    x_inverse: None,
+                    x_value: None,
+                });
+            }
+        }
+        None
+    }
+
+    /// Invoke the authorizer callback
+    pub fn authorize(
+        &self,
+        action: AuthAction,
+        arg1: Option<&str>,
+        arg2: Option<&str>,
+        arg3: Option<&str>,
+        arg4: Option<&str>,
+    ) -> AuthResult {
+        match &self.authorizer {
+            Some(authorizer) => {
+                AuthResult::from_code(authorizer(action as i32, arg1, arg2, arg3, arg4))
+            }
+            None => AuthResult::Ok,
+        }
     }
 
     /// Set an error on this connection
@@ -384,11 +621,15 @@ impl SqliteConnection {
             ));
         }
 
-        if let Some(authorizer) = &self.authorizer {
-            let rc = authorizer(SQLITE_ATTACH, Some(filename), None, Some(schema_name), None);
-            if rc != SQLITE_OK {
-                return Err(Error::with_message(ErrorCode::Auth, "authorization denied"));
-            }
+        let auth = self.authorize(
+            AuthAction::Attach,
+            Some(filename),
+            None,
+            Some(schema_name),
+            None,
+        );
+        if auth != AuthResult::Ok {
+            return Err(Error::with_message(ErrorCode::Auth, "authorization denied"));
         }
 
         let mut db = DbInfo::new(schema_name);
@@ -426,16 +667,22 @@ impl SqliteConnection {
             ));
         }
 
-        if let Some(authorizer) = &self.authorizer {
-            let rc = authorizer(SQLITE_DETACH, Some(schema_name), None, None, None);
-            if rc != SQLITE_OK {
-                return Err(Error::with_message(ErrorCode::Auth, "authorization denied"));
-            }
+        let auth = self.authorize(AuthAction::Detach, Some(schema_name), None, None, None);
+        if auth != AuthResult::Ok {
+            return Err(Error::with_message(ErrorCode::Auth, "authorization denied"));
         }
 
         self.dbs.remove(idx);
         Ok(())
     }
+}
+
+fn matches_arg_count(info: &AggregateInfo, n_arg: i32) -> bool {
+    if n_arg < 0 {
+        return true;
+    }
+    let count = n_arg as usize;
+    count >= info.min_args && count <= info.max_args
 }
 
 // ============================================================================
@@ -948,5 +1195,57 @@ mod tests {
     fn test_autocommit() {
         let conn = SqliteConnection::new();
         assert!(sqlite3_get_autocommit(&conn));
+    }
+
+    #[test]
+    fn test_function_registry() {
+        fn custom_func(args: &[Value]) -> Result<Value> {
+            Ok(Value::Integer(args.len() as i64))
+        }
+
+        let mut conn = SqliteConnection::new();
+        conn.create_function("custom", 1, custom_func);
+
+        let def = conn
+            .find_function("custom", 1)
+            .expect("function registered");
+        assert!(def.x_func.is_some());
+
+        let builtin = conn.find_function("abs", 1).expect("builtin lookup");
+        assert!(builtin.x_func.is_some());
+    }
+
+    #[test]
+    fn test_collation_needed_callback() {
+        let mut conn = SqliteConnection::new();
+        conn.set_collation_needed(Some(Box::new(|conn, name| {
+            if name.eq_ignore_ascii_case("CUSTOM") {
+                conn.create_collation("CUSTOM", |a, b| a.len().cmp(&b.len()));
+            }
+        })));
+
+        let coll = conn.find_collation("CUSTOM");
+        assert!(coll.is_some());
+    }
+
+    #[test]
+    fn test_authorizer_wrapper() {
+        let mut conn = SqliteConnection::new();
+        sqlite3_set_authorizer(
+            &mut conn,
+            Some(Box::new(|action, _, _, _, _| {
+                if action == AuthAction::Attach as i32 {
+                    1
+                } else {
+                    0
+                }
+            })),
+        )
+        .unwrap();
+
+        assert_eq!(
+            conn.authorize(AuthAction::Attach, None, None, None, None),
+            AuthResult::Deny
+        );
     }
 }

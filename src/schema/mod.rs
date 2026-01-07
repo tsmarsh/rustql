@@ -24,7 +24,7 @@ pub const MAX_ATTACHED: usize = 10;
 // ============================================================================
 
 /// Text encoding (SQLITE_UTF8, etc.)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 #[repr(u8)]
 pub enum Encoding {
     #[default]

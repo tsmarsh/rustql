@@ -239,6 +239,12 @@ pub struct Vdbe {
 
     /// Schema for main database (for DDL operations)
     schema: Option<Arc<RwLock<Schema>>>,
+
+    /// Deferred foreign key violation counter
+    deferred_fk_counter: i64,
+
+    /// Foreign key enforcement enabled
+    fk_enabled: bool,
 }
 
 impl Default for Vdbe {
@@ -272,7 +278,19 @@ impl Vdbe {
             column_names: Vec::new(),
             btree: None,
             schema: None,
+            deferred_fk_counter: 0,
+            fk_enabled: true,
         }
+    }
+
+    /// Set foreign key enforcement
+    pub fn set_fk_enabled(&mut self, enabled: bool) {
+        self.fk_enabled = enabled;
+    }
+
+    /// Get deferred FK violation count
+    pub fn deferred_fk_count(&self) -> i64 {
+        self.deferred_fk_counter
     }
 
     /// Set the database btree for storage operations
@@ -1357,6 +1375,83 @@ impl Vdbe {
                 // Placeholder: Misc operations
             }
 
+            // ================================================================
+            // Foreign Key Operations
+            // ================================================================
+            Opcode::FkCounter => {
+                // FkCounter P1 P2
+                // Add P1 to the deferred FK constraint counter
+                // P2 = database index (unused for now)
+                let delta = op.p1 as i64;
+                self.deferred_fk_counter += delta;
+            }
+
+            Opcode::FkIfZero => {
+                // FkIfZero P1 P2
+                // Jump to P2 if deferred FK counter is zero
+                // P1 = database index (unused for now)
+                if self.deferred_fk_counter == 0 {
+                    self.pc = op.p2 - 1; // -1 because we increment after
+                }
+            }
+
+            Opcode::FkCheck => {
+                // FkCheck P1 P2 P3 P4
+                // Check immediate FK constraints
+                // P1 = cursor for table being modified
+                // P2 = register containing rowid
+                // P3 = operation type (0=INSERT, 1=DELETE, 2=UPDATE)
+                // P4 = table name
+                if self.fk_enabled {
+                    if let (Some(ref schema_lock), Some(ref btree)) = (&self.schema, &self.btree) {
+                        if let Ok(schema) = schema_lock.read() {
+                            // Get table name from P4
+                            let table_name = match &op.p4 {
+                                P4::Text(name) => name.as_str(),
+                                _ => "",
+                            };
+
+                            if !table_name.is_empty() {
+                                if let Some(table) = schema.table(table_name) {
+                                    // Get values from the cursor's cached record
+                                    if let Some(cursor) = self.cursor(op.p1) {
+                                        if let Some(ref row_data) = cursor.row_data {
+                                            // Decode the row values (simplified)
+                                            let values = self.decode_record_values(
+                                                row_data,
+                                                cursor.n_field as usize,
+                                            );
+
+                                            // Perform FK check based on operation type
+                                            let op_type = op.p3;
+                                            let result = match op_type {
+                                                0 => {
+                                                    // INSERT
+                                                    crate::executor::fkey::fk_check_insert(
+                                                        &schema, btree, &table, &values, true,
+                                                    )
+                                                }
+                                                1 => {
+                                                    // DELETE
+                                                    crate::executor::fkey::fk_check_delete(
+                                                        &schema, btree, &table, &values, true,
+                                                    )
+                                                }
+                                                _ => Ok(()),
+                                            };
+
+                                            if let Err(e) = result {
+                                                return Err(e);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             Opcode::MaxOpcode => {
                 // Should never be executed
                 return Err(Error::with_message(
@@ -1466,6 +1561,15 @@ impl Vdbe {
             sql: Some(sql.to_string()),
             row_estimate: 0,
         })
+    }
+
+    /// Decode a record's raw bytes into Value vector
+    /// This is a simplified decoder for FK checking
+    fn decode_record_values(&self, _data: &[u8], n_fields: usize) -> Vec<Value> {
+        // For now, return placeholder values
+        // TODO: Implement proper record format decoding when needed
+        // The actual format is: header_size (varint), type_codes[], data[]
+        vec![Value::Null; n_fields]
     }
 }
 

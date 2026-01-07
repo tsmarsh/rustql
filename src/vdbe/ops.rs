@@ -393,6 +393,25 @@ pub enum Opcode {
     /// Count rows
     Count,
 
+    // ========================================================================
+    // Foreign Key Operations
+    // ========================================================================
+    /// Increment/decrement deferred FK violation counter
+    /// P1 = amount to add (positive or negative)
+    /// P2 = database index
+    FkCounter,
+
+    /// Jump to P2 if deferred FK counter is zero (no violations)
+    /// P1 = database index
+    FkIfZero,
+
+    /// Check immediate FK constraints for a row
+    /// P1 = cursor for table being modified
+    /// P2 = register containing rowid
+    /// P3 = 0=INSERT, 1=DELETE, 2=UPDATE
+    /// P4 = table name
+    FkCheck,
+
     /// Maximum opcode value
     MaxOpcode,
 }
@@ -428,6 +447,7 @@ impl Opcode {
                 | Opcode::IdxLE
                 | Opcode::IdxLT
                 | Opcode::SorterNext
+                | Opcode::FkIfZero
         )
     }
 
@@ -461,6 +481,7 @@ impl Opcode {
                 | Opcode::IdxRowid
                 | Opcode::IdxInsert
                 | Opcode::IdxDelete
+                | Opcode::FkCheck
         )
     }
 
@@ -581,6 +602,9 @@ impl Opcode {
             Opcode::SortKey => "SortKey",
             Opcode::Sequence => "Sequence",
             Opcode::Count => "Count",
+            Opcode::FkCounter => "FkCounter",
+            Opcode::FkIfZero => "FkIfZero",
+            Opcode::FkCheck => "FkCheck",
             Opcode::MaxOpcode => "MaxOpcode",
         }
     }

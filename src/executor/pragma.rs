@@ -72,6 +72,15 @@ pub fn pragma_columns(pragma: &PragmaStmt) -> Option<(Vec<String>, Vec<ColumnTyp
                 ColumnType::Text,
             ],
         ),
+        "foreign_key_check" => (
+            vec!["table", "rowid", "parent", "fkid"],
+            vec![
+                ColumnType::Text,
+                ColumnType::Integer,
+                ColumnType::Text,
+                ColumnType::Integer,
+            ],
+        ),
         "wal_checkpoint" => (
             vec!["busy", "log", "checkpointed"],
             vec![
@@ -97,6 +106,7 @@ pub fn execute_pragma(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Resul
         "index_list" => pragma_index_list(conn, schema_name, pragma),
         "index_info" => pragma_index_info(conn, schema_name, pragma),
         "foreign_key_list" => pragma_foreign_key_list(conn, schema_name, pragma),
+        "foreign_key_check" => pragma_foreign_key_check(conn, schema_name, pragma),
         "page_size" => pragma_page_size(conn, schema_name, pragma),
         "page_count" => pragma_page_count(conn),
         "cache_size" => pragma_cache_size(conn, schema_name, pragma),
@@ -330,6 +340,63 @@ fn pragma_foreign_key_list(
             ColumnType::Text,
             ColumnType::Text,
             ColumnType::Text,
+        ],
+        rows,
+    })
+}
+
+fn pragma_foreign_key_check(
+    conn: &SqliteConnection,
+    schema_name: &str,
+    pragma: &PragmaStmt,
+) -> Result<PragmaResult> {
+    let schema = lookup_schema(conn, schema_name)?;
+    let schema_guard = schema
+        .read()
+        .map_err(|_| Error::with_message(ErrorCode::Busy, "schema lock"))?;
+
+    // Get table name if specified (optional - checks single table)
+    let table_name = pragma.value.as_ref().and_then(|v| match v {
+        PragmaValue::Set(Expr::Literal(Literal::String(s))) => Some(s.clone()),
+        PragmaValue::Set(Expr::Column(col_ref)) => Some(col_ref.column.clone()),
+        PragmaValue::Call(Expr::Literal(Literal::String(s))) => Some(s.clone()),
+        PragmaValue::Call(Expr::Column(col_ref)) => Some(col_ref.column.clone()),
+        _ => None,
+    });
+
+    // Try to get btree for FK checking
+    let btree = conn.dbs.first().and_then(|db| db.btree.clone());
+
+    let violations = if let Some(ref btree) = btree {
+        crate::executor::fkey::foreign_key_check(&schema_guard, btree, table_name.as_deref())?
+    } else {
+        Vec::new()
+    };
+
+    let rows: Vec<Vec<Value>> = violations
+        .iter()
+        .map(|v| {
+            vec![
+                Value::Text(v.table.clone()),
+                Value::Integer(v.rowid),
+                Value::Text(v.parent.clone()),
+                Value::Integer(v.fkid as i64),
+            ]
+        })
+        .collect();
+
+    Ok(PragmaResult {
+        columns: vec![
+            "table".into(),
+            "rowid".into(),
+            "parent".into(),
+            "fkid".into(),
+        ],
+        types: vec![
+            ColumnType::Text,
+            ColumnType::Integer,
+            ColumnType::Text,
+            ColumnType::Integer,
         ],
         rows,
     })

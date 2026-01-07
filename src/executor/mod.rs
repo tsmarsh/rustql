@@ -2,6 +2,7 @@
 
 pub mod analyze;
 pub mod delete;
+pub mod fkey;
 pub mod insert;
 pub mod planner;
 pub mod pragma;
@@ -24,6 +25,10 @@ pub use where_expr::{
 pub use wherecode::{apply_affinity, generate_where_code, Affinity, WhereCodeGen};
 
 pub use delete::{compile_delete, DeleteCompiler};
+pub use fkey::{
+    fk_check_delete, fk_check_insert, fk_check_update, foreign_key_check, DeferredFkState,
+    FkContext, FkViolation,
+};
 pub use insert::{compile_insert, InsertCompiler};
 pub use prepare::{compile_sql, parse_sql, CompiledStmt, StatementCompiler, StmtType};
 pub use update::{compile_update, UpdateCompiler};

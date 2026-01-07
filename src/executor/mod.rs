@@ -8,6 +8,7 @@ pub mod planner;
 pub mod pragma;
 pub mod prepare;
 pub mod select;
+pub mod trigger;
 pub mod update;
 pub mod where_clause;
 pub mod where_expr;
@@ -31,4 +32,8 @@ pub use fkey::{
 };
 pub use insert::{compile_insert, InsertCompiler};
 pub use prepare::{compile_sql, parse_sql, CompiledStmt, StatementCompiler, StmtType};
+pub use trigger::{
+    compile_create_trigger, compile_drop_trigger, find_matching_triggers, generate_trigger_code,
+    TriggerContext, TriggerMask,
+};
 pub use update::{compile_update, UpdateCompiler};

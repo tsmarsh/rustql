@@ -412,6 +412,31 @@ pub enum Opcode {
     /// P4 = table name
     FkCheck,
 
+    // ========================================================================
+    // Trigger Operations
+    // ========================================================================
+    /// Execute a trigger subprogram
+    /// P1 = subprogram context register
+    /// P2 = return address
+    /// P3 = trigger mask/flags
+    /// P4 = SubProgram containing trigger bytecode
+    Program,
+
+    /// Access parameter from parent VDBE (for trigger body)
+    /// P1 = which parameter (0 = OLD row, 1 = NEW row)
+    /// P2 = column index (-1 for rowid)
+    /// P3 = destination register
+    Param,
+
+    /// Test if trigger should fire and record affected rowid
+    /// P1 = register containing rowid
+    /// P2 = trigger flags (timing/event bits)
+    /// P3 = jump destination if trigger should not fire
+    TriggerTest,
+
+    /// Mark end of trigger prolog (where OLD/NEW setup ends)
+    TriggerProlog,
+
     /// Maximum opcode value
     MaxOpcode,
 }
@@ -448,6 +473,8 @@ impl Opcode {
                 | Opcode::IdxLT
                 | Opcode::SorterNext
                 | Opcode::FkIfZero
+                | Opcode::Program
+                | Opcode::TriggerTest
         )
     }
 
@@ -605,6 +632,10 @@ impl Opcode {
             Opcode::FkCounter => "FkCounter",
             Opcode::FkIfZero => "FkIfZero",
             Opcode::FkCheck => "FkCheck",
+            Opcode::Program => "Program",
+            Opcode::Param => "Param",
+            Opcode::TriggerTest => "TriggerTest",
+            Opcode::TriggerProlog => "TriggerProlog",
             Opcode::MaxOpcode => "MaxOpcode",
         }
     }

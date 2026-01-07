@@ -1452,6 +1452,51 @@ impl Vdbe {
                 }
             }
 
+            // ================================================================
+            // Trigger Operations
+            // ================================================================
+            Opcode::Program => {
+                // Program P1 P2 P3 P4
+                // Execute a trigger subprogram
+                // P1 = subprogram context register
+                // P2 = return address (jump here when subprogram finishes)
+                // P3 = trigger mask/flags
+                // P4 = SubProgram containing trigger bytecode
+                //
+                // For now, triggers are a placeholder - full implementation
+                // requires nested VDBE execution infrastructure
+                // TODO: Implement trigger execution
+            }
+
+            Opcode::Param => {
+                // Param P1 P2 P3
+                // Access parameter from parent VDBE (for trigger body)
+                // P1 = which parameter (0 = OLD row, 1 = NEW row)
+                // P2 = column index (-1 for rowid)
+                // P3 = destination register
+                //
+                // For now, return NULL - full implementation requires
+                // trigger context with OLD/NEW row values
+                self.mem_mut(op.p3).set_null();
+            }
+
+            Opcode::TriggerTest => {
+                // TriggerTest P1 P2 P3
+                // Test if trigger should fire
+                // P1 = register containing rowid
+                // P2 = trigger flags (timing/event bits)
+                // P3 = jump destination if trigger should NOT fire
+                //
+                // For now, always skip (jump to P3) - triggers are disabled
+                self.pc = op.p3 - 1;
+            }
+
+            Opcode::TriggerProlog => {
+                // TriggerProlog
+                // Marks end of trigger prolog (where OLD/NEW setup ends)
+                // This is a no-op marker used for debugging/tracing
+            }
+
             Opcode::MaxOpcode => {
                 // Should never be executed
                 return Err(Error::with_message(

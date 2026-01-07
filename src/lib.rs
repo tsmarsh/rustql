@@ -13,6 +13,7 @@ pub mod functions;
 pub mod mem;
 pub mod os;
 pub mod parser;
+pub mod random;
 pub mod schema;
 pub mod storage;
 pub mod types;
@@ -27,6 +28,12 @@ pub use error::{Error, Result};
 pub use mem::{
     sqlite3_free, sqlite3_malloc, sqlite3_memory_highwater, sqlite3_memory_used, sqlite3_msize,
     sqlite3_realloc, sqlite3_soft_heap_limit64, sqlite3_status, StatusOp,
+};
+
+// Re-export random functions
+pub use random::{
+    sqlite3_prng_reset, sqlite3_prng_seed, sqlite3_random_blob, sqlite3_random_int64,
+    sqlite3_randomness, sqlite3_temp_file_path, sqlite3_temp_filename,
 };
 
 // Re-export API types and functions

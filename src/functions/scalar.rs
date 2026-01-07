@@ -663,21 +663,7 @@ pub fn func_random(args: &[Value]) -> Result<Value> {
         ));
     }
 
-    // Simple LCG random number generator
-    // In production, this would use a proper RNG
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as i64;
-
-    // Mix bits
-    let mut x = seed;
-    x ^= x >> 17;
-    x ^= x << 31;
-    x ^= x >> 8;
-
-    Ok(Value::Integer(x))
+    Ok(Value::Integer(crate::random::sqlite3_random_int64()))
 }
 
 /// randomblob(N) - Return N bytes of random data
@@ -698,21 +684,7 @@ pub fn func_randomblob(args: &[Value]) -> Result<Value> {
     }
 
     let n = n.min(1_000_000_000) as usize;
-
-    // Generate pseudo-random bytes
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let mut seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-
-    let mut bytes = Vec::with_capacity(n);
-    for _ in 0..n {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-        bytes.push((seed >> 33) as u8);
-    }
-
-    Ok(Value::Blob(bytes))
+    Ok(Value::Blob(crate::random::sqlite3_random_blob(n)))
 }
 
 /// unicode(X) - Return Unicode code point of first character

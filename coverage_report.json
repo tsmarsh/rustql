@@ -1,0 +1,498 @@
+{
+  "total_lines": 12057,
+  "covered_lines": 4590,
+  "line_rate": 0.38069171435680516,
+  "total_branches": 0,
+  "covered_branches": 0,
+  "branch_rate": 0.0,
+  "modules": [
+    {
+      "name": "src/executor",
+      "line_rate": 0.4212046204620462,
+      "branch_rate": 0.0,
+      "complexity": 0.0,
+      "files": [
+        {
+          "name": "src/executor/delete.rs",
+          "line_rate": 0.646551724137931,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/executor"
+        },
+        {
+          "name": "src/executor/insert.rs",
+          "line_rate": 0.4841628959276018,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/executor"
+        },
+        {
+          "name": "src/executor/prepare.rs",
+          "line_rate": 0.4301675977653631,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/executor"
+        },
+        {
+          "name": "src/executor/select.rs",
+          "line_rate": 0.31543624161073824,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/executor"
+        },
+        {
+          "name": "src/executor/update.rs",
+          "line_rate": 0.5864978902953587,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/executor"
+        },
+        {
+          "name": "src/executor/where_clause.rs",
+          "line_rate": 0.5484949832775919,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/executor"
+        },
+        {
+          "name": "src/executor/wherecode.rs",
+          "line_rate": 0.1390728476821192,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/executor"
+        }
+      ]
+    },
+    {
+      "name": "src/util",
+      "line_rate": 0.0,
+      "branch_rate": 0.0,
+      "complexity": 0.0,
+      "files": [
+        {
+          "name": "src/util/bitvec.rs",
+          "line_rate": 0.0,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/util"
+        }
+      ]
+    },
+    {
+      "name": "src/storage",
+      "line_rate": 0.0749912800837112,
+      "branch_rate": 0.0,
+      "complexity": 0.0,
+      "files": [
+        {
+          "name": "src/storage/btree.rs",
+          "line_rate": 0.0,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/storage"
+        },
+        {
+          "name": "src/storage/pager.rs",
+          "line_rate": 0.11214953271028037,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/storage"
+        },
+        {
+          "name": "src/storage/pcache.rs",
+          "line_rate": 0.0,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/storage"
+        },
+        {
+          "name": "src/storage/wal.rs",
+          "line_rate": 0.408675799086758,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/storage"
+        }
+      ]
+    },
+    {
+      "name": "src/os",
+      "line_rate": 0.27640449438202247,
+      "branch_rate": 0.0,
+      "complexity": 0.0,
+      "files": [
+        {
+          "name": "src/os/mutex.rs",
+          "line_rate": 0.1282051282051282,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/os"
+        },
+        {
+          "name": "src/os/unix.rs",
+          "line_rate": 0.37681159420289856,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/os"
+        },
+        {
+          "name": "src/os/vfs.rs",
+          "line_rate": 0.0989010989010989,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/os"
+        }
+      ]
+    },
+    {
+      "name": "src/schema",
+      "line_rate": 0.615686274509804,
+      "branch_rate": 0.0,
+      "complexity": 0.0,
+      "files": [
+        {
+          "name": "src/schema/mod.rs",
+          "line_rate": 0.615686274509804,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/schema"
+        }
+      ]
+    },
+    {
+      "name": "src/parser",
+      "line_rate": 0.5258171482709616,
+      "branch_rate": 0.0,
+      "complexity": 0.0,
+      "files": [
+        {
+          "name": "src/parser/ast.rs",
+          "line_rate": 0.6444444444444445,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/parser"
+        },
+        {
+          "name": "src/parser/grammar.rs",
+          "line_rate": 0.4387135922330097,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/parser"
+        },
+        {
+          "name": "src/parser/tokenizer.rs",
+          "line_rate": 0.8564593301435407,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/parser"
+        }
+      ]
+    },
+    {
+      "name": "src/functions",
+      "line_rate": 0.3632538569424965,
+      "branch_rate": 0.0,
+      "complexity": 0.0,
+      "files": [
+        {
+          "name": "src/functions/aggregate.rs",
+          "line_rate": 0.5294117647058824,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/functions"
+        },
+        {
+          "name": "src/functions/scalar.rs",
+          "line_rate": 0.31785714285714284,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/functions"
+        }
+      ]
+    },
+    {
+      "name": "src",
+      "line_rate": 0.38069171435680516,
+      "branch_rate": 0.0,
+      "complexity": 0.0,
+      "files": [
+        {
+          "name": "src/error.rs",
+          "line_rate": 0.17674418604651163,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src"
+        },
+        {
+          "name": "src/types.rs",
+          "line_rate": 0.6086956521739131,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src"
+        }
+      ]
+    },
+    {
+      "name": "src/vdbe",
+      "line_rate": 0.5722781335773102,
+      "branch_rate": 0.0,
+      "complexity": 0.0,
+      "files": [
+        {
+          "name": "src/vdbe/aux.rs",
+          "line_rate": 0.6494252873563219,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/vdbe"
+        },
+        {
+          "name": "src/vdbe/bytecode.rs",
+          "line_rate": 0.5223880597014925,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/vdbe"
+        },
+        {
+          "name": "src/vdbe/engine.rs",
+          "line_rate": 0.33810888252148996,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/vdbe"
+        },
+        {
+          "name": "src/vdbe/expr.rs",
+          "line_rate": 0.6867924528301886,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/vdbe"
+        },
+        {
+          "name": "src/vdbe/mem.rs",
+          "line_rate": 0.6890080428954424,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/vdbe"
+        },
+        {
+          "name": "src/vdbe/ops.rs",
+          "line_rate": 0.20754716981132076,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/vdbe"
+        },
+        {
+          "name": "src/vdbe/sort.rs",
+          "line_rate": 0.7018633540372671,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/vdbe"
+        },
+        {
+          "name": "src/vdbe/trace.rs",
+          "line_rate": 0.7545454545454545,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/vdbe"
+        },
+        {
+          "name": "src/vdbe/types.rs",
+          "line_rate": 0.4642857142857143,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/vdbe"
+        },
+        {
+          "name": "src/vdbe/value.rs",
+          "line_rate": 0.47706422018348627,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/vdbe"
+        }
+      ]
+    },
+    {
+      "name": "src/api",
+      "line_rate": 0.4960212201591512,
+      "branch_rate": 0.0,
+      "complexity": 0.0,
+      "files": [
+        {
+          "name": "src/api/blob.rs",
+          "line_rate": 0.8571428571428571,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/api"
+        },
+        {
+          "name": "src/api/config.rs",
+          "line_rate": 0.5428571428571428,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/api"
+        },
+        {
+          "name": "src/api/connection.rs",
+          "line_rate": 0.35443037974683544,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/api"
+        },
+        {
+          "name": "src/api/stmt.rs",
+          "line_rate": 0.515625,
+          "branch_rate": 0.0,
+          "complexity": 0.0,
+          "lines": 0,
+          "covered_lines": 0,
+          "branches": 0,
+          "covered_branches": 0,
+          "module": "src/api"
+        }
+      ]
+    }
+  ],
+  "files": []
+}

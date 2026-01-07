@@ -1,0 +1,352 @@
+================================================================================
+RUSTQL COVERAGE ANALYSIS REPORT
+================================================================================
+
+📊 OVERALL COVERAGE STATISTICS
+----------------------------------------
+Total Lines:          12,057
+Covered Lines:        4,590
+Line Coverage:        38.1%
+Total Branches:       0
+Covered Branches:     0
+Branch Coverage:      0.0%
+
+📁 MODULE COVERAGE BREAKDOWN
+----------------------------------------
+Module: src/schema
+  Line Coverage:   61.6%
+  Branch Coverage: 0.0%
+  Complexity:      0.0
+
+Module: src/vdbe
+  Line Coverage:   57.2%
+  Branch Coverage: 0.0%
+  Complexity:      0.0
+
+Module: src/parser
+  Line Coverage:   52.6%
+  Branch Coverage: 0.0%
+  Complexity:      0.0
+
+Module: src/api
+  Line Coverage:   49.6%
+  Branch Coverage: 0.0%
+  Complexity:      0.0
+
+Module: src/executor
+  Line Coverage:   42.1%
+  Branch Coverage: 0.0%
+  Complexity:      0.0
+
+Module: src
+  Line Coverage:   38.1%
+  Branch Coverage: 0.0%
+  Complexity:      0.0
+
+Module: src/functions
+  Line Coverage:   36.3%
+  Branch Coverage: 0.0%
+  Complexity:      0.0
+
+Module: src/os
+  Line Coverage:   27.6%
+  Branch Coverage: 0.0%
+  Complexity:      0.0
+
+Module: src/storage
+  Line Coverage:   7.5%
+  Branch Coverage: 0.0%
+  Complexity:      0.0
+
+Module: src/util
+  Line Coverage:   0.0%
+  Branch Coverage: 0.0%
+  Complexity:      0.0
+
+📄 DETAILED FILE COVERAGE
+----------------------------------------
+File: src/util/bitvec.rs
+  Module:        src/util
+  Line Coverage: 0.0% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/storage/btree.rs
+  Module:        src/storage
+  Line Coverage: 0.0% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/storage/pcache.rs
+  Module:        src/storage
+  Line Coverage: 0.0% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/os/vfs.rs
+  Module:        src/os
+  Line Coverage: 9.9% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/storage/pager.rs
+  Module:        src/storage
+  Line Coverage: 11.2% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/os/mutex.rs
+  Module:        src/os
+  Line Coverage: 12.8% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/executor/wherecode.rs
+  Module:        src/executor
+  Line Coverage: 13.9% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/error.rs
+  Module:        src
+  Line Coverage: 17.7% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/vdbe/ops.rs
+  Module:        src/vdbe
+  Line Coverage: 20.8% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/executor/select.rs
+  Module:        src/executor
+  Line Coverage: 31.5% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/functions/scalar.rs
+  Module:        src/functions
+  Line Coverage: 31.8% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/vdbe/engine.rs
+  Module:        src/vdbe
+  Line Coverage: 33.8% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/api/connection.rs
+  Module:        src/api
+  Line Coverage: 35.4% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/os/unix.rs
+  Module:        src/os
+  Line Coverage: 37.7% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/storage/wal.rs
+  Module:        src/storage
+  Line Coverage: 40.9% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/executor/prepare.rs
+  Module:        src/executor
+  Line Coverage: 43.0% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/parser/grammar.rs
+  Module:        src/parser
+  Line Coverage: 43.9% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/vdbe/types.rs
+  Module:        src/vdbe
+  Line Coverage: 46.4% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/vdbe/value.rs
+  Module:        src/vdbe
+  Line Coverage: 47.7% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/executor/insert.rs
+  Module:        src/executor
+  Line Coverage: 48.4% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/api/stmt.rs
+  Module:        src/api
+  Line Coverage: 51.6% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/vdbe/bytecode.rs
+  Module:        src/vdbe
+  Line Coverage: 52.2% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/functions/aggregate.rs
+  Module:        src/functions
+  Line Coverage: 52.9% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/api/config.rs
+  Module:        src/api
+  Line Coverage: 54.3% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/executor/where_clause.rs
+  Module:        src/executor
+  Line Coverage: 54.8% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/executor/update.rs
+  Module:        src/executor
+  Line Coverage: 58.6% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/types.rs
+  Module:        src
+  Line Coverage: 60.9% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/schema/mod.rs
+  Module:        src/schema
+  Line Coverage: 61.6% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/parser/ast.rs
+  Module:        src/parser
+  Line Coverage: 64.4% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/executor/delete.rs
+  Module:        src/executor
+  Line Coverage: 64.7% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/vdbe/aux.rs
+  Module:        src/vdbe
+  Line Coverage: 64.9% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/vdbe/expr.rs
+  Module:        src/vdbe
+  Line Coverage: 68.7% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/vdbe/mem.rs
+  Module:        src/vdbe
+  Line Coverage: 68.9% ❌ NEEDS WORK
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/vdbe/sort.rs
+  Module:        src/vdbe
+  Line Coverage: 70.2% ⚠️  GOOD
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/vdbe/trace.rs
+  Module:        src/vdbe
+  Line Coverage: 75.5% ⚠️  GOOD
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/parser/tokenizer.rs
+  Module:        src/parser
+  Line Coverage: 85.6% ⚠️  GOOD
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+File: src/api/blob.rs
+  Module:        src/api
+  Line Coverage: 85.7% ⚠️  GOOD
+  Lines:         0/0
+  Branch Coverage: 0.0%
+  Complexity:    0.0
+
+🎯 SUMMARY & RECOMMENDATIONS
+----------------------------------------
+❌ NEEDS WORK: Overall coverage needs significant improvement
+Current overall line coverage: 38.1%
+
+🔍 Files needing attention (< 50% coverage):
+  • src/executor/insert.rs: 48.4%
+  • src/executor/prepare.rs: 43.0%
+  • src/executor/select.rs: 31.5%
+  • src/executor/wherecode.rs: 13.9%
+  • src/util/bitvec.rs: 0.0%
+  • src/storage/btree.rs: 0.0%
+  • src/storage/pager.rs: 11.2%
+  • src/storage/pcache.rs: 0.0%
+  • src/storage/wal.rs: 40.9%
+  • src/os/mutex.rs: 12.8%
+  • src/os/unix.rs: 37.7%
+  • src/os/vfs.rs: 9.9%
+  • src/parser/grammar.rs: 43.9%
+  • src/functions/scalar.rs: 31.8%
+  • src/error.rs: 17.7%
+  • src/vdbe/engine.rs: 33.8%
+  • src/vdbe/ops.rs: 20.8%
+  • src/vdbe/types.rs: 46.4%
+  • src/vdbe/value.rs: 47.7%
+  • src/api/connection.rs: 35.4%

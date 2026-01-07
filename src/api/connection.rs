@@ -930,39 +930,7 @@ pub fn sqlite3_errmsg16(conn: &SqliteConnection) -> Vec<u16> {
 
 /// sqlite3_errstr - Get error string for code
 pub fn sqlite3_errstr(code: ErrorCode) -> &'static str {
-    match code {
-        ErrorCode::Ok => "not an error",
-        ErrorCode::Error => "SQL logic error",
-        ErrorCode::Internal => "internal error",
-        ErrorCode::Perm => "access permission denied",
-        ErrorCode::Abort => "query aborted",
-        ErrorCode::Busy => "database is locked",
-        ErrorCode::Locked => "database table is locked",
-        ErrorCode::NoMem => "out of memory",
-        ErrorCode::ReadOnly => "attempt to write a readonly database",
-        ErrorCode::Interrupt => "interrupted",
-        ErrorCode::IoErr => "disk I/O error",
-        ErrorCode::Corrupt => "database disk image is malformed",
-        ErrorCode::NotFound => "unknown operation",
-        ErrorCode::Full => "database or disk is full",
-        ErrorCode::CantOpen => "unable to open database file",
-        ErrorCode::Protocol => "locking protocol",
-        ErrorCode::Empty => "empty",
-        ErrorCode::Schema => "database schema has changed",
-        ErrorCode::TooBig => "string or blob too big",
-        ErrorCode::Constraint => "constraint failed",
-        ErrorCode::Mismatch => "datatype mismatch",
-        ErrorCode::Misuse => "bad parameter or other API misuse",
-        ErrorCode::NoLfs => "large file support is disabled",
-        ErrorCode::Auth => "authorization denied",
-        ErrorCode::Format => "file format error",
-        ErrorCode::Range => "column index out of range",
-        ErrorCode::NotADb => "file is not a database",
-        ErrorCode::Notice => "notification message",
-        ErrorCode::Warning => "warning message",
-        ErrorCode::Row => "another row available",
-        ErrorCode::Done => "no more rows available",
-    }
+    crate::util::general::sqlite3_errstr(code)
 }
 
 // ============================================================================

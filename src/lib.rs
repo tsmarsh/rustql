@@ -10,6 +10,7 @@ pub mod api;
 pub mod error;
 pub mod executor;
 pub mod functions;
+pub mod mem;
 pub mod os;
 pub mod parser;
 pub mod schema;
@@ -21,6 +22,12 @@ pub mod vdbe;
 
 // Re-export main public types
 pub use error::{Error, Result};
+
+// Re-export memory allocation functions
+pub use mem::{
+    sqlite3_free, sqlite3_malloc, sqlite3_memory_highwater, sqlite3_memory_used, sqlite3_msize,
+    sqlite3_realloc, sqlite3_soft_heap_limit64, sqlite3_status, StatusOp,
+};
 
 // Re-export API types and functions
 pub use api::{

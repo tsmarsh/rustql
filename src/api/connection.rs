@@ -185,6 +185,30 @@ impl AuthResult {
 }
 
 // ============================================================================
+// Database Status
+// ============================================================================
+
+/// Database connection status counters (sqlite3_db_status)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum DbStatusOp {
+    LookasideUsed = 0,
+    CacheUsed = 1,
+    SchemaUsed = 2,
+    StmtUsed = 3,
+    LookasideHit = 4,
+    LookasideMissSize = 5,
+    LookasideMissFull = 6,
+    CacheHit = 7,
+    CacheMiss = 8,
+    CacheWrite = 9,
+    DeferredFks = 10,
+    CacheUsedShared = 11,
+    CacheSpill = 12,
+    TempBufSpill = 13,
+}
+
+// ============================================================================
 // Function Registry
 // ============================================================================
 
@@ -989,6 +1013,107 @@ pub fn sqlite3_db_readonly(conn: &SqliteConnection, db_name: &str) -> i32 {
     }
 }
 
+/// sqlite3_db_status64 - Get database status counters (64-bit)
+pub fn sqlite3_db_status64(
+    conn: &SqliteConnection,
+    op: DbStatusOp,
+    current: &mut i64,
+    highwater: &mut i64,
+    reset: bool,
+) -> Result<()> {
+    match op {
+        DbStatusOp::LookasideUsed
+        | DbStatusOp::LookasideHit
+        | DbStatusOp::LookasideMissSize
+        | DbStatusOp::LookasideMissFull => {
+            *current = 0;
+            *highwater = 0;
+        }
+        DbStatusOp::CacheUsed | DbStatusOp::CacheUsedShared => {
+            *current = db_cache_used(conn);
+            *highwater = 0;
+        }
+        DbStatusOp::SchemaUsed | DbStatusOp::StmtUsed => {
+            *current = 0;
+            *highwater = 0;
+        }
+        DbStatusOp::CacheHit | DbStatusOp::CacheMiss | DbStatusOp::CacheWrite => {
+            *current = db_cache_stat(conn, op, reset);
+            *highwater = 0;
+        }
+        DbStatusOp::CacheSpill | DbStatusOp::TempBufSpill => {
+            *current = 0;
+            *highwater = 0;
+        }
+        DbStatusOp::DeferredFks => {
+            *current = 0;
+            *highwater = 0;
+        }
+    }
+    Ok(())
+}
+
+/// sqlite3_db_status - Get database status counters (32-bit)
+pub fn sqlite3_db_status(
+    conn: &SqliteConnection,
+    op: DbStatusOp,
+    current: &mut i32,
+    highwater: &mut i32,
+    reset: bool,
+) -> Result<()> {
+    let mut cur64 = 0i64;
+    let mut hi64 = 0i64;
+    sqlite3_db_status64(conn, op, &mut cur64, &mut hi64, reset)?;
+    *current = (cur64 & 0x7fff_ffff) as i32;
+    *highwater = (hi64 & 0x7fff_ffff) as i32;
+    Ok(())
+}
+
+fn db_cache_used(conn: &SqliteConnection) -> i64 {
+    let mut total = 0i64;
+    for db in &conn.dbs {
+        if let Some(btree) = &db.btree {
+            if let Ok(shared) = btree.shared.read() {
+                total += shared.pager.mem_used() as i64;
+            }
+        }
+    }
+    total
+}
+
+fn db_cache_stat(conn: &SqliteConnection, op: DbStatusOp, reset: bool) -> i64 {
+    let mut total = 0i64;
+    for db in &conn.dbs {
+        if let Some(btree) = &db.btree {
+            if reset {
+                if let Ok(mut shared) = btree.shared.write() {
+                    let value = match op {
+                        DbStatusOp::CacheHit => shared.pager.n_hit as i64,
+                        DbStatusOp::CacheMiss => shared.pager.n_miss as i64,
+                        DbStatusOp::CacheWrite => shared.pager.n_write as i64,
+                        _ => 0,
+                    };
+                    match op {
+                        DbStatusOp::CacheHit => shared.pager.n_hit = 0,
+                        DbStatusOp::CacheMiss => shared.pager.n_miss = 0,
+                        DbStatusOp::CacheWrite => shared.pager.n_write = 0,
+                        _ => {}
+                    }
+                    total += value;
+                }
+            } else if let Ok(shared) = btree.shared.read() {
+                total += match op {
+                    DbStatusOp::CacheHit => shared.pager.n_hit as i64,
+                    DbStatusOp::CacheMiss => shared.pager.n_miss as i64,
+                    DbStatusOp::CacheWrite => shared.pager.n_write as i64,
+                    _ => 0,
+                };
+            }
+        }
+    }
+    total
+}
+
 // ============================================================================
 // Interrupt and Busy
 // ============================================================================
@@ -1361,6 +1486,34 @@ mod tests {
     fn test_autocommit() {
         let conn = SqliteConnection::new();
         assert!(sqlite3_get_autocommit(&conn));
+    }
+
+    #[test]
+    fn test_db_status_cache_used() {
+        let conn = sqlite3_open(":memory:").unwrap();
+        let mut current = 0i64;
+        let mut highwater = 0i64;
+        sqlite3_db_status64(
+            &conn,
+            DbStatusOp::CacheUsed,
+            &mut current,
+            &mut highwater,
+            false,
+        )
+        .unwrap();
+        assert!(current >= 0);
+
+        let mut current32 = 0i32;
+        let mut highwater32 = 0i32;
+        sqlite3_db_status(
+            &conn,
+            DbStatusOp::CacheUsed,
+            &mut current32,
+            &mut highwater32,
+            false,
+        )
+        .unwrap();
+        assert!(current32 >= 0);
     }
 
     #[test]

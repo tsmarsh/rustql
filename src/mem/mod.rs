@@ -181,13 +181,25 @@ pub fn sqlite3_status(
         | StatusOp::PagecacheOverflow
         | StatusOp::ScratchUsed
         | StatusOp::ScratchOverflow
-        | StatusOp::ParserStack => {
+        | StatusOp::ParserStack
+        | StatusOp::PagecacheSize
+        | StatusOp::ScratchSize => {
             // These would be implemented when those subsystems exist
             *current = 0;
             *highwater = 0;
         }
     }
     Ok(())
+}
+
+/// Query status information about the memory subsystem (64-bit variant)
+pub fn sqlite3_status64(
+    op: StatusOp,
+    current: &mut i64,
+    highwater: &mut i64,
+    reset: bool,
+) -> Result<()> {
+    sqlite3_status(op, current, highwater, reset)
 }
 
 /// Status operation codes for sqlite3_status
@@ -207,6 +219,10 @@ pub enum StatusOp {
     MallocSize = 5,
     /// Parser stack depth
     ParserStack = 6,
+    /// Page cache size
+    PagecacheSize = 7,
+    /// Scratch buffer size
+    ScratchSize = 8,
     /// Number of outstanding allocations
     MallocCount = 9,
 }

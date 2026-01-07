@@ -27,7 +27,7 @@ pub use error::{Error, Result};
 // Re-export memory allocation functions
 pub use mem::{
     sqlite3_free, sqlite3_malloc, sqlite3_memory_highwater, sqlite3_memory_used, sqlite3_msize,
-    sqlite3_realloc, sqlite3_soft_heap_limit64, sqlite3_status, StatusOp,
+    sqlite3_realloc, sqlite3_soft_heap_limit64, sqlite3_status, sqlite3_status64, StatusOp,
 };
 
 // Re-export random functions
@@ -41,9 +41,10 @@ pub use api::{
     sqlite3_backup_finish, sqlite3_backup_init, sqlite3_backup_pagecount, sqlite3_backup_remaining,
     sqlite3_backup_step, sqlite3_changes, sqlite3_close, sqlite3_column_count,
     sqlite3_column_double, sqlite3_column_int, sqlite3_column_int64, sqlite3_column_name,
-    sqlite3_column_text, sqlite3_column_type, sqlite3_column_value, sqlite3_errcode,
-    sqlite3_errmsg, sqlite3_errstr, sqlite3_finalize, sqlite3_initialize,
-    sqlite3_last_insert_rowid, sqlite3_libversion, sqlite3_libversion_number, sqlite3_open,
-    sqlite3_open_v2, sqlite3_prepare_v2, sqlite3_reset, sqlite3_shutdown, sqlite3_step,
-    sqlite3_total_changes, Backup, BackupStepResult, PreparedStmt, SqliteConnection,
+    sqlite3_column_text, sqlite3_column_type, sqlite3_column_value, sqlite3_db_status,
+    sqlite3_db_status64, sqlite3_errcode, sqlite3_errmsg, sqlite3_errstr, sqlite3_finalize,
+    sqlite3_initialize, sqlite3_last_insert_rowid, sqlite3_libversion, sqlite3_libversion_number,
+    sqlite3_open, sqlite3_open_v2, sqlite3_prepare_v2, sqlite3_reset, sqlite3_shutdown,
+    sqlite3_step, sqlite3_total_changes, Backup, BackupStepResult, DbStatusOp, PreparedStmt,
+    SqliteConnection,
 };

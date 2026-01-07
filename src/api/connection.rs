@@ -911,14 +911,27 @@ pub fn sqlite3_busy_handler(
     handler: Option<BusyHandler>,
 ) -> Result<()> {
     conn.busy_handler = handler;
+    conn.busy_timeout = 0;
     Ok(())
 }
 
 /// sqlite3_busy_timeout - Set busy timeout
 pub fn sqlite3_busy_timeout(conn: &mut SqliteConnection, ms: i32) -> Result<()> {
     conn.busy_timeout = ms;
-    // Clear any custom busy handler when setting timeout
-    conn.busy_handler = None;
+    if ms > 0 {
+        let timeout = ms as i64;
+        conn.busy_handler = Some(Box::new(move |count| {
+            let delay = if count < 12 {
+                (count + 1) * (count + 1)
+            } else {
+                100
+            } as i64;
+            std::thread::sleep(std::time::Duration::from_millis(delay as u64));
+            (count as i64 * delay) < timeout
+        }));
+    } else {
+        conn.busy_handler = None;
+    }
     Ok(())
 }
 
@@ -952,6 +965,61 @@ pub fn sqlite3_set_authorizer(
     authorizer: Option<Authorizer>,
 ) -> Result<()> {
     conn.authorizer = authorizer;
+    Ok(())
+}
+
+/// sqlite3_create_function - Register a scalar function
+pub fn sqlite3_create_function(
+    conn: &mut SqliteConnection,
+    name: &str,
+    n_arg: i32,
+    func: ScalarFunc,
+) -> Result<()> {
+    conn.create_function(name, n_arg, func);
+    Ok(())
+}
+
+/// sqlite3_create_aggregate - Register an aggregate function
+pub fn sqlite3_create_aggregate(
+    conn: &mut SqliteConnection,
+    name: &str,
+    n_arg: i32,
+    step: AggStep,
+    finalizer: AggFinal,
+) -> Result<()> {
+    conn.create_aggregate(name, n_arg, step, finalizer);
+    Ok(())
+}
+
+/// sqlite3_create_window_function - Register a window function
+pub fn sqlite3_create_window_function(
+    conn: &mut SqliteConnection,
+    name: &str,
+    n_arg: i32,
+    step: AggStep,
+    finalizer: AggFinal,
+    value: AggFinal,
+    inverse: AggStep,
+) -> Result<()> {
+    conn.create_window_function(name, n_arg, step, finalizer, value, inverse);
+    Ok(())
+}
+
+/// sqlite3_create_collation - Register a collation sequence
+pub fn sqlite3_create_collation<F>(conn: &mut SqliteConnection, name: &str, cmp: F) -> Result<()>
+where
+    F: Fn(&str, &str) -> std::cmp::Ordering + Send + Sync + 'static,
+{
+    conn.create_collation(name, cmp);
+    Ok(())
+}
+
+/// sqlite3_collation_needed - Register a collation-needed callback
+pub fn sqlite3_collation_needed(
+    conn: &mut SqliteConnection,
+    callback: Option<CollationNeeded>,
+) -> Result<()> {
+    conn.set_collation_needed(callback);
     Ok(())
 }
 

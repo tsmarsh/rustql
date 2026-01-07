@@ -15,6 +15,7 @@ pub mod parser;
 pub mod schema;
 pub mod storage;
 pub mod types;
+pub mod utf;
 pub mod util;
 pub mod vdbe;
 

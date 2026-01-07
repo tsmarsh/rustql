@@ -961,6 +961,26 @@ pub struct DropIndexStmt {
 }
 
 // ============================================================================
+// ALTER TABLE Statement
+// ============================================================================
+
+/// ALTER TABLE statement
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterTableStmt {
+    pub table: QualifiedName,
+    pub action: AlterTableAction,
+}
+
+/// ALTER TABLE action
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterTableAction {
+    RenameTable(String),
+    RenameColumn { old: String, new: String },
+    AddColumn(ColumnDef),
+    DropColumn(String),
+}
+
+// ============================================================================
 // Schema Builder Implementation
 // ============================================================================
 
@@ -1372,6 +1392,375 @@ impl Schema {
 
         Ok(())
     }
+
+    /// Process ALTER TABLE statement
+    pub fn alter_table(&mut self, stmt: &AlterTableStmt) -> Result<()> {
+        let table_name = stmt.table.name.clone();
+        let table_key = table_name.to_lowercase();
+        let table_arc = self.tables.get(&table_key).cloned().ok_or_else(|| {
+            Error::with_message(ErrorCode::Error, format!("no such table: {}", table_name))
+        })?;
+
+        if is_system_table_name(&table_name) {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                format!("table {} may not be altered", table_name),
+            ));
+        }
+
+        match &stmt.action {
+            AlterTableAction::RenameTable(new_name) => {
+                self.rename_table(&table_arc, &table_name, new_name)
+            }
+            AlterTableAction::RenameColumn { old, new } => {
+                self.rename_column(&table_arc, &table_name, old, new)
+            }
+            AlterTableAction::AddColumn(def) => self.add_column(&table_arc, def),
+            AlterTableAction::DropColumn(name) => self.drop_column(&table_arc, name),
+        }
+    }
+
+    fn rename_table(
+        &mut self,
+        table_arc: &Arc<Table>,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<()> {
+        let new_key = new_name.to_lowercase();
+        if new_key == old_name.to_lowercase() {
+            return Ok(());
+        }
+        if self.table_exists(new_name) || self.index_exists(new_name) {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                format!(
+                    "there is already another table or index with this name: {}",
+                    new_name
+                ),
+            ));
+        }
+        if is_system_table_name(new_name) {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                format!("table {} may not be altered", new_name),
+            ));
+        }
+
+        self.update_foreign_keys_for_table(old_name, new_name)?;
+
+        let mut table = (**table_arc).clone();
+        table.name = new_name.to_string();
+
+        let mut index_updates = Vec::new();
+        for (name, idx) in &self.indexes {
+            if idx.table.eq_ignore_ascii_case(old_name) {
+                index_updates.push(name.clone());
+            }
+        }
+        for name in index_updates {
+            if let Some(idx_arc) = self.indexes.get(&name).cloned() {
+                let mut idx = (*idx_arc).clone();
+                idx.table = new_name.to_string();
+                let arc = Arc::new(idx);
+                self.indexes.insert(name.clone(), arc.clone());
+            }
+        }
+
+        table.indexes = table
+            .indexes
+            .iter()
+            .filter_map(|idx| self.indexes.get(&idx.name.to_lowercase()).cloned())
+            .collect();
+
+        let mut trigger_updates = Vec::new();
+        for (name, trigger) in &self.triggers {
+            if trigger.table.eq_ignore_ascii_case(old_name) {
+                trigger_updates.push(name.clone());
+            }
+        }
+        for name in trigger_updates {
+            if let Some(trig) = self.triggers.get(&name).cloned() {
+                let mut updated = (*trig).clone();
+                updated.table = new_name.to_string();
+                self.triggers.insert(name, Arc::new(updated));
+            }
+        }
+
+        self.tables.remove(&old_name.to_lowercase());
+        self.tables.insert(new_key, Arc::new(table));
+        Ok(())
+    }
+
+    fn rename_column(
+        &mut self,
+        table_arc: &Arc<Table>,
+        table_name: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<()> {
+        let mut table = (**table_arc).clone();
+        let col_idx = table.find_column(old_name)? as usize;
+        if table.column(new_name).is_some() {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                format!("duplicate column name: {}", new_name),
+            ));
+        }
+
+        table.columns[col_idx].name = new_name.to_string();
+
+        let updates = update_ref_columns_for_table(self, table_name, old_name, new_name)?;
+        for (key, updated) in updates {
+            self.tables.insert(key, updated);
+        }
+
+        self.tables
+            .insert(table_name.to_lowercase(), Arc::new(table));
+        Ok(())
+    }
+
+    fn add_column(&mut self, table_arc: &Arc<Table>, def: &ColumnDef) -> Result<()> {
+        let mut table = (**table_arc).clone();
+
+        if table.column(&def.name).is_some() {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                format!("duplicate column name: {}", def.name),
+            ));
+        }
+
+        let mut has_not_null = false;
+        let mut has_default = false;
+        let mut has_primary_key = false;
+        let mut has_unique = false;
+        let mut has_stored_generated = false;
+        let mut has_expr_default = false;
+
+        for constraint in &def.constraints {
+            match constraint {
+                ColumnConstraint::PrimaryKey { .. } => has_primary_key = true,
+                ColumnConstraint::Unique { .. } => has_unique = true,
+                ColumnConstraint::NotNull { .. } => has_not_null = true,
+                ColumnConstraint::Default(value) => {
+                    has_default = !matches!(value, DefaultValue::Null);
+                    if matches!(value, DefaultValue::Expr(_)) {
+                        has_expr_default = true;
+                    }
+                }
+                ColumnConstraint::Generated { storage, .. } => {
+                    if *storage == GeneratedStorage::Stored {
+                        has_stored_generated = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if has_primary_key {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                "Cannot add a PRIMARY KEY column",
+            ));
+        }
+        if has_unique {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                "Cannot add a UNIQUE column",
+            ));
+        }
+        if has_not_null && !has_default {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                "Cannot add a NOT NULL column with default value NULL",
+            ));
+        }
+        if has_expr_default {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                "Cannot add a column with non-constant default",
+            ));
+        }
+        if has_stored_generated {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                "cannot add a STORED column",
+            ));
+        }
+
+        let column = self.build_column(def, &mut table)?;
+        table.columns.push(column);
+        self.tables
+            .insert(table.name.to_lowercase(), Arc::new(table));
+        Ok(())
+    }
+
+    fn drop_column(&mut self, table_arc: &Arc<Table>, name: &str) -> Result<()> {
+        let mut table = (**table_arc).clone();
+        let col_idx = table.find_column(name)? as usize;
+
+        if table.columns.len() <= 1 {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                "cannot drop column: only one column remaining",
+            ));
+        }
+
+        if table
+            .primary_key
+            .as_ref()
+            .map_or(false, |pk| pk.contains(&col_idx))
+        {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                "cannot drop PRIMARY KEY column",
+            ));
+        }
+
+        for idx in &table.indexes {
+            if idx
+                .columns
+                .iter()
+                .any(|col| col.column_idx == col_idx as i32)
+            {
+                return Err(Error::with_message(
+                    ErrorCode::Error,
+                    "cannot drop column used by an index",
+                ));
+            }
+        }
+
+        for fk in &table.foreign_keys {
+            if fk.columns.iter().any(|c| *c == col_idx) {
+                return Err(Error::with_message(
+                    ErrorCode::Error,
+                    "cannot drop column used by a foreign key",
+                ));
+            }
+        }
+
+        if references_column(self, &table.name, name) {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                "cannot drop column referenced by a foreign key",
+            ));
+        }
+
+        table.columns.remove(col_idx);
+
+        if let Some(pk) = &mut table.primary_key {
+            for entry in pk.iter_mut() {
+                if *entry > col_idx {
+                    *entry -= 1;
+                }
+            }
+        }
+
+        for fk in &mut table.foreign_keys {
+            for col in fk.columns.iter_mut() {
+                if *col > col_idx {
+                    *col -= 1;
+                }
+            }
+        }
+
+        let mut index_updates = Vec::new();
+        for (name, idx) in &self.indexes {
+            if idx.table.eq_ignore_ascii_case(&table.name) {
+                index_updates.push(name.clone());
+            }
+        }
+        for name in index_updates {
+            if let Some(idx_arc) = self.indexes.get(&name).cloned() {
+                let mut idx = (*idx_arc).clone();
+                for col in idx.columns.iter_mut() {
+                    if col.column_idx > col_idx as i32 {
+                        col.column_idx -= 1;
+                    }
+                }
+                let arc = Arc::new(idx);
+                self.indexes.insert(name.clone(), arc.clone());
+            }
+        }
+
+        table.indexes = table
+            .indexes
+            .iter()
+            .filter_map(|idx| self.indexes.get(&idx.name.to_lowercase()).cloned())
+            .collect();
+
+        self.tables
+            .insert(table.name.to_lowercase(), Arc::new(table));
+        Ok(())
+    }
+
+    fn update_foreign_keys_for_table(&mut self, old: &str, new: &str) -> Result<()> {
+        let mut updates = Vec::new();
+        for (key, table_arc) in &self.tables {
+            let mut table = (**table_arc).clone();
+            let mut changed = false;
+            for fk in &mut table.foreign_keys {
+                if fk.ref_table.eq_ignore_ascii_case(old) {
+                    fk.ref_table = new.to_string();
+                    changed = true;
+                }
+            }
+            if changed {
+                updates.push((key.clone(), Arc::new(table)));
+            }
+        }
+        for (key, arc) in updates {
+            self.tables.insert(key, arc);
+        }
+        Ok(())
+    }
+}
+
+fn is_system_table_name(name: &str) -> bool {
+    name.to_lowercase().starts_with("sqlite_")
+}
+
+fn update_ref_columns_for_table(
+    schema: &Schema,
+    table_name: &str,
+    old_col: &str,
+    new_col: &str,
+) -> Result<Vec<(String, Arc<Table>)>> {
+    let mut updates = Vec::new();
+    for (key, table_arc) in &schema.tables {
+        let mut table = (**table_arc).clone();
+        let mut changed = false;
+        for fk in &mut table.foreign_keys {
+            if fk.ref_table.eq_ignore_ascii_case(table_name) {
+                if let Some(cols) = fk.ref_columns.as_mut() {
+                    for col in cols.iter_mut() {
+                        if col.eq_ignore_ascii_case(old_col) {
+                            *col = new_col.to_string();
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if changed {
+            updates.push((key.clone(), Arc::new(table)));
+        }
+    }
+    Ok(updates)
+}
+
+fn references_column(schema: &Schema, table_name: &str, col_name: &str) -> bool {
+    for table_arc in schema.tables.values() {
+        for fk in &table_arc.foreign_keys {
+            if fk.ref_table.eq_ignore_ascii_case(table_name) {
+                if let Some(cols) = &fk.ref_columns {
+                    if cols.iter().any(|c| c.eq_ignore_ascii_case(col_name)) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 // ============================================================================
@@ -1640,6 +2029,136 @@ mod tests {
             name: QualifiedName::new("users"),
         };
         assert!(schema.drop_table(&drop_if_exists).is_ok());
+    }
+
+    #[test]
+    fn test_schema_alter_table_rename_and_fk_updates() {
+        let mut schema = Schema::new();
+
+        let parent = CreateTableStmt {
+            if_not_exists: false,
+            name: QualifiedName::new("parent"),
+            definition: TableDefinition::Columns {
+                columns: vec![ColumnDef {
+                    name: "id".to_string(),
+                    type_name: Some("INTEGER".to_string()),
+                    constraints: vec![ColumnConstraint::PrimaryKey {
+                        order: None,
+                        conflict: None,
+                        autoincrement: false,
+                    }],
+                }],
+                constraints: vec![],
+            },
+            without_rowid: false,
+            strict: false,
+        };
+
+        let child = CreateTableStmt {
+            if_not_exists: false,
+            name: QualifiedName::new("child"),
+            definition: TableDefinition::Columns {
+                columns: vec![ColumnDef {
+                    name: "parent_id".to_string(),
+                    type_name: Some("INTEGER".to_string()),
+                    constraints: vec![ColumnConstraint::ForeignKey {
+                        ref_table: "parent".to_string(),
+                        ref_columns: Some(vec!["id".to_string()]),
+                        on_delete: None,
+                        on_update: None,
+                        deferrable: None,
+                    }],
+                }],
+                constraints: vec![],
+            },
+            without_rowid: false,
+            strict: false,
+        };
+
+        schema.create_table(&parent).unwrap();
+        schema.create_table(&child).unwrap();
+
+        let rename = AlterTableStmt {
+            table: QualifiedName::new("parent"),
+            action: AlterTableAction::RenameTable("parent2".to_string()),
+        };
+        schema.alter_table(&rename).unwrap();
+
+        assert!(schema.table_exists("parent2"));
+        let child_table = schema.table("child").unwrap();
+        assert_eq!(child_table.foreign_keys[0].ref_table, "parent2");
+
+        let rename_col = AlterTableStmt {
+            table: QualifiedName::new("parent2"),
+            action: AlterTableAction::RenameColumn {
+                old: "id".to_string(),
+                new: "pid".to_string(),
+            },
+        };
+        schema.alter_table(&rename_col).unwrap();
+
+        let parent_table = schema.table("parent2").unwrap();
+        assert_eq!(parent_table.columns[0].name, "pid");
+        let child_table = schema.table("child").unwrap();
+        assert_eq!(
+            child_table.foreign_keys[0].ref_columns.as_ref().unwrap()[0],
+            "pid"
+        );
+    }
+
+    #[test]
+    fn test_schema_alter_table_add_drop_column() {
+        let mut schema = Schema::new();
+
+        let stmt = CreateTableStmt {
+            if_not_exists: false,
+            name: QualifiedName::new("items"),
+            definition: TableDefinition::Columns {
+                columns: vec![
+                    ColumnDef {
+                        name: "id".to_string(),
+                        type_name: Some("INTEGER".to_string()),
+                        constraints: vec![],
+                    },
+                    ColumnDef {
+                        name: "name".to_string(),
+                        type_name: Some("TEXT".to_string()),
+                        constraints: vec![],
+                    },
+                ],
+                constraints: vec![],
+            },
+            without_rowid: false,
+            strict: false,
+        };
+
+        schema.create_table(&stmt).unwrap();
+
+        let add_col = AlterTableStmt {
+            table: QualifiedName::new("items"),
+            action: AlterTableAction::AddColumn(ColumnDef {
+                name: "category".to_string(),
+                type_name: Some("TEXT".to_string()),
+                constraints: vec![
+                    ColumnConstraint::NotNull { conflict: None },
+                    ColumnConstraint::Default(DefaultValue::String("misc".to_string())),
+                ],
+            }),
+        };
+        schema.alter_table(&add_col).unwrap();
+
+        let table = schema.table("items").unwrap();
+        assert_eq!(table.columns.len(), 3);
+
+        let drop_col = AlterTableStmt {
+            table: QualifiedName::new("items"),
+            action: AlterTableAction::DropColumn("name".to_string()),
+        };
+        schema.alter_table(&drop_col).unwrap();
+
+        let table = schema.table("items").unwrap();
+        assert_eq!(table.columns.len(), 2);
+        assert!(table.column("name").is_none());
     }
 
     #[test]

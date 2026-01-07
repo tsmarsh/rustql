@@ -83,7 +83,6 @@ impl StmtType {
                 | StmtType::Commit
                 | StmtType::Rollback
                 | StmtType::Pragma
-                | StmtType::Analyze
         )
     }
 }

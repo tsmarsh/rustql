@@ -522,6 +522,8 @@ pub struct Index {
     pub is_primary_key: bool,
     /// CREATE INDEX statement (for schema table)
     pub sql: Option<String>,
+    /// Statistics for the index (sqlite_stat1)
+    pub stats: Option<IndexStats>,
 }
 
 impl Default for Index {
@@ -535,6 +537,7 @@ impl Default for Index {
             partial: None,
             is_primary_key: false,
             sql: None,
+            stats: None,
         }
     }
 }
@@ -582,6 +585,8 @@ pub struct Table {
     pub autoincrement: bool,
     /// CREATE TABLE statement (for schema table)
     pub sql: Option<String>,
+    /// Estimated row count from ANALYZE
+    pub row_estimate: i64,
 }
 
 impl Default for Table {
@@ -600,6 +605,7 @@ impl Default for Table {
             is_virtual: false,
             autoincrement: false,
             sql: None,
+            row_estimate: 0,
         }
     }
 }
@@ -745,6 +751,8 @@ pub struct Schema {
     pub file_format: u8,
     /// Text encoding
     pub encoding: Encoding,
+    /// sqlite_stat1 rows keyed by (table, index)
+    pub stat1: HashMap<(String, Option<String>), Stat1Row>,
 }
 
 impl Schema {
@@ -777,6 +785,109 @@ impl Schema {
     pub fn trigger(&self, name: &str) -> Option<Arc<Trigger>> {
         self.triggers.get(&name.to_lowercase()).cloned()
     }
+
+    /// Remove all sqlite_stat1 rows for a table
+    pub fn clear_stat1_for_table(&mut self, table: &str) {
+        let table_key = table.to_lowercase();
+        self.stat1
+            .retain(|(tbl, _), _| !tbl.eq_ignore_ascii_case(&table_key));
+    }
+
+    /// Insert or replace a sqlite_stat1 row and apply it to schema objects
+    pub fn set_stat1(&mut self, row: Stat1Row) -> Result<()> {
+        let key = (
+            row.tbl.to_lowercase(),
+            row.idx.as_ref().map(|s| s.to_lowercase()),
+        );
+        self.stat1.insert(key, row.clone());
+        self.apply_stat1_row(&row)
+    }
+
+    /// Apply all sqlite_stat1 rows to tables and indexes
+    pub fn load_statistics(&mut self) -> Result<()> {
+        let rows: Vec<Stat1Row> = self.stat1.values().cloned().collect();
+        for row in rows {
+            self.apply_stat1_row(&row)?;
+        }
+        Ok(())
+    }
+
+    fn apply_stat1_row(&mut self, row: &Stat1Row) -> Result<()> {
+        let stats = parse_stat1(row.stat.as_str())?;
+        if let Some(idx_name) = row.idx.as_ref() {
+            let key = idx_name.to_lowercase();
+            if let Some(index_arc) = self.indexes.get(&key).cloned() {
+                let mut index = (*index_arc).clone();
+                index.stats = Some(stats);
+                self.indexes.insert(key, Arc::new(index));
+            }
+        } else {
+            let key = row.tbl.to_lowercase();
+            if let Some(table_arc) = self.tables.get_mut(&key) {
+                let table = Arc::make_mut(table_arc);
+                table.row_estimate = stats.row_count;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// sqlite_stat1 row
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stat1Row {
+    pub tbl: String,
+    pub idx: Option<String>,
+    pub stat: String,
+}
+
+/// Statistics for an index from sqlite_stat1
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexStats {
+    pub row_count: i64,
+    pub avg_eq: Vec<f64>,
+    pub n_distinct: Vec<i64>,
+}
+
+/// sqlite_stat4 row (sampled statistics)
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stat4Row {
+    pub tbl: String,
+    pub idx: String,
+    pub nlt: Vec<i64>,
+    pub ndlt: Vec<i64>,
+    pub neq: Vec<i64>,
+    pub sample: Vec<u8>,
+}
+
+fn parse_stat1(stat: &str) -> Result<IndexStats> {
+    let mut parts = stat.split_whitespace();
+    let row_part = parts
+        .next()
+        .ok_or_else(|| Error::with_message(ErrorCode::Corrupt, "empty stat string"))?;
+    let row_count = row_part
+        .parse::<i64>()
+        .map_err(|_| Error::with_message(ErrorCode::Corrupt, "invalid row count in stat string"))?;
+
+    let mut avg_eq = Vec::new();
+    let mut n_distinct = Vec::new();
+    for part in parts {
+        let avg = part
+            .parse::<f64>()
+            .map_err(|_| Error::with_message(ErrorCode::Corrupt, "invalid index stat value"))?;
+        avg_eq.push(avg);
+        let distinct = if avg > 0.0 {
+            ((row_count as f64) / avg).round() as i64
+        } else {
+            0
+        };
+        n_distinct.push(distinct);
+    }
+
+    Ok(IndexStats {
+        row_count,
+        avg_eq,
+        n_distinct,
+    })
 }
 
 // ============================================================================
@@ -1041,6 +1152,7 @@ impl Schema {
             is_virtual: false,
             autoincrement: false,
             sql: None,
+            row_estimate: 0,
         };
 
         // Process columns
@@ -1305,6 +1417,7 @@ impl Schema {
             partial: stmt.where_clause.clone(),
             is_primary_key: false,
             sql: None,
+            stats: None,
         };
 
         // Process indexed columns

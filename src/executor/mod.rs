@@ -1,5 +1,6 @@
 //! Query execution: SELECT, INSERT, UPDATE, DELETE
 
+pub mod analyze;
 pub mod delete;
 pub mod insert;
 pub mod planner;

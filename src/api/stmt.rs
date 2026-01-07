@@ -3,8 +3,10 @@
 //! This module implements sqlite3_stmt (prepared statement) and related functions.
 
 use crate::error::{Error, ErrorCode, Result};
+use crate::executor::analyze::execute_analyze;
 use crate::executor::pragma::{execute_pragma, pragma_columns};
 use crate::executor::prepare::{compile_sql, CompiledStmt, StmtType};
+use crate::parser::ast::QualifiedName;
 use crate::types::{ColumnType, StepResult, Value};
 use crate::vdbe::engine::Vdbe;
 use crate::vdbe::ops::VdbeOp;
@@ -53,7 +55,9 @@ pub struct PreparedStmt {
     pragma: Option<crate::parser::ast::PragmaStmt>,
     /// PRAGMA execution state
     pragma_state: Option<PragmaState>,
-    /// Connection pointer for PRAGMA execution
+    /// ANALYZE target (if applicable)
+    analyze_target: Option<QualifiedName>,
+    /// Connection pointer for PRAGMA/ANALYZE execution
     conn_ptr: Option<*mut SqliteConnection>,
 }
 
@@ -79,6 +83,7 @@ impl PreparedStmt {
             vdbe: None,
             pragma: None,
             pragma_state: None,
+            analyze_target: None,
             conn_ptr: None,
         }
     }
@@ -108,6 +113,7 @@ impl PreparedStmt {
             vdbe: None,
             pragma: None,
             pragma_state: None,
+            analyze_target: None,
             conn_ptr: None,
         }
     }
@@ -244,12 +250,15 @@ pub fn sqlite3_prepare_v2<'a>(
         return Ok((Box::new(PreparedStmt::new("")), ""));
     }
 
-    let parsed_pragma = crate::executor::prepare::parse_sql(sql)
-        .ok()
-        .and_then(|stmt| match stmt {
-            crate::parser::ast::Stmt::Pragma(pragma) => Some(pragma),
-            _ => None,
-        });
+    let parsed_stmt = crate::executor::prepare::parse_sql(sql).ok();
+    let parsed_pragma = parsed_stmt.as_ref().and_then(|stmt| match stmt {
+        crate::parser::ast::Stmt::Pragma(pragma) => Some(pragma.clone()),
+        _ => None,
+    });
+    let parsed_analyze = parsed_stmt.as_ref().and_then(|stmt| match stmt {
+        crate::parser::ast::Stmt::Analyze(target) => Some(target.clone()),
+        _ => None,
+    });
 
     // Compile the SQL to VDBE bytecode
     match compile_sql(sql) {
@@ -262,6 +271,10 @@ pub fn sqlite3_prepare_v2<'a>(
                     stmt.set_columns(vec![pragma.name.clone()], vec![ColumnType::Text]);
                 }
                 stmt.pragma = Some(pragma);
+                stmt.conn_ptr = Some(conn as *mut SqliteConnection);
+            }
+            if let Some(analyze_target) = parsed_analyze {
+                stmt.analyze_target = analyze_target;
                 stmt.conn_ptr = Some(conn as *mut SqliteConnection);
             }
             let stmt = Box::new(stmt);
@@ -318,6 +331,9 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
 
     if stmt.stmt_type == Some(StmtType::Pragma) && stmt.pragma.is_some() {
         return pragma_step(stmt);
+    }
+    if stmt.stmt_type == Some(StmtType::Analyze) {
+        return analyze_step(stmt);
     }
 
     // Create VDBE if not already created
@@ -411,6 +427,17 @@ fn pragma_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
     state.idx += 1;
     stmt.set_row(row);
     Ok(StepResult::Row)
+}
+
+fn analyze_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
+    let conn_ptr = stmt
+        .conn_ptr
+        .ok_or_else(|| Error::with_message(ErrorCode::Error, "missing connection".to_string()))?;
+    let target = stmt.analyze_target.clone();
+    let conn = unsafe { &mut *conn_ptr };
+    execute_analyze(conn, target)?;
+    stmt.set_done();
+    Ok(StepResult::Done)
 }
 
 /// sqlite3_reset - Reset statement for re-execution

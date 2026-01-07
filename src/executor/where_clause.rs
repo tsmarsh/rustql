@@ -7,6 +7,7 @@ use bitflags::bitflags;
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::parser::ast::{BinaryOp, Expr, LikeOp, Literal, UnaryOp};
+use crate::schema::IndexStats;
 
 use super::where_expr;
 
@@ -452,6 +453,8 @@ pub struct IndexInfo {
 
     /// Is covering (includes all needed columns)?
     pub is_covering: bool,
+    /// Index statistics (sqlite_stat1)
+    pub stats: Option<IndexStats>,
 }
 
 /// Query planner for WHERE clause optimization
@@ -937,8 +940,7 @@ impl QueryPlanner {
             let eq_match_count = self.count_index_eq_matches(index, &usable_eq_terms, table_idx);
 
             if eq_match_count > 0 {
-                let rows =
-                    (table.estimated_rows as f64 * 0.1f64.powi(eq_match_count as i32)).max(1.0);
+                let rows = self.estimate_index_rows(table, index, eq_match_count);
                 let cost = INDEX_SEEK_COST + rows * ROW_READ_COST;
 
                 if cost < best_cost {
@@ -981,8 +983,16 @@ impl QueryPlanner {
         // Calculate output rows
         let output_rows = match &best_plan {
             WherePlan::RowidEq | WherePlan::PrimaryKey { .. } => 1.0,
-            WherePlan::IndexScan { eq_cols, .. } => {
-                (table.estimated_rows as f64 * 0.1f64.powi(*eq_cols)).max(1.0)
+            WherePlan::IndexScan {
+                index_name,
+                eq_cols,
+                ..
+            } => {
+                if let Some(index) = table.indexes.iter().find(|idx| idx.name == *index_name) {
+                    self.estimate_index_rows(table, index, *eq_cols)
+                } else {
+                    (table.estimated_rows as f64 * 0.1f64.powi(*eq_cols)).max(1.0)
+                }
             }
             _ => table.estimated_rows as f64 * total_selectivity,
         };
@@ -992,6 +1002,33 @@ impl QueryPlanner {
         level.cost = best_cost * rows_in;
 
         Ok((level.cost, level))
+    }
+
+    fn estimate_index_rows(
+        &self,
+        table: &TableInfo,
+        index: &IndexInfo,
+        eq_match_count: i32,
+    ) -> f64 {
+        if eq_match_count <= 0 {
+            return (table.estimated_rows as f64).max(1.0);
+        }
+        if let Some(stats) = &index.stats {
+            let idx = (eq_match_count as usize).saturating_sub(1);
+            if idx < stats.avg_eq.len() {
+                let estimate = stats.avg_eq[idx];
+                if estimate > 0.0 {
+                    return estimate.max(1.0);
+                }
+            }
+            let base = if stats.row_count > 0 {
+                stats.row_count as f64
+            } else {
+                table.estimated_rows as f64
+            };
+            return (base * 0.1f64.powi(eq_match_count)).max(1.0);
+        }
+        (table.estimated_rows as f64 * 0.1f64.powi(eq_match_count)).max(1.0)
     }
 
     /// Count how many index columns match equality terms
@@ -1137,6 +1174,7 @@ mod tests {
                 is_primary: false,
                 is_unique: true,
                 is_covering: false,
+                stats: None,
             },
         );
 

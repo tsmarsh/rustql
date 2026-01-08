@@ -1017,13 +1017,26 @@ impl Vdbe {
             Opcode::OpenRead => {
                 // P1 = cursor, P2 = root page (or register if P5 has OPFLAG_P2ISREG)
                 // P3 = num columns, P4 = table name
-                let root_page = if op.p5 & 0x02 != 0 {
+                let mut root_page = if op.p5 & 0x02 != 0 {
                     // P2 is a register containing the root page
                     self.mem(op.p2).to_int() as Pgno
                 } else {
                     // P2 is the root page directly
                     op.p2 as Pgno
                 };
+
+                // If root_page is 0 and we have a table name in P4, look it up in schema
+                if root_page == 0 {
+                    if let P4::Text(table_name) = &op.p4 {
+                        if let Some(ref schema) = self.schema {
+                            if let Ok(schema_guard) = schema.read() {
+                                if let Some(table) = schema_guard.tables.get(table_name) {
+                                    root_page = table.root_page;
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Clone btree Arc to avoid borrow issues
                 let btree = self.btree.clone();

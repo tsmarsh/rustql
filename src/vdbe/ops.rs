@@ -462,6 +462,7 @@ impl Opcode {
                 | Opcode::Yield
                 | Opcode::Next
                 | Opcode::Prev
+                | Opcode::Rewind
                 | Opcode::SeekGE
                 | Opcode::SeekGT
                 | Opcode::SeekLE

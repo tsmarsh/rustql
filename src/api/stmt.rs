@@ -280,6 +280,8 @@ pub fn sqlite3_prepare_v2<'a>(
     match compile_sql(sql) {
         Ok((compiled, tail)) => {
             let mut stmt = PreparedStmt::from_compiled(sql, compiled, tail);
+            // Always set connection pointer so VDBE has access to btree and schema
+            stmt.conn_ptr = Some(conn as *mut SqliteConnection);
             if let Some(pragma) = parsed_pragma {
                 if let Some((names, types)) = pragma_columns(&pragma) {
                     stmt.set_columns(names, types);
@@ -287,19 +289,15 @@ pub fn sqlite3_prepare_v2<'a>(
                     stmt.set_columns(vec![pragma.name.clone()], vec![ColumnType::Text]);
                 }
                 stmt.pragma = Some(pragma);
-                stmt.conn_ptr = Some(conn as *mut SqliteConnection);
             }
             if let Some(analyze_target) = parsed_analyze {
                 stmt.analyze_target = analyze_target;
-                stmt.conn_ptr = Some(conn as *mut SqliteConnection);
             }
             if let Some(attach_stmt) = parsed_attach {
                 stmt.attach_stmt = Some(attach_stmt);
-                stmt.conn_ptr = Some(conn as *mut SqliteConnection);
             }
             if let Some(detach_name) = parsed_detach {
                 stmt.detach_name = Some(detach_name);
-                stmt.conn_ptr = Some(conn as *mut SqliteConnection);
             }
             let stmt = Box::new(stmt);
             // Calculate actual tail position in original string

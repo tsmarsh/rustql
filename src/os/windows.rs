@@ -12,7 +12,9 @@ use std::cell::UnsafeCell;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::sync::Arc;
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_DISK_FULL, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF,
     ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, ERROR_LOCK_VIOLATION, ERROR_PATH_NOT_FOUND,
@@ -29,7 +31,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_ALL_ACCESS, PAGE_READWRITE,
+    CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_ALL_ACCESS,
+    MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
 };
 use windows_sys::Win32::System::SystemInformation::{GetSystemTimeAsFileTime, GetTickCount64};
 use windows_sys::Win32::System::Threading::{GetCurrentThreadId, Sleep};
@@ -138,10 +141,9 @@ impl Vfs for WinVfs {
 
     fn open(&self, path: Option<&str>, flags: OpenFlags) -> Result<Box<dyn VfsFile>> {
         let desired_access = if flags.contains(OpenFlags::READONLY) {
-            windows_sys::Win32::Storage::FileSystem::GENERIC_READ
+            GENERIC_READ
         } else {
-            windows_sys::Win32::Storage::FileSystem::GENERIC_READ
-                | windows_sys::Win32::Storage::FileSystem::GENERIC_WRITE
+            GENERIC_READ | GENERIC_WRITE
         };
 
         let mut attributes = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_OVERLAPPED;
@@ -382,7 +384,10 @@ impl Drop for WinFile {
             for ptr in &shm.regions {
                 if !ptr.is_null() {
                     unsafe {
-                        UnmapViewOfFile(*ptr as *const _);
+                        let addr = MEMORY_MAPPED_VIEW_ADDRESS {
+                            Value: *ptr as *mut _,
+                        };
+                        UnmapViewOfFile(addr);
                     }
                 }
             }
@@ -533,8 +538,7 @@ impl WinFile {
         let handle = unsafe {
             CreateFileW(
                 wide_path.as_ptr(),
-                windows_sys::Win32::Storage::FileSystem::GENERIC_READ
-                    | windows_sys::Win32::Storage::FileSystem::GENERIC_WRITE,
+                GENERIC_READ | GENERIC_WRITE,
                 FILE_SHARE_FLAGS,
                 std::ptr::null(),
                 OPEN_ALWAYS,
@@ -872,7 +876,7 @@ impl VfsFile for WinFile {
             let offset = (region as u64) * (size as u64);
             let offset_low = (offset & 0xFFFF_FFFF) as u32;
             let offset_high = (offset >> 32) as u32;
-            let ptr = unsafe {
+            let mapped = unsafe {
                 MapViewOfFile(
                     shm.map_handle,
                     FILE_MAP_ALL_ACCESS,
@@ -882,11 +886,11 @@ impl VfsFile for WinFile {
                 )
             };
 
-            if ptr.is_null() {
+            if mapped.Value.is_null() {
                 return Err(WinVfs::error_from_win32());
             }
 
-            shm.regions[region as usize] = ptr as *mut u8;
+            shm.regions[region as usize] = mapped.Value as *mut u8;
             shm.n_region = std::cmp::max(shm.n_region, region + 1);
         }
 

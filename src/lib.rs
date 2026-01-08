@@ -46,8 +46,14 @@ pub use api::{
     sqlite3_db_status64, sqlite3_errcode, sqlite3_errmsg, sqlite3_errstr, sqlite3_finalize,
     sqlite3_initialize, sqlite3_last_insert_rowid, sqlite3_libversion, sqlite3_libversion_number,
     sqlite3_open, sqlite3_open_v2, sqlite3_prepare_v2, sqlite3_reset, sqlite3_shutdown,
-    sqlite3_step, sqlite3_total_changes, Backup, BackupStepResult, DbStatusOp, PreparedStmt,
-    SqliteConnection,
+    sqlite3_step, sqlite3_total_changes, sqlite3changeset_apply, sqlite3session_attach,
+    sqlite3session_changeset, sqlite3session_changeset_size, sqlite3session_changeset_strm,
+    sqlite3session_config, sqlite3session_create, sqlite3session_delete, sqlite3session_diff,
+    sqlite3session_enable, sqlite3session_indirect, sqlite3session_isempty,
+    sqlite3session_memory_used, sqlite3session_object_config, sqlite3session_patchset,
+    sqlite3session_patchset_strm, sqlite3session_table_filter, Backup, BackupStepResult, ChangeOp,
+    Changeset, ChangesetChange, ChangesetIter, ConflictAction, ConflictType, DbStatusOp, Patchset,
+    PreparedStmt, Session, SessionConfigOp, SessionObjConfig, SqliteConnection,
 };
 
 pub use rtree::{RtreeBbox, RtreeConstraint, RtreeResult, RtreeTable};

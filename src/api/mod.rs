@@ -7,10 +7,12 @@ mod backup;
 mod blob;
 mod config;
 mod connection;
+mod session;
 mod stmt;
 
 pub use backup::*;
 pub use blob::*;
 pub use config::*;
 pub use connection::*;
+pub use session::*;
 pub use stmt::*;

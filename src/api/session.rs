@@ -10,11 +10,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::schema::Table;
-use crate::types::Value;
+use crate::types::{StepResult, Value};
 use crate::vdbe::aux::{get_varint, put_varint};
 
 use super::connection::SqliteConnection;
-use super::stmt::{sqlite3_bind_value, sqlite3_prepare_v2, sqlite3_step};
+use super::stmt::{sqlite3_bind_value, sqlite3_column_value, sqlite3_prepare_v2, sqlite3_step};
 
 const CHANGESET_END: u8 = 0;
 const CHANGESET_INSERT: u8 = 1;
@@ -1150,6 +1150,878 @@ fn values_bytes(values: &[Value]) -> usize {
 }
 
 // ============================================================================
+// Changegroup Implementation
+// ============================================================================
+
+/// A changegroup combines multiple changesets or patchsets.
+pub struct Changegroup {
+    tables: HashMap<String, ChangeGroupTable>,
+    table_order: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ChangeGroupTable {
+    name: String,
+    n_col: i32,
+    pk: Vec<bool>,
+    changes: HashMap<Vec<u8>, SessionChange>,
+    change_order: Vec<Vec<u8>>,
+}
+
+impl Changegroup {
+    fn new() -> Self {
+        Self {
+            tables: HashMap::new(),
+            table_order: Vec::new(),
+        }
+    }
+
+    fn add_changeset(&mut self, changeset: &Changeset) -> Result<()> {
+        let mut iter = changeset.iter();
+        while let Some(change) = iter.next()? {
+            self.add_change(&change)?;
+        }
+        Ok(())
+    }
+
+    fn add_change(&mut self, change: &ChangesetChange) -> Result<()> {
+        let table_key = change.table.to_lowercase();
+
+        // Create table entry if it doesn't exist
+        if !self.tables.contains_key(&table_key) {
+            self.tables.insert(
+                table_key.clone(),
+                ChangeGroupTable {
+                    name: change.table.clone(),
+                    n_col: change.n_col,
+                    pk: change.pk.clone(),
+                    changes: HashMap::new(),
+                    change_order: Vec::new(),
+                },
+            );
+            self.table_order.push(table_key.clone());
+        }
+
+        let table = self
+            .tables
+            .get_mut(&table_key)
+            .ok_or_else(|| Error::new(ErrorCode::Error))?;
+
+        // Validate schema consistency
+        if table.n_col != change.n_col || table.pk != change.pk {
+            return Err(Error::new(ErrorCode::Schema));
+        }
+
+        // Compute PK key for this change
+        let pk_key = compute_pk_key_from_change(change)?;
+
+        // Merge with existing change if present
+        if let Some(existing) = table.changes.get(&pk_key) {
+            let merged = merge_changes(existing, change)?;
+            if let Some(merged_change) = merged {
+                table.changes.insert(pk_key, merged_change);
+            } else {
+                // Changes cancel out - remove from table
+                table.changes.remove(&pk_key);
+                table.change_order.retain(|k| k != &pk_key);
+            }
+        } else {
+            table.change_order.push(pk_key.clone());
+            table.changes.insert(
+                pk_key,
+                SessionChange {
+                    op: change.op,
+                    old: change.old.clone(),
+                    new: change.new.clone(),
+                    indirect: change.indirect,
+                },
+            );
+        }
+
+        Ok(())
+    }
+
+    fn output(&self) -> Result<Changeset> {
+        let mut data = Vec::new();
+
+        for table_key in &self.table_order {
+            if let Some(table) = self.tables.get(table_key) {
+                if table.changes.is_empty() {
+                    continue;
+                }
+
+                // Write table header
+                put_varint(&mut data, table.name.len() as u64);
+                data.extend_from_slice(table.name.as_bytes());
+                put_varint(&mut data, table.n_col as u64);
+                for &is_pk in &table.pk {
+                    data.push(if is_pk { 1 } else { 0 });
+                }
+
+                // Write changes in order
+                for pk_key in &table.change_order {
+                    if let Some(change) = table.changes.get(pk_key) {
+                        let op_byte = match change.op {
+                            ChangeOp::Insert => CHANGESET_INSERT,
+                            ChangeOp::Update => CHANGESET_UPDATE,
+                            ChangeOp::Delete => CHANGESET_DELETE,
+                        };
+                        let mut header = op_byte;
+                        if change.indirect {
+                            header |= CHANGESET_INDIRECT;
+                        }
+                        data.push(header);
+
+                        if let Some(ref old) = change.old {
+                            for value in old {
+                                encode_value(&mut data, value);
+                            }
+                        }
+                        if let Some(ref new) = change.new {
+                            for value in new {
+                                encode_value(&mut data, value);
+                            }
+                        }
+                    }
+                }
+                data.push(CHANGESET_END);
+            }
+        }
+
+        Ok(Changeset { data })
+    }
+}
+
+fn compute_pk_key_from_change(change: &ChangesetChange) -> Result<Vec<u8>> {
+    let values = match change.op {
+        ChangeOp::Insert => change.new.as_ref(),
+        ChangeOp::Update => change.old.as_ref().or(change.new.as_ref()),
+        ChangeOp::Delete => change.old.as_ref(),
+    }
+    .ok_or_else(|| Error::new(ErrorCode::Error))?;
+
+    let mut key = Vec::new();
+    for (idx, is_pk) in change.pk.iter().enumerate() {
+        if *is_pk && idx < values.len() {
+            encode_value(&mut key, &values[idx]);
+        }
+    }
+    Ok(key)
+}
+
+/// Merge two changes on the same primary key.
+/// Returns None if the changes cancel out.
+fn merge_changes(existing: &SessionChange, new: &ChangesetChange) -> Result<Option<SessionChange>> {
+    match (existing.op, new.op) {
+        // INSERT + INSERT: Keep existing (shouldn't happen in practice)
+        (ChangeOp::Insert, ChangeOp::Insert) => Ok(Some(existing.clone())),
+
+        // INSERT + UPDATE: Update the INSERT's new values
+        (ChangeOp::Insert, ChangeOp::Update) => {
+            let merged_new = merge_values(existing.new.as_ref(), new.new.as_ref());
+            Ok(Some(SessionChange {
+                op: ChangeOp::Insert,
+                old: None,
+                new: Some(merged_new),
+                indirect: existing.indirect && new.indirect,
+            }))
+        }
+
+        // INSERT + DELETE: Cancel out
+        (ChangeOp::Insert, ChangeOp::Delete) => Ok(None),
+
+        // UPDATE + INSERT: Keep existing UPDATE (shouldn't happen in practice)
+        (ChangeOp::Update, ChangeOp::Insert) => Ok(Some(existing.clone())),
+
+        // UPDATE + UPDATE: Merge the updates
+        (ChangeOp::Update, ChangeOp::Update) => {
+            let merged_new = merge_values(existing.new.as_ref(), new.new.as_ref());
+            Ok(Some(SessionChange {
+                op: ChangeOp::Update,
+                old: existing.old.clone(),
+                new: Some(merged_new),
+                indirect: existing.indirect && new.indirect,
+            }))
+        }
+
+        // UPDATE + DELETE: Becomes DELETE with original old values
+        (ChangeOp::Update, ChangeOp::Delete) => Ok(Some(SessionChange {
+            op: ChangeOp::Delete,
+            old: existing.old.clone(),
+            new: None,
+            indirect: existing.indirect && new.indirect,
+        })),
+
+        // DELETE + INSERT: Becomes UPDATE (or nothing if identical)
+        (ChangeOp::Delete, ChangeOp::Insert) => {
+            let old_vals = existing.old.as_ref();
+            let new_vals = new.new.as_ref();
+            if old_vals == new_vals {
+                Ok(None) // Identical row restored
+            } else {
+                Ok(Some(SessionChange {
+                    op: ChangeOp::Update,
+                    old: existing.old.clone(),
+                    new: new_vals.cloned(),
+                    indirect: existing.indirect && new.indirect,
+                }))
+            }
+        }
+
+        // DELETE + UPDATE: Keep existing (shouldn't happen in practice)
+        (ChangeOp::Delete, ChangeOp::Update) => Ok(Some(existing.clone())),
+
+        // DELETE + DELETE: Keep existing (shouldn't happen in practice)
+        (ChangeOp::Delete, ChangeOp::Delete) => Ok(Some(existing.clone())),
+    }
+}
+
+fn merge_values(existing: Option<&Vec<Value>>, new: Option<&Vec<Value>>) -> Vec<Value> {
+    match (existing, new) {
+        (Some(e), Some(n)) => {
+            let mut result = e.clone();
+            for (i, val) in n.iter().enumerate() {
+                if i < result.len() && !matches!(val, Value::Null) {
+                    result[i] = val.clone();
+                }
+            }
+            result
+        }
+        (Some(e), None) => e.clone(),
+        (None, Some(n)) => n.clone(),
+        (None, None) => Vec::new(),
+    }
+}
+
+// ============================================================================
+// Changegroup Public API
+// ============================================================================
+
+pub fn sqlite3changegroup_new() -> Changegroup {
+    Changegroup::new()
+}
+
+pub fn sqlite3changegroup_add(group: &mut Changegroup, changeset: &Changeset) -> Result<()> {
+    group.add_changeset(changeset)
+}
+
+pub fn sqlite3changegroup_add_change(
+    group: &mut Changegroup,
+    change: &ChangesetChange,
+) -> Result<()> {
+    group.add_change(change)
+}
+
+pub fn sqlite3changegroup_output(group: &Changegroup) -> Result<Changeset> {
+    group.output()
+}
+
+pub fn sqlite3changegroup_delete(_group: Changegroup) {
+    // Rust drops automatically
+}
+
+// ============================================================================
+// Changeset Concat
+// ============================================================================
+
+pub fn sqlite3changeset_concat(a: &Changeset, b: &Changeset) -> Result<Changeset> {
+    let mut group = sqlite3changegroup_new();
+    sqlite3changegroup_add(&mut group, a)?;
+    sqlite3changegroup_add(&mut group, b)?;
+    sqlite3changegroup_output(&group)
+}
+
+// ============================================================================
+// Rebaser Implementation
+// ============================================================================
+
+/// Rebase buffer entry representing a conflict resolution
+#[derive(Debug, Clone)]
+struct RebaseEntry {
+    table: String,
+    pk: Vec<u8>,
+    action: ConflictAction,
+    conflict_type: ConflictType,
+    old_values: Option<Vec<Value>>,
+    new_values: Option<Vec<Value>>,
+}
+
+/// Rebaser for adjusting changesets based on conflict resolutions
+pub struct Rebaser {
+    entries: Vec<RebaseEntry>,
+}
+
+impl Rebaser {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    fn configure(&mut self, rebase_data: &[u8]) -> Result<()> {
+        // Parse rebase buffer format
+        // Format: [table_name_len][table_name][pk_len][pk][action][conflict_type][old?][new?]...
+        let mut pos = 0;
+        while pos < rebase_data.len() {
+            // Read table name
+            let (name_len, consumed) = get_varint(&rebase_data[pos..]);
+            if consumed == 0 {
+                break;
+            }
+            pos += consumed;
+
+            if pos + name_len as usize > rebase_data.len() {
+                return Err(Error::new(ErrorCode::Corrupt));
+            }
+            let table = std::str::from_utf8(&rebase_data[pos..pos + name_len as usize])
+                .map_err(|_| Error::new(ErrorCode::Corrupt))?
+                .to_string();
+            pos += name_len as usize;
+
+            // Read PK
+            let (pk_len, consumed) = get_varint(&rebase_data[pos..]);
+            if consumed == 0 {
+                return Err(Error::new(ErrorCode::Corrupt));
+            }
+            pos += consumed;
+
+            if pos + pk_len as usize > rebase_data.len() {
+                return Err(Error::new(ErrorCode::Corrupt));
+            }
+            let pk = rebase_data[pos..pos + pk_len as usize].to_vec();
+            pos += pk_len as usize;
+
+            // Read action and conflict type
+            if pos + 2 > rebase_data.len() {
+                return Err(Error::new(ErrorCode::Corrupt));
+            }
+            let action = match rebase_data[pos] {
+                0 => ConflictAction::Omit,
+                1 => ConflictAction::Replace,
+                2 => ConflictAction::Abort,
+                _ => return Err(Error::new(ErrorCode::Corrupt)),
+            };
+            pos += 1;
+
+            let conflict_type = match rebase_data[pos] {
+                1 => ConflictType::Data,
+                2 => ConflictType::NotFound,
+                3 => ConflictType::Constraint,
+                _ => ConflictType::Other,
+            };
+            pos += 1;
+
+            self.entries.push(RebaseEntry {
+                table,
+                pk,
+                action,
+                conflict_type,
+                old_values: None,
+                new_values: None,
+            });
+        }
+        Ok(())
+    }
+
+    fn rebase(&self, changeset: &Changeset) -> Result<Changeset> {
+        let mut output = Vec::new();
+        let mut iter = changeset.iter();
+
+        while let Some(change) = iter.next()? {
+            let pk_key = compute_pk_key_from_change(&change)?;
+
+            // Find matching rebase entry
+            let entry = self
+                .entries
+                .iter()
+                .find(|e| e.table.eq_ignore_ascii_case(&change.table) && e.pk == pk_key);
+
+            let rebased = match entry {
+                Some(entry) => self.rebase_change(&change, entry)?,
+                None => Some(change.clone()),
+            };
+
+            if let Some(rebased_change) = rebased {
+                encode_full_change(&mut output, &rebased_change)?;
+            }
+        }
+
+        Ok(Changeset { data: output })
+    }
+
+    fn rebase_change(
+        &self,
+        change: &ChangesetChange,
+        entry: &RebaseEntry,
+    ) -> Result<Option<ChangesetChange>> {
+        match entry.action {
+            ConflictAction::Replace => {
+                // For REPLACE, the local change is overridden
+                match change.op {
+                    ChangeOp::Insert => Ok(None),                 // INSERT overridden
+                    ChangeOp::Update => Ok(None),                 // UPDATE overridden
+                    ChangeOp::Delete => Ok(Some(change.clone())), // Keep DELETE
+                }
+            }
+            ConflictAction::Omit => {
+                // For OMIT, adjust the change based on conflict type
+                match (change.op, entry.conflict_type) {
+                    (ChangeOp::Insert, ConflictType::Data) => {
+                        // INSERT conflicted - convert to UPDATE
+                        Ok(Some(ChangesetChange {
+                            table: change.table.clone(),
+                            op: ChangeOp::Update,
+                            n_col: change.n_col,
+                            pk: change.pk.clone(),
+                            old: entry.new_values.clone(),
+                            new: change.new.clone(),
+                            indirect: change.indirect,
+                        }))
+                    }
+                    (ChangeOp::Delete, ConflictType::NotFound) => {
+                        // DELETE target not found - omit
+                        Ok(None)
+                    }
+                    _ => Ok(Some(change.clone())),
+                }
+            }
+            ConflictAction::Abort => {
+                // Abort should not appear in rebase data
+                Ok(Some(change.clone()))
+            }
+        }
+    }
+}
+
+fn encode_full_change(data: &mut Vec<u8>, change: &ChangesetChange) -> Result<()> {
+    // Write table header
+    put_varint(data, change.table.len() as u64);
+    data.extend_from_slice(change.table.as_bytes());
+    put_varint(data, change.n_col as u64);
+    for &is_pk in &change.pk {
+        data.push(if is_pk { 1 } else { 0 });
+    }
+
+    // Write change
+    let op_byte = match change.op {
+        ChangeOp::Insert => CHANGESET_INSERT,
+        ChangeOp::Update => CHANGESET_UPDATE,
+        ChangeOp::Delete => CHANGESET_DELETE,
+    };
+    let mut header = op_byte;
+    if change.indirect {
+        header |= CHANGESET_INDIRECT;
+    }
+    data.push(header);
+
+    if let Some(ref old) = change.old {
+        for value in old {
+            encode_value(data, value);
+        }
+    }
+    if let Some(ref new) = change.new {
+        for value in new {
+            encode_value(data, value);
+        }
+    }
+    data.push(CHANGESET_END);
+
+    Ok(())
+}
+
+// ============================================================================
+// Rebaser Public API
+// ============================================================================
+
+pub fn sqlite3rebaser_create() -> Rebaser {
+    Rebaser::new()
+}
+
+pub fn sqlite3rebaser_configure(rebaser: &mut Rebaser, rebase_data: &[u8]) -> Result<()> {
+    rebaser.configure(rebase_data)
+}
+
+pub fn sqlite3rebaser_rebase(rebaser: &Rebaser, changeset: &Changeset) -> Result<Changeset> {
+    rebaser.rebase(changeset)
+}
+
+pub fn sqlite3rebaser_delete(_rebaser: Rebaser) {
+    // Rust drops automatically
+}
+
+// ============================================================================
+// Streaming Input API
+// ============================================================================
+
+use std::io::Read;
+
+/// Streaming changeset input for low-memory environments
+pub struct ChangesetInputStream<R: Read> {
+    reader: R,
+    buffer: Vec<u8>,
+    pos: usize,
+    header: Option<ChangesetHeader>,
+    exhausted: bool,
+}
+
+impl<R: Read> ChangesetInputStream<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buffer: Vec::with_capacity(4096),
+            pos: 0,
+            header: None,
+            exhausted: false,
+        }
+    }
+
+    fn fill_buffer(&mut self, min_bytes: usize) -> Result<bool> {
+        if self.exhausted {
+            return Ok(self.buffer.len() - self.pos >= min_bytes);
+        }
+
+        // Compact buffer if needed
+        if self.pos > 0 {
+            self.buffer.drain(..self.pos);
+            self.pos = 0;
+        }
+
+        // Read more data if needed
+        while self.buffer.len() < min_bytes {
+            let chunk_size = STREAM_CHUNK_SIZE.load(Ordering::SeqCst).max(64);
+            let old_len = self.buffer.len();
+            self.buffer.resize(old_len + chunk_size, 0);
+
+            match self.reader.read(&mut self.buffer[old_len..]) {
+                Ok(0) => {
+                    self.buffer.truncate(old_len);
+                    self.exhausted = true;
+                    break;
+                }
+                Ok(n) => {
+                    self.buffer.truncate(old_len + n);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err(Error::new(ErrorCode::IoErr)),
+            }
+        }
+
+        Ok(self.buffer.len() >= min_bytes)
+    }
+
+    pub fn next(&mut self) -> Result<Option<ChangesetChange>> {
+        loop {
+            // Ensure we have at least some data
+            if !self.fill_buffer(1)? {
+                return Ok(None);
+            }
+
+            if self.pos >= self.buffer.len() {
+                return Ok(None);
+            }
+
+            // Parse table header if needed
+            if self.header.is_none() {
+                // Need enough data for header
+                if !self.fill_buffer(self.pos + 16)? && self.pos >= self.buffer.len() {
+                    return Ok(None);
+                }
+                self.header = Some(decode_table_header(&self.buffer, &mut self.pos)?);
+            }
+
+            let header = self
+                .header
+                .clone()
+                .ok_or_else(|| Error::new(ErrorCode::Error))?;
+
+            // Ensure we have data for next op
+            if !self.fill_buffer(self.pos + 1)? {
+                return Ok(None);
+            }
+
+            let op_byte = self.buffer[self.pos];
+            self.pos += 1;
+
+            if op_byte == CHANGESET_END {
+                self.header = None;
+                continue;
+            }
+
+            let indirect = op_byte & CHANGESET_INDIRECT != 0;
+            let op = match op_byte & !CHANGESET_INDIRECT {
+                CHANGESET_INSERT => ChangeOp::Insert,
+                CHANGESET_UPDATE => ChangeOp::Update,
+                CHANGESET_DELETE => ChangeOp::Delete,
+                _ => return Err(Error::new(ErrorCode::Corrupt)),
+            };
+
+            // Estimate bytes needed for values
+            let n_col = header.n_col as usize;
+            let estimated_size = n_col * 10; // rough estimate
+            self.fill_buffer(self.pos + estimated_size)?;
+
+            let old = match op {
+                ChangeOp::Insert => None,
+                ChangeOp::Update | ChangeOp::Delete => {
+                    Some(decode_values(&self.buffer, &mut self.pos, n_col)?)
+                }
+            };
+            let new = match op {
+                ChangeOp::Delete => None,
+                ChangeOp::Insert | ChangeOp::Update => {
+                    Some(decode_values(&self.buffer, &mut self.pos, n_col)?)
+                }
+            };
+
+            return Ok(Some(ChangesetChange {
+                table: header.table,
+                op,
+                n_col: header.n_col,
+                pk: header.pk,
+                old,
+                new,
+                indirect,
+            }));
+        }
+    }
+}
+
+/// Apply a changeset from a stream
+pub fn sqlite3changeset_apply_strm<R, F, G>(
+    conn: &mut SqliteConnection,
+    reader: R,
+    filter: Option<F>,
+    conflict: Option<G>,
+) -> Result<()>
+where
+    R: Read,
+    F: Fn(&str) -> bool,
+    G: Fn(&ChangesetChange, ConflictType) -> ConflictAction,
+{
+    let mut stream = ChangesetInputStream::new(reader);
+    while let Some(change) = stream.next()? {
+        if let Some(ref filter_fn) = filter {
+            if !filter_fn(&change.table) {
+                continue;
+            }
+        }
+
+        let result = apply_single_change(conn, &change);
+        if let Err(err) = result {
+            let conflict_type = classify_conflict(&err);
+            if let Some(ref conflict_fn) = conflict {
+                match conflict_fn(&change, conflict_type) {
+                    ConflictAction::Omit => continue,
+                    ConflictAction::Replace => {
+                        apply_change_with_replace(conn, &change)?;
+                    }
+                    ConflictAction::Abort => return Err(err),
+                }
+            } else {
+                return Err(err);
+            }
+        }
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Changeset Statistics
+// ============================================================================
+
+/// Statistics about a changeset
+#[derive(Debug, Default, Clone)]
+pub struct ChangesetStats {
+    pub inserts: i32,
+    pub updates: i32,
+    pub deletes: i32,
+    pub tables: i32,
+    pub size: usize,
+}
+
+impl ChangesetStats {
+    pub fn from_changeset(changeset: &Changeset) -> Result<Self> {
+        let mut stats = ChangesetStats {
+            size: changeset.data.len(),
+            ..Default::default()
+        };
+        let mut seen_tables = std::collections::HashSet::new();
+        let mut iter = changeset.iter();
+
+        while let Some(change) = iter.next()? {
+            if !seen_tables.contains(&change.table) {
+                seen_tables.insert(change.table.clone());
+                stats.tables += 1;
+            }
+            match change.op {
+                ChangeOp::Insert => stats.inserts += 1,
+                ChangeOp::Update => stats.updates += 1,
+                ChangeOp::Delete => stats.deletes += 1,
+            }
+        }
+
+        Ok(stats)
+    }
+}
+
+pub fn sqlite3changeset_stats(changeset: &Changeset) -> Result<ChangesetStats> {
+    ChangesetStats::from_changeset(changeset)
+}
+
+// ============================================================================
+// Session Diff Implementation
+// ============================================================================
+
+pub fn sqlite3session_diff_table(
+    session: &mut Session,
+    from_db: &str,
+    table_name: &str,
+) -> Result<()> {
+    // Attach the table if not already attached
+    session.attach_table(table_name)?;
+
+    let conn = unsafe { &mut *session.db };
+
+    // Get table info
+    let (n_col, pk_cols) = session.table_info(table_name)?;
+
+    // Build column list for the table
+    let columns = resolve_table_columns(conn, table_name, n_col as usize)?;
+    let col_list = columns.join(", ");
+    let pk_conditions: Vec<String> = pk_cols
+        .iter()
+        .enumerate()
+        .filter(|(_, &is_pk)| is_pk)
+        .map(|(i, _)| format!("t1.\"{}\" = t2.\"{}\"", columns[i], columns[i]))
+        .collect();
+
+    if pk_conditions.is_empty() {
+        // No PK, can't diff
+        return Ok(());
+    }
+
+    let pk_where = pk_conditions.join(" AND ");
+
+    // Find rows in to_db but not in from_db (INSERT)
+    let insert_sql = format!(
+        "SELECT {} FROM \"{}\".\"{}\" t1 WHERE NOT EXISTS \
+         (SELECT 1 FROM \"{}\".\"{}\" t2 WHERE {})",
+        col_list, session.db_name, table_name, from_db, table_name, pk_where
+    );
+    let (mut stmt, _) = sqlite3_prepare_v2(conn, &insert_sql)?;
+    loop {
+        match sqlite3_step(&mut stmt)? {
+            StepResult::Row => {
+                let mut values = Vec::with_capacity(n_col as usize);
+                for i in 0..n_col {
+                    values.push(sqlite3_column_value(&stmt, i));
+                }
+                session.record_change(table_name, ChangeOp::Insert, None, Some(values))?;
+            }
+            StepResult::Done => break,
+        }
+    }
+
+    // Find rows in from_db but not in to_db (DELETE)
+    let delete_sql = format!(
+        "SELECT {} FROM \"{}\".\"{}\" t2 WHERE NOT EXISTS \
+         (SELECT 1 FROM \"{}\".\"{}\" t1 WHERE {})",
+        col_list, from_db, table_name, session.db_name, table_name, pk_where
+    );
+    let (mut stmt, _) = sqlite3_prepare_v2(conn, &delete_sql)?;
+    loop {
+        match sqlite3_step(&mut stmt)? {
+            StepResult::Row => {
+                let mut values = Vec::with_capacity(n_col as usize);
+                for i in 0..n_col {
+                    values.push(sqlite3_column_value(&stmt, i));
+                }
+                session.record_change(table_name, ChangeOp::Delete, Some(values), None)?;
+            }
+            StepResult::Done => break,
+        }
+    }
+
+    // Find rows that differ (UPDATE)
+    let non_pk_cols: Vec<String> = columns
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !pk_cols.get(*i).copied().unwrap_or(false))
+        .map(|(_, name)| name.clone())
+        .collect();
+
+    if !non_pk_cols.is_empty() {
+        let diff_conditions: Vec<String> = non_pk_cols
+            .iter()
+            .map(|col| format!("(t1.\"{}\" IS NOT t2.\"{}\")", col, col))
+            .collect();
+        let diff_where = diff_conditions.join(" OR ");
+
+        let t1_cols: String = columns
+            .iter()
+            .map(|c| format!("t1.\"{}\"", c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let t2_cols: String = columns
+            .iter()
+            .map(|c| format!("t2.\"{}\"", c))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let update_sql = format!(
+            "SELECT {}, {} FROM \"{}\".\"{}\" t1, \"{}\".\"{}\" t2 \
+             WHERE {} AND ({})",
+            t1_cols,
+            t2_cols,
+            session.db_name,
+            table_name,
+            from_db,
+            table_name,
+            pk_where,
+            diff_where
+        );
+        let (mut stmt, _) = sqlite3_prepare_v2(conn, &update_sql)?;
+        loop {
+            match sqlite3_step(&mut stmt)? {
+                StepResult::Row => {
+                    let mut new_values = Vec::with_capacity(n_col as usize);
+                    let mut old_values = Vec::with_capacity(n_col as usize);
+                    for i in 0..n_col {
+                        new_values.push(sqlite3_column_value(&stmt, i));
+                    }
+                    for i in 0..n_col {
+                        old_values.push(sqlite3_column_value(&stmt, n_col + i));
+                    }
+                    session.record_change(
+                        table_name,
+                        ChangeOp::Update,
+                        Some(old_values),
+                        Some(new_values),
+                    )?;
+                }
+                StepResult::Done => break,
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Changeset Utility Functions
+// ============================================================================
+
+/// Check if a changeset is empty
+pub fn sqlite3changeset_is_empty(changeset: &Changeset) -> bool {
+    changeset.data.is_empty()
+}
+
+/// Get the size of a changeset in bytes
+pub fn sqlite3changeset_size(changeset: &Changeset) -> usize {
+    changeset.data.len()
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1222,5 +2094,256 @@ mod tests {
         let mut iter = inverted.iter();
         let change = iter.next().unwrap().unwrap();
         assert_eq!(change.op, ChangeOp::Insert);
+    }
+
+    #[test]
+    fn test_changegroup_basic() {
+        let mut conn = setup_conn_with_table();
+        let mut session = sqlite3session_create(&mut conn, "main").unwrap();
+        sqlite3session_attach(&mut session, Some("t1")).unwrap();
+
+        // First changeset: INSERT id=1
+        session
+            .record_change(
+                "t1",
+                ChangeOp::Insert,
+                None,
+                Some(vec![Value::Integer(1), Value::Text("a".into())]),
+            )
+            .unwrap();
+        let cs1 = sqlite3session_changeset(&session).unwrap();
+
+        // Reset session for second changeset
+        drop(session);
+        let mut session = sqlite3session_create(&mut conn, "main").unwrap();
+        sqlite3session_attach(&mut session, Some("t1")).unwrap();
+
+        // Second changeset: INSERT id=2
+        session
+            .record_change(
+                "t1",
+                ChangeOp::Insert,
+                None,
+                Some(vec![Value::Integer(2), Value::Text("b".into())]),
+            )
+            .unwrap();
+        let cs2 = sqlite3session_changeset(&session).unwrap();
+
+        // Combine using changegroup
+        let mut group = sqlite3changegroup_new();
+        sqlite3changegroup_add(&mut group, &cs1).unwrap();
+        sqlite3changegroup_add(&mut group, &cs2).unwrap();
+        let combined = sqlite3changegroup_output(&group).unwrap();
+
+        // Verify combined has 2 inserts
+        let stats = sqlite3changeset_stats(&combined).unwrap();
+        assert_eq!(stats.inserts, 2);
+        assert_eq!(stats.tables, 1);
+    }
+
+    #[test]
+    fn test_changegroup_insert_then_delete() {
+        let mut conn = setup_conn_with_table();
+        let mut session = sqlite3session_create(&mut conn, "main").unwrap();
+        sqlite3session_attach(&mut session, Some("t1")).unwrap();
+
+        // First changeset: INSERT id=1
+        session
+            .record_change(
+                "t1",
+                ChangeOp::Insert,
+                None,
+                Some(vec![Value::Integer(1), Value::Text("a".into())]),
+            )
+            .unwrap();
+        let cs1 = sqlite3session_changeset(&session).unwrap();
+
+        // Reset session for second changeset
+        drop(session);
+        let mut session = sqlite3session_create(&mut conn, "main").unwrap();
+        sqlite3session_attach(&mut session, Some("t1")).unwrap();
+
+        // Second changeset: DELETE id=1
+        session
+            .record_change(
+                "t1",
+                ChangeOp::Delete,
+                Some(vec![Value::Integer(1), Value::Text("a".into())]),
+                None,
+            )
+            .unwrap();
+        let cs2 = sqlite3session_changeset(&session).unwrap();
+
+        // Combine - should cancel out
+        let mut group = sqlite3changegroup_new();
+        sqlite3changegroup_add(&mut group, &cs1).unwrap();
+        sqlite3changegroup_add(&mut group, &cs2).unwrap();
+        let combined = sqlite3changegroup_output(&group).unwrap();
+
+        // Verify combined is empty
+        assert!(sqlite3changeset_is_empty(&combined));
+    }
+
+    #[test]
+    fn test_changeset_concat() {
+        let mut conn = setup_conn_with_table();
+        let mut session = sqlite3session_create(&mut conn, "main").unwrap();
+        sqlite3session_attach(&mut session, Some("t1")).unwrap();
+
+        session
+            .record_change(
+                "t1",
+                ChangeOp::Insert,
+                None,
+                Some(vec![Value::Integer(1), Value::Text("a".into())]),
+            )
+            .unwrap();
+        let cs1 = sqlite3session_changeset(&session).unwrap();
+
+        drop(session);
+        let mut session = sqlite3session_create(&mut conn, "main").unwrap();
+        sqlite3session_attach(&mut session, Some("t1")).unwrap();
+
+        session
+            .record_change(
+                "t1",
+                ChangeOp::Insert,
+                None,
+                Some(vec![Value::Integer(2), Value::Text("b".into())]),
+            )
+            .unwrap();
+        let cs2 = sqlite3session_changeset(&session).unwrap();
+
+        let combined = sqlite3changeset_concat(&cs1, &cs2).unwrap();
+        let stats = sqlite3changeset_stats(&combined).unwrap();
+        assert_eq!(stats.inserts, 2);
+    }
+
+    #[test]
+    fn test_changeset_stats() {
+        let mut conn = setup_conn_with_table();
+        let mut session = sqlite3session_create(&mut conn, "main").unwrap();
+        sqlite3session_attach(&mut session, Some("t1")).unwrap();
+
+        session
+            .record_change(
+                "t1",
+                ChangeOp::Insert,
+                None,
+                Some(vec![Value::Integer(1), Value::Text("a".into())]),
+            )
+            .unwrap();
+        session
+            .record_change(
+                "t1",
+                ChangeOp::Update,
+                Some(vec![Value::Integer(2), Value::Text("old".into())]),
+                Some(vec![Value::Integer(2), Value::Text("new".into())]),
+            )
+            .unwrap();
+        session
+            .record_change(
+                "t1",
+                ChangeOp::Delete,
+                Some(vec![Value::Integer(3), Value::Text("c".into())]),
+                None,
+            )
+            .unwrap();
+
+        let changeset = sqlite3session_changeset(&session).unwrap();
+        let stats = sqlite3changeset_stats(&changeset).unwrap();
+
+        assert_eq!(stats.inserts, 1);
+        assert_eq!(stats.updates, 1);
+        assert_eq!(stats.deletes, 1);
+        assert_eq!(stats.tables, 1);
+        assert!(stats.size > 0);
+    }
+
+    #[test]
+    fn test_changeset_size_and_empty() {
+        let mut conn = setup_conn_with_table();
+        let mut session = sqlite3session_create(&mut conn, "main").unwrap();
+        sqlite3session_attach(&mut session, Some("t1")).unwrap();
+
+        let empty_changeset = sqlite3session_changeset(&session).unwrap();
+        assert!(sqlite3changeset_is_empty(&empty_changeset));
+        assert_eq!(sqlite3changeset_size(&empty_changeset), 0);
+
+        session
+            .record_change(
+                "t1",
+                ChangeOp::Insert,
+                None,
+                Some(vec![Value::Integer(1), Value::Text("a".into())]),
+            )
+            .unwrap();
+
+        let changeset = sqlite3session_changeset(&session).unwrap();
+        assert!(!sqlite3changeset_is_empty(&changeset));
+        assert!(sqlite3changeset_size(&changeset) > 0);
+    }
+
+    #[test]
+    fn test_rebaser_basic() {
+        // Create a simple rebaser
+        let rebaser = sqlite3rebaser_create();
+
+        // Create a changeset
+        let mut conn = setup_conn_with_table();
+        let mut session = sqlite3session_create(&mut conn, "main").unwrap();
+        sqlite3session_attach(&mut session, Some("t1")).unwrap();
+
+        session
+            .record_change(
+                "t1",
+                ChangeOp::Insert,
+                None,
+                Some(vec![Value::Integer(1), Value::Text("a".into())]),
+            )
+            .unwrap();
+
+        let changeset = sqlite3session_changeset(&session).unwrap();
+
+        // Rebase (with no configuration, should be a no-op)
+        let rebased = sqlite3rebaser_rebase(&rebaser, &changeset).unwrap();
+
+        // Verify the rebased changeset has the same content
+        let mut iter = rebased.iter();
+        let change = iter.next().unwrap().unwrap();
+        assert_eq!(change.op, ChangeOp::Insert);
+        assert_eq!(change.table, "t1");
+    }
+
+    #[test]
+    fn test_streaming_input() {
+        let mut conn = setup_conn_with_table();
+        let mut session = sqlite3session_create(&mut conn, "main").unwrap();
+        sqlite3session_attach(&mut session, Some("t1")).unwrap();
+
+        session
+            .record_change(
+                "t1",
+                ChangeOp::Insert,
+                None,
+                Some(vec![Value::Integer(1), Value::Text("test".into())]),
+            )
+            .unwrap();
+
+        let changeset = sqlite3session_changeset(&session).unwrap();
+        let data = changeset.data().to_vec();
+
+        // Create a stream from the data
+        let cursor = std::io::Cursor::new(data);
+        let mut stream = ChangesetInputStream::new(cursor);
+
+        // Read from stream
+        let change = stream.next().unwrap().unwrap();
+        assert_eq!(change.op, ChangeOp::Insert);
+        assert_eq!(change.table, "t1");
+        assert_eq!(change.n_col, 2);
+
+        // No more changes
+        assert!(stream.next().unwrap().is_none());
     }
 }

@@ -973,7 +973,10 @@ impl VfsFile for WinFile {
         for ptr in &shm.regions {
             if !ptr.is_null() {
                 unsafe {
-                    UnmapViewOfFile(*ptr as *const _);
+                    let addr = MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: *ptr as *mut _,
+                    };
+                    UnmapViewOfFile(addr);
                 }
             }
         }

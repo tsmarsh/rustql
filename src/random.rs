@@ -401,18 +401,20 @@ mod tests {
     }
 
     #[test]
-    fn test_global_prng_seed() {
-        // Use a unique seed for this test to avoid interference from other tests
-        let seed = b"unique deterministic seed for test_global_prng_seed";
+    fn test_prng_seed_determinism() {
+        // Test that seeding with the same value produces the same sequence
+        // Use local PRNG instances to avoid interference from parallel tests
+        let seed = b"deterministic seed for testing";
 
-        sqlite3_prng_seed(seed);
-        let a = sqlite3_random_int64();
-        let a2 = sqlite3_random_int64(); // Get a second value to advance state
+        let mut prng1 = SqlitePrng::new();
+        prng1.seed(seed);
+        let a = prng1.next_i64();
+        let a2 = prng1.next_i64();
 
-        // Reseed and verify we get the same sequence
-        sqlite3_prng_seed(seed);
-        let b = sqlite3_random_int64();
-        let b2 = sqlite3_random_int64();
+        let mut prng2 = SqlitePrng::new();
+        prng2.seed(seed);
+        let b = prng2.next_i64();
+        let b2 = prng2.next_i64();
 
         assert_eq!(a, b);
         assert_eq!(a2, b2);

@@ -1182,7 +1182,7 @@ impl Vdbe {
                         // Read payload from BtCursor
                         if let Some(ref payload) = bt_cursor.info.payload {
                             // Decode the record to get the column value
-                            match crate::vdbe::aux::decode_record_header(payload) {
+                            match crate::vdbe::auxdata::decode_record_header(payload) {
                                 Ok((types, header_size)) => {
                                     if col_idx < types.len() {
                                         // Calculate offset to this column's data
@@ -1192,7 +1192,7 @@ impl Vdbe {
                                         }
                                         // Deserialize the value
                                         let col_data = &payload[data_offset..];
-                                        match crate::vdbe::aux::deserialize_value(
+                                        match crate::vdbe::auxdata::deserialize_value(
                                             col_data,
                                             &types[col_idx],
                                         ) {
@@ -1212,7 +1212,7 @@ impl Vdbe {
                         }
                     } else if let Some(ref row_data) = cursor.row_data {
                         // Fallback: read from cached row_data
-                        match crate::vdbe::aux::decode_record_header(row_data) {
+                        match crate::vdbe::auxdata::decode_record_header(row_data) {
                             Ok((types, header_size)) => {
                                 if col_idx < types.len() {
                                     let mut data_offset = header_size;
@@ -1220,7 +1220,7 @@ impl Vdbe {
                                         data_offset += types[i].size();
                                     }
                                     let col_data = &row_data[data_offset..];
-                                    match crate::vdbe::aux::deserialize_value(
+                                    match crate::vdbe::auxdata::deserialize_value(
                                         col_data,
                                         &types[col_idx],
                                     ) {
@@ -1269,7 +1269,7 @@ impl Vdbe {
             Opcode::MakeRecord => {
                 // Make record from P1..P1+P2-1, store in P3
                 // Uses SQLite record format with varint header and serial types
-                let record = crate::vdbe::aux::make_record(&self.mem, op.p1, op.p2);
+                let record = crate::vdbe::auxdata::make_record(&self.mem, op.p1, op.p2);
                 self.mem_mut(op.p3).set_blob(&record);
             }
 

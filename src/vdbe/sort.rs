@@ -12,7 +12,7 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use crate::error::{Error, ErrorCode, Result};
-use crate::vdbe::aux::{decode_record_header, get_varint, put_varint, SerialType};
+use crate::vdbe::auxdata::{decode_record_header, get_varint, put_varint, SerialType};
 use crate::vdbe::mem::Mem;
 use crate::vdbe::ops::KeyInfo;
 

@@ -1,6 +1,6 @@
 //! Virtual Database Engine (VDBE)
 
-pub mod aux;
+pub mod auxdata;
 pub mod bytecode;
 pub mod engine;
 pub mod expr;
@@ -19,7 +19,7 @@ pub use value::{
     sqlite3_value_type, FunctionContext, SqliteValue,
 };
 
-pub use aux::{
+pub use auxdata::{
     decode_record_header, deserialize_value, explain_program, get_varint, make_record, put_varint,
     varint_len, Label, SerialType, VdbeBuilder,
 };

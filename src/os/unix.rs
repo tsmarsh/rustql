@@ -14,6 +14,32 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
 // ============================================================================
+// Platform-specific helpers
+// ============================================================================
+
+/// Get errno in a cross-platform way (Linux vs macOS/BSD)
+#[cfg(target_os = "linux")]
+fn get_errno() -> i32 {
+    unsafe { *libc::__errno_location() }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn get_errno() -> i32 {
+    unsafe { *libc::__error() }
+}
+
+/// fdatasync - use fsync on platforms without fdatasync (macOS)
+#[cfg(target_os = "linux")]
+unsafe fn platform_fdatasync(fd: RawFd) -> i32 {
+    libc::fdatasync(fd)
+}
+
+#[cfg(not(target_os = "linux"))]
+unsafe fn platform_fdatasync(fd: RawFd) -> i32 {
+    libc::fsync(fd)
+}
+
+// ============================================================================
 // Unix VFS
 // ============================================================================
 
@@ -77,7 +103,7 @@ impl UnixVfs {
 
     /// Create an error from the current errno
     fn error_from_errno() -> Error {
-        let errno = unsafe { *libc::__errno_location() };
+        let errno = get_errno();
         let msg = std::io::Error::from_raw_os_error(errno).to_string();
 
         let code = match errno {
@@ -167,7 +193,7 @@ impl Vfs for UnixVfs {
         let rc = unsafe { libc::unlink(c_path.as_ptr()) };
 
         if rc != 0 {
-            let errno = unsafe { *libc::__errno_location() };
+            let errno = get_errno();
             if errno != libc::ENOENT {
                 return Err(Self::error_from_errno());
             }
@@ -280,7 +306,7 @@ impl Vfs for UnixVfs {
     }
 
     fn get_last_error(&self) -> (i32, String) {
-        let errno = unsafe { *libc::__errno_location() };
+        let errno = get_errno();
         let msg = std::io::Error::from_raw_os_error(errno).to_string();
         (errno, msg)
     }
@@ -381,7 +407,7 @@ impl UnixFile {
                 return Ok(());
             }
 
-            let errno = unsafe { *libc::__errno_location() };
+            let errno = get_errno();
             if errno == libc::EINTR {
                 continue; // Retry on interrupt
             }
@@ -457,7 +483,7 @@ impl VfsFile for UnixFile {
 
     fn sync(&self, flags: SyncFlags) -> Result<()> {
         let rc = if flags.contains(SyncFlags::DATAONLY) {
-            unsafe { libc::fdatasync(self.fd) }
+            unsafe { platform_fdatasync(self.fd) }
         } else {
             unsafe { libc::fsync(self.fd) }
         };
@@ -626,7 +652,7 @@ impl VfsFile for UnixFile {
 
         let rc = unsafe { libc::fcntl(shm.fd, libc::F_SETLK, &flock) };
         if rc != 0 {
-            let errno = unsafe { *libc::__errno_location() };
+            let errno = get_errno();
             if errno == libc::EAGAIN || errno == libc::EACCES {
                 return Err(Error::new(ErrorCode::Busy));
             }

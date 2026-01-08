@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::error::{Error, ErrorCode, Result};
 use crate::schema::Table;
 use crate::types::{StepResult, Value};
-use crate::vdbe::aux::{get_varint, put_varint};
+use crate::vdbe::auxdata::{get_varint, put_varint};
 
 use super::connection::SqliteConnection;
 use super::stmt::{sqlite3_bind_value, sqlite3_column_value, sqlite3_prepare_v2, sqlite3_step};

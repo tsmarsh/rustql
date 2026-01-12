@@ -107,6 +107,12 @@ pub struct Mem {
     pub db: Option<Weak<Connection>>,
 }
 
+impl Default for Mem {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Mem {
     /// Create a new NULL value.
     pub fn new() -> Self {

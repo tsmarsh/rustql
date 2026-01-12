@@ -5,8 +5,10 @@
 //! OS file system.
 
 use bitflags::bitflags;
+use std::ptr::NonNull;
 
 use crate::error::{Error, ErrorCode, Result};
+use crate::storage::pcache::PCache;
 use crate::types::{LockLevel, OpenFlags, Pgno, SyncFlags, Vfs, VfsFile};
 
 // ============================================================================
@@ -218,6 +220,24 @@ impl PgHdr {
     }
 }
 
+impl Drop for PgHdr {
+    fn drop(&mut self) {
+        // If this page is dirty and has a pager reference, write back to cache
+        if self.is_dirty() {
+            if let Some(pager_ptr) = self.pager {
+                // SAFETY: pager_ptr is valid as long as the connection is open
+                unsafe {
+                    let pager = &mut *pager_ptr;
+                    if let Some(mut cache_page) = pager.pcache.fetch(self.pgno, true) {
+                        let cache_ref = cache_page.as_mut();
+                        cache_ref.data[..self.data.len()].copy_from_slice(&self.data);
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ============================================================================
 // Savepoint
 // ============================================================================
@@ -376,6 +396,8 @@ pub struct Pager {
     pub max_page_count: Pgno,
 
     // Cache
+    /// Page cache for in-memory page storage
+    pub pcache: PCache,
     /// Page cache size (in pages)
     pub cache_size: i32,
     /// Spill size threshold
@@ -438,6 +460,9 @@ impl Pager {
     ) -> Result<Self> {
         let journal_path = format!("{}-journal", path);
 
+        // Create page cache with default page size and no extra bytes
+        let pcache = PCache::open(DEFAULT_PAGE_SIZE as usize, 0, true);
+
         Ok(Pager {
             fd: None,
             jfd: None,
@@ -455,6 +480,7 @@ impl Pager {
             db_orig_size: 0,
             db_file_size: 0,
             max_page_count: 0xFFFFFFFF,
+            pcache,
             cache_size: 2000,
             spill_size: 1,
             mmap_limit: 0,
@@ -516,7 +542,7 @@ impl Pager {
 
     /// Set the page size (sqlite3PagerSetPagesize)
     pub fn set_page_size(&mut self, page_size: u32, reserve: i32) -> Result<()> {
-        if page_size < MIN_PAGE_SIZE || page_size > MAX_PAGE_SIZE {
+        if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&page_size) {
             return Err(Error::new(ErrorCode::Misuse));
         }
         if !page_size.is_power_of_two() {
@@ -617,8 +643,41 @@ impl Pager {
             self.shared_lock()?;
         }
 
-        // Create new page
+        // Try to fetch from page cache first (create=true to allocate if not present)
+        if let Some(cache_page) = self.pcache.fetch(pgno, true) {
+            // Page is in cache - copy data to returned PgHdr
+            let mut page = Box::new(PgHdr::new(pgno, self.page_size));
+            // Set pager pointer so Drop can write back dirty pages
+            page.pager = Some(self as *mut Pager);
+            unsafe {
+                let cache_page_ref = cache_page.as_ref();
+                // Check if page has been read from disk (non-zero data)
+                let is_new_page =
+                    cache_page_ref.n_ref == 1 && cache_page_ref.data.iter().all(|&b| b == 0);
+
+                if is_new_page {
+                    // New page - read from disk if file is open
+                    if let Some(ref mut fd) = self.fd {
+                        let offset = ((pgno - 1) as i64) * (self.page_size as i64);
+                        let _ = fd.read(&mut page.data, offset);
+                        self.n_read += 1;
+                    }
+                    // Update cache with disk data
+                    self.update_cache_page(cache_page, &page.data);
+                } else {
+                    // Existing page - copy from cache
+                    page.data.copy_from_slice(&cache_page_ref.data);
+                    self.n_hit += 1;
+                }
+            }
+            page.n_ref = 1;
+            return Ok(page);
+        }
+
+        // Fallback: create page without cache (shouldn't happen with create=true)
         let mut page = Box::new(PgHdr::new(pgno, self.page_size));
+        // Set pager pointer so Drop can write back dirty pages
+        page.pager = Some(self as *mut Pager);
 
         // Read from disk if file is open and page exists
         if let Some(ref mut fd) = self.fd {
@@ -628,7 +687,27 @@ impl Pager {
         }
 
         page.n_ref = 1;
+        self.n_miss += 1;
         Ok(page)
+    }
+
+    /// Update cached page data (internal helper)
+    fn update_cache_page(
+        &mut self,
+        mut cache_page: NonNull<crate::storage::pcache::PgHdr>,
+        data: &[u8],
+    ) {
+        unsafe {
+            let cache_ref = cache_page.as_mut();
+            cache_ref.data[..data.len()].copy_from_slice(data);
+        }
+    }
+
+    /// Write page data back to cache (call after modifying a page)
+    pub fn write_page_to_cache(&mut self, page: &PgHdr) {
+        if let Some(cache_page) = self.pcache.fetch(page.pgno, false) {
+            self.update_cache_page(cache_page, &page.data);
+        }
     }
 
     /// Get a page only if it's already cached (sqlite3PagerLookup)

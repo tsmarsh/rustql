@@ -190,6 +190,9 @@ impl<D: TestDatabase> TestRunner<D> {
             }
 
             // Run the test
+            if self.verbose {
+                eprintln!("Running test: {} (line {})", test.name, test.line);
+            }
             let result = self.run_test(test);
             stats.total += 1;
 
@@ -269,11 +272,17 @@ impl<D: TestDatabase> TestRunner<D> {
                 match self.db.catch_sql(&sql) {
                     Ok(CatchResult::Success(vals)) => {
                         actual_results.push("0".to_string());
-                        actual_results.extend(vals);
+                        if vals.is_empty() {
+                            // TCL format for empty result
+                            actual_results.push("{}".to_string());
+                        } else {
+                            actual_results.extend(vals);
+                        }
                     }
                     Ok(CatchResult::Error(msg)) => {
                         actual_results.push("1".to_string());
-                        actual_results.push(msg);
+                        // Wrap in braces for TCL quoting
+                        actual_results.push(format!("{{{}}}", msg));
                     }
                     Err(e) => {
                         error = Some(e);

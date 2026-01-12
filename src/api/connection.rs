@@ -1376,8 +1376,7 @@ fn parse_uri(uri: &str) -> Result<(String, OpenFlags)> {
     // Full format: file:path?mode=ro&cache=shared
     let mut flags = OpenFlags::empty();
 
-    let path = if uri.starts_with("file:") {
-        let rest = &uri[5..];
+    let path = if let Some(rest) = uri.strip_prefix("file:") {
         if let Some(query_start) = rest.find('?') {
             let (path_part, query) = rest.split_at(query_start);
             let query = &query[1..]; // Skip '?'

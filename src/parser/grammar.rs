@@ -2332,9 +2332,8 @@ impl<'a> Parser<'a> {
         let text = self.current_text().to_string();
         self.advance();
 
-        if text.starts_with('?') {
+        if let Some(num_part) = text.strip_prefix('?') {
             // Numbered parameter: ? or ?NNN
-            let num_part = &text[1..];
             if num_part.is_empty() {
                 return Ok(Variable::Numbered(None));
             }

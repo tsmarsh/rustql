@@ -54,9 +54,7 @@ impl<T> Hash<T> {
             }
         }
 
-        if data.is_none() {
-            return None;
-        }
+        data.as_ref()?;
         let new_elem = HashElem {
             next: None,
             prev: None,

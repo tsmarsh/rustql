@@ -295,10 +295,8 @@ impl AllocVec {
 
     /// Push a byte
     pub fn push(&mut self, byte: u8) -> bool {
-        if self.len >= self.capacity {
-            if !self.grow() {
-                return false;
-            }
+        if self.len >= self.capacity && !self.grow() {
+            return false;
         }
         unsafe {
             *self.ptr.add(self.len) = byte;

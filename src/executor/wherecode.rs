@@ -680,11 +680,8 @@ impl WhereCodeGen {
     pub fn code_close(&mut self, level: &super::where_clause::WhereLevel) -> Result<()> {
         let cursor = level.from_idx;
 
-        match &level.plan {
-            WherePlan::IndexScan { .. } => {
-                self.emit(Opcode::Close, cursor + 100, 0, 0, P4::Unused);
-            }
-            _ => {}
+        if let WherePlan::IndexScan { .. } = &level.plan {
+            self.emit(Opcode::Close, cursor + 100, 0, 0, P4::Unused);
         }
 
         self.emit(Opcode::Close, cursor, 0, 0, P4::Unused);

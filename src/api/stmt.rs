@@ -5,7 +5,7 @@
 use crate::error::{Error, ErrorCode, Result};
 use crate::executor::analyze::execute_analyze;
 use crate::executor::pragma::{execute_pragma, pragma_columns};
-use crate::executor::prepare::{compile_sql, CompiledStmt, StmtType};
+use crate::executor::prepare::{compile_sql, compile_sql_with_schema, CompiledStmt, StmtType};
 use crate::parser::ast::{AttachStmt, Expr, Literal, QualifiedName, Variable};
 use crate::types::{ColumnType, StepResult, Value};
 use crate::vdbe::engine::Vdbe;
@@ -276,8 +276,18 @@ pub fn sqlite3_prepare_v2<'a>(
         _ => None,
     });
 
-    // Compile the SQL to VDBE bytecode
-    match compile_sql(sql) {
+    // Compile the SQL to VDBE bytecode with schema access for name resolution
+    let compile_result = if let Some(ref schema_arc) = conn.main_db().schema {
+        if let Ok(schema) = schema_arc.read() {
+            compile_sql_with_schema(sql, &schema)
+        } else {
+            compile_sql(sql)
+        }
+    } else {
+        compile_sql(sql)
+    };
+
+    match compile_result {
         Ok((compiled, tail)) => {
             let mut stmt = PreparedStmt::from_compiled(sql, compiled, tail);
             // Always set connection pointer so VDBE has access to btree and schema
@@ -1036,11 +1046,11 @@ pub fn sqlite3_stmt_status(stmt: &mut PreparedStmt, op: i32, reset: bool) -> i32
     // Get value from VDBE if present
     let value = if let Some(vdbe) = &stmt.vdbe {
         match op {
-            StmtStatusOp::FullscanStep => 0, // Would track full scans
-            StmtStatusOp::Sort => 0,         // Would track sorts
-            StmtStatusOp::AutoIndex => 0,    // Would track auto-index
-            StmtStatusOp::VmStep => vdbe.get_pc() as i32, // Approximate VM steps
-            StmtStatusOp::Reprepare => 0,    // Would track reprepares
+            StmtStatusOp::FullscanStep => 0,       // Would track full scans
+            StmtStatusOp::Sort => 0,               // Would track sorts
+            StmtStatusOp::AutoIndex => 0,          // Would track auto-index
+            StmtStatusOp::VmStep => vdbe.get_pc(), // Approximate VM steps
+            StmtStatusOp::Reprepare => 0,          // Would track reprepares
             StmtStatusOp::Run => {
                 if stmt.stepped {
                     1

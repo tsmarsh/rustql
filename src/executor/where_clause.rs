@@ -100,9 +100,10 @@ bitflags! {
 // ============================================================================
 
 /// Access plan for a single table in a query
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum WherePlan {
     /// Full table scan
+    #[default]
     FullScan,
 
     /// Use an index for scanning
@@ -131,12 +132,6 @@ pub enum WherePlan {
         /// End constraint (<=, <)
         has_end: bool,
     },
-}
-
-impl Default for WherePlan {
-    fn default() -> Self {
-        WherePlan::FullScan
-    }
 }
 
 // ============================================================================
@@ -629,7 +624,7 @@ impl QueryPlanner {
 
         let expr = term.expr.clone();
         match expr.as_ref() {
-            Expr::Binary { op, left, .. } => {
+            Expr::Binary { op, .. } => {
                 term.op = Some(match op {
                     BinaryOp::Eq => TermOp::Eq,
                     BinaryOp::Ne => TermOp::Ne,
@@ -964,7 +959,7 @@ impl QueryPlanner {
                 .iter()
                 .filter(|t| {
                     t.left_col
-                        .map_or(false, |(ti, ci)| ti == table_idx as i32 && ci == -1)
+                        .is_some_and(|(ti, ci)| ti == table_idx as i32 && ci == -1)
                 })
                 .count();
 
@@ -1042,7 +1037,7 @@ impl QueryPlanner {
         for (i, &col_idx) in index.columns.iter().enumerate() {
             let has_eq = eq_terms.iter().any(|t| {
                 t.left_col
-                    .map_or(false, |(ti, ci)| ti == table_idx as i32 && ci == col_idx)
+                    .is_some_and(|(ti, ci)| ti == table_idx as i32 && ci == col_idx)
             });
 
             if has_eq {

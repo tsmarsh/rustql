@@ -585,6 +585,17 @@ impl Error {
     pub fn set_extended(&mut self, ext: ExtendedErrorCode) {
         self.extended = Some(ext);
     }
+
+    /// Get the SQLite-compatible error message (just the message, no code prefix)
+    /// This mimics sqlite3_errmsg() behavior
+    pub fn sqlite_errmsg(&self) -> String {
+        if let Some(ref msg) = self.message {
+            msg.clone()
+        } else {
+            // Fall back to error code description if no message
+            format!("{}", self.code)
+        }
+    }
 }
 
 impl Default for Error {

@@ -99,7 +99,7 @@ impl DateTime {
     fn parse_yyyy_mm_dd(&mut self, input: &str) -> Result<bool> {
         let bytes = input.as_bytes();
         let mut idx = 0;
-        let neg = if bytes.get(0) == Some(&b'-') {
+        let neg = if bytes.first() == Some(&b'-') {
             idx += 1;
             true
         } else {
@@ -118,7 +118,7 @@ impl DateTime {
             Some(v) => v,
             None => return Ok(false),
         };
-        if month < 1 || month > 12 {
+        if !(1..=12).contains(&month) {
             return Err(Error::with_message(ErrorCode::Error, "invalid month"));
         }
         idx += 2;
@@ -130,7 +130,7 @@ impl DateTime {
             Some(v) => v,
             None => return Ok(false),
         };
-        if day < 1 || day > 31 {
+        if !(1..=31).contains(&day) {
             return Err(Error::with_message(ErrorCode::Error, "invalid day"));
         }
         idx += 2;
@@ -270,7 +270,7 @@ impl DateTime {
     fn set_raw_date_number(&mut self, r: f64) {
         self.second = r;
         self.raw_s = true;
-        if r >= 0.0 && r < 5_373_484.5 {
+        if (0.0..5_373_484.5).contains(&r) {
             self.i_jd = (r * MS_PER_DAY as f64 + 0.5) as i64;
             self.valid_jd = true;
         }
@@ -291,7 +291,7 @@ impl DateTime {
         } else {
             (2000, 1, 1)
         };
-        if y < -4713 || y > 9999 || self.raw_s {
+        if !(-4713..=9999).contains(&y) || self.raw_s {
             self.datetime_error();
             return;
         }
@@ -331,7 +331,7 @@ impl DateTime {
             self.valid_ymd = true;
             return;
         }
-        let z = ((self.i_jd + 43_200_000) / MS_PER_DAY) as i64;
+        let z = ((self.i_jd + 43_200_000) / MS_PER_DAY);
         let alpha = ((z as f64 + 32044.75) / 36524.25) as i64 - 52;
         let a = z + 1 + alpha - ((alpha + 100) / 4) + 25;
         let b = a + 1524;
@@ -358,7 +358,7 @@ impl DateTime {
             return;
         }
         self.compute_jd();
-        let day_ms = ((self.i_jd + 43_200_000) % MS_PER_DAY) as i64;
+        let day_ms = ((self.i_jd + 43_200_000) % MS_PER_DAY);
         let day_min = day_ms / 60_000;
         self.second = (day_ms % 60_000) as f64 / 1000.0;
         self.minute = (day_min % 60) as i32;
@@ -413,7 +413,7 @@ impl DateTime {
                 }
                 if self.raw_s {
                     let r = self.second * 1000.0 + JD_UNIX_EPOCH_MS as f64;
-                    if r >= 0.0 && r < 464_269_060_800_000.0 {
+                    if (0.0..464_269_060_800_000.0).contains(&r) {
                         self.clear_ymd_hms_tz();
                         self.i_jd = (r + 0.5) as i64;
                         self.valid_jd = true;
@@ -725,7 +725,7 @@ impl DateTime {
             self.is_error = false;
             self.is_local = true;
             self.is_utc = false;
-            return Ok(());
+            Ok(())
         }
         #[cfg(not(unix))]
         {
@@ -764,7 +764,7 @@ impl DateTime {
             self.clear_ymd_hms_tz();
             self.is_utc = true;
             self.is_local = false;
-            return Ok(());
+            Ok(())
         }
         #[cfg(not(unix))]
         {
@@ -783,7 +783,7 @@ fn parse_fixed_digits(bytes: &[u8], start: usize, count: usize) -> Option<i32> {
     let mut val = 0i32;
     for i in start..start + count {
         let b = bytes[i];
-        if !(b'0'..=b'9').contains(&b) {
+        if !b.is_ascii_digit() {
             return None;
         }
         val = val * 10 + (b - b'0') as i32;
@@ -797,7 +797,7 @@ fn parse_fraction(bytes: &[u8], start: usize) -> (f64, usize) {
     let mut idx = start;
     while idx < bytes.len() {
         let b = bytes[idx];
-        if !(b'0'..=b'9').contains(&b) {
+        if !b.is_ascii_digit() {
             break;
         }
         val = val * 10.0 + (b - b'0') as f64;
@@ -817,7 +817,7 @@ fn parse_weekday(modifier: &str) -> Option<i32> {
         return None;
     }
     let day = parts.next()?.parse::<i32>().ok()?;
-    if day >= 0 && day <= 6 {
+    if (0..=6).contains(&day) {
         Some(day)
     } else {
         None

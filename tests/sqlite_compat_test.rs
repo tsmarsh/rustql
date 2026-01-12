@@ -112,10 +112,7 @@ fn run_test_file(file_name: &str) -> Option<sqlite_compat::runner::TestFileStats
 }
 
 /// Run all priority test files and report overall progress
-/// NOTE: This test is currently disabled because SELECT queries hang
-/// until VDBE execution is complete. Run manually when ready.
 #[test]
-#[ignore = "SELECT queries hang until VDBE is complete"]
 fn test_sqlite_compatibility_progress() {
     let test_dir = Path::new(SQLITE_TEST_DIR);
     if !test_dir.exists() {
@@ -143,9 +140,7 @@ fn test_sqlite_compatibility_progress() {
 }
 
 /// Test individual test files (for debugging)
-/// NOTE: Currently disabled because SELECT queries hang
 #[test]
-#[ignore = "SELECT queries hang until VDBE is complete"]
 fn test_table_basic() {
     if let Some(stats) = run_test_file("table.test") {
         println!("table.test: {:.1}% pass rate", stats.pass_rate());
@@ -153,7 +148,6 @@ fn test_table_basic() {
 }
 
 #[test]
-#[ignore = "SELECT queries hang until VDBE is complete"]
 fn test_select1_basic() {
     if let Some(stats) = run_test_file("select1.test") {
         println!("select1.test: {:.1}% pass rate", stats.pass_rate());
@@ -161,9 +155,7 @@ fn test_select1_basic() {
 }
 
 /// Quick smoke test with simple SQL
-/// NOTE: Currently disabled because SELECT queries hang
 #[test]
-#[ignore = "SELECT queries hang until VDBE is complete"]
 fn test_basic_sql_execution() {
     let db = match RustqlTestDb::new("/tmp/rustql_smoke_test.db") {
         Ok(db) => db,

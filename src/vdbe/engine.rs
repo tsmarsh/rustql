@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::schema::Schema;
-use crate::storage::btree::{BtCursor, Btree, BtreeCursorFlags};
+use crate::storage::btree::{BtCursor, Btree, BtreeCursorFlags, BtreeInsertFlags, BtreePayload};
 use crate::types::{ColumnType, Pgno, Value};
 use crate::vdbe::mem::Mem;
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
@@ -103,6 +103,20 @@ pub struct VdbeCursor {
     pub seek_key: Option<Vec<Mem>>,
     /// B-tree cursor for actual storage operations
     pub btree_cursor: Option<BtCursor>,
+    /// Table name (for looking up column indices at runtime)
+    pub table_name: Option<String>,
+    /// Is this a sqlite_master virtual cursor?
+    pub is_sqlite_master: bool,
+    /// Current index for virtual cursors (sqlite_master iteration)
+    pub virtual_index: usize,
+    /// Cached schema entries for sqlite_master (type, name, tbl_name, rootpage, sql)
+    pub schema_entries: Option<Vec<(String, String, String, u32, Option<String>)>>,
+    /// Sorter data - rows to be sorted (each row is a serialized record)
+    pub sorter_data: Vec<Vec<u8>>,
+    /// Sorter index - current position in sorted data
+    pub sorter_index: usize,
+    /// Has the sorter been sorted?
+    pub sorter_sorted: bool,
 }
 
 impl std::fmt::Debug for VdbeCursor {
@@ -135,6 +149,13 @@ impl VdbeCursor {
             null_row: false,
             seek_key: None,
             btree_cursor: None,
+            table_name: None,
+            is_sqlite_master: false,
+            virtual_index: 0,
+            schema_entries: None,
+            sorter_data: Vec::new(),
+            sorter_index: 0,
+            sorter_sorted: false,
         }
     }
 
@@ -225,6 +246,12 @@ pub struct Vdbe {
     /// Interrupt flag
     interrupted: bool,
 
+    /// Instruction counter (for infinite loop detection)
+    instruction_count: u64,
+
+    /// Maximum instructions before aborting (0 = unlimited)
+    max_instructions: u64,
+
     /// Result row start register
     result_start: i32,
 
@@ -292,6 +319,8 @@ impl Vdbe {
             vars: Vec::new(),
             var_names: Vec::new(),
             interrupted: false,
+            instruction_count: 0,
+            max_instructions: 100_000, // Default 100K instruction limit
             result_start: 0,
             result_count: 0,
             column_names: Vec::new(),
@@ -679,6 +708,18 @@ impl Vdbe {
                 return Ok(ExecResult::Done);
             }
 
+            // Check instruction limit to prevent infinite loops
+            self.instruction_count += 1;
+            if self.max_instructions > 0 && self.instruction_count > self.max_instructions {
+                self.is_done = true;
+                self.magic = VDBE_MAGIC_HALT;
+                self.error_msg = Some(format!(
+                    "Query aborted: exceeded {} instruction limit (possible infinite loop)",
+                    self.max_instructions
+                ));
+                return Err(Error::new(ErrorCode::Abort));
+            }
+
             let result = self.exec_op()?;
 
             match result {
@@ -1025,6 +1066,84 @@ impl Vdbe {
                     op.p2 as Pgno
                 };
 
+                // Extract table name from P4 for column resolution
+                let table_name = if let P4::Text(name) = &op.p4 {
+                    Some(name.clone())
+                } else {
+                    None
+                };
+
+                // Check for sqlite_master virtual table
+                let is_sqlite_master = table_name
+                    .as_ref()
+                    .map(|n| n.eq_ignore_ascii_case("sqlite_master"))
+                    .unwrap_or(false);
+
+                if is_sqlite_master {
+                    // Populate schema entries from current schema BEFORE borrowing cursor
+                    let mut entries = Vec::new();
+                    if let Some(ref schema) = self.schema {
+                        if let Ok(schema_guard) = schema.read() {
+                            for (_, table) in schema_guard.tables.iter() {
+                                entries.push((
+                                    "table".to_string(),
+                                    table.name.clone(),
+                                    table.name.clone(),
+                                    table.root_page,
+                                    table.sql.clone(),
+                                ));
+                            }
+                        }
+                    }
+
+                    // Create virtual cursor for sqlite_master
+                    self.open_cursor(op.p1, 0, false)?;
+                    if let Some(cursor) = self.cursor_mut(op.p1) {
+                        cursor.n_field = 5; // type, name, tbl_name, rootpage, sql
+                        cursor.table_name = table_name;
+                        cursor.is_sqlite_master = true;
+                        cursor.schema_entries = Some(entries);
+                    }
+                } else {
+                    // If root_page is 0 and we have a table name in P4, look it up in schema
+                    if root_page == 0 {
+                        if let Some(ref tname) = table_name {
+                            if let Some(ref schema) = self.schema {
+                                if let Ok(schema_guard) = schema.read() {
+                                    if let Some(table) = schema_guard.tables.get(tname) {
+                                        root_page = table.root_page;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Clone btree Arc to avoid borrow issues
+                    let btree = self.btree.clone();
+                    self.open_cursor(op.p1, root_page, false)?;
+                    if let Some(cursor) = self.cursor_mut(op.p1) {
+                        cursor.n_field = op.p3;
+                        cursor.table_name = table_name;
+                        // Create a real BtCursor if we have a btree
+                        if let Some(ref btree) = btree {
+                            let flags = BtreeCursorFlags::empty();
+                            match btree.cursor(root_page, flags, None) {
+                                Ok(bt_cursor) => cursor.btree_cursor = Some(bt_cursor),
+                                Err(_) => {} // Failed to create cursor, use placeholder
+                            }
+                        }
+                    }
+                }
+            }
+
+            Opcode::OpenWrite => {
+                // P1 = cursor, P2 = root page, P3 = num columns
+                let mut root_page = if op.p5 & 0x02 != 0 {
+                    self.mem(op.p2).to_int() as Pgno
+                } else {
+                    op.p2 as Pgno
+                };
+
                 // If root_page is 0 and we have a table name in P4, look it up in schema
                 if root_page == 0 {
                     if let P4::Text(table_name) = &op.p4 {
@@ -1037,30 +1156,6 @@ impl Vdbe {
                         }
                     }
                 }
-
-                // Clone btree Arc to avoid borrow issues
-                let btree = self.btree.clone();
-                self.open_cursor(op.p1, root_page, false)?;
-                if let Some(cursor) = self.cursor_mut(op.p1) {
-                    cursor.n_field = op.p3;
-                    // Create a real BtCursor if we have a btree
-                    if let Some(ref btree) = btree {
-                        let flags = BtreeCursorFlags::empty();
-                        match btree.cursor(root_page, flags, None) {
-                            Ok(bt_cursor) => cursor.btree_cursor = Some(bt_cursor),
-                            Err(_) => {} // Failed to create cursor, use placeholder
-                        }
-                    }
-                }
-            }
-
-            Opcode::OpenWrite => {
-                // P1 = cursor, P2 = root page, P3 = num columns
-                let root_page = if op.p5 & 0x02 != 0 {
-                    self.mem(op.p2).to_int() as Pgno
-                } else {
-                    op.p2 as Pgno
-                };
 
                 // Clone btree Arc to avoid borrow issues
                 let btree = self.btree.clone();
@@ -1094,7 +1189,18 @@ impl Vdbe {
                 // Move cursor to first row, jump to P2 if empty
                 let mut is_empty = true;
                 if let Some(cursor) = self.cursor_mut(op.p1) {
-                    if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                    if cursor.is_sqlite_master {
+                        // Virtual cursor for sqlite_master
+                        cursor.virtual_index = 0;
+                        if let Some(ref entries) = cursor.schema_entries {
+                            is_empty = entries.is_empty();
+                            if !is_empty {
+                                cursor.state = CursorState::Valid;
+                            } else {
+                                cursor.state = CursorState::AtEnd;
+                            }
+                        }
+                    } else if let Some(ref mut bt_cursor) = cursor.btree_cursor {
                         match bt_cursor.first() {
                             Ok(empty) => {
                                 is_empty = empty;
@@ -1121,7 +1227,18 @@ impl Vdbe {
                 // Move cursor to next row, jump to P2 if has more rows
                 let mut has_more = false;
                 if let Some(cursor) = self.cursor_mut(op.p1) {
-                    if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                    if cursor.is_sqlite_master {
+                        // Virtual cursor for sqlite_master
+                        cursor.virtual_index += 1;
+                        if let Some(ref entries) = cursor.schema_entries {
+                            has_more = cursor.virtual_index < entries.len();
+                            cursor.state = if has_more {
+                                CursorState::Valid
+                            } else {
+                                CursorState::AtEnd
+                            };
+                        }
+                    } else if let Some(ref mut bt_cursor) = cursor.btree_cursor {
                         match bt_cursor.next(0) {
                             Ok(()) => {
                                 // Check if cursor is still valid
@@ -1174,8 +1291,77 @@ impl Vdbe {
 
             Opcode::Column => {
                 // Read column P2 from cursor P1 into register P3
-                let col_idx = op.p2 as usize;
-                if let Some(cursor) = self.cursor(op.p1) {
+                // If P4 is a column name and P2 is 0, look up index by name
+                let mut col_idx = op.p2 as usize;
+
+                // Try to resolve column index by name if P4 contains a column name
+                if let P4::Text(col_name) = &op.p4 {
+                    if let Some(cursor) = self.cursor(op.p1) {
+                        // Special handling for sqlite_master virtual table
+                        if cursor.is_sqlite_master {
+                            // sqlite_master columns: type, name, tbl_name, rootpage, sql
+                            col_idx = match col_name.to_lowercase().as_str() {
+                                "type" => 0,
+                                "name" => 1,
+                                "tbl_name" => 2,
+                                "rootpage" => 3,
+                                "sql" => 4,
+                                _ => col_idx,
+                            };
+                        } else if let Some(ref table_name) = cursor.table_name {
+                            if let Some(ref schema) = self.schema {
+                                if let Ok(schema_guard) = schema.read() {
+                                    if let Some(table) = schema_guard.tables.get(table_name) {
+                                        for (i, col) in table.columns.iter().enumerate() {
+                                            if col.name.eq_ignore_ascii_case(col_name) {
+                                                col_idx = i;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Handle sqlite_master virtual cursor separately to avoid borrow issues
+                let sqlite_master_value: Option<Mem> = if let Some(cursor) = self.cursor(op.p1) {
+                    if cursor.is_sqlite_master {
+                        if let Some(ref entries) = cursor.schema_entries {
+                            if cursor.virtual_index < entries.len() {
+                                let entry = &entries[cursor.virtual_index];
+                                let result = match col_idx {
+                                    0 => Mem::from_str(&entry.0),       // type
+                                    1 => Mem::from_str(&entry.1),       // name
+                                    2 => Mem::from_str(&entry.2),       // tbl_name
+                                    3 => Mem::from_int(entry.3 as i64), // rootpage
+                                    4 => {
+                                        if let Some(ref sql) = entry.4 {
+                                            Mem::from_str(sql)
+                                        } else {
+                                            Mem::new() // null
+                                        }
+                                    }
+                                    _ => Mem::new(), // null
+                                };
+                                Some(result)
+                            } else {
+                                Some(Mem::new()) // null
+                            }
+                        } else {
+                            Some(Mem::new()) // null
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(value) = sqlite_master_value {
+                    *self.mem_mut(op.p3) = value;
+                } else if let Some(cursor) = self.cursor(op.p1) {
                     if cursor.null_row {
                         self.mem_mut(op.p3).set_null();
                     } else if let Some(ref bt_cursor) = cursor.btree_cursor {
@@ -1273,6 +1459,41 @@ impl Vdbe {
                 self.mem_mut(op.p3).set_blob(&record);
             }
 
+            Opcode::DecodeRecord => {
+                // Decode record in P1, store columns starting at P2, P3 columns total
+                let record_data = self.mem(op.p1).to_blob();
+                if !record_data.is_empty() {
+                    match crate::vdbe::aux::decode_record_header(&record_data) {
+                        Ok((types, header_size)) => {
+                            let num_cols = op.p3.min(types.len() as i32) as usize;
+                            let mut data_offset = header_size;
+                            for i in 0..num_cols {
+                                if i < types.len() {
+                                    let col_data = &record_data[data_offset..];
+                                    match crate::vdbe::aux::deserialize_value(col_data, &types[i]) {
+                                        Ok(mem) => {
+                                            *self.mem_mut(op.p2 + i as i32) = mem;
+                                        }
+                                        Err(_) => {
+                                            self.mem_mut(op.p2 + i as i32).set_null();
+                                        }
+                                    }
+                                    data_offset += types[i].size();
+                                } else {
+                                    self.mem_mut(op.p2 + i as i32).set_null();
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            // Failed to decode, set all columns to null
+                            for i in 0..op.p3 {
+                                self.mem_mut(op.p2 + i).set_null();
+                            }
+                        }
+                    }
+                }
+            }
+
             // ================================================================
             // Transaction (placeholder)
             // ================================================================
@@ -1348,12 +1569,38 @@ impl Vdbe {
                 // Insert record P2 with rowid P3 into cursor P1
                 // P4 = table name (for debug)
                 // P5 = flags (conflict resolution)
-                let _record_reg = op.p2;
+                let record_data = self.mem(op.p2).to_blob();
                 let rowid = self.mem(op.p3).to_int();
+
+                // Get btree Arc before cursor borrow
+                let btree_arc = self.btree.clone();
+
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     cursor.rowid = Some(rowid);
-                    // TODO: Actually insert into btree when btree.insert takes &self
-                    // For now, we track the rowid for basic operation
+
+                    // Actually insert into btree
+                    if let Some(ref btree) = btree_arc {
+                        if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                            // Create payload with record data
+                            let payload = BtreePayload {
+                                key: None, // Table insert, not index
+                                n_key: rowid,
+                                data: Some(record_data.clone()),
+                                mem: Vec::new(),
+                                n_data: record_data.len() as i32,
+                                n_zero: 0,
+                            };
+
+                            // Insert flags from P5 (lower 8 bits)
+                            let flags = BtreeInsertFlags::from_bits_truncate(op.p5 as u8);
+
+                            // Perform the insert
+                            if let Err(e) = btree.insert(bt_cursor, &payload, flags, 0) {
+                                // Log error but continue for now
+                                eprintln!("Insert failed: {:?}", e);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1379,15 +1626,59 @@ impl Vdbe {
                 // Placeholder: These need btree integration
             }
 
-            Opcode::OpenPseudo
-            | Opcode::OpenAutoindex
-            | Opcode::ResetSorter
-            | Opcode::SorterInsert
-            | Opcode::SorterSort
-            | Opcode::SorterNext
-            | Opcode::SorterData
-            | Opcode::SorterCompare => {
-                // Placeholder: Sorter operations
+            Opcode::OpenPseudo | Opcode::OpenAutoindex | Opcode::ResetSorter => {
+                // Placeholder: Other sorter-related operations
+            }
+
+            Opcode::SorterInsert => {
+                // SorterInsert P1 P2: Insert record from register P2 into sorter P1
+                let record_data = self.mem(op.p2).to_blob();
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    cursor.sorter_data.push(record_data);
+                }
+            }
+
+            Opcode::SorterSort => {
+                // SorterSort P1 P2: Sort the sorter P1. Jump to P2 if empty.
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    if cursor.sorter_data.is_empty() {
+                        self.pc = op.p2;
+                    } else {
+                        // Sort the data
+                        cursor.sorter_data.sort();
+                        cursor.sorter_sorted = true;
+                        cursor.sorter_index = 0;
+                        cursor.state = CursorState::Valid;
+                    }
+                } else {
+                    self.pc = op.p2;
+                }
+            }
+
+            Opcode::SorterNext => {
+                // SorterNext P1 P2: Advance to next sorted row. Jump to P2 if more rows.
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    cursor.sorter_index += 1;
+                    if cursor.sorter_index < cursor.sorter_data.len() {
+                        self.pc = op.p2; // Jump back to loop start
+                    } else {
+                        cursor.state = CursorState::AtEnd;
+                    }
+                }
+            }
+
+            Opcode::SorterData => {
+                // SorterData P1 P2: Copy current sorter row data to register P2
+                if let Some(cursor) = self.cursor(op.p1) {
+                    if cursor.sorter_index < cursor.sorter_data.len() {
+                        let data = cursor.sorter_data[cursor.sorter_index].clone();
+                        self.mem_mut(op.p2).set_blob(&data);
+                    }
+                }
+            }
+
+            Opcode::SorterCompare => {
+                // Placeholder: Sorter comparison
             }
 
             Opcode::ReadCookie | Opcode::SetCookie | Opcode::VerifyCookie => {
@@ -1439,12 +1730,66 @@ impl Vdbe {
                 if let P4::Text(sql) = &op.p4 {
                     if let Some(ref schema) = self.schema {
                         if let Ok(mut schema_guard) = schema.write() {
+                            // Check if IF NOT EXISTS was specified
+                            let if_not_exists = sql.to_uppercase().contains("IF NOT EXISTS");
+
                             // Parse CREATE TABLE SQL and register the table
                             if let Some(table) = self.parse_create_table_sql(sql, root_page) {
-                                schema_guard
-                                    .tables
-                                    .insert(table.name.clone(), std::sync::Arc::new(table));
+                                let table_name_lower = table.name.to_lowercase();
+
+                                // Check for reserved internal names (sqlite_*)
+                                if table_name_lower.starts_with("sqlite_") {
+                                    return Err(crate::error::Error::with_message(
+                                        crate::error::ErrorCode::Error,
+                                        format!(
+                                            "object name reserved for internal use: {}",
+                                            table.name
+                                        ),
+                                    ));
+                                }
+
+                                // Check for duplicate column names
+                                let mut seen_columns = std::collections::HashSet::new();
+                                for col in &table.columns {
+                                    let col_lower = col.name.to_lowercase();
+                                    if !seen_columns.insert(col_lower) {
+                                        return Err(crate::error::Error::with_message(
+                                            crate::error::ErrorCode::Error,
+                                            format!("duplicate column name: {}", col.name),
+                                        ));
+                                    }
+                                }
+
+                                // Check if table already exists
+                                if let std::collections::hash_map::Entry::Vacant(e) =
+                                    schema_guard.tables.entry(table_name_lower)
+                                {
+                                    e.insert(std::sync::Arc::new(table));
+                                } else {
+                                    if !if_not_exists {
+                                        // Return error: table already exists
+                                        return Err(crate::error::Error::with_message(
+                                            crate::error::ErrorCode::Error,
+                                            format!("table {} already exists", table.name),
+                                        ));
+                                    }
+                                    // IF NOT EXISTS was specified, silently succeed
+                                }
                             }
+                        }
+                    }
+                }
+            }
+
+            Opcode::DropSchema => {
+                // DropSchema P1 P2 P3 P4
+                // Remove table/index from schema
+                // P4 = name of table/index to drop
+                if let P4::Text(name) = &op.p4 {
+                    if let Some(ref schema) = self.schema {
+                        if let Ok(mut schema_guard) = schema.write() {
+                            let name_lower = name.to_lowercase();
+                            schema_guard.tables.remove(&name_lower);
                         }
                     }
                 }
@@ -1523,9 +1868,7 @@ impl Vdbe {
                                                 _ => Ok(()),
                                             };
 
-                                            if let Err(e) = result {
-                                                return Err(e);
-                                            }
+                                            result?
                                         }
                                     }
                                 }

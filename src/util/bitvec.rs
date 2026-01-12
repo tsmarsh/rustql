@@ -77,7 +77,7 @@ impl BitVec {
             BitvecRepr::Bitmap(bits) => {
                 let byte = (idx / 8) as usize;
                 let bit = (idx & 7) as u8;
-                bits.get(byte).map_or(false, |v| (v & (1 << bit)) != 0)
+                bits.get(byte).is_some_and(|v| (v & (1 << bit)) != 0)
             }
             BitvecRepr::Hash(hash) => {
                 let mut h = (idx as usize) % BITVEC_NINT;
@@ -223,7 +223,7 @@ impl BitVec {
         self.repr = BitvecRepr::Sub((0..BITVEC_NPTR).map(|_| None).collect());
         self.n_set = 0;
         self.divisor = self.size / BITVEC_NPTR as u32;
-        if self.size % BITVEC_NPTR as u32 != 0 {
+        if !self.size.is_multiple_of(BITVEC_NPTR as u32) {
             self.divisor += 1;
         }
         if self.divisor < BITVEC_NBIT {

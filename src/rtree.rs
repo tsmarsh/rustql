@@ -31,7 +31,7 @@ impl RtreeBbox {
     }
 
     pub fn from_coords(coords: &[f64]) -> Result<Self> {
-        if coords.len() % 2 != 0 {
+        if !coords.len().is_multiple_of(2) {
             return Err(Error::with_message(
                 ErrorCode::Error,
                 "coordinate list must be min/max pairs",
@@ -358,7 +358,7 @@ impl RtreeTable {
         assigned[seed1] = true;
         assigned[seed2] = true;
 
-        let min_size = (self.node_capacity + 1) / 2;
+        let min_size = self.node_capacity.div_ceil(2);
 
         for _ in 2..entries.len() {
             let remaining: Vec<usize> = (0..entries.len()).filter(|i| !assigned[*i]).collect();
@@ -507,7 +507,7 @@ impl RtreeTable {
     }
 
     fn condense_tree(&mut self, mut node_id: i64) -> Result<()> {
-        let min_entries = (self.node_capacity + 1) / 2;
+        let min_entries = self.node_capacity.div_ceil(2);
         let mut orphan_entries = Vec::new();
 
         loop {

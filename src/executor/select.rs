@@ -19,9 +19,10 @@ use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 // ============================================================================
 
 /// Where to send SELECT results
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum SelectDest {
     /// Return results to caller (normal query)
+    #[default]
     Output,
     /// Store in memory registers starting at reg
     Mem { base_reg: i32 },
@@ -39,12 +40,6 @@ pub enum SelectDest {
     Set { reg: i32 },
     /// Discard results (e.g., INSERT ... SELECT with side effects)
     Discard,
-}
-
-impl Default for SelectDest {
-    fn default() -> Self {
-        SelectDest::Output
-    }
 }
 
 // ============================================================================
@@ -78,7 +73,7 @@ pub struct TableInfo {
     /// VDBE cursor number
     pub cursor: i32,
     /// Schema table (if real table)
-    pub schema_table: Option<Table>,
+    pub schema_table: Option<std::sync::Arc<Table>>,
     /// Is this from a subquery?
     pub is_subquery: bool,
     /// Join type (for joined tables)
@@ -90,7 +85,7 @@ pub struct TableInfo {
 // ============================================================================
 
 /// State for SELECT compilation
-pub struct SelectCompiler {
+pub struct SelectCompiler<'s> {
     /// Generated opcodes
     ops: Vec<VdbeOp>,
     /// Next available register
@@ -115,9 +110,13 @@ pub struct SelectCompiler {
     has_window_functions: bool,
     /// GROUP BY expressions
     group_by_regs: Vec<i32>,
+    /// Expanded column names (populated during compile)
+    result_column_names: Vec<String>,
+    /// Schema for name resolution (optional)
+    schema: Option<&'s crate::schema::Schema>,
 }
 
-impl SelectCompiler {
+impl<'s> SelectCompiler<'s> {
     /// Create a new SELECT compiler
     pub fn new() -> Self {
         Self {
@@ -133,7 +132,34 @@ impl SelectCompiler {
             has_aggregates: false,
             has_window_functions: false,
             group_by_regs: Vec::new(),
+            result_column_names: Vec::new(),
+            schema: None,
         }
+    }
+
+    /// Create a new SELECT compiler with schema access
+    pub fn with_schema(schema: &'s crate::schema::Schema) -> Self {
+        Self {
+            ops: Vec::new(),
+            next_reg: 1,
+            next_cursor: 0,
+            tables: Vec::new(),
+            columns: Vec::new(),
+            next_label: 0,
+            labels: HashMap::new(),
+            ctes: HashMap::new(),
+            is_compound: false,
+            has_aggregates: false,
+            has_window_functions: false,
+            group_by_regs: Vec::new(),
+            result_column_names: Vec::new(),
+            schema: Some(schema),
+        }
+    }
+
+    /// Get the expanded column names after compilation
+    pub fn column_names(&self) -> &[String] {
+        &self.result_column_names
     }
 
     /// Compile a SELECT statement
@@ -143,12 +169,35 @@ impl SelectCompiler {
             self.process_with_clause(with)?;
         }
 
-        // Compile the body
-        self.compile_body(&select.body, dest)?;
+        // If ORDER BY is present, redirect output to a sorter
+        let (actual_dest, sorter_cursor, order_by_cols) = if let Some(order_by) = &select.order_by {
+            let sorter_cursor = self.alloc_cursor();
+            let num_cols = order_by.len();
+            // Open ephemeral table for sorting
+            self.emit(
+                Opcode::OpenEphemeral,
+                sorter_cursor,
+                num_cols as i32,
+                0,
+                P4::Unused,
+            );
+            (
+                SelectDest::Sorter {
+                    cursor: sorter_cursor,
+                },
+                Some(sorter_cursor),
+                Some(order_by.clone()),
+            )
+        } else {
+            (dest.clone(), None, None)
+        };
 
-        // Handle ORDER BY (at top level)
-        if let Some(order_by) = &select.order_by {
-            self.compile_order_by(order_by, dest)?;
+        // Compile the body with appropriate destination
+        self.compile_body(&select.body, &actual_dest)?;
+
+        // Handle ORDER BY output (after body has populated sorter)
+        if let (Some(sorter_cursor), Some(order_by)) = (sorter_cursor, order_by_cols) {
+            self.compile_order_by_output(&order_by, sorter_cursor, dest)?;
         }
 
         // Handle LIMIT/OFFSET
@@ -858,6 +907,103 @@ impl SelectCompiler {
             TableRef::Table { name, alias, .. } => {
                 let cursor = self.alloc_cursor();
                 let table_name = &name.name;
+                let table_name_lower = table_name.to_lowercase();
+
+                // Look up table in schema if available
+                let schema_table = if table_name_lower == "sqlite_master" {
+                    // Create a virtual schema for sqlite_master
+                    use crate::schema::{Affinity, Column, Table};
+                    Some(std::sync::Arc::new(Table {
+                        name: "sqlite_master".to_string(),
+                        db_idx: 0,
+                        root_page: 1,
+                        columns: vec![
+                            Column {
+                                name: "type".to_string(),
+                                type_name: Some("TEXT".to_string()),
+                                affinity: Affinity::Text,
+                                not_null: false,
+                                not_null_conflict: None,
+                                default_value: None,
+                                collation: "BINARY".to_string(),
+                                is_primary_key: false,
+                                is_hidden: false,
+                                generated: None,
+                            },
+                            Column {
+                                name: "name".to_string(),
+                                type_name: Some("TEXT".to_string()),
+                                affinity: Affinity::Text,
+                                not_null: false,
+                                not_null_conflict: None,
+                                default_value: None,
+                                collation: "BINARY".to_string(),
+                                is_primary_key: false,
+                                is_hidden: false,
+                                generated: None,
+                            },
+                            Column {
+                                name: "tbl_name".to_string(),
+                                type_name: Some("TEXT".to_string()),
+                                affinity: Affinity::Text,
+                                not_null: false,
+                                not_null_conflict: None,
+                                default_value: None,
+                                collation: "BINARY".to_string(),
+                                is_primary_key: false,
+                                is_hidden: false,
+                                generated: None,
+                            },
+                            Column {
+                                name: "rootpage".to_string(),
+                                type_name: Some("INTEGER".to_string()),
+                                affinity: Affinity::Integer,
+                                not_null: false,
+                                not_null_conflict: None,
+                                default_value: None,
+                                collation: "BINARY".to_string(),
+                                is_primary_key: false,
+                                is_hidden: false,
+                                generated: None,
+                            },
+                            Column {
+                                name: "sql".to_string(),
+                                type_name: Some("TEXT".to_string()),
+                                affinity: Affinity::Text,
+                                not_null: false,
+                                not_null_conflict: None,
+                                default_value: None,
+                                collation: "BINARY".to_string(),
+                                is_primary_key: false,
+                                is_hidden: false,
+                                generated: None,
+                            },
+                        ],
+                        primary_key: None,
+                        indexes: Vec::new(),
+                        foreign_keys: Vec::new(),
+                        checks: Vec::new(),
+                        without_rowid: false,
+                        strict: false,
+                        is_virtual: false,
+                        autoincrement: false,
+                        sql: None,
+                        row_estimate: 0,
+                    }))
+                } else if let Some(schema) = self.schema {
+                    // Check if table exists (but not for sqlite_ internal tables)
+                    if !table_name_lower.starts_with("sqlite_")
+                        && !schema.tables.contains_key(&table_name_lower)
+                    {
+                        return Err(Error::with_message(
+                            ErrorCode::Error,
+                            format!("no such table: {}", table_name),
+                        ));
+                    }
+                    schema.tables.get(&table_name_lower).cloned()
+                } else {
+                    None
+                };
 
                 // Open the table (read mode)
                 self.emit(Opcode::OpenRead, cursor, 0, 0, P4::Text(table_name.clone()));
@@ -866,7 +1012,7 @@ impl SelectCompiler {
                     name: alias.clone().unwrap_or_else(|| table_name.clone()),
                     table_name: table_name.clone(),
                     cursor,
-                    schema_table: None, // Would be resolved from schema
+                    schema_table,
                     is_subquery: false,
                     join_type,
                 });
@@ -878,7 +1024,11 @@ impl SelectCompiler {
 
                 // Compile subquery into ephemeral table
                 let subquery_dest = SelectDest::EphemTable { cursor };
-                let mut subcompiler = SelectCompiler::new();
+                let mut subcompiler = if let Some(schema) = self.schema {
+                    SelectCompiler::with_schema(schema)
+                } else {
+                    SelectCompiler::new()
+                };
                 subcompiler.next_reg = self.next_reg;
                 subcompiler.next_cursor = self.next_cursor;
                 let subquery_ops = subcompiler.compile(query, &subquery_dest)?;
@@ -928,7 +1078,7 @@ impl SelectCompiler {
                 // For now, treat as error
                 return Err(Error::with_message(
                     ErrorCode::Error,
-                    &format!("Table-valued function {} not yet supported", name),
+                    format!("Table-valued function {} not yet supported", name),
                 ));
             }
         }
@@ -943,28 +1093,48 @@ impl SelectCompiler {
         for col in columns {
             match col {
                 ResultColumn::Star => {
-                    // All columns from all tables
-                    let cursors: Vec<i32> = self.tables.iter().map(|t| t.cursor).collect();
-                    for cursor in cursors {
-                        // For each column in table, emit Column opcode
-                        // In a real implementation, we'd get column count from schema
-                        // For now, assume we don't know column count
-                        let reg = self.alloc_reg();
-                        self.emit(Opcode::Column, cursor, -1, reg, P4::Unused);
-                        count += 1;
+                    // Expand * to all columns from all tables using schema
+                    let tables_snapshot: Vec<_> = self.tables.clone();
+                    for table in &tables_snapshot {
+                        if let Some(schema_table) = &table.schema_table {
+                            for (col_idx, col_def) in schema_table.columns.iter().enumerate() {
+                                let reg = self.alloc_reg();
+                                self.emit(
+                                    Opcode::Column,
+                                    table.cursor,
+                                    col_idx as i32,
+                                    reg,
+                                    P4::Unused,
+                                );
+                                self.result_column_names.push(col_def.name.clone());
+                                count += 1;
+                            }
+                        }
                     }
                 }
                 ResultColumn::TableStar(table_name) => {
-                    // All columns from specific table
-                    let cursor = self
-                        .tables
-                        .iter()
-                        .find(|t| t.name == *table_name)
-                        .map(|t| t.cursor);
-                    if let Some(c) = cursor {
-                        let reg = self.alloc_reg();
-                        self.emit(Opcode::Column, c, -1, reg, P4::Unused);
-                        count += 1;
+                    // Expand table.* to columns from specific table
+                    let tables_snapshot: Vec<_> = self.tables.clone();
+                    for table in &tables_snapshot {
+                        if table.name.eq_ignore_ascii_case(table_name)
+                            || table.table_name.eq_ignore_ascii_case(table_name)
+                        {
+                            if let Some(schema_table) = &table.schema_table {
+                                for (col_idx, col_def) in schema_table.columns.iter().enumerate() {
+                                    let reg = self.alloc_reg();
+                                    self.emit(
+                                        Opcode::Column,
+                                        table.cursor,
+                                        col_idx as i32,
+                                        reg,
+                                        P4::Unused,
+                                    );
+                                    self.result_column_names.push(col_def.name.clone());
+                                    count += 1;
+                                }
+                            }
+                            break;
+                        }
                     }
                 }
                 ResultColumn::Expr { expr, alias } => {
@@ -972,8 +1142,12 @@ impl SelectCompiler {
                     self.compile_expr(expr, reg)?;
                     count += 1;
 
+                    let name = alias
+                        .clone()
+                        .unwrap_or_else(|| self.expr_to_name(expr, count));
+                    self.result_column_names.push(name.clone());
                     self.columns.push(ColumnInfo {
-                        name: alias.clone().unwrap_or_else(|| format!("column{}", count)),
+                        name,
                         table: None,
                         affinity: Affinity::Blob,
                         reg,
@@ -983,6 +1157,16 @@ impl SelectCompiler {
         }
 
         Ok((base_reg, count))
+    }
+
+    /// Convert an expression to a column name
+    fn expr_to_name(&self, expr: &Expr, index: usize) -> String {
+        match expr {
+            Expr::Column(col) => col.column.clone(),
+            Expr::Literal(lit) => format!("{:?}", lit),
+            Expr::Function(func) => func.name.clone(),
+            _ => format!("column{}", index),
+        }
     }
 
     /// Compile WHERE condition
@@ -1038,14 +1222,16 @@ impl SelectCompiler {
                 }
             }
             Expr::Column(col_ref) => {
+                // Use column_index if available from resolver
+                let col_idx = col_ref.column_index.unwrap_or(0);
+
                 // Find the table and column
                 if let Some(table) = &col_ref.table {
                     if let Some(tinfo) = self.tables.iter().find(|t| t.name == *table) {
-                        // Column index would come from schema
                         self.emit(
                             Opcode::Column,
                             tinfo.cursor,
-                            0,
+                            col_idx,
                             dest_reg,
                             P4::Text(col_ref.column.clone()),
                         );
@@ -1056,7 +1242,7 @@ impl SelectCompiler {
                         self.emit(
                             Opcode::Column,
                             tinfo.cursor,
-                            0,
+                            col_idx,
                             dest_reg,
                             P4::Text(col_ref.column.clone()),
                         );
@@ -1069,29 +1255,71 @@ impl SelectCompiler {
                 self.compile_expr(left, left_reg)?;
                 self.compile_expr(right, right_reg)?;
 
-                let opcode = match op {
-                    BinaryOp::Add => Opcode::Add,
-                    BinaryOp::Sub => Opcode::Subtract,
-                    BinaryOp::Mul => Opcode::Multiply,
-                    BinaryOp::Div => Opcode::Divide,
-                    BinaryOp::Mod => Opcode::Remainder,
-                    BinaryOp::Eq => Opcode::Eq,
-                    BinaryOp::Ne => Opcode::Ne,
-                    BinaryOp::Lt => Opcode::Lt,
-                    BinaryOp::Le => Opcode::Le,
-                    BinaryOp::Gt => Opcode::Gt,
-                    BinaryOp::Ge => Opcode::Ge,
-                    BinaryOp::And => Opcode::And,
-                    BinaryOp::Or => Opcode::Or,
-                    BinaryOp::BitAnd => Opcode::BitAnd,
-                    BinaryOp::BitOr => Opcode::BitOr,
-                    BinaryOp::ShiftLeft => Opcode::ShiftLeft,
-                    BinaryOp::ShiftRight => Opcode::ShiftRight,
-                    BinaryOp::Concat => Opcode::Concat,
-                    _ => Opcode::Noop,
-                };
+                // Check if this is a comparison operation (jump-based opcodes)
+                let is_comparison = matches!(
+                    op,
+                    BinaryOp::Eq
+                        | BinaryOp::Ne
+                        | BinaryOp::Lt
+                        | BinaryOp::Le
+                        | BinaryOp::Gt
+                        | BinaryOp::Ge
+                );
 
-                self.emit(opcode, left_reg, right_reg, dest_reg, P4::Unused);
+                if is_comparison {
+                    // Comparison opcodes are jump-based: Eq P1 P2 P3 means
+                    // "if r[P1] == r[P3], jump to P2"
+                    // We need to produce a 0/1 boolean result in dest_reg
+                    let cmp_opcode = match op {
+                        BinaryOp::Eq => Opcode::Eq,
+                        BinaryOp::Ne => Opcode::Ne,
+                        BinaryOp::Lt => Opcode::Lt,
+                        BinaryOp::Le => Opcode::Le,
+                        BinaryOp::Gt => Opcode::Gt,
+                        BinaryOp::Ge => Opcode::Ge,
+                        _ => unreachable!(),
+                    };
+
+                    // Set result to 0 (false) initially
+                    self.emit(Opcode::Integer, 0, dest_reg, 0, P4::Unused);
+
+                    // Allocate labels for control flow
+                    let true_label = self.alloc_label();
+                    let end_label = self.alloc_label();
+
+                    // Compare: if condition is true, jump to true_label
+                    // Comparison opcode format: P1=left operand, P2=jump target, P3=right operand
+                    self.emit(cmp_opcode, left_reg, true_label, right_reg, P4::Unused);
+
+                    // Fall through means false - goto end
+                    self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+
+                    // True path: set result to 1
+                    self.resolve_label(true_label, self.current_addr());
+                    self.emit(Opcode::Integer, 1, dest_reg, 0, P4::Unused);
+
+                    // End label
+                    self.resolve_label(end_label, self.current_addr());
+                } else {
+                    // Arithmetic and other value-producing operations
+                    let opcode = match op {
+                        BinaryOp::Add => Opcode::Add,
+                        BinaryOp::Sub => Opcode::Subtract,
+                        BinaryOp::Mul => Opcode::Multiply,
+                        BinaryOp::Div => Opcode::Divide,
+                        BinaryOp::Mod => Opcode::Remainder,
+                        BinaryOp::And => Opcode::And,
+                        BinaryOp::Or => Opcode::Or,
+                        BinaryOp::BitAnd => Opcode::BitAnd,
+                        BinaryOp::BitOr => Opcode::BitOr,
+                        BinaryOp::ShiftLeft => Opcode::ShiftLeft,
+                        BinaryOp::ShiftRight => Opcode::ShiftRight,
+                        BinaryOp::Concat => Opcode::Concat,
+                        _ => Opcode::Noop,
+                    };
+
+                    self.emit(opcode, left_reg, right_reg, dest_reg, P4::Unused);
+                }
             }
             Expr::Unary { op, expr: inner } => {
                 self.compile_expr(inner, dest_reg)?;
@@ -1204,10 +1432,70 @@ impl SelectCompiler {
         Ok(())
     }
 
-    /// Compile ORDER BY
-    fn compile_order_by(&mut self, _order_by: &[OrderingTerm], _dest: &SelectDest) -> Result<()> {
-        // In a real implementation, this would set up a sorter
-        // For now, ORDER BY is handled in the simple select
+    /// Compile ORDER BY output - sort the sorter and output rows
+    fn compile_order_by_output(
+        &mut self,
+        _order_by: &[OrderingTerm],
+        sorter_cursor: i32,
+        dest: &SelectDest,
+    ) -> Result<()> {
+        // Sort the sorter
+        let sort_done_label = self.alloc_label();
+        self.emit(
+            Opcode::SorterSort,
+            sorter_cursor,
+            sort_done_label,
+            0,
+            P4::Unused,
+        );
+
+        // Loop through sorted rows
+        let sorter_loop_start = self.current_addr();
+
+        // Get the row data from sorter into a register
+        let record_reg = self.alloc_reg();
+        self.emit(Opcode::SorterData, sorter_cursor, record_reg, 0, P4::Unused);
+
+        // Decode the record and output columns
+        // We need to know how many columns - use the number of result columns
+        let num_cols = self.result_column_names.len();
+        let base_reg = self.alloc_regs(num_cols);
+
+        // Use DecodeRecord to extract columns from the serialized record
+        // DecodeRecord P1 P2 P3: Decode record in P1, store starting at P2, num cols in P3
+        self.emit(
+            Opcode::DecodeRecord,
+            record_reg,
+            base_reg,
+            num_cols as i32,
+            P4::Unused,
+        );
+
+        // Output the decoded row
+        match dest {
+            SelectDest::Output => {
+                self.emit(Opcode::ResultRow, base_reg, num_cols as i32, 0, P4::Unused);
+            }
+            _ => {
+                self.emit(Opcode::ResultRow, base_reg, num_cols as i32, 0, P4::Unused);
+            }
+        }
+
+        // Move to next sorted row
+        self.emit(
+            Opcode::SorterNext,
+            sorter_cursor,
+            sorter_loop_start as i32,
+            0,
+            P4::Unused,
+        );
+
+        // Sorting done
+        self.resolve_label(sort_done_label, self.current_addr());
+
+        // Close the sorter
+        self.emit(Opcode::Close, sorter_cursor, 0, 0, P4::Unused);
+
         Ok(())
     }
 
@@ -1563,7 +1851,7 @@ impl SelectCompiler {
     }
 }
 
-impl Default for SelectCompiler {
+impl Default for SelectCompiler<'_> {
     fn default() -> Self {
         Self::new()
     }

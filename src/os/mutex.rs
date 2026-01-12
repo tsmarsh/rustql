@@ -190,9 +190,9 @@ pub fn mutex_leave(mutex: Option<&Arc<SqliteMutex>>) {
 }
 
 pub fn mutex_held(mutex: Option<&Arc<SqliteMutex>>) -> bool {
-    mutex.map_or(true, |m| m.held())
+    mutex.is_none_or(|m| m.held())
 }
 
 pub fn mutex_notheld(mutex: Option<&Arc<SqliteMutex>>) -> bool {
-    mutex.map_or(true, |m| m.not_held())
+    mutex.is_none_or(|m| m.not_held())
 }

@@ -114,15 +114,15 @@ impl SerialType {
                 SerialType::Zero
             } else if v == 1 {
                 SerialType::One
-            } else if v >= -128 && v <= 127 {
+            } else if (-128..=127).contains(&v) {
                 SerialType::Int8
-            } else if v >= -32768 && v <= 32767 {
+            } else if (-32768..=32767).contains(&v) {
                 SerialType::Int16
-            } else if v >= -8388608 && v <= 8388607 {
+            } else if (-8388608..=8388607).contains(&v) {
                 SerialType::Int24
-            } else if v >= -2147483648 && v <= 2147483647 {
+            } else if (-2147483648..=2147483647).contains(&v) {
                 SerialType::Int32
-            } else if v >= -140737488355328 && v <= 140737488355327 {
+            } else if (-140737488355328..=140737488355327).contains(&v) {
                 SerialType::Int48
             } else {
                 SerialType::Int64
@@ -490,8 +490,8 @@ pub fn explain_program(ops: &[VdbeOp]) -> String {
     // Header
     let _ = writeln!(
         output,
-        "{:>4}  {:<15}  {:>4}  {:>4}  {:>4}  {:<10}  {}",
-        "addr", "opcode", "p1", "p2", "p3", "p4", "comment"
+        "{:>4}  {:<15}  {:>4}  {:>4}  {:>4}  {:<10}  comment",
+        "addr", "opcode", "p1", "p2", "p3", "p4"
     );
     let _ = writeln!(
         output,

@@ -260,7 +260,10 @@ pub enum Opcode {
     /// Make a record from P1..P1+P2-1 registers, store in P3
     MakeRecord,
 
-    /// Decode record P1 into P2..P2+P3 registers
+    /// Decode record in P1, store columns starting at P2, P3 columns total
+    DecodeRecord,
+
+    /// Output result row from P1..P1+P2-1 registers
     ResultRow,
 
     /// Insert record into cursor P1
@@ -335,6 +338,9 @@ pub enum Opcode {
 
     /// Parse a CREATE statement and add to schema
     ParseSchema,
+
+    /// Remove table/index from schema (DROP TABLE/INDEX)
+    DropSchema,
 
     // ========================================================================
     // Transaction Operations
@@ -592,6 +598,7 @@ impl Opcode {
             Opcode::Column => "Column",
             Opcode::Rowid => "Rowid",
             Opcode::MakeRecord => "MakeRecord",
+            Opcode::DecodeRecord => "DecodeRecord",
             Opcode::ResultRow => "ResultRow",
             Opcode::Insert => "Insert",
             Opcode::InsertInt => "InsertInt",
@@ -614,6 +621,7 @@ impl Opcode {
             Opcode::SorterCompare => "SorterCompare",
             Opcode::CreateBtree => "CreateBtree",
             Opcode::ParseSchema => "ParseSchema",
+            Opcode::DropSchema => "DropSchema",
             Opcode::Transaction => "Transaction",
             Opcode::AutoCommit => "AutoCommit",
             Opcode::Savepoint => "Savepoint",
@@ -653,9 +661,10 @@ impl fmt::Display for Opcode {
 // ============================================================================
 
 /// P4 operand - can hold various types of data
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum P4 {
     /// Not used
+    #[default]
     Unused,
     /// 64-bit integer
     Int64(i64),
@@ -681,12 +690,6 @@ pub enum P4 {
     Table(String),
     /// Integer array (for IN lists)
     IntArray(Vec<i64>),
-}
-
-impl Default for P4 {
-    fn default() -> Self {
-        P4::Unused
-    }
 }
 
 impl P4 {

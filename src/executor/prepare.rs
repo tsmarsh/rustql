@@ -92,22 +92,35 @@ impl StmtType {
 // ============================================================================
 
 /// Compiles SQL statements to VDBE bytecode
-pub struct StatementCompiler {
+pub struct StatementCompiler<'s> {
     /// Parameter counter for extraction
     param_count: i32,
     /// Parameter names found
     param_names: Vec<Option<String>>,
     /// Named parameters seen (for deduplication)
     named_params: HashSet<String>,
+    /// Schema for name resolution (optional)
+    schema: Option<&'s crate::schema::Schema>,
 }
 
-impl StatementCompiler {
+impl<'s> StatementCompiler<'s> {
     /// Create a new statement compiler
     pub fn new() -> Self {
         Self {
             param_count: 0,
             param_names: Vec::new(),
             named_params: HashSet::new(),
+            schema: None,
+        }
+    }
+
+    /// Create a new statement compiler with schema access
+    pub fn with_schema(schema: &'s crate::schema::Schema) -> Self {
+        Self {
+            param_count: 0,
+            param_names: Vec::new(),
+            named_params: HashSet::new(),
+            schema: Some(schema),
         }
     }
 
@@ -148,9 +161,20 @@ impl StatementCompiler {
     ) -> Result<(Vec<VdbeOp>, StmtType, Vec<String>, Vec<ColumnType>)> {
         match stmt {
             Stmt::Select(select) => {
-                let mut compiler = SelectCompiler::new();
+                let mut compiler = if let Some(schema) = self.schema {
+                    SelectCompiler::with_schema(schema)
+                } else {
+                    SelectCompiler::new()
+                };
                 let ops = compiler.compile(select, &SelectDest::Output)?;
-                let (names, types) = self.extract_select_columns(select);
+                // Use column names from compiler (properly expanded for Star)
+                let names = if compiler.column_names().is_empty() {
+                    // Fallback to extracting from AST if compiler didn't populate names
+                    self.extract_select_columns(select).0
+                } else {
+                    compiler.column_names().to_vec()
+                };
+                let (_, types) = self.extract_select_columns(select);
                 Ok((ops, StmtType::Select, names, types))
             }
 
@@ -857,16 +881,47 @@ impl StatementCompiler {
     }
 
     fn compile_drop(&mut self, drop: &DropStmt, kind: &str) -> Result<Vec<VdbeOp>> {
+        let table_name = &drop.name.name;
+        let table_name_lower = table_name.to_lowercase();
+
+        // Check for reserved names (sqlite_master, etc.) - cannot be dropped
+        if table_name_lower.starts_with("sqlite_") {
+            return Err(crate::error::Error::with_message(
+                crate::error::ErrorCode::Error,
+                format!("table {} may not be dropped", table_name),
+            ));
+        }
+
+        // Check if table exists in schema
+        if let Some(schema) = self.schema {
+            if !schema.tables.contains_key(&table_name_lower) {
+                if !drop.if_exists {
+                    return Err(crate::error::Error::with_message(
+                        crate::error::ErrorCode::Error,
+                        format!("no such {}: {}", kind, table_name),
+                    ));
+                }
+                // IF EXISTS specified and table doesn't exist - return no-op
+                let mut ops = Vec::new();
+                ops.push(Self::make_op(Opcode::Init, 0, 1, 0, P4::Unused));
+                ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
+                return Ok(ops);
+            }
+        }
+
+        // Generate bytecode to drop the table
         let mut ops = Vec::new();
-        ops.push(Self::make_op(Opcode::Init, 0, 1, 0, P4::Unused));
-        ops.push(Self::make_op(
-            Opcode::Noop,
-            0,
-            0,
-            0,
-            P4::Text(format!("DROP {} {}", kind.to_uppercase(), drop.name)),
-        ));
+        ops.push(Self::make_op(Opcode::Init, 0, 2, 0, P4::Unused));
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
+        // DropSchema opcode to remove from schema
+        ops.push(Self::make_op(
+            Opcode::DropSchema,
+            0,
+            0,
+            0,
+            P4::Text(table_name.clone()),
+        ));
+        ops.push(Self::make_op(Opcode::Goto, 0, 1, 0, P4::Unused));
         Ok(ops)
     }
 
@@ -1200,7 +1255,7 @@ impl StatementCompiler {
     }
 }
 
-impl Default for StatementCompiler {
+impl Default for StatementCompiler<'_> {
     fn default() -> Self {
         Self::new()
     }
@@ -1243,8 +1298,20 @@ fn find_statement_tail(sql: &str) -> &str {
 /// Compile SQL to VDBE bytecode
 ///
 /// Returns the compiled statement and any remaining SQL (tail).
-pub fn compile_sql<'a>(sql: &'a str) -> Result<(CompiledStmt, &'a str)> {
+pub fn compile_sql(sql: &str) -> Result<(CompiledStmt, &str)> {
     let mut compiler = StatementCompiler::new();
+    compiler.compile(sql)
+}
+
+/// Compile SQL to VDBE bytecode with schema access
+///
+/// Returns the compiled statement and any remaining SQL (tail).
+/// The schema is used for name resolution (e.g., expanding SELECT *).
+pub fn compile_sql_with_schema<'a>(
+    sql: &'a str,
+    schema: &crate::schema::Schema,
+) -> Result<(CompiledStmt, &'a str)> {
+    let mut compiler = StatementCompiler::with_schema(schema);
     compiler.compile(sql)
 }
 

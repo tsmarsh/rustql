@@ -302,6 +302,7 @@ pub struct BtreePayload {
     pub n_zero: i32,
 }
 
+#[derive(Default)]
 pub struct CellInfo {
     pub n_key: i64,
     pub payload: Option<Vec<u8>>,
@@ -310,20 +311,6 @@ pub struct CellInfo {
     pub n_size: u16,
     pub n_header: u16,
     pub overflow_pgno: Option<Pgno>,
-}
-
-impl Default for CellInfo {
-    fn default() -> Self {
-        Self {
-            n_key: 0,
-            payload: None,
-            n_payload: 0,
-            n_local: 0,
-            n_size: 0,
-            n_header: 0,
-            overflow_pgno: None,
-        }
-    }
 }
 
 pub struct KeyInfo {
@@ -366,7 +353,7 @@ impl DbHeader {
         if page_size == 1 {
             page_size = 65536;
         }
-        if page_size < 512 || page_size > 65536 || !page_size.is_power_of_two() {
+        if !(512..=65536).contains(&page_size) || !page_size.is_power_of_two() {
             return Err(Error::new(ErrorCode::Corrupt));
         }
         let reserve = data[20];
@@ -534,18 +521,18 @@ fn build_cell(
         let local = page.payload_to_local(payload_size as i64, limits)? as usize;
         cell.extend_from_slice(&data[..std::cmp::min(data.len(), local)]);
         if local > data.len() {
-            cell.extend(std::iter::repeat(0u8).take(local - data.len()));
+            cell.extend(std::iter::repeat_n(0u8, local - data.len()));
         } else if payload.n_zero > 0 && local >= data.len() {
             let remaining = local - data.len();
             if remaining > 0 {
-                cell.extend(std::iter::repeat(0u8).take(remaining));
+                cell.extend(std::iter::repeat_n(0u8, remaining));
             }
         }
         if local < payload_size {
             let mut full = Vec::with_capacity(payload_size);
             full.extend_from_slice(data);
             if payload.n_zero > 0 {
-                full.extend(std::iter::repeat(0u8).take(payload.n_zero as usize));
+                full.extend(std::iter::repeat_n(0u8, payload.n_zero as usize));
             }
             let overflow_bytes = &full[local..];
             overflow = build_overflow_pages(limits, overflow_bytes);
@@ -939,12 +926,10 @@ fn split_internal_with_parent(
         } else {
             return Err(Error::new(ErrorCode::Internal));
         }
+    } else if let InternalKey::Blob(blob) = sep_key {
+        keys_gp.insert(insert_pos, InternalKey::Blob(blob));
     } else {
-        if let InternalKey::Blob(blob) = sep_key {
-            keys_gp.insert(insert_pos, InternalKey::Blob(blob));
-        } else {
-            return Err(Error::new(ErrorCode::Internal));
-        }
+        return Err(Error::new(ErrorCode::Internal));
     }
 
     let grand_flags = grandparent.data[grand_limits.header_start()];
@@ -1240,7 +1225,7 @@ fn merge_internal_with_sibling(
         InternalKey::Blob(payload)
     };
 
-    if left_keys.len() > 1 && right_keys.len() > 0 {
+    if left_keys.len() > 1 && !right_keys.is_empty() {
         let borrow_from_left = left_keys.len() > right_keys.len();
         if borrow_from_left {
             let borrowed_child = left_children.pop().ok_or(Error::new(ErrorCode::Corrupt))?;
@@ -1766,7 +1751,7 @@ impl MemPage {
 
     pub fn cell_offset_for_index(&self, index: u16, limits: PageLimits) -> Result<usize> {
         let ptr = self.cell_ptr(index, limits)? as usize;
-        Ok((ptr & self.mask_page as usize) as usize)
+        Ok((ptr & self.mask_page as usize))
     }
 
     pub fn cell_slice(&self, index: u16, limits: PageLimits) -> Result<&[u8]> {
@@ -2038,7 +2023,7 @@ impl MemPage {
     }
 
     fn is_underfull(&self, limits: PageLimits) -> Result<bool> {
-        let free = self.compute_free_space(limits)? as i32;
+        let free = self.compute_free_space(limits)?;
         Ok(free > (limits.usable_size as i32 / 2))
     }
 }
@@ -2098,8 +2083,11 @@ impl Btree {
             free_pages: Vec::new(),
         };
 
+        // Try to read existing database header from page 1
+        let mut is_new_db = true;
         if let Ok(page) = shared.pager.get(1, PagerGetFlags::empty()) {
             if let Ok(header) = DbHeader::parse(&page.data) {
+                is_new_db = false;
                 if header.page_size != shared.page_size {
                     let _ = shared
                         .pager
@@ -2111,6 +2099,50 @@ impl Btree {
                 shared.file_format = header.file_format;
                 shared.auto_vacuum = header.auto_vacuum;
                 shared.incr_vacuum = header.incr_vacuum;
+            }
+        }
+
+        // For a new database, initialize page 1 with empty sqlite_master btree
+        if is_new_db {
+            // Reserve page 1 for the database header and sqlite_master
+            shared.pager.db_size = 1;
+            shared.n_page = 1;
+
+            // Initialize page 1 with database header and empty btree
+            if let Ok(mut page) = shared.pager.get(1, PagerGetFlags::empty()) {
+                let _ = shared.pager.write(&mut page);
+                page.data.fill(0);
+
+                // Write SQLite file header (first 100 bytes)
+                // Magic header string at offset 0
+                page.data[0..16].copy_from_slice(b"SQLite format 3\0");
+                // Page size at offset 16 (big-endian)
+                let ps = shared.page_size as u16;
+                page.data[16..18].copy_from_slice(&ps.to_be_bytes());
+                // File format versions at offset 18-19
+                page.data[18] = 1; // Write version
+                page.data[19] = 1; // Read version
+                                   // Reserved bytes at offset 20
+                page.data[20] = 0;
+                // Other header fields are left as 0 for now
+
+                // Write empty leaf btree header at offset 100
+                let header_offset = 100usize;
+                // Leaf page with intkey (for sqlite_master which is a table)
+                page.data[header_offset] =
+                    BTREE_PAGEFLAG_LEAF | BTREE_PAGEFLAG_INTKEY | BTREE_PAGEFLAG_LEAFDATA;
+                // First freeblock = 0
+                page.data[header_offset + 1] = 0;
+                page.data[header_offset + 2] = 0;
+                // Number of cells = 0
+                page.data[header_offset + 3] = 0;
+                page.data[header_offset + 4] = 0;
+                // Cell content offset = usable_size (end of page)
+                let cell_offset = shared.usable_size as u16;
+                page.data[header_offset + 5..header_offset + 7]
+                    .copy_from_slice(&cell_offset.to_be_bytes());
+                // Fragmented free bytes = 0
+                page.data[header_offset + 7] = 0;
             }
         }
 
@@ -2440,7 +2472,7 @@ impl Btree {
 
     /// sqlite3BtreeInsert
     pub fn insert(
-        &mut self,
+        &self,
         _cursor: &mut BtCursor,
         _payload: &BtreePayload,
         _flags: BtreeInsertFlags,

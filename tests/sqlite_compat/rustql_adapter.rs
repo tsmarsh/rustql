@@ -68,7 +68,7 @@ impl RustqlTestDb {
             let conn = self.conn_mut()?;
             let (mut stmt, tail) = match sqlite3_prepare_v2(conn, remaining) {
                 Ok(result) => result,
-                Err(e) => return Err(format!("{}", e)),
+                Err(e) => return Err(e.sqlite_errmsg()),
             };
 
             // If no statement was compiled (empty or comment-only), advance
@@ -114,7 +114,7 @@ impl RustqlTestDb {
                     }
                 }
                 Ok(StepResult::Done) => break,
-                Err(e) => return Err(format!("{}", e)),
+                Err(e) => return Err(e.sqlite_errmsg()),
             }
         }
 

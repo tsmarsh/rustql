@@ -31,20 +31,15 @@ const MAX_MERGE_COUNT: usize = 16;
 // ============================================================================
 
 /// State of the sorter
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SorterState {
     /// Adding records
+    #[default]
     Building,
     /// In-memory sort complete
     Sorted,
     /// External merge in progress
     Merging,
-}
-
-impl Default for SorterState {
-    fn default() -> Self {
-        SorterState::Building
-    }
 }
 
 // ============================================================================
@@ -265,7 +260,7 @@ impl VdbeSorter {
         match self.state {
             SorterState::Building => true,
             SorterState::Sorted => self.current_idx >= self.records.len(),
-            SorterState::Merging => self.merge.as_ref().map_or(true, |m| m.eof()),
+            SorterState::Merging => self.merge.as_ref().is_none_or(|m| m.eof()),
         }
     }
 
@@ -540,7 +535,11 @@ impl MergeEngine {
 
         // Replay up to the root
         while pos > 1 {
-            let sibling = if pos % 2 == 0 { pos + 1 } else { pos - 1 };
+            let sibling = if pos.is_multiple_of(2) {
+                pos + 1
+            } else {
+                pos - 1
+            };
             let parent = pos / 2;
 
             let left = self.tree[pos];
@@ -551,7 +550,7 @@ impl MergeEngine {
             };
 
             // Ensure we compare in consistent order
-            let (a, b) = if pos % 2 == 0 {
+            let (a, b) = if pos.is_multiple_of(2) {
                 (left, right)
             } else {
                 (right, left)
@@ -571,7 +570,7 @@ impl MergeEngine {
         }
         // Check if the winner has no more data
         let winner = self.tree.get(1).copied().unwrap_or(0);
-        self.readers.get(winner).map_or(true, |r| r.eof())
+        self.readers.get(winner).is_none_or(|r| r.eof())
     }
 
     /// Get the current winner's key

@@ -272,11 +272,7 @@ pub fn func_substr(args: &[Value]) -> Result<Value> {
         Some(_) => {
             // Negative length in SQLite means characters before the position
             let end_pos = (start - 1).max(0) as usize;
-            if end_pos > actual_start {
-                end_pos - actual_start
-            } else {
-                0
-            }
+            end_pos.saturating_sub(actual_start)
         }
         None => chars.len().saturating_sub(actual_start),
     };
@@ -580,7 +576,7 @@ pub fn func_unhex(args: &[Value]) -> Result<Value> {
     let hex = value_to_string(&args[0]);
     let hex = hex.trim();
 
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Ok(Value::Null);
     }
 
@@ -713,7 +709,7 @@ pub fn func_char(args: &[Value]) -> Result<Value> {
 
     for arg in args {
         let code = value_to_i64(arg);
-        if code >= 0 && code <= 0x10FFFF {
+        if (0..=0x10FFFF).contains(&code) {
             if let Some(c) = char::from_u32(code as u32) {
                 result.push(c);
             }

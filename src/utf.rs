@@ -46,7 +46,7 @@ pub fn utf8_read(bytes: &[u8], pos: &mut usize) -> u32 {
         return 0;
     }
 
-    let mut c = bytes[*pos] as u32;
+    let c = bytes[*pos] as u32;
     *pos += 1;
 
     if c >= 0xc0 {

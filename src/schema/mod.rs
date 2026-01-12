@@ -504,7 +504,7 @@ impl Default for IndexColumn {
 }
 
 /// Database index
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Index {
     /// Index name
     pub name: String,
@@ -526,22 +526,6 @@ pub struct Index {
     pub stats: Option<IndexStats>,
 }
 
-impl Default for Index {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            table: String::new(),
-            columns: Vec::new(),
-            root_page: 0,
-            unique: false,
-            partial: None,
-            is_primary_key: false,
-            sql: None,
-            stats: None,
-        }
-    }
-}
-
 impl Index {
     pub fn new(name: impl Into<String>, table: impl Into<String>) -> Self {
         Self {
@@ -557,7 +541,7 @@ impl Index {
 // ============================================================================
 
 /// Database table
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Table {
     /// Table name
     pub name: String,
@@ -587,27 +571,6 @@ pub struct Table {
     pub sql: Option<String>,
     /// Estimated row count from ANALYZE
     pub row_estimate: i64,
-}
-
-impl Default for Table {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            db_idx: 0,
-            root_page: 0,
-            columns: Vec::new(),
-            primary_key: None,
-            indexes: Vec::new(),
-            foreign_keys: Vec::new(),
-            checks: Vec::new(),
-            without_rowid: false,
-            strict: false,
-            is_virtual: false,
-            autoincrement: false,
-            sql: None,
-            row_estimate: 0,
-        }
-    }
 }
 
 impl Table {
@@ -1721,7 +1684,7 @@ impl Schema {
         if table
             .primary_key
             .as_ref()
-            .map_or(false, |pk| pk.contains(&col_idx))
+            .is_some_and(|pk| pk.contains(&col_idx))
         {
             return Err(Error::with_message(
                 ErrorCode::Error,
@@ -1743,7 +1706,7 @@ impl Schema {
         }
 
         for fk in &table.foreign_keys {
-            if fk.columns.iter().any(|c| *c == col_idx) {
+            if fk.columns.contains(&col_idx) {
                 return Err(Error::with_message(
                     ErrorCode::Error,
                     "cannot drop column used by a foreign key",

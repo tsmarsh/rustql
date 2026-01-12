@@ -315,7 +315,7 @@ pub fn expand_sql(sql: &str, params: &[String], param_names: &[Option<String>]) 
             '"' => {
                 // Identifier - copy as-is
                 result.push(c);
-                while let Some(d) = chars.next() {
+                for d in chars.by_ref() {
                     result.push(d);
                     if d == '"' {
                         break;
@@ -325,7 +325,7 @@ pub fn expand_sql(sql: &str, params: &[String], param_names: &[Option<String>]) 
             '-' if chars.peek() == Some(&'-') => {
                 // Line comment - copy to end of line
                 result.push(c);
-                while let Some(d) = chars.next() {
+                for d in chars.by_ref() {
                     result.push(d);
                     if d == '\n' {
                         break;

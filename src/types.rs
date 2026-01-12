@@ -65,9 +65,10 @@ pub enum ColumnType {
 ///
 /// Represents a value that can be stored in or retrieved from SQLite.
 /// Implements SQLite's type affinity and coercion rules.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum Value {
     /// NULL value
+    #[default]
     Null,
     /// Integer value (64-bit signed)
     Integer(i64),
@@ -173,12 +174,6 @@ impl Value {
             Value::Text(s) => s.len(),
             Value::Blob(b) => b.len(),
         }
-    }
-}
-
-impl Default for Value {
-    fn default() -> Self {
-        Value::Null
     }
 }
 

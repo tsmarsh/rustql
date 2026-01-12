@@ -821,11 +821,14 @@ impl<'a> Tokenizer<'a> {
     fn skip_whitespace_and_comments(&mut self) {
         loop {
             // Skip UTF-8 BOM at start of file
-            if self.pos == 0 && self.bytes.len() >= 3 {
-                if self.bytes[0] == 0xEF && self.bytes[1] == 0xBB && self.bytes[2] == 0xBF {
-                    self.pos = 3;
-                    self.column = 4;
-                }
+            if self.pos == 0
+                && self.bytes.len() >= 3
+                && self.bytes[0] == 0xEF
+                && self.bytes[1] == 0xBB
+                && self.bytes[2] == 0xBF
+            {
+                self.pos = 3;
+                self.column = 4;
             }
 
             // Skip whitespace

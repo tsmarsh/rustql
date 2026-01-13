@@ -1463,14 +1463,14 @@ impl Vdbe {
                 // Decode record in P1, store columns starting at P2, P3 columns total
                 let record_data = self.mem(op.p1).to_blob();
                 if !record_data.is_empty() {
-                    match crate::vdbe::aux::decode_record_header(&record_data) {
+                    match crate::vdbe::decode_record_header(&record_data) {
                         Ok((types, header_size)) => {
                             let num_cols = op.p3.min(types.len() as i32) as usize;
                             let mut data_offset = header_size;
                             for i in 0..num_cols {
                                 if i < types.len() {
                                     let col_data = &record_data[data_offset..];
-                                    match crate::vdbe::aux::deserialize_value(col_data, &types[i]) {
+                                    match crate::vdbe::deserialize_value(col_data, &types[i]) {
                                         Ok(mem) => {
                                             *self.mem_mut(op.p2 + i as i32) = mem;
                                         }

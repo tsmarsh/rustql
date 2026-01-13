@@ -234,6 +234,7 @@ pub enum Fts3Expr {
     And(Box<Fts3Expr>, Box<Fts3Expr>),
     Or(Box<Fts3Expr>, Box<Fts3Expr>),
     Not(Box<Fts3Expr>, Box<Fts3Expr>),
+    Near(Box<Fts3Expr>, Box<Fts3Expr>, i32),
 }
 
 #[derive(Debug, Clone)]
@@ -320,6 +321,8 @@ impl Fts3Table {
         let schema = schema.into();
         let mut columns = Vec::new();
         let mut prefixes = Vec::new();
+        let mut has_content = true;
+        let mut content_table = None;
 
         let mut pending_prefix = false;
         for arg in args {
@@ -330,6 +333,27 @@ impl Fts3Table {
             } else if let Some(value) = trimmed.strip_prefix("PREFIX=") {
                 prefixes.extend(parse_prefixes(value));
                 pending_prefix = true;
+            } else if let Some(value) = trimmed.strip_prefix("content=") {
+                let value = value.trim();
+                if value.eq_ignore_ascii_case("none") {
+                    has_content = false;
+                    content_table = None;
+                } else {
+                    has_content = true;
+                    content_table = Some(value.to_string());
+                }
+            } else if let Some(value) = trimmed.strip_prefix("CONTENT=") {
+                let value = value.trim();
+                if value.eq_ignore_ascii_case("none") {
+                    has_content = false;
+                    content_table = None;
+                } else {
+                    has_content = true;
+                    content_table = Some(value.to_string());
+                }
+            } else if trimmed.starts_with("tokenize=") || trimmed.starts_with("TOKENIZE=") {
+                // Tokenizer options are parsed elsewhere; default tokenizer for now.
+                continue;
             } else if pending_prefix {
                 if let Ok(value) = trimmed.parse::<i32>() {
                     prefixes.push(value);
@@ -346,6 +370,8 @@ impl Fts3Table {
 
         let mut table = Self::new(name, schema, columns, Box::new(SimpleTokenizer));
         table.prefixes = prefixes;
+        table.has_content = has_content;
+        table.content_table = content_table;
         table
     }
 
@@ -368,8 +394,10 @@ impl Fts3Table {
                 }
             }
         }
-        let values_owned = values.iter().map(|s| s.to_string()).collect();
-        self.content.insert(rowid, values_owned);
+        if self.has_content {
+            let values_owned = values.iter().map(|s| s.to_string()).collect();
+            self.content.insert(rowid, values_owned);
+        }
         self.flush_pending(pending)?;
         Ok(())
     }
@@ -389,7 +417,9 @@ impl Fts3Table {
                 }
             }
         }
-        self.content.remove(&rowid);
+        if self.has_content {
+            self.content.remove(&rowid);
+        }
         self.flush_pending(pending)?;
         Ok(())
     }
@@ -407,10 +437,16 @@ impl Fts3Table {
     }
 
     pub fn row_values(&self, rowid: i64) -> Option<&[String]> {
+        if !self.has_content {
+            return None;
+        }
         self.content.get(&rowid).map(|values| values.as_slice())
     }
 
     pub fn all_rowids(&self) -> Vec<i64> {
+        if !self.has_content {
+            return Vec::new();
+        }
         let mut rowids: Vec<i64> = self.content.keys().copied().collect();
         rowids.sort_unstable();
         rowids
@@ -471,6 +507,13 @@ impl Fts3Table {
             return Err(Error::with_message(ErrorCode::Error, "empty query"));
         }
 
+        if let Some((left, right, distance)) = split_near(expr) {
+            return Ok(Fts3Expr::Near(
+                Box::new(self.parse_query(left)?),
+                Box::new(self.parse_query(right)?),
+                distance,
+            ));
+        }
         if let Some((left, right)) = split_keyword(expr, " OR ") {
             return Ok(Fts3Expr::Or(
                 Box::new(self.parse_query(left)?),
@@ -523,6 +566,11 @@ impl Fts3Table {
                 let left = self.evaluate_expr(left)?;
                 let right = self.evaluate_expr(right)?;
                 Ok(except_doclists(&left, &right))
+            }
+            Fts3Expr::Near(left, right, distance) => {
+                let left = self.evaluate_expr(left)?;
+                let right = self.evaluate_expr(right)?;
+                Ok(near_merge_doclists(&left, &right, *distance))
             }
         }
     }
@@ -660,6 +708,35 @@ fn split_keyword<'a>(expr: &'a str, keyword: &str) -> Option<(&'a str, &'a str)>
         let right = expr[pos + keyword.len()..].trim();
         if !left.is_empty() && !right.is_empty() {
             return Some((left, right));
+        }
+    }
+    None
+}
+
+fn split_near(expr: &str) -> Option<(&str, &str, i32)> {
+    let upper = expr.to_ascii_uppercase();
+    if let Some(pos) = upper.find(" NEAR/") {
+        let left = expr[..pos].trim();
+        let rest = &expr[pos + 6..];
+        let mut distance_str = String::new();
+        for ch in rest.chars() {
+            if ch.is_ascii_digit() {
+                distance_str.push(ch);
+            } else {
+                break;
+            }
+        }
+        let distance = distance_str.parse::<i32>().unwrap_or(10);
+        let right = rest[distance_str.len()..].trim();
+        if !left.is_empty() && !right.is_empty() {
+            return Some((left, right, distance));
+        }
+    }
+    if let Some(pos) = upper.find(" NEAR ") {
+        let left = expr[..pos].trim();
+        let right = expr[pos + 6..].trim();
+        if !left.is_empty() && !right.is_empty() {
+            return Some((left, right, 10));
         }
     }
     None
@@ -847,6 +924,42 @@ fn phrase_merge_doclists(
     map_to_doclist(merged)
 }
 
+fn near_merge_doclists(left: &Fts3Doclist, right: &Fts3Doclist, distance: i32) -> Fts3Doclist {
+    let left_map = doclist_to_map(left);
+    let right_map = doclist_to_map(right);
+    let mut merged = BTreeMap::new();
+
+    for (rowid, left_positions) in left_map {
+        let Some(right_positions) = right_map.get(&rowid) else {
+            continue;
+        };
+
+        let left_by_column = positions_by_column(&left_positions);
+        let right_by_column = positions_by_column(right_positions);
+
+        let mut matched = Vec::new();
+        for (column, right_offsets) in right_by_column {
+            let Some(left_offsets) = left_by_column.get(&column) else {
+                continue;
+            };
+            for offset in right_offsets {
+                if left_offsets
+                    .iter()
+                    .any(|left_offset| (offset - left_offset).abs() <= distance)
+                {
+                    matched.push(Fts3Position { column, offset });
+                }
+            }
+        }
+
+        if !matched.is_empty() {
+            merged.insert(rowid, matched);
+        }
+    }
+
+    map_to_doclist(merged)
+}
+
 fn except_doclists(left: &Fts3Doclist, right: &Fts3Doclist) -> Fts3Doclist {
     let left_map = doclist_to_map(left);
     let right_map = doclist_to_map(right);
@@ -1008,6 +1121,19 @@ mod tests {
             table.insert(rowid, &[text.as_str()]).expect("insert");
         }
         assert!(table.segments.iter().any(|seg| seg.level == 1));
+    }
+
+    #[test]
+    fn test_near_query() {
+        let mut table = Fts3Table::new(
+            "docs",
+            "main",
+            vec!["body".to_string()],
+            Box::new(SimpleTokenizer),
+        );
+        table.insert(1, &["alpha beta gamma"]).expect("insert");
+        let rows = table.query_rowids("alpha NEAR beta").expect("query");
+        assert_eq!(rows, vec![1]);
     }
 
     #[test]

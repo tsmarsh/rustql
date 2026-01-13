@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::collections::HashSet;
 
 use crate::api::SqliteConnection;
 use crate::error::{Error, ErrorCode, Result};
@@ -465,7 +467,7 @@ impl Fts3Table {
         let mut current = self.lookup_term(first)?;
         for term in iter {
             let next = self.lookup_term(term)?;
-            current = intersect_doclists(&current, &next);
+            current = phrase_merge_doclists(&current, &next, 1);
         }
         Ok(current)
     }
@@ -543,8 +545,12 @@ fn merge_doclists(doclists: Vec<Vec<u8>>) -> Fts3Doclist {
     for doclist in doclists {
         let iter = DoclistIter::new(&doclist);
         for entry in iter {
-            let positions = merged.entry(entry.rowid).or_insert_with(Vec::new);
-            positions.extend(entry.positions);
+            if entry.positions.is_empty() {
+                merged.remove(&entry.rowid);
+            } else {
+                let positions = merged.entry(entry.rowid).or_insert_with(Vec::new);
+                positions.extend(entry.positions);
+            }
         }
     }
     map_to_doclist(merged)
@@ -572,6 +578,44 @@ fn intersect_doclists(left: &Fts3Doclist, right: &Fts3Doclist) -> Fts3Doclist {
     map_to_doclist(merged)
 }
 
+fn phrase_merge_doclists(
+    left: &Fts3Doclist,
+    right: &Fts3Doclist,
+    distance: i32,
+) -> Fts3Doclist {
+    let left_map = doclist_to_map(left);
+    let right_map = doclist_to_map(right);
+    let mut merged = BTreeMap::new();
+
+    for (rowid, left_positions) in left_map {
+        let Some(right_positions) = right_map.get(&rowid) else {
+            continue;
+        };
+
+        let left_by_column = positions_by_column(&left_positions);
+        let right_by_column = positions_by_column(right_positions);
+
+        let mut matched = Vec::new();
+        for (column, right_offsets) in right_by_column {
+            let Some(left_offsets) = left_by_column.get(&column) else {
+                continue;
+            };
+            let left_set: HashSet<i32> = left_offsets.iter().copied().collect();
+            for offset in right_offsets {
+                if left_set.contains(&(offset - distance)) {
+                    matched.push(Fts3Position { column, offset });
+                }
+            }
+        }
+
+        if !matched.is_empty() {
+            merged.insert(rowid, matched);
+        }
+    }
+
+    map_to_doclist(merged)
+}
+
 fn except_doclists(left: &Fts3Doclist, right: &Fts3Doclist) -> Fts3Doclist {
     let left_map = doclist_to_map(left);
     let right_map = doclist_to_map(right);
@@ -588,6 +632,17 @@ fn doclist_to_map(doclist: &Fts3Doclist) -> BTreeMap<i64, Vec<Fts3Position>> {
         map.entry(entry.rowid)
             .or_insert_with(Vec::new)
             .extend(entry.positions);
+    }
+    map
+}
+
+fn positions_by_column(positions: &[Fts3Position]) -> HashMap<i32, Vec<i32>> {
+    let mut map: HashMap<i32, Vec<i32>> = HashMap::new();
+    for pos in positions {
+        map.entry(pos.column).or_default().push(pos.offset);
+    }
+    for offsets in map.values_mut() {
+        offsets.sort_unstable();
     }
     map
 }
@@ -649,6 +704,42 @@ mod tests {
         assert_eq!(decoded.len(), entries.len());
         assert_eq!(decoded[0].rowid, entries[0].rowid);
         assert_eq!(decoded[1].rowid, entries[1].rowid);
+    }
+
+    #[test]
+    fn test_phrase_merge() {
+        let left = Fts3Doclist::encode(&[Fts3DoclistEntry {
+            rowid: 1,
+            positions: vec![
+                Fts3Position {
+                    column: 0,
+                    offset: 2,
+                },
+                Fts3Position {
+                    column: 0,
+                    offset: 5,
+                },
+            ],
+        }]);
+        let right = Fts3Doclist::encode(&[Fts3DoclistEntry {
+            rowid: 1,
+            positions: vec![
+                Fts3Position {
+                    column: 0,
+                    offset: 3,
+                },
+                Fts3Position {
+                    column: 0,
+                    offset: 6,
+                },
+            ],
+        }]);
+
+        let merged = phrase_merge_doclists(&left, &right, 1);
+        let entries: Vec<Fts3DoclistEntry> = merged.iter().collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].rowid, 1);
+        assert_eq!(entries[0].positions.len(), 2);
     }
 
     #[test]

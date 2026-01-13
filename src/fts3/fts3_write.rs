@@ -98,6 +98,28 @@ impl LeafNode {
         len
     }
 
+    pub fn encoded_len_with(&self, term: &[u8], doclist: &[u8]) -> usize {
+        if self.entries.is_empty() {
+            let mut len = fts3_varint_len(0);
+            len += fts3_varint_len(term.len() as u64);
+            len += term.len();
+            len += fts3_varint_len(doclist.len() as u64);
+            len += doclist.len();
+            return len;
+        }
+
+        let mut len = self.encoded_len();
+        let prev_term = &self.entries.last().expect("non-empty entries").0;
+        let prefix = shared_prefix_len(prev_term, term);
+        let suffix_len = term.len() - prefix;
+        len += fts3_varint_len(prefix as u64);
+        len += fts3_varint_len(suffix_len as u64);
+        len += suffix_len;
+        len += fts3_varint_len(doclist.len() as u64);
+        len += doclist.len();
+        len
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         if self.entries.is_empty() {
             return Vec::new();

@@ -565,6 +565,10 @@ pub struct Table {
     pub strict: bool,
     /// Is virtual table
     pub is_virtual: bool,
+    /// Virtual table module name (if virtual)
+    pub virtual_module: Option<String>,
+    /// Virtual table module arguments
+    pub virtual_args: Vec<String>,
     /// Has AUTOINCREMENT column
     pub autoincrement: bool,
     /// CREATE TABLE statement (for schema table)
@@ -1113,6 +1117,8 @@ impl Schema {
             without_rowid: stmt.without_rowid,
             strict: stmt.strict,
             is_virtual: false,
+            virtual_module: None,
+            virtual_args: Vec::new(),
             autoincrement: false,
             sql: None,
             row_estimate: 0,

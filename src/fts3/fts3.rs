@@ -10,6 +10,7 @@ use super::fts3_write::{LeafNode, PendingTerms};
 pub const FTS3_POS_END: u32 = 0;
 pub const FTS3_POS_COLUMN: u32 = 1;
 pub const FTS3_LEAF_MAX: usize = 2048;
+pub const FTS3_MERGE_THRESHOLD: usize = 4;
 
 pub fn fts3_put_varint_u64(buf: &mut Vec<u8>, mut v: u64) -> usize {
     let mut written = 0;
@@ -228,6 +229,7 @@ impl Fts3Tokenizer for SimpleTokenizer {
 #[derive(Debug, Clone)]
 pub enum Fts3Expr {
     Term(String),
+    Prefix(String),
     Phrase(Vec<String>),
     And(Box<Fts3Expr>, Box<Fts3Expr>),
     Or(Box<Fts3Expr>, Box<Fts3Expr>),
@@ -270,6 +272,7 @@ pub struct Fts3Table {
     pub prefixes: Vec<i32>,
     pub index: Fts3Index,
     pub segments: Vec<Fts3Segment>,
+    pub content: HashMap<i64, Vec<String>>,
 }
 
 pub struct Fts3Cursor {
@@ -304,7 +307,46 @@ impl Fts3Table {
                 stat: format!("{}_stat", name),
             },
             segments: Vec::new(),
+            content: HashMap::new(),
         }
+    }
+
+    pub fn from_virtual_spec(
+        name: impl Into<String>,
+        schema: impl Into<String>,
+        args: &[String],
+    ) -> Self {
+        let name = name.into();
+        let schema = schema.into();
+        let mut columns = Vec::new();
+        let mut prefixes = Vec::new();
+
+        let mut pending_prefix = false;
+        for arg in args {
+            let trimmed = arg.trim();
+            if let Some(value) = trimmed.strip_prefix("prefix=") {
+                prefixes.extend(parse_prefixes(value));
+                pending_prefix = true;
+            } else if let Some(value) = trimmed.strip_prefix("PREFIX=") {
+                prefixes.extend(parse_prefixes(value));
+                pending_prefix = true;
+            } else if pending_prefix {
+                if let Ok(value) = trimmed.parse::<i32>() {
+                    prefixes.push(value);
+                } else {
+                    pending_prefix = false;
+                    if !trimmed.contains('=') {
+                        columns.push(trimmed.to_string());
+                    }
+                }
+            } else if !trimmed.contains('=') {
+                columns.push(trimmed.to_string());
+            }
+        }
+
+        let mut table = Self::new(name, schema, columns, Box::new(SimpleTokenizer));
+        table.prefixes = prefixes;
+        table
     }
 
     pub fn tokenize(&self, text: &str) -> Result<Vec<String>> {
@@ -317,8 +359,17 @@ impl Fts3Table {
             let tokens = self.tokenize(value)?;
             for (pos, token) in tokens.into_iter().enumerate() {
                 pending.add(&token, rowid, col_idx as i32, pos as i32);
+                for prefix in &self.prefixes {
+                    let prefix_len = *prefix as usize;
+                    if token.len() >= prefix_len {
+                        let prefix_term = format!("{}*", &token[..prefix_len]);
+                        pending.add(&prefix_term, rowid, col_idx as i32, pos as i32);
+                    }
+                }
             }
         }
+        let values_owned = values.iter().map(|s| s.to_string()).collect();
+        self.content.insert(rowid, values_owned);
         self.flush_pending(pending)?;
         Ok(())
     }
@@ -329,8 +380,16 @@ impl Fts3Table {
             let tokens = self.tokenize(value)?;
             for token in tokens {
                 pending.add_delete(&token, rowid);
+                for prefix in &self.prefixes {
+                    let prefix_len = *prefix as usize;
+                    if token.len() >= prefix_len {
+                        let prefix_term = format!("{}*", &token[..prefix_len]);
+                        pending.add_delete(&prefix_term, rowid);
+                    }
+                }
             }
         }
+        self.content.remove(&rowid);
         self.flush_pending(pending)?;
         Ok(())
     }
@@ -345,6 +404,26 @@ impl Fts3Table {
             rowid: 0,
             eof,
         })
+    }
+
+    pub fn row_values(&self, rowid: i64) -> Option<&[String]> {
+        self.content.get(&rowid).map(|values| values.as_slice())
+    }
+
+    pub fn all_rowids(&self) -> Vec<i64> {
+        let mut rowids: Vec<i64> = self.content.keys().copied().collect();
+        rowids.sort_unstable();
+        rowids
+    }
+
+    pub fn query_rowids(&self, expr: &str) -> Result<Vec<i64>> {
+        let parsed = self.parse_query(expr)?;
+        let doclist = self.evaluate_expr(&parsed)?;
+        let mut rowids = Vec::new();
+        for entry in doclist.iter() {
+            rowids.push(entry.rowid);
+        }
+        Ok(rowids)
     }
 
     fn flush_pending(&mut self, pending: PendingTerms) -> Result<()> {
@@ -372,6 +451,7 @@ impl Fts3Table {
             idx,
             leaves,
         });
+        self.maybe_merge()?;
         Ok(())
     }
 
@@ -417,12 +497,17 @@ impl Fts3Table {
             ));
         }
 
+        if let Some(stripped) = expr.strip_suffix('*') {
+            return Ok(Fts3Expr::Prefix(stripped.to_string()));
+        }
+
         Ok(Fts3Expr::Term(expr.to_string()))
     }
 
     fn evaluate_expr(&self, expr: &Fts3Expr) -> Result<Fts3Doclist> {
         match expr {
             Fts3Expr::Term(term) => self.lookup_term(term),
+            Fts3Expr::Prefix(prefix) => self.lookup_prefix(prefix),
             Fts3Expr::Phrase(terms) => self.lookup_phrase(terms),
             Fts3Expr::And(left, right) => {
                 let left = self.evaluate_expr(left)?;
@@ -459,6 +544,27 @@ impl Fts3Table {
         Ok(merge_doclists(doclists))
     }
 
+    fn lookup_prefix(&self, prefix: &str) -> Result<Fts3Doclist> {
+        let prefix_len = prefix.len() as i32;
+        if self.prefixes.contains(&prefix_len) {
+            let prefix_term = format!("{}*", prefix);
+            return self.lookup_term(&prefix_term);
+        }
+
+        let mut doclists = Vec::new();
+        for segment in &self.segments {
+            for leaf in &segment.leaves {
+                let terms = leaf_terms(leaf)?;
+                for (term, doclist) in terms {
+                    if term.starts_with(prefix.as_bytes()) {
+                        doclists.push(doclist);
+                    }
+                }
+            }
+        }
+        Ok(merge_doclists(doclists))
+    }
+
     fn lookup_phrase(&self, terms: &[String]) -> Result<Fts3Doclist> {
         let mut iter = terms.iter();
         let Some(first) = iter.next() else {
@@ -470,6 +576,79 @@ impl Fts3Table {
             current = phrase_merge_doclists(&current, &next, 1);
         }
         Ok(current)
+    }
+
+    fn maybe_merge(&mut self) -> Result<()> {
+        let mut level = 0;
+        loop {
+            let count = self
+                .segments
+                .iter()
+                .filter(|seg| seg.level == level)
+                .count();
+            if count < FTS3_MERGE_THRESHOLD {
+                break;
+            }
+            self.merge_level(level)?;
+            level += 1;
+        }
+        Ok(())
+    }
+
+    fn merge_level(&mut self, level: i32) -> Result<()> {
+        let mut segments: Vec<Fts3Segment> = self
+            .segments
+            .iter()
+            .filter(|seg| seg.level == level)
+            .cloned()
+            .collect();
+        if segments.is_empty() {
+            return Ok(());
+        }
+        segments.sort_by(|a, b| a.idx.cmp(&b.idx));
+
+        let mut term_doclists: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
+        for segment in &segments {
+            for leaf in &segment.leaves {
+                for (term, doclist) in leaf_terms(leaf)? {
+                    term_doclists
+                        .entry(term)
+                        .or_default()
+                        .push(doclist);
+                }
+            }
+        }
+
+        let mut merged_terms: Vec<(Vec<u8>, Vec<u8>)> = term_doclists
+            .into_iter()
+            .map(|(term, doclists)| (term, merge_doclists(doclists).data))
+            .collect();
+        merged_terms.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut leaves = Vec::new();
+        let mut current = LeafNode::new();
+        for (term, doclist) in merged_terms {
+            if current.encoded_len_with(&term, &doclist) > FTS3_LEAF_MAX && !current.is_empty() {
+                leaves.push(current.encode());
+                current = LeafNode::new();
+            }
+            current.add_term(&term, &doclist);
+        }
+        if !current.is_empty() {
+            leaves.push(current.encode());
+        }
+
+        let new_idx = self.next_segment_idx(level + 1);
+        let new_segment = Fts3Segment {
+            level: level + 1,
+            idx: new_idx,
+            leaves,
+        };
+
+        self.segments
+            .retain(|seg| seg.level != level || !segments.iter().any(|s| s.idx == seg.idx));
+        self.segments.push(new_segment);
+        Ok(())
     }
 }
 
@@ -538,6 +717,58 @@ fn leaf_find_term(leaf: &[u8], term: &[u8]) -> Option<Vec<u8>> {
     }
 
     None
+}
+
+fn leaf_terms(leaf: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+    let mut pos = 0usize;
+    let (_, n) = fts3_get_varint_u64(leaf)?;
+    pos += n;
+
+    let (term_len, n) = fts3_get_varint_u64(&leaf[pos..])?;
+    pos += n;
+    let term_len = term_len as usize;
+    if pos + term_len > leaf.len() {
+        return None;
+    }
+    let mut current_term = leaf[pos..pos + term_len].to_vec();
+    pos += term_len;
+
+    let (doclist_len, n) = fts3_get_varint_u64(&leaf[pos..])?;
+    pos += n;
+    let doclist_len = doclist_len as usize;
+    if pos + doclist_len > leaf.len() {
+        return None;
+    }
+
+    let mut terms = Vec::new();
+    terms.push((current_term.clone(), leaf[pos..pos + doclist_len].to_vec()));
+    pos += doclist_len;
+
+    while pos < leaf.len() {
+        let (prefix_len, n) = fts3_get_varint_u64(&leaf[pos..])?;
+        pos += n;
+        let (suffix_len, n) = fts3_get_varint_u64(&leaf[pos..])?;
+        pos += n;
+        let prefix_len = prefix_len as usize;
+        let suffix_len = suffix_len as usize;
+        if pos + suffix_len > leaf.len() {
+            return None;
+        }
+        current_term.truncate(prefix_len);
+        current_term.extend_from_slice(&leaf[pos..pos + suffix_len]);
+        pos += suffix_len;
+
+        let (doclist_len, n) = fts3_get_varint_u64(&leaf[pos..])?;
+        pos += n;
+        let doclist_len = doclist_len as usize;
+        if pos + doclist_len > leaf.len() {
+            return None;
+        }
+        terms.push((current_term.clone(), leaf[pos..pos + doclist_len].to_vec()));
+        pos += doclist_len;
+    }
+
+    Some(terms)
 }
 
 fn merge_doclists(doclists: Vec<Vec<u8>>) -> Fts3Doclist {
@@ -659,6 +890,13 @@ fn map_to_doclist(mut map: BTreeMap<i64, Vec<Fts3Position>>) -> Fts3Doclist {
     Fts3Doclist::encode(&entries)
 }
 
+fn parse_prefixes(value: &str) -> Vec<i32> {
+    value
+        .split(',')
+        .filter_map(|part| part.trim().parse::<i32>().ok())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,6 +978,36 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].rowid, 1);
         assert_eq!(entries[0].positions.len(), 2);
+    }
+
+    #[test]
+    fn test_prefix_query() {
+        let mut table = Fts3Table::new(
+            "docs",
+            "main",
+            vec!["body".to_string()],
+            Box::new(SimpleTokenizer),
+        );
+        table.prefixes = vec![2];
+        table.insert(1, &["hello world"]).expect("insert");
+        let rows = table.query_rowids("he*").expect("query");
+        assert_eq!(rows, vec![1]);
+    }
+
+    #[test]
+    fn test_segment_merge() {
+        let mut table = Fts3Table::new(
+            "docs",
+            "main",
+            vec!["body".to_string()],
+            Box::new(SimpleTokenizer),
+        );
+        for i in 0..FTS3_MERGE_THRESHOLD {
+            let rowid = i as i64 + 1;
+            let text = format!("term{}", i);
+            table.insert(rowid, &[text.as_str()]).expect("insert");
+        }
+        assert!(table.segments.iter().any(|seg| seg.level == 1));
     }
 
     #[test]

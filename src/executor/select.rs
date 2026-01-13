@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use crate::error::{Error, ErrorCode, Result};
 use crate::executor::window::{select_has_window_functions, WindowCompiler};
 use crate::parser::ast::{
-    BinaryOp, CompoundOp, Distinct, Expr, FromClause, JoinType, LimitClause, OrderingTerm,
-    ResultColumn, SelectBody, SelectCore, SelectStmt, TableRef, WithClause,
+    BinaryOp, CompoundOp, Distinct, Expr, FromClause, JoinType, LikeOp, LimitClause, Literal,
+    OrderingTerm, ResultColumn, SelectBody, SelectCore, SelectStmt, TableRef, WithClause,
 };
 use crate::schema::{Affinity, Table};
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
@@ -257,6 +257,11 @@ impl<'s> SelectCompiler<'s> {
 
     /// Compile a simple SELECT without aggregates
     fn compile_simple_select(&mut self, core: &SelectCore, dest: &SelectDest) -> Result<()> {
+        let fts3_filter = core
+            .where_clause
+            .as_deref()
+            .and_then(|expr| self.extract_fts3_match_filter(expr));
+
         // Determine if we need DISTINCT processing
         let distinct_cursor = if core.distinct == Distinct::Distinct {
             let cursor = self.alloc_cursor();
@@ -273,6 +278,17 @@ impl<'s> SelectCompiler<'s> {
         // Generate Rewind for each table cursor
         let mut rewind_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
         for cursor in &table_cursors {
+            if let Some((filter_cursor, filter)) = &fts3_filter {
+                if filter_cursor == cursor {
+                    self.emit(
+                        Opcode::VFilter,
+                        *cursor,
+                        0,
+                        0,
+                        P4::Text(filter.clone()),
+                    );
+                }
+            }
             let label = self.alloc_label();
             self.emit(Opcode::Rewind, *cursor, label, 0, P4::Unused);
             rewind_labels.push(label);
@@ -282,10 +298,14 @@ impl<'s> SelectCompiler<'s> {
         let loop_start = self.current_addr();
 
         // Evaluate WHERE clause
-        let where_skip_label = if let Some(where_expr) = &core.where_clause {
-            let label = self.alloc_label();
-            self.compile_where_condition(where_expr, label)?;
-            Some(label)
+        let where_skip_label = if fts3_filter.is_none() {
+            if let Some(where_expr) = &core.where_clause {
+                let label = self.alloc_label();
+                self.compile_where_condition(where_expr, label)?;
+                Some(label)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -986,6 +1006,8 @@ impl<'s> SelectCompiler<'s> {
                         without_rowid: false,
                         strict: false,
                         is_virtual: false,
+                        virtual_module: None,
+                        virtual_args: Vec::new(),
                         autoincrement: false,
                         sql: None,
                         row_estimate: 0,
@@ -1176,6 +1198,49 @@ impl<'s> SelectCompiler<'s> {
         // If false (0), jump to skip_label
         self.emit(Opcode::IfNot, reg, skip_label, 1, P4::Unused);
         Ok(())
+    }
+
+    fn extract_fts3_match_filter(&self, expr: &Expr) -> Option<(i32, String)> {
+        if self.tables.len() != 1 {
+            return None;
+        }
+        let table = self.tables.first()?;
+        let schema_table = table.schema_table.as_ref()?;
+        if !schema_table.is_virtual {
+            return None;
+        }
+        let module = schema_table
+            .virtual_module
+            .as_ref()
+            .map(|name| name.to_ascii_lowercase())?;
+        if module != "fts3" {
+            return None;
+        }
+
+        if let Expr::Like {
+            expr: left,
+            pattern,
+            op: LikeOp::Match,
+            negated: false,
+            ..
+        } = expr
+        {
+            let Expr::Literal(Literal::String(text)) = pattern.as_ref() else {
+                return None;
+            };
+            match left.as_ref() {
+                Expr::Column(col) => {
+                    if let Some(ref table_name) = col.table {
+                        if !table_name.eq_ignore_ascii_case(&table.table_name) {
+                            return None;
+                        }
+                    }
+                    return Some((table.cursor, text.clone()));
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Compile an expression into a register

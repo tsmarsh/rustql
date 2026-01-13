@@ -197,6 +197,9 @@ pub enum Opcode {
     /// Open cursor P1 on table P2 for writing
     OpenWrite,
 
+    /// Apply filter to virtual table cursor P1 (P4 = query)
+    VFilter,
+
     /// Open an ephemeral table
     OpenEphemeral,
 
@@ -491,6 +494,7 @@ impl Opcode {
             self,
             Opcode::OpenRead
                 | Opcode::OpenWrite
+                | Opcode::VFilter
                 | Opcode::Close
                 | Opcode::Rewind
                 | Opcode::Last

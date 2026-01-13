@@ -107,10 +107,18 @@ pub struct VdbeCursor {
     pub table_name: Option<String>,
     /// Is this a sqlite_master virtual cursor?
     pub is_sqlite_master: bool,
+    /// Is this a virtual table cursor (custom module)
+    pub is_virtual: bool,
     /// Current index for virtual cursors (sqlite_master iteration)
     pub virtual_index: usize,
     /// Cached schema entries for sqlite_master (type, name, tbl_name, rootpage, sql)
     pub schema_entries: Option<Vec<(String, String, String, u32, Option<String>)>>,
+    /// Virtual table name (for module lookup)
+    pub vtab_name: Option<String>,
+    /// Virtual table rowids for current scan
+    pub vtab_rowids: Vec<i64>,
+    /// Current index into virtual table rowids
+    pub vtab_row_index: usize,
     /// Sorter data - rows to be sorted (each row is a serialized record)
     pub sorter_data: Vec<Vec<u8>>,
     /// Sorter index - current position in sorted data
@@ -151,8 +159,12 @@ impl VdbeCursor {
             btree_cursor: None,
             table_name: None,
             is_sqlite_master: false,
+            is_virtual: false,
             virtual_index: 0,
             schema_entries: None,
+            vtab_name: None,
+            vtab_rowids: Vec::new(),
+            vtab_row_index: 0,
             sorter_data: Vec::new(),
             sorter_index: 0,
             sorter_sorted: false,
@@ -1143,6 +1155,7 @@ impl Vdbe {
                         cursor.schema_entries = Some(entries);
                     }
                 } else {
+                    let mut table_meta = None;
                     // If root_page is 0 and we have a table name in P4, look it up in schema
                     if root_page == 0 {
                         if let Some(ref tname) = table_name {
@@ -1150,24 +1163,42 @@ impl Vdbe {
                                 if let Ok(schema_guard) = schema.read() {
                                     if let Some(table) = schema_guard.tables.get(tname) {
                                         root_page = table.root_page;
+                                        table_meta = Some(std::sync::Arc::clone(table));
                                     }
                                 }
                             }
                         }
                     }
 
-                    // Clone btree Arc to avoid borrow issues
-                    let btree = self.btree.clone();
-                    self.open_cursor(op.p1, root_page, false)?;
-                    if let Some(cursor) = self.cursor_mut(op.p1) {
-                        cursor.n_field = op.p3;
-                        cursor.table_name = table_name;
-                        // Create a real BtCursor if we have a btree
-                        if let Some(ref btree) = btree {
-                            let flags = BtreeCursorFlags::empty();
-                            match btree.cursor(root_page, flags, None) {
-                                Ok(bt_cursor) => cursor.btree_cursor = Some(bt_cursor),
-                                Err(_) => {} // Failed to create cursor, use placeholder
+                    if table_meta
+                        .as_ref()
+                        .map(|table| table.is_virtual)
+                        .unwrap_or(false)
+                    {
+                        self.open_cursor(op.p1, 0, false)?;
+                        if let Some(cursor) = self.cursor_mut(op.p1) {
+                            cursor.n_field = table_meta
+                                .as_ref()
+                                .map(|table| table.columns.len() as i32)
+                                .unwrap_or(op.p3);
+                            cursor.table_name = table_name.clone();
+                            cursor.is_virtual = true;
+                            cursor.vtab_name = table_name;
+                        }
+                    } else {
+                        // Clone btree Arc to avoid borrow issues
+                        let btree = self.btree.clone();
+                        self.open_cursor(op.p1, root_page, false)?;
+                        if let Some(cursor) = self.cursor_mut(op.p1) {
+                            cursor.n_field = op.p3;
+                            cursor.table_name = table_name;
+                            // Create a real BtCursor if we have a btree
+                            if let Some(ref btree) = btree {
+                                let flags = BtreeCursorFlags::empty();
+                                match btree.cursor(root_page, flags, None) {
+                                    Ok(bt_cursor) => cursor.btree_cursor = Some(bt_cursor),
+                                    Err(_) => {} // Failed to create cursor, use placeholder
+                                }
                             }
                         }
                     }
@@ -1195,17 +1226,73 @@ impl Vdbe {
                     }
                 }
 
-                // Clone btree Arc to avoid borrow issues
-                let btree = self.btree.clone();
-                self.open_cursor(op.p1, root_page, true)?;
+                let mut is_virtual = false;
+                let mut table_name = None;
+                if let P4::Text(name) = &op.p4 {
+                    table_name = Some(name.clone());
+                    if let Some(ref schema) = self.schema {
+                        if let Ok(schema_guard) = schema.read() {
+                            if let Some(table) = schema_guard.tables.get(name) {
+                                is_virtual = table.is_virtual;
+                            }
+                        }
+                    }
+                }
+
+                if is_virtual {
+                    self.open_cursor(op.p1, 0, true)?;
+                    if let Some(cursor) = self.cursor_mut(op.p1) {
+                        cursor.n_field = op.p3;
+                        cursor.is_virtual = true;
+                        cursor.table_name = table_name.clone();
+                        cursor.vtab_name = table_name;
+                    }
+                } else {
+                    // Clone btree Arc to avoid borrow issues
+                    let btree = self.btree.clone();
+                    self.open_cursor(op.p1, root_page, true)?;
+                    if let Some(cursor) = self.cursor_mut(op.p1) {
+                        cursor.n_field = op.p3;
+                        // Create a writable BtCursor if we have a btree
+                        if let Some(ref btree) = btree {
+                            let flags = BtreeCursorFlags::WRCSR;
+                            match btree.cursor(root_page, flags, None) {
+                                Ok(bt_cursor) => cursor.btree_cursor = Some(bt_cursor),
+                                Err(_) => {} // Failed to create cursor
+                            }
+                        }
+                    }
+                }
+            }
+
+            Opcode::VFilter => {
+                // Apply filter to virtual table cursor P1 (P4 = query string)
                 if let Some(cursor) = self.cursor_mut(op.p1) {
-                    cursor.n_field = op.p3;
-                    // Create a writable BtCursor if we have a btree
-                    if let Some(ref btree) = btree {
-                        let flags = BtreeCursorFlags::WRCSR;
-                        match btree.cursor(root_page, flags, None) {
-                            Ok(bt_cursor) => cursor.btree_cursor = Some(bt_cursor),
-                            Err(_) => {} // Failed to create cursor
+                    if cursor.is_virtual {
+                        let query = match &op.p4 {
+                            P4::Text(text) => Some(text.as_str()),
+                            P4::Vtab(text) => Some(text.as_str()),
+                            _ => None,
+                        };
+                        if let (Some(vtab_name), Some(query)) = (cursor.vtab_name.as_ref(), query) {
+                            #[cfg(feature = "fts3")]
+                            {
+                                if let Some(table) = crate::fts3::get_table(vtab_name) {
+                                    if let Ok(mut table) = table.lock() {
+                                        if let Ok(rowids) = table.query_rowids(query) {
+                                            cursor.vtab_rowids = rowids;
+                                            cursor.vtab_row_index = 0;
+                                            if cursor.vtab_rowids.is_empty() {
+                                                cursor.state = CursorState::AtEnd;
+                                                cursor.rowid = None;
+                                            } else {
+                                                cursor.state = CursorState::Valid;
+                                                cursor.rowid = Some(cursor.vtab_rowids[0]);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1237,6 +1324,28 @@ impl Vdbe {
                             } else {
                                 cursor.state = CursorState::AtEnd;
                             }
+                        }
+                    } else if cursor.is_virtual {
+                        if cursor.vtab_rowids.is_empty() {
+                            if let Some(ref vtab_name) = cursor.vtab_name {
+                                #[cfg(feature = "fts3")]
+                                {
+                                    if let Some(table) = crate::fts3::get_table(vtab_name) {
+                                        if let Ok(table) = table.lock() {
+                                            cursor.vtab_rowids = table.all_rowids();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        cursor.vtab_row_index = 0;
+                        is_empty = cursor.vtab_rowids.is_empty();
+                        if !is_empty {
+                            cursor.state = CursorState::Valid;
+                            cursor.rowid = Some(cursor.vtab_rowids[0]);
+                        } else {
+                            cursor.state = CursorState::AtEnd;
+                            cursor.rowid = None;
                         }
                     } else if let Some(ref mut bt_cursor) = cursor.btree_cursor {
                         match bt_cursor.first() {
@@ -1281,6 +1390,19 @@ impl Vdbe {
                             } else {
                                 CursorState::AtEnd
                             };
+                        }
+                    } else if cursor.is_virtual {
+                        cursor.vtab_row_index += 1;
+                        has_more = cursor.vtab_row_index < cursor.vtab_rowids.len();
+                        cursor.state = if has_more {
+                            CursorState::Valid
+                        } else {
+                            CursorState::AtEnd
+                        };
+                        if has_more {
+                            cursor.rowid = Some(cursor.vtab_rowids[cursor.vtab_row_index]);
+                        } else {
+                            cursor.rowid = None;
                         }
                     } else if let Some(ref mut bt_cursor) = cursor.btree_cursor {
                         match bt_cursor.next(0) {
@@ -1423,7 +1545,36 @@ impl Vdbe {
                     None
                 };
 
+                let vtab_value: Option<Mem> = if let Some(cursor) = self.cursor(op.p1) {
+                    if cursor.is_virtual {
+                        let mut result = Mem::new();
+                        if let (Some(rowid), Some(vtab_name)) =
+                            (cursor.rowid, cursor.vtab_name.as_ref())
+                        {
+                            #[cfg(feature = "fts3")]
+                            {
+                                if let Some(table) = crate::fts3::get_table(vtab_name) {
+                                    if let Ok(table) = table.lock() {
+                                        if let Some(values) = table.row_values(rowid) {
+                                            if let Some(value) = values.get(col_idx) {
+                                                result = Mem::from_str(value);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Some(result)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
                 if let Some(value) = sqlite_master_value {
+                    *self.mem_mut(op.p3) = value;
+                } else if let Some(value) = vtab_value {
                     *self.mem_mut(op.p3) = value;
                 } else if let Some(cursor) = self.cursor(op.p1) {
                     if cursor.null_row {
@@ -2176,9 +2327,12 @@ impl Vdbe {
             let table_name = after_create[..using_pos].trim().to_string();
             let mut columns = Vec::new();
 
+            let mut module_name = String::new();
+            let mut module_args: Vec<String> = Vec::new();
             if using_pos < after_create.len() {
-                let mut after_using = after_create[using_pos + 5..].trim();
+                let after_using = after_create[using_pos + 5..].trim();
                 if let Some(paren_pos) = after_using.find('(') {
+                    module_name = after_using[..paren_pos].trim().to_string();
                     let args = after_using[paren_pos + 1..].trim();
                     let args = args.strip_suffix(')')?;
                     for arg in args.split(',') {
@@ -2186,23 +2340,33 @@ impl Vdbe {
                         if name.is_empty() {
                             continue;
                         }
-                        columns.push(Column {
-                            name: name.to_string(),
-                            type_name: None,
-                            affinity: Affinity::Blob,
-                            not_null: false,
-                            not_null_conflict: None,
-                            default_value: None,
-                            collation: "BINARY".to_string(),
-                            is_primary_key: false,
-                            is_hidden: false,
-                            generated: None,
-                        });
+                        module_args.push(name.to_string());
+                        if !name.contains('=') {
+                            columns.push(Column {
+                                name: name.to_string(),
+                                type_name: None,
+                                affinity: Affinity::Blob,
+                                not_null: false,
+                                not_null_conflict: None,
+                                default_value: None,
+                                collation: "BINARY".to_string(),
+                                is_primary_key: false,
+                                is_hidden: false,
+                                generated: None,
+                            });
+                        }
                     }
                 } else {
-                    // No args: leave columns empty until module defines them.
-                    after_using = after_using.trim();
-                    let _module = after_using;
+                    module_name = after_using.trim().to_string();
+                }
+            }
+
+            #[cfg(feature = "fts3")]
+            {
+                if module_name.eq_ignore_ascii_case("fts3") {
+                    let table =
+                        crate::fts3::Fts3Table::from_virtual_spec(table_name.clone(), "main", &module_args);
+                    crate::fts3::register_table(table);
                 }
             }
 
@@ -2218,6 +2382,12 @@ impl Vdbe {
                 without_rowid: false,
                 strict: false,
                 is_virtual: true,
+                virtual_module: if module_name.is_empty() {
+                    None
+                } else {
+                    Some(module_name)
+                },
+                virtual_args: module_args,
                 autoincrement: false,
                 sql: Some(sql.to_string()),
                 row_estimate: 0,
@@ -2311,6 +2481,8 @@ impl Vdbe {
             without_rowid: false,
             strict: false,
             is_virtual: false,
+            virtual_module: None,
+            virtual_args: Vec::new(),
             autoincrement: false,
             sql: Some(sql.to_string()),
             row_estimate: 0,

@@ -8,14 +8,14 @@ features (such as virtual tables and FTS) are partially implemented.
 
 ```mermaid
 flowchart TD
-  UserSQL[SQL Input] --> Parser[Parser + AST]
-  Parser --> Compiler[Statement Compiler]
-  Compiler --> VDBE[VDBE Bytecode]
-  VDBE --> Engine[VDBE Engine]
-  Engine --> Storage[Storage + Btree + Pager]
-  Engine --> Schema[Schema Registry]
-  Engine --> Functions[Scalar/Aggr Functions]
-  Engine --> Ext[Extensions (FTS, RTree, etc.)]
+  UserSQL["SQL Input"] --> Parser["Parser + AST"]
+  Parser --> Compiler["Statement Compiler"]
+  Compiler --> VDBE["VDBE Bytecode"]
+  VDBE --> Engine["VDBE Engine"]
+  Engine --> Storage["Storage + Btree + Pager"]
+  Engine --> Schema["Schema Registry"]
+  Engine --> Functions["Scalar/Aggr Functions"]
+  Engine --> Ext["Extensions (FTS, RTree, etc.)"]
 
   Schema --> Parser
   Storage --> Schema
@@ -26,16 +26,16 @@ flowchart TD
 ```mermaid
 flowchart LR
   subgraph src
-    api[api/ (public SQLite-style API)]
-    parser[parser/ (tokenizer + grammar + AST)]
-    executor[executor/ (SQL -> VDBE compiler)]
-    vdbe[vdbe/ (ops + engine + mem + auxdata)]
-    storage[storage/ (pager + btree + wal)]
-    schema[schema/ (schema registry + DDL modeling)]
-    functions[functions/ (built-in SQL functions)]
-    util[util/ (helpers)]
-    rtree[rtree.rs (RTree extension)]
-    fts3[fts3/ (FTS3 scaffolding)]
+    api["api/ (public SQLite-style API)"]
+    parser["parser/ (tokenizer + grammar + AST)"]
+    executor["executor/ (SQL -> VDBE compiler)"]
+    vdbe["vdbe/ (ops + engine + mem + auxdata)"]
+    storage["storage/ (pager + btree + wal)"]
+    schema["schema/ (schema registry + DDL modeling)"]
+    functions["functions/ (built-in SQL functions)"]
+    util["util/ (helpers)"]
+    rtree["rtree.rs (RTree extension)"]
+    fts3["fts3/ (FTS3 scaffolding)"]
   end
 
   api --> parser
@@ -77,11 +77,11 @@ The VDBE engine parses the CREATE SQL and updates the in-memory schema.
 
 ```mermaid
 flowchart TD
-  CreateSQL[CREATE TABLE / CREATE VIRTUAL TABLE]
-  CreateSQL --> Compiler[executor::prepare]
-  Compiler --> ParseSchemaOp[VDBE Opcode::ParseSchema]
-  ParseSchemaOp --> VDBEEngine[vdbe::engine]
-  VDBEEngine --> Schema[Schema Registry]
+  CreateSQL["CREATE TABLE / CREATE VIRTUAL TABLE"]
+  CreateSQL --> Compiler["executor::prepare"]
+  Compiler --> ParseSchemaOp["VDBE Opcode::ParseSchema"]
+  ParseSchemaOp --> VDBEEngine["vdbe::engine"]
+  VDBEEngine --> Schema["Schema Registry"]
 ```
 
 Notes:
@@ -93,10 +93,10 @@ Notes:
 
 ```mermaid
 flowchart TD
-  VDBEEngine[vdbe::engine] --> Btree[storage::btree]
-  Btree --> Pager[storage::pager]
-  Pager --> VFS[os/ (VFS abstractions)]
-  Pager --> WAL[storage::wal]
+  VDBEEngine["vdbe::engine"] --> Btree["storage::btree"]
+  Btree --> Pager["storage::pager"]
+  Pager --> VFS["os/ (VFS abstractions)"]
+  Pager --> WAL["storage::wal"]
 ```
 
 ## FTS3 Scaffold (Current State)
@@ -107,11 +107,11 @@ not yet integrated as a virtual table module.
 
 ```mermaid
 flowchart TD
-  Tokens[Tokenize input] --> Pending[PendingTerms]
-  Pending --> Leaf[LeafNode encode]
-  Leaf --> Segments[In-memory segments]
-  Segments --> Lookup[Term lookup]
-  Lookup --> Doclist[Doclist merge]
+  Tokens["Tokenize input"] --> Pending["PendingTerms"]
+  Pending --> Leaf["LeafNode encode"]
+  Leaf --> Segments["In-memory segments"]
+  Segments --> Lookup["Term lookup"]
+  Lookup --> Doclist["Doclist merge"]
 ```
 
 ## Virtual Tables (Planned)
@@ -121,21 +121,21 @@ implemented today.
 
 ```mermaid
 flowchart TD
-  CreateVTab[CREATE VIRTUAL TABLE] --> Schema[Schema Registry]
-  Query[VDBE Query] --> VTabOps[Virtual Table Opcodes]
-  VTabOps --> Module[Module Registry]
-  Module --> XFilter[xFilter/xNext/xColumn/xRowid]
-  Module --> Storage[Module storage/indexes]
+  CreateVTab["CREATE VIRTUAL TABLE"] --> Schema["Schema Registry"]
+  Query["VDBE Query"] --> VTabOps["Virtual Table Opcodes"]
+  VTabOps --> Module["Module Registry"]
+  Module --> XFilter["xFilter/xNext/xColumn/xRowid"]
+  Module --> Storage["Module storage/indexes"]
 ```
 
 ## Extension Points
 
 ```mermaid
 flowchart LR
-  VDBE --> Functions
-  VDBE --> Extensions
-  Extensions --> rtree
-  Extensions --> fts3
+  VDBE["VDBE"] --> Functions["Functions"]
+  VDBE --> Extensions["Extensions"]
+  Extensions --> rtree["rtree"]
+  Extensions --> fts3["fts3"]
 ```
 
 ## Open Gaps vs SQLite

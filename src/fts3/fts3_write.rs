@@ -59,12 +59,13 @@ pub struct LeafNode {
 
 impl LeafNode {
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     pub fn add_term(&mut self, term: &[u8], doclist: &[u8]) {
-        self.entries
-            .push((term.to_vec(), doclist.to_vec()));
+        self.entries.push((term.to_vec(), doclist.to_vec()));
     }
 
     pub fn is_empty(&self) -> bool {

@@ -9,9 +9,9 @@
 pub mod api;
 pub mod error;
 pub mod executor;
-pub mod functions;
 #[cfg(feature = "fts3")]
 pub mod fts3;
+pub mod functions;
 pub mod mem;
 pub mod os;
 pub mod parser;

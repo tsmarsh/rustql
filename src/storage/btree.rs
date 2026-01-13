@@ -2644,7 +2644,7 @@ impl Btree {
     }
 
     /// sqlite3BtreeDelete
-    pub fn delete(&mut self, _cursor: &mut BtCursor, _flags: BtreeInsertFlags) -> Result<()> {
+    pub fn delete(&self, _cursor: &mut BtCursor, _flags: BtreeInsertFlags) -> Result<()> {
         let shared = self
             .shared
             .write()

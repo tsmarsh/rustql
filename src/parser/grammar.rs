@@ -1001,9 +1001,7 @@ impl<'a> Parser<'a> {
 
         if self.match_token(TokenKind::Virtual) {
             self.expect(TokenKind::Table)?;
-            return Ok(Stmt::CreateVirtualTable(
-                self.parse_create_virtual_table()?,
-            ));
+            return Ok(Stmt::CreateVirtualTable(self.parse_create_virtual_table()?));
         }
 
         if self.match_token(TokenKind::Table) {
@@ -1046,8 +1044,7 @@ impl<'a> Parser<'a> {
                     if self.check(TokenKind::Identifier) {
                         args.push(self.expect_identifier()?);
                     } else if self.check(TokenKind::String) {
-                        let token = self.current();
-                        args.push(token.text.clone());
+                        args.push(self.current_text().to_string());
                         self.advance();
                     } else {
                         return Err(self.error("expected column name or string in module args"));

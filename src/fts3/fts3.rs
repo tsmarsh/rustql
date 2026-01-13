@@ -112,10 +112,7 @@ impl Fts3Doclist {
 
             let mut by_column: BTreeMap<i32, Vec<i32>> = BTreeMap::new();
             for pos in &entry.positions {
-                by_column
-                    .entry(pos.column)
-                    .or_default()
-                    .push(pos.offset);
+                by_column.entry(pos.column).or_default().push(pos.offset);
             }
 
             let mut first_column = true;
@@ -357,9 +354,7 @@ impl Fts3Table {
         let mut leaves = Vec::new();
         let mut current = LeafNode::new();
         for (term, doclist) in items {
-            if current.encoded_len_with(&term, &doclist) > FTS3_LEAF_MAX
-                && !current.is_empty()
-            {
+            if current.encoded_len_with(&term, &doclist) > FTS3_LEAF_MAX && !current.is_empty() {
                 leaves.push(current.encode());
                 current = LeafNode::new();
             }
@@ -415,7 +410,9 @@ impl Fts3Table {
 
         let tokens: Vec<&str> = expr.split_whitespace().collect();
         if tokens.len() > 1 {
-            return Ok(Fts3Expr::Phrase(tokens.iter().map(|t| t.to_string()).collect()));
+            return Ok(Fts3Expr::Phrase(
+                tokens.iter().map(|t| t.to_string()).collect(),
+            ));
         }
 
         Ok(Fts3Expr::Term(expr.to_string()))
@@ -605,7 +602,6 @@ fn map_to_doclist(mut map: BTreeMap<i64, Vec<Fts3Position>>) -> Fts3Doclist {
         });
     }
     Fts3Doclist::encode(&entries)
-}
 }
 
 #[cfg(test)]

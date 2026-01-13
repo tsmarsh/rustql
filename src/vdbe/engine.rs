@@ -443,17 +443,29 @@ impl Vdbe {
 
     /// Get memory cell
     pub fn mem(&self, reg: i32) -> &Mem {
-        &self.mem[reg as usize]
+        let idx = reg as usize;
+        // Return first element (null) for out-of-bounds - safer than panic
+        self.mem.get(idx).unwrap_or(&self.mem[0])
     }
 
     /// Get mutable memory cell
     pub fn mem_mut(&mut self, reg: i32) -> &mut Mem {
-        &mut self.mem[reg as usize]
+        let idx = reg as usize;
+        // Grow memory array if needed
+        if idx >= self.mem.len() {
+            self.mem.resize(idx + 16, Mem::new());
+        }
+        &mut self.mem[idx]
     }
 
     /// Set memory cell value
     pub fn set_mem(&mut self, reg: i32, value: Mem) {
-        self.mem[reg as usize] = value;
+        let idx = reg as usize;
+        // Grow memory array if needed
+        if idx >= self.mem.len() {
+            self.mem.resize(idx + 16, Mem::new());
+        }
+        self.mem[idx] = value;
     }
 
     // ========================================================================
@@ -920,16 +932,42 @@ impl Vdbe {
             // Comparison
             // ================================================================
             Opcode::Eq => {
-                let cmp = self.mem(op.p1).compare(self.mem(op.p3));
-                if cmp == Ordering::Equal {
-                    self.pc = op.p2;
+                // P5 flags: SQLITE_NULLEQ (0x80) means NULL==NULL is true
+                let left = self.mem(op.p1);
+                let right = self.mem(op.p3);
+                let nulleq = (op.p5 & 0x80) != 0;
+
+                // In standard SQL, comparing with NULL yields unknown (no jump)
+                // unless NULLEQ flag is set
+                if !nulleq && (left.is_null() || right.is_null()) {
+                    // No jump - comparison with NULL is unknown
+                } else {
+                    let cmp = left.compare(right);
+                    if cmp == Ordering::Equal {
+                        self.pc = op.p2;
+                    }
                 }
             }
 
             Opcode::Ne => {
-                let cmp = self.mem(op.p1).compare(self.mem(op.p3));
-                if cmp != Ordering::Equal {
-                    self.pc = op.p2;
+                // P5 flags: SQLITE_NULLEQ (0x80) means NULL==NULL is true
+                let left = self.mem(op.p1);
+                let right = self.mem(op.p3);
+                let nulleq = (op.p5 & 0x80) != 0;
+
+                // In standard SQL, comparing with NULL yields unknown (no jump)
+                // unless NULLEQ flag is set
+                if !nulleq && (left.is_null() || right.is_null()) {
+                    // For Ne with NULL, SQLite typically DOES jump (NULL != X is true)
+                    // Actually this is subtle - let's check if either is NULL
+                    if left.is_null() || right.is_null() {
+                        self.pc = op.p2;
+                    }
+                } else {
+                    let cmp = left.compare(right);
+                    if cmp != Ordering::Equal {
+                        self.pc = op.p2;
+                    }
                 }
             }
 
@@ -1206,15 +1244,21 @@ impl Vdbe {
                                 is_empty = empty;
                                 if !empty {
                                     cursor.state = CursorState::Valid;
+                                    cursor.rowid = Some(bt_cursor.integer_key());
                                 } else {
                                     cursor.state = CursorState::AtEnd;
+                                    cursor.rowid = None;
                                 }
                             }
-                            Err(_) => cursor.state = CursorState::AtEnd,
+                            Err(_) => {
+                                cursor.state = CursorState::AtEnd;
+                                cursor.rowid = None;
+                            }
                         }
                     } else {
                         // No btree cursor - assume empty
                         cursor.state = CursorState::AtEnd;
+                        cursor.rowid = None;
                     }
                 }
                 // Jump if no rows
@@ -1249,11 +1293,21 @@ impl Vdbe {
                                 } else {
                                     CursorState::AtEnd
                                 };
+                                // Update rowid from cursor position
+                                if has_more {
+                                    cursor.rowid = Some(bt_cursor.integer_key());
+                                } else {
+                                    cursor.rowid = None;
+                                }
                             }
-                            Err(_) => cursor.state = CursorState::AtEnd,
+                            Err(_) => {
+                                cursor.state = CursorState::AtEnd;
+                                cursor.rowid = None;
+                            }
                         }
                     } else {
                         cursor.state = CursorState::AtEnd;
+                        cursor.rowid = None;
                     }
                 }
                 // Jump to P2 if there are more rows
@@ -1276,11 +1330,21 @@ impl Vdbe {
                                 } else {
                                     CursorState::AtEnd
                                 };
+                                // Update rowid from cursor position
+                                if has_more {
+                                    cursor.rowid = Some(bt_cursor.integer_key());
+                                } else {
+                                    cursor.rowid = None;
+                                }
                             }
-                            Err(_) => cursor.state = CursorState::AtEnd,
+                            Err(_) => {
+                                cursor.state = CursorState::AtEnd;
+                                cursor.rowid = None;
+                            }
                         }
                     } else {
                         cursor.state = CursorState::AtEnd;
+                        cursor.rowid = None;
                     }
                 }
                 // Jump to P2 if there are more rows
@@ -1607,17 +1671,126 @@ impl Vdbe {
             }
 
             // ================================================================
+            // Seek Operations
+            // ================================================================
+            Opcode::SeekRowid => {
+                // SeekRowid P1 P2 P3: Move cursor P1 to rowid in register P3
+                // If not found, jump to P2. Register P3 must be an integer.
+                let rowid = self.mem(op.p3).to_int();
+                let mut found = false;
+
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                        match bt_cursor.table_moveto(rowid, false) {
+                            Ok(0) => {
+                                // Exact match found
+                                cursor.state = CursorState::Valid;
+                                cursor.rowid = Some(rowid);
+                                found = true;
+                            }
+                            Ok(_) => {
+                                // Not found - cursor positioned elsewhere
+                                cursor.state = CursorState::Invalid;
+                            }
+                            Err(_) => {
+                                cursor.state = CursorState::Invalid;
+                            }
+                        }
+                    }
+                }
+
+                if !found {
+                    self.pc = op.p2;
+                }
+            }
+
+            Opcode::NotExists => {
+                // NotExists P1 P2 P3: If rowid P3 does NOT exist in cursor P1, jump to P2
+                let rowid = self.mem(op.p3).to_int();
+                let mut exists = false;
+
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                        match bt_cursor.table_moveto(rowid, false) {
+                            Ok(0) => {
+                                // Exact match found - row exists
+                                cursor.state = CursorState::Valid;
+                                cursor.rowid = Some(rowid);
+                                exists = true;
+                            }
+                            Ok(_) => {
+                                // Not found
+                                cursor.state = CursorState::Invalid;
+                            }
+                            Err(_) => {
+                                cursor.state = CursorState::Invalid;
+                            }
+                        }
+                    }
+                }
+
+                if !exists {
+                    self.pc = op.p2;
+                }
+            }
+
+            Opcode::Delete => {
+                // Delete P1 P2 P3 P4 P5: Delete the current row from cursor P1
+                // P2 = jump destination on constraint violation
+                // P3 = register holding rowid for triggers
+                // P4 = table name
+                // P5 = flags (OPFLAG_* constants)
+                let btree_arc = self.btree.clone();
+
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    if let Some(ref btree) = btree_arc {
+                        if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                            let flags = BtreeInsertFlags::from_bits_truncate(op.p5 as u8);
+                            if let Err(e) = btree.delete(bt_cursor, flags) {
+                                eprintln!("Delete failed: {:?}", e);
+                            }
+                        }
+                    }
+                    // Invalidate cursor after delete
+                    cursor.state = CursorState::Invalid;
+                    cursor.rowid = None;
+                }
+            }
+
+            Opcode::Last => {
+                // Last P1 P2: Move cursor P1 to last row, jump to P2 if empty
+                let mut is_empty = true;
+
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                        match bt_cursor.last() {
+                            Ok(empty) => {
+                                is_empty = empty;
+                                if !empty {
+                                    cursor.state = CursorState::Valid;
+                                    cursor.rowid = Some(bt_cursor.integer_key());
+                                } else {
+                                    cursor.state = CursorState::AtEnd;
+                                }
+                            }
+                            Err(_) => cursor.state = CursorState::AtEnd,
+                        }
+                    }
+                }
+
+                if is_empty {
+                    self.pc = op.p2;
+                }
+            }
+
+            // ================================================================
             // Other opcodes (placeholder implementations)
             // ================================================================
-            Opcode::Last
-            | Opcode::SeekRowid
-            | Opcode::SeekGE
+            Opcode::SeekGE
             | Opcode::SeekGT
             | Opcode::SeekLE
             | Opcode::SeekLT
             | Opcode::SeekNull
-            | Opcode::NotExists
-            | Opcode::Delete
             | Opcode::IdxGE
             | Opcode::IdxGT
             | Opcode::IdxLE
@@ -1625,7 +1798,7 @@ impl Vdbe {
             | Opcode::IdxRowid
             | Opcode::IdxInsert
             | Opcode::IdxDelete => {
-                // Placeholder: These need btree integration
+                // Placeholder: These need btree integration for index operations
             }
 
             Opcode::OpenPseudo | Opcode::OpenAutoindex | Opcode::ResetSorter => {

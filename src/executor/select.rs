@@ -80,6 +80,12 @@ pub struct TableInfo {
     pub join_type: JoinType,
 }
 
+#[derive(Debug, Clone)]
+struct Fts3MatchFilter {
+    cursor: i32,
+    pattern: Expr,
+}
+
 // ============================================================================
 // Select Compiler State
 // ============================================================================
@@ -257,10 +263,10 @@ impl<'s> SelectCompiler<'s> {
 
     /// Compile a simple SELECT without aggregates
     fn compile_simple_select(&mut self, core: &SelectCore, dest: &SelectDest) -> Result<()> {
-        let fts3_filter = core
-            .where_clause
-            .as_deref()
-            .and_then(|expr| self.extract_fts3_match_filter(expr));
+        let (fts3_filter, remaining_where) = match core.where_clause.as_deref() {
+            Some(expr) => self.split_fts3_match_filter(expr),
+            None => (None, None),
+        };
 
         // Determine if we need DISTINCT processing
         let distinct_cursor = if core.distinct == Distinct::Distinct {
@@ -278,15 +284,24 @@ impl<'s> SelectCompiler<'s> {
         // Generate Rewind for each table cursor
         let mut rewind_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
         for cursor in &table_cursors {
-            if let Some((filter_cursor, filter)) = &fts3_filter {
-                if filter_cursor == cursor {
-                    self.emit(
-                        Opcode::VFilter,
-                        *cursor,
-                        0,
-                        0,
-                        P4::Text(filter.clone()),
-                    );
+            if let Some(filter) = &fts3_filter {
+                if filter.cursor == *cursor {
+                    match &filter.pattern {
+                        Expr::Literal(Literal::String(text)) => {
+                            self.emit(
+                                Opcode::VFilter,
+                                *cursor,
+                                0,
+                                0,
+                                P4::Text(text.clone()),
+                            );
+                        }
+                        expr => {
+                            let reg = self.alloc_reg();
+                            self.compile_expr(expr, reg)?;
+                            self.emit(Opcode::VFilter, *cursor, reg, 0, P4::Unused);
+                        }
+                    }
                 }
             }
             let label = self.alloc_label();
@@ -298,14 +313,10 @@ impl<'s> SelectCompiler<'s> {
         let loop_start = self.current_addr();
 
         // Evaluate WHERE clause
-        let where_skip_label = if fts3_filter.is_none() {
-            if let Some(where_expr) = &core.where_clause {
-                let label = self.alloc_label();
-                self.compile_where_condition(where_expr, label)?;
-                Some(label)
-            } else {
-                None
-            }
+        let where_skip_label = if let Some(where_expr) = remaining_where.as_ref() {
+            let label = self.alloc_label();
+            self.compile_where_condition(where_expr, label)?;
+            Some(label)
         } else {
             None
         };
@@ -1200,7 +1211,27 @@ impl<'s> SelectCompiler<'s> {
         Ok(())
     }
 
-    fn extract_fts3_match_filter(&self, expr: &Expr) -> Option<(i32, String)> {
+    fn split_fts3_match_filter(&self, expr: &Expr) -> (Option<Fts3MatchFilter>, Option<Expr>) {
+        if let Some(filter) = self.extract_fts3_match_filter(expr) {
+            return (Some(filter), None);
+        }
+        if let Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } = expr
+        {
+            if let Some(filter) = self.extract_fts3_match_filter(left) {
+                return (Some(filter), Some(*right.clone()));
+            }
+            if let Some(filter) = self.extract_fts3_match_filter(right) {
+                return (Some(filter), Some(*left.clone()));
+            }
+        }
+        (None, Some(expr.clone()))
+    }
+
+    fn extract_fts3_match_filter(&self, expr: &Expr) -> Option<Fts3MatchFilter> {
         if self.tables.len() != 1 {
             return None;
         }
@@ -1225,17 +1256,19 @@ impl<'s> SelectCompiler<'s> {
             ..
         } = expr
         {
-            let Expr::Literal(Literal::String(text)) = pattern.as_ref() else {
-                return None;
-            };
             match left.as_ref() {
                 Expr::Column(col) => {
                     if let Some(ref table_name) = col.table {
                         if !table_name.eq_ignore_ascii_case(&table.table_name) {
                             return None;
                         }
+                    } else if !col.column.eq_ignore_ascii_case(&table.table_name) {
+                        return None;
                     }
-                    return Some((table.cursor, text.clone()));
+                    return Some(Fts3MatchFilter {
+                        cursor: table.cursor,
+                        pattern: (*pattern.clone()),
+                    });
                 }
                 _ => {}
             }

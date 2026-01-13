@@ -1271,17 +1271,21 @@ impl Vdbe {
                 // Apply filter to virtual table cursor P1 (P4 = query string)
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if cursor.is_virtual {
-                        let query = match &op.p4 {
-                            P4::Text(text) => Some(text.as_str()),
-                            P4::Vtab(text) => Some(text.as_str()),
-                            _ => None,
+                        let mut query = match &op.p4 {
+                            P4::Text(text) => text.clone(),
+                            P4::Vtab(text) => text.clone(),
+                            _ => String::new(),
                         };
-                        if let (Some(vtab_name), Some(query)) = (cursor.vtab_name.as_ref(), query) {
+                        if query.is_empty() && op.p2 > 0 {
+                            query = self.mem(op.p2).to_str();
+                        }
+
+                        if let Some(vtab_name) = cursor.vtab_name.as_ref() {
                             #[cfg(feature = "fts3")]
                             {
                                 if let Some(table) = crate::fts3::get_table(vtab_name) {
                                     if let Ok(mut table) = table.lock() {
-                                        if let Ok(rowids) = table.query_rowids(query) {
+                                        if let Ok(rowids) = table.query_rowids(&query) {
                                             cursor.vtab_rowids = rowids;
                                             cursor.vtab_row_index = 0;
                                             if cursor.vtab_rowids.is_empty() {

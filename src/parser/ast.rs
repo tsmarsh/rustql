@@ -83,6 +83,7 @@ pub enum Stmt {
     Update(UpdateStmt),
     Delete(DeleteStmt),
     CreateTable(CreateTableStmt),
+    CreateVirtualTable(CreateVirtualTableStmt),
     CreateIndex(CreateIndexStmt),
     CreateView(CreateViewStmt),
     CreateTrigger(CreateTriggerStmt),
@@ -445,6 +446,15 @@ pub struct CreateTableStmt {
     pub definition: TableDefinition,
     pub without_rowid: bool,
     pub strict: bool,
+}
+
+/// CREATE VIRTUAL TABLE statement
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateVirtualTableStmt {
+    pub if_not_exists: bool,
+    pub name: QualifiedName,
+    pub module: String,
+    pub args: Vec<String>,
 }
 
 /// Table definition

@@ -1987,6 +1987,68 @@ impl Vdbe {
 
         // Simple parser for CREATE TABLE name (col1 type, col2 type, ...)
         let sql_upper = sql.to_uppercase();
+        if sql_upper.starts_with("CREATE VIRTUAL TABLE") {
+            let mut after_create = sql["CREATE VIRTUAL TABLE".len()..].trim();
+            let after_upper = after_create.to_uppercase();
+            if after_upper.starts_with("IF NOT EXISTS") {
+                after_create = after_create[13..].trim();
+            }
+
+            let using_pos = after_create
+                .to_uppercase()
+                .find("USING")
+                .unwrap_or(after_create.len());
+            let table_name = after_create[..using_pos].trim().to_string();
+            let mut columns = Vec::new();
+
+            if using_pos < after_create.len() {
+                let mut after_using = after_create[using_pos + 5..].trim();
+                if let Some(paren_pos) = after_using.find('(') {
+                    let args = after_using[paren_pos + 1..].trim();
+                    let args = args.strip_suffix(')')?;
+                    for arg in args.split(',') {
+                        let name = arg.trim();
+                        if name.is_empty() {
+                            continue;
+                        }
+                        columns.push(Column {
+                            name: name.to_string(),
+                            type_name: None,
+                            affinity: Affinity::Blob,
+                            not_null: false,
+                            not_null_conflict: None,
+                            default_value: None,
+                            collation: "BINARY".to_string(),
+                            is_primary_key: false,
+                            is_hidden: false,
+                            generated: None,
+                        });
+                    }
+                } else {
+                    // No args: leave columns empty until module defines them.
+                    after_using = after_using.trim();
+                    let _module = after_using;
+                }
+            }
+
+            return Some(Table {
+                name: table_name,
+                db_idx: 0,
+                root_page,
+                columns,
+                primary_key: None,
+                indexes: Vec::new(),
+                foreign_keys: Vec::new(),
+                checks: Vec::new(),
+                without_rowid: false,
+                strict: false,
+                is_virtual: true,
+                autoincrement: false,
+                sql: Some(sql.to_string()),
+                row_estimate: 0,
+            });
+        }
+
         if !sql_upper.starts_with("CREATE TABLE") {
             return None;
         }

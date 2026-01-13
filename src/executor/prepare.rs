@@ -48,6 +48,7 @@ pub enum StmtType {
     Update,
     Delete,
     CreateTable,
+    CreateVirtualTable,
     CreateIndex,
     CreateView,
     CreateTrigger,
@@ -196,6 +197,11 @@ impl<'s> StatementCompiler<'s> {
             Stmt::CreateTable(create) => {
                 let ops = self.compile_create_table(create)?;
                 Ok((ops, StmtType::CreateTable, Vec::new(), Vec::new()))
+            }
+
+            Stmt::CreateVirtualTable(create) => {
+                let ops = self.compile_create_virtual_table(create)?;
+                Ok((ops, StmtType::CreateVirtualTable, Vec::new(), Vec::new()))
             }
 
             Stmt::CreateIndex(create) => {
@@ -809,6 +815,36 @@ impl<'s> StatementCompiler<'s> {
         Ok(ops)
     }
 
+    fn compile_create_virtual_table(
+        &mut self,
+        create: &CreateVirtualTableStmt,
+    ) -> Result<Vec<VdbeOp>> {
+        let mut ops = Vec::new();
+
+        let reg_root_page = 1;
+        ops.push(Self::make_op(Opcode::Init, 0, 2, 0, P4::Unused));
+        ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
+        ops.push(Self::make_op(
+            Opcode::Integer,
+            0,
+            reg_root_page,
+            0,
+            P4::Unused,
+        ));
+
+        let create_sql = self.build_create_virtual_table_sql(create);
+        ops.push(Self::make_op(
+            Opcode::ParseSchema,
+            0,
+            reg_root_page,
+            0,
+            P4::Text(create_sql),
+        ));
+        ops.push(Self::make_op(Opcode::Goto, 0, 1, 0, P4::Unused));
+
+        Ok(ops)
+    }
+
     /// Build CREATE TABLE SQL from AST for storage in schema
     fn build_create_table_sql(&self, create: &CreateTableStmt) -> String {
         use crate::parser::ast::TableDefinition;
@@ -835,6 +871,22 @@ impl<'s> StatementCompiler<'s> {
             sql.push_str(&col_defs.join(", "));
         }
         sql.push(')');
+        sql
+    }
+
+    fn build_create_virtual_table_sql(&self, create: &CreateVirtualTableStmt) -> String {
+        let mut sql = String::from("CREATE VIRTUAL TABLE ");
+        if create.if_not_exists {
+            sql.push_str("IF NOT EXISTS ");
+        }
+        sql.push_str(&create.name.name);
+        sql.push_str(" USING ");
+        sql.push_str(&create.module);
+        if !create.args.is_empty() {
+            sql.push('(');
+            sql.push_str(&create.args.join(", "));
+            sql.push(')');
+        }
         sql
     }
 

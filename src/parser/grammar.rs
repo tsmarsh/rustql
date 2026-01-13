@@ -999,6 +999,13 @@ impl<'a> Parser<'a> {
         let temporary = self.match_token(TokenKind::Temp) || self.match_token(TokenKind::Temporary);
         let unique = self.match_token(TokenKind::Unique);
 
+        if self.match_token(TokenKind::Virtual) {
+            self.expect(TokenKind::Table)?;
+            return Ok(Stmt::CreateVirtualTable(
+                self.parse_create_virtual_table()?,
+            ));
+        }
+
         if self.match_token(TokenKind::Table) {
             return Ok(Stmt::CreateTable(self.parse_create_table(temporary)?));
         }
@@ -1016,6 +1023,49 @@ impl<'a> Parser<'a> {
         }
 
         Err(self.error("expected TABLE, INDEX, VIEW, or TRIGGER after CREATE"))
+    }
+
+    fn parse_create_virtual_table(&mut self) -> Result<CreateVirtualTableStmt> {
+        let if_not_exists = if self.match_token(TokenKind::If) {
+            self.expect(TokenKind::Not)?;
+            self.expect(TokenKind::Exists)?;
+            true
+        } else {
+            false
+        };
+
+        let name = self.parse_qualified_name()?;
+
+        self.expect(TokenKind::Using)?;
+        let module = self.expect_identifier()?;
+
+        let mut args = Vec::new();
+        if self.match_token(TokenKind::LParen) {
+            if !self.check(TokenKind::RParen) {
+                loop {
+                    if self.check(TokenKind::Identifier) {
+                        args.push(self.expect_identifier()?);
+                    } else if self.check(TokenKind::String) {
+                        let token = self.current();
+                        args.push(token.text.clone());
+                        self.advance();
+                    } else {
+                        return Err(self.error("expected column name or string in module args"));
+                    }
+                    if !self.match_token(TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect(TokenKind::RParen)?;
+        }
+
+        Ok(CreateVirtualTableStmt {
+            if_not_exists,
+            name,
+            module,
+            args,
+        })
     }
 
     fn parse_create_table(&mut self, temporary: bool) -> Result<CreateTableStmt> {

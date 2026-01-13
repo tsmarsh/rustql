@@ -72,9 +72,7 @@ impl InsertCompiler {
             P4::Text(insert.table.name.clone()),
         );
 
-        // For now, assume a simple table structure
-        // In a real implementation, we'd look up the schema
-        self.num_columns = 3; // Placeholder
+        self.num_columns = self.infer_num_columns(insert);
 
         // Handle conflict action
         let conflict_action = insert.or_action.unwrap_or(ConflictAction::Abort);
@@ -177,6 +175,17 @@ impl InsertCompiler {
         }
 
         Ok(())
+    }
+
+    fn infer_num_columns(&self, insert: &InsertStmt) -> usize {
+        if !insert.columns.is_empty() {
+            return insert.columns.len();
+        }
+        match &insert.source {
+            InsertSource::Values(rows) => rows.first().map(|row| row.len()).unwrap_or(0),
+            InsertSource::Select(_) => 0,
+            InsertSource::DefaultValues => 0,
+        }
     }
 
     /// Compile INSERT...SELECT

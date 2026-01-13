@@ -1228,12 +1228,14 @@ impl Vdbe {
 
                 let mut is_virtual = false;
                 let mut table_name = None;
+                let mut table_columns = None;
                 if let P4::Text(name) = &op.p4 {
                     table_name = Some(name.clone());
                     if let Some(ref schema) = self.schema {
                         if let Ok(schema_guard) = schema.read() {
                             if let Some(table) = schema_guard.tables.get(name) {
                                 is_virtual = table.is_virtual;
+                                table_columns = Some(table.columns.len() as i32);
                             }
                         }
                     }
@@ -1242,7 +1244,7 @@ impl Vdbe {
                 if is_virtual {
                     self.open_cursor(op.p1, 0, true)?;
                     if let Some(cursor) = self.cursor_mut(op.p1) {
-                        cursor.n_field = op.p3;
+                        cursor.n_field = table_columns.unwrap_or(op.p3);
                         cursor.is_virtual = true;
                         cursor.table_name = table_name.clone();
                         cursor.vtab_name = table_name;
@@ -1795,26 +1797,49 @@ impl Vdbe {
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     cursor.rowid = Some(rowid);
 
-                    // Actually insert into btree
-                    if let Some(ref btree) = btree_arc {
-                        if let Some(ref mut bt_cursor) = cursor.btree_cursor {
-                            // Create payload with record data
-                            let payload = BtreePayload {
-                                key: None, // Table insert, not index
-                                n_key: rowid,
-                                data: Some(record_data.clone()),
-                                mem: Vec::new(),
-                                n_data: record_data.len() as i32,
-                                n_zero: 0,
-                            };
+                    if cursor.is_virtual {
+                        if let Some(ref vtab_name) = cursor.vtab_name {
+                            #[cfg(feature = "fts3")]
+                            {
+                                if let Some(table) = crate::fts3::get_table(vtab_name) {
+                                    if let Ok(mut table) = table.lock() {
+                                        let mut mems = self.decode_record_mems(&record_data);
+                                        let column_count = table.columns.len();
+                                        if column_count > 0 {
+                                            mems.truncate(column_count);
+                                            mems.resize_with(column_count, Mem::new);
+                                        }
+                                        let values: Vec<String> =
+                                            mems.iter().map(|mem| mem.to_str()).collect();
+                                        let refs: Vec<&str> =
+                                            values.iter().map(|value| value.as_str()).collect();
+                                        let _ = table.insert(rowid, &refs);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // Actually insert into btree
+                        if let Some(ref btree) = btree_arc {
+                            if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                                // Create payload with record data
+                                let payload = BtreePayload {
+                                    key: None, // Table insert, not index
+                                    n_key: rowid,
+                                    data: Some(record_data.clone()),
+                                    mem: Vec::new(),
+                                    n_data: record_data.len() as i32,
+                                    n_zero: 0,
+                                };
 
-                            // Insert flags from P5 (lower 8 bits)
-                            let flags = BtreeInsertFlags::from_bits_truncate(op.p5 as u8);
+                                // Insert flags from P5 (lower 8 bits)
+                                let flags = BtreeInsertFlags::from_bits_truncate(op.p5 as u8);
 
-                            // Perform the insert
-                            if let Err(e) = btree.insert(bt_cursor, &payload, flags, 0) {
-                                // Log error but continue for now
-                                eprintln!("Insert failed: {:?}", e);
+                                // Perform the insert
+                                if let Err(e) = btree.insert(bt_cursor, &payload, flags, 0) {
+                                    // Log error but continue for now
+                                    eprintln!("Insert failed: {:?}", e);
+                                }
                             }
                         }
                     }
@@ -1894,7 +1919,26 @@ impl Vdbe {
                 let btree_arc = self.btree.clone();
 
                 if let Some(cursor) = self.cursor_mut(op.p1) {
-                    if let Some(ref btree) = btree_arc {
+                    if cursor.is_virtual {
+                        if let Some(rowid) = cursor.rowid {
+                            if let Some(ref vtab_name) = cursor.vtab_name {
+                                #[cfg(feature = "fts3")]
+                                {
+                                    if let Some(table) = crate::fts3::get_table(vtab_name) {
+                                        if let Ok(mut table) = table.lock() {
+                                            if let Some(values) = table.row_values(rowid) {
+                                                let refs: Vec<&str> = values
+                                                    .iter()
+                                                    .map(|value| value.as_str())
+                                                    .collect();
+                                                let _ = table.delete(rowid, &refs);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if let Some(ref btree) = btree_arc {
                         if let Some(ref mut bt_cursor) = cursor.btree_cursor {
                             let flags = BtreeInsertFlags::from_bits_truncate(op.p5 as u8);
                             if let Err(e) = btree.delete(bt_cursor, flags) {
@@ -2496,6 +2540,32 @@ impl Vdbe {
         // TODO: Implement proper record format decoding when needed
         // The actual format is: header_size (varint), type_codes[], data[]
         vec![Value::Null; n_fields]
+    }
+
+    fn decode_record_mems(&self, data: &[u8]) -> Vec<Mem> {
+        if data.is_empty() {
+            return Vec::new();
+        }
+        let Ok((types, header_size)) = crate::vdbe::auxdata::decode_record_header(data) else {
+            return Vec::new();
+        };
+
+        let mut mems = Vec::with_capacity(types.len());
+        let mut data_offset = header_size;
+        for typ in &types {
+            let size = typ.size();
+            if data_offset > data.len() || data_offset + size > data.len() {
+                mems.push(Mem::new());
+            } else {
+                let col_data = &data[data_offset..];
+                match crate::vdbe::auxdata::deserialize_value(col_data, typ) {
+                    Ok(mem) => mems.push(mem),
+                    Err(_) => mems.push(Mem::new()),
+                }
+            }
+            data_offset = data_offset.saturating_add(size);
+        }
+        mems
     }
 }
 

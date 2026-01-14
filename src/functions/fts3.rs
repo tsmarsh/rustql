@@ -107,6 +107,28 @@ pub fn func_offsets(args: &[Value]) -> Result<Value> {
     Ok(Value::Text(parts.join(" ")))
 }
 
+/// matchinfo(text, query)
+pub fn func_matchinfo(args: &[Value]) -> Result<Value> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(Error::with_message(
+            ErrorCode::Error,
+            "matchinfo() expects 1 or 2 arguments",
+        ));
+    }
+
+    let query = if args.len() == 1 {
+        value_to_string(&args[0])
+    } else {
+        value_to_string(&args[1])
+    };
+    let terms = tokenize_query(&query);
+    let mut buf = Vec::with_capacity(terms.len() * 4);
+    for _ in terms {
+        buf.extend_from_slice(&0u32.to_le_bytes());
+    }
+    Ok(Value::Blob(buf))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,6 +156,16 @@ mod tests {
         match result {
             Value::Text(text) => assert!(!text.is_empty()),
             _ => panic!("expected text"),
+        }
+    }
+
+    #[test]
+    fn test_matchinfo_basic() {
+        let args = [Value::Text("alpha beta".to_string())];
+        let result = func_matchinfo(&args).expect("matchinfo");
+        match result {
+            Value::Blob(blob) => assert_eq!(blob.len(), 8),
+            _ => panic!("expected blob"),
         }
     }
 }

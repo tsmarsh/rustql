@@ -1766,7 +1766,8 @@ impl Vdbe {
                             args.push(mem.to_value());
                         }
                         if (name.eq_ignore_ascii_case("snippet")
-                            || name.eq_ignore_ascii_case("offsets"))
+                            || name.eq_ignore_ascii_case("offsets")
+                            || name.eq_ignore_ascii_case("matchinfo"))
                             && args.len() == 1
                         {
                             if let Some(query) = self.vtab_query.clone() {

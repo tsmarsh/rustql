@@ -866,6 +866,32 @@ impl<'s> StatementCompiler<'s> {
                 );
             }
         }
+        if create.module.eq_ignore_ascii_case("fts5") {
+            let shadow_tables = self.build_fts5_shadow_tables(create);
+            for (table_name, sql) in shadow_tables {
+                ops.push(Self::make_op(
+                    Opcode::CreateBtree,
+                    0,
+                    reg_root_page,
+                    BTREE_INTKEY as i32,
+                    P4::Unused,
+                ));
+                ops.push(Self::make_op(
+                    Opcode::ParseSchema,
+                    0,
+                    reg_root_page,
+                    0,
+                    P4::Text(sql.clone()),
+                ));
+                self.append_sqlite_master_insert(
+                    &mut ops,
+                    sqlite_master_cursor,
+                    &table_name,
+                    reg_root_page,
+                    &sql,
+                );
+            }
+        }
 
         ops.push(Self::make_op(
             Opcode::Integer,
@@ -986,7 +1012,100 @@ impl<'s> StatementCompiler<'s> {
         tables
     }
 
+    fn build_fts5_shadow_tables(&self, create: &CreateVirtualTableStmt) -> Vec<(String, String)> {
+        let (columns, has_content, internal_content) =
+            self.parse_fts5_virtual_columns(&create.args);
+        let mut tables = Vec::new();
+        let name = &create.name.name;
+
+        if has_content && internal_content {
+            let table_name = format!("{}_content", name);
+            let mut sql = format!("CREATE TABLE {} (id INTEGER PRIMARY KEY", table_name);
+            for (idx, _) in columns.iter().enumerate() {
+                sql.push_str(", c");
+                sql.push_str(&idx.to_string());
+            }
+            sql.push(')');
+            tables.push((table_name, sql));
+        }
+
+        let data_name = format!("{}_data", name);
+        tables.push((
+            data_name.clone(),
+            format!(
+                "CREATE TABLE {} (id INTEGER PRIMARY KEY, block BLOB)",
+                data_name
+            ),
+        ));
+        let idx_name = format!("{}_idx", name);
+        tables.push((
+            idx_name.clone(),
+            format!("CREATE TABLE {} (segid, term, pgno)", idx_name),
+        ));
+        let docsize_name = format!("{}_docsize", name);
+        tables.push((
+            docsize_name.clone(),
+            format!(
+                "CREATE TABLE {} (id INTEGER PRIMARY KEY, sz BLOB)",
+                docsize_name
+            ),
+        ));
+        let config_name = format!("{}_config", name);
+        tables.push((
+            config_name.clone(),
+            format!("CREATE TABLE {} (k PRIMARY KEY, v)", config_name),
+        ));
+
+        tables
+    }
+
     fn parse_fts3_virtual_columns(&self, args: &[String]) -> (Vec<String>, bool, bool) {
+        let mut columns = Vec::new();
+        let mut has_content = true;
+        let mut internal_content = true;
+        let mut pending_prefix = false;
+
+        for arg in args {
+            let trimmed = arg.trim();
+            if let Some(value) = trimmed.strip_prefix("content=") {
+                let value = value.trim();
+                if value.eq_ignore_ascii_case("none") {
+                    has_content = false;
+                    internal_content = false;
+                } else {
+                    has_content = true;
+                    internal_content = false;
+                }
+            } else if let Some(value) = trimmed.strip_prefix("CONTENT=") {
+                let value = value.trim();
+                if value.eq_ignore_ascii_case("none") {
+                    has_content = false;
+                    internal_content = false;
+                } else {
+                    has_content = true;
+                    internal_content = false;
+                }
+            } else if trimmed.starts_with("prefix=") || trimmed.starts_with("PREFIX=") {
+                pending_prefix = true;
+            } else if trimmed.starts_with("tokenize=") || trimmed.starts_with("TOKENIZE=") {
+                continue;
+            } else if pending_prefix {
+                if trimmed.parse::<i32>().is_ok() {
+                    continue;
+                }
+                pending_prefix = false;
+                if !trimmed.contains('=') {
+                    columns.push(trimmed.to_string());
+                }
+            } else if !trimmed.contains('=') {
+                columns.push(trimmed.to_string());
+            }
+        }
+
+        (columns, has_content, internal_content)
+    }
+
+    fn parse_fts5_virtual_columns(&self, args: &[String]) -> (Vec<String>, bool, bool) {
         let mut columns = Vec::new();
         let mut has_content = true;
         let mut internal_content = true;

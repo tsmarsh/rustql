@@ -702,6 +702,17 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
                 crate::fts3::register_table(table);
             }
         }
+        #[cfg(feature = "fts5")]
+        {
+            if module_name.eq_ignore_ascii_case("fts5") {
+                let table = crate::fts5::Fts5Table::from_virtual_spec(
+                    table_name.clone(),
+                    "main",
+                    &module_args,
+                );
+                crate::fts5::register_table(table);
+            }
+        }
 
         if module_name.eq_ignore_ascii_case("fts3tokenize") {
             columns = ["input", "token", "start", "end", "position"]

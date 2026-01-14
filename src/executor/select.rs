@@ -1317,6 +1317,9 @@ impl<'s> SelectCompiler<'s> {
         if self.is_fts3tokenize_table() {
             return self.split_fts3_tokenize_filter(expr);
         }
+        if self.is_fts5_table() {
+            return self.split_fts5_match_filter(expr);
+        }
         self.split_fts3_match_filter(expr)
     }
 
@@ -1406,6 +1409,72 @@ impl<'s> SelectCompiler<'s> {
         (None, Some(expr.clone()))
     }
 
+    fn split_fts5_match_filter(&self, expr: &Expr) -> (Option<Fts3MatchFilter>, Option<Expr>) {
+        if let Some(filter) = self.extract_fts5_match_filter(expr) {
+            return (Some(filter), None);
+        }
+        if let Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } = expr
+        {
+            if let (Some(left_filter), Some(right_filter)) = (
+                self.extract_fts5_match_filter(left),
+                self.extract_fts5_match_filter(right),
+            ) {
+                if let (Some(left_text), Some(right_text)) = (
+                    filter_literal_text(&left_filter.pattern),
+                    filter_literal_text(&right_filter.pattern),
+                ) {
+                    return (
+                        Some(Fts3MatchFilter {
+                            cursor: left_filter.cursor,
+                            pattern: Expr::Literal(Literal::String(format!(
+                                "{} AND {}",
+                                left_text, right_text
+                            ))),
+                        }),
+                        None,
+                    );
+                }
+            }
+            if let Some(filter) = self.extract_fts5_match_filter(left) {
+                return (Some(filter), Some(*right.clone()));
+            }
+            if let Some(filter) = self.extract_fts5_match_filter(right) {
+                return (Some(filter), Some(*left.clone()));
+            }
+        } else if let Expr::Binary {
+            op: BinaryOp::Or,
+            left,
+            right,
+        } = expr
+        {
+            if let (Some(left_filter), Some(right_filter)) = (
+                self.extract_fts5_match_filter(left),
+                self.extract_fts5_match_filter(right),
+            ) {
+                if let (Some(left_text), Some(right_text)) = (
+                    filter_literal_text(&left_filter.pattern),
+                    filter_literal_text(&right_filter.pattern),
+                ) {
+                    return (
+                        Some(Fts3MatchFilter {
+                            cursor: left_filter.cursor,
+                            pattern: Expr::Literal(Literal::String(format!(
+                                "{} OR {}",
+                                left_text, right_text
+                            ))),
+                        }),
+                        None,
+                    );
+                }
+            }
+        }
+        (None, Some(expr.clone()))
+    }
+
     fn extract_fts3_match_filter(&self, expr: &Expr) -> Option<Fts3MatchFilter> {
         if self.tables.len() != 1 {
             return None;
@@ -1420,6 +1489,51 @@ impl<'s> SelectCompiler<'s> {
             .as_ref()
             .map(|name| name.to_ascii_lowercase())?;
         if module != "fts3" {
+            return None;
+        }
+
+        if let Expr::Like {
+            expr: left,
+            pattern,
+            op: LikeOp::Match,
+            negated: false,
+            ..
+        } = expr
+        {
+            match left.as_ref() {
+                Expr::Column(col) => {
+                    if let Some(ref table_name) = col.table {
+                        if !table_name.eq_ignore_ascii_case(&table.table_name) {
+                            return None;
+                        }
+                    } else if !col.column.eq_ignore_ascii_case(&table.table_name) {
+                        return None;
+                    }
+                    return Some(Fts3MatchFilter {
+                        cursor: table.cursor,
+                        pattern: (*pattern.clone()),
+                    });
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn extract_fts5_match_filter(&self, expr: &Expr) -> Option<Fts3MatchFilter> {
+        if self.tables.len() != 1 {
+            return None;
+        }
+        let table = self.tables.first()?;
+        let schema_table = table.schema_table.as_ref()?;
+        if !schema_table.is_virtual {
+            return None;
+        }
+        let module = schema_table
+            .virtual_module
+            .as_ref()
+            .map(|name| name.to_ascii_lowercase())?;
+        if module != "fts5" {
             return None;
         }
 
@@ -1501,6 +1615,20 @@ impl<'s> SelectCompiler<'s> {
             .virtual_module
             .as_ref()
             .map(|name| name.eq_ignore_ascii_case("fts3tokenize"))
+            .unwrap_or(false)
+    }
+
+    fn is_fts5_table(&self) -> bool {
+        let Some(table) = self.tables.first() else {
+            return false;
+        };
+        let Some(schema_table) = table.schema_table.as_ref() else {
+            return false;
+        };
+        schema_table
+            .virtual_module
+            .as_ref()
+            .map(|name| name.eq_ignore_ascii_case("fts5"))
             .unwrap_or(false)
     }
 

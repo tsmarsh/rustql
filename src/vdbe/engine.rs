@@ -1377,6 +1377,7 @@ impl Vdbe {
                             .and_then(|table| table.virtual_module.clone())
                     })
                 });
+                let mut new_vtab_query: Option<String> = None;
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if cursor.is_virtual {
                         #[allow(unused_variables)]
@@ -1432,14 +1433,45 @@ impl Vdbe {
                                                 }
                                             }
                                         }
-                                        self.vtab_query =
-                                            if query.is_empty() { None } else { Some(query) };
+                                        new_vtab_query = if query.is_empty() {
+                                            None
+                                        } else {
+                                            Some(query.clone())
+                                        };
+                                    }
+                                }
+                            }
+                            #[cfg(feature = "fts5")]
+                            {
+                                if let Some(module) = vtab_module.as_ref() {
+                                    if module.eq_ignore_ascii_case("fts5") {
+                                        if let Some(table) = crate::fts5::get_table(vtab_name) {
+                                            if let Ok(table) = table.lock() {
+                                                if let Ok(rowids) = table.query_rowids(&query) {
+                                                    cursor.vtab_rowids = rowids;
+                                                    cursor.vtab_row_index = 0;
+                                                    if cursor.vtab_rowids.is_empty() {
+                                                        cursor.state = CursorState::AtEnd;
+                                                        cursor.rowid = None;
+                                                    } else {
+                                                        cursor.state = CursorState::Valid;
+                                                        cursor.rowid = Some(cursor.vtab_rowids[0]);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        new_vtab_query = if query.is_empty() {
+                                            None
+                                        } else {
+                                            Some(query.clone())
+                                        };
                                     }
                                 }
                             }
                         }
                     }
                 }
+                self.vtab_query = new_vtab_query;
             }
 
             Opcode::OpenEphemeral => {
@@ -1500,6 +1532,18 @@ impl Vdbe {
                                                             )?;
                                                         }
                                                     }
+                                                    cursor.vtab_rowids = table.all_rowids();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                #[cfg(feature = "fts5")]
+                                {
+                                    if let Some(module) = vtab_module.as_ref() {
+                                        if module.eq_ignore_ascii_case("fts5") {
+                                            if let Some(table) = crate::fts5::get_table(vtab_name) {
+                                                if let Ok(table) = table.lock() {
                                                     cursor.vtab_rowids = table.all_rowids();
                                                 }
                                             }
@@ -1826,6 +1870,30 @@ impl Vdbe {
                                                             .map(|vals| vals.to_vec())
                                                     };
                                                 if let Some(values) = values {
+                                                    if let Some(value) = values.get(col_idx) {
+                                                        result = Mem::from_str(value);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            #[cfg(feature = "fts5")]
+                            {
+                                let schema = self.schema.clone();
+                                let module = schema.as_ref().and_then(|schema| {
+                                    schema
+                                        .read()
+                                        .ok()
+                                        .and_then(|guard| guard.table(vtab_name))
+                                        .and_then(|table| table.virtual_module.clone())
+                                });
+                                if let Some(module) = module {
+                                    if module.eq_ignore_ascii_case("fts5") {
+                                        if let Some(table) = crate::fts5::get_table(vtab_name) {
+                                            if let Ok(table) = table.lock() {
+                                                if let Some(values) = table.row_values(rowid) {
                                                     if let Some(value) = values.get(col_idx) {
                                                         result = Mem::from_str(value);
                                                     }
@@ -2232,6 +2300,7 @@ impl Vdbe {
 
                 let btree = self.btree.clone();
                 let schema = self.schema.clone();
+                let record_mems = self.decode_record_mems(&record_data);
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     cursor.rowid = Some(rowid);
 
@@ -2241,7 +2310,7 @@ impl Vdbe {
                             {
                                 if let Some(table) = crate::fts3::get_table(vtab_name) {
                                     if let Ok(mut table) = table.lock() {
-                                        let mut mems = self.decode_record_mems(&record_data);
+                                        let mut mems = record_mems.clone();
                                         let column_count = table.columns.len();
                                         if column_count > 0 {
                                             mems.truncate(column_count);
@@ -2268,6 +2337,24 @@ impl Vdbe {
                                             table.insert(rowid, &refs)
                                         };
                                         let _ = result;
+                                    }
+                                }
+                            }
+                            #[cfg(feature = "fts5")]
+                            {
+                                if let Some(table) = crate::fts5::get_table(vtab_name) {
+                                    if let Ok(mut table) = table.lock() {
+                                        let mut mems = record_mems.clone();
+                                        let column_count = table.columns.len();
+                                        if column_count > 0 {
+                                            mems.truncate(column_count);
+                                            mems.resize_with(column_count, Mem::new);
+                                        }
+                                        let values: Vec<String> =
+                                            mems.iter().map(|mem| mem.to_str()).collect();
+                                        let refs: Vec<&str> =
+                                            values.iter().map(|value| value.as_str()).collect();
+                                        let _ = table.insert(rowid, &refs);
                                     }
                                 }
                             }
@@ -2447,6 +2534,22 @@ impl Vdbe {
                                                         table.delete(rowid, &refs)
                                                     };
                                                 let _ = result;
+                                            }
+                                        }
+                                    }
+                                }
+                                #[cfg(feature = "fts5")]
+                                {
+                                    if let Some(table) = crate::fts5::get_table(vtab_name) {
+                                        if let Ok(mut table) = table.lock() {
+                                            let values: Option<Vec<String>> =
+                                                table.row_values(rowid).map(|v| v.to_vec());
+                                            if let Some(values) = values {
+                                                let refs: Vec<&str> = values
+                                                    .iter()
+                                                    .map(|value| value.as_str())
+                                                    .collect();
+                                                let _ = table.delete(rowid, &refs);
                                             }
                                         }
                                     }

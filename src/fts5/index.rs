@@ -410,15 +410,8 @@ impl Fts5Segment {
         }
 
         let mut entries = decode_doclist(doclist)?;
-        if let Some(last) = entries.last() {
-            if entry.rowid <= last.rowid {
-                return Err(Error::with_message(
-                    ErrorCode::Corrupt,
-                    "doclist rowids must be strictly increasing",
-                ));
-            }
-        }
         entries.push(entry);
+        normalize_doclist_entries(&mut entries);
         *doclist = encode_doclist(&entries)?;
         Ok(())
     }
@@ -492,6 +485,28 @@ impl Fts5Index {
         merge_doclists(&doclists)
     }
 
+    pub fn lookup_prefix(&self, prefix: &[u8]) -> Result<Vec<Fts5DoclistEntry>> {
+        let mut doclists = Vec::new();
+        for level in &self.levels {
+            for segment in level {
+                for (term, doclist) in segment.term_doclists() {
+                    if term.starts_with(prefix) {
+                        doclists.push(doclist.clone());
+                    }
+                }
+            }
+        }
+        for (term, doclist) in self.pending.term_doclists() {
+            if term.starts_with(prefix) {
+                doclists.push(doclist.clone());
+            }
+        }
+        if doclists.is_empty() {
+            return Ok(Vec::new());
+        }
+        merge_doclists(&doclists)
+    }
+
     fn merge_level(&mut self, level: usize) -> Result<()> {
         if level >= self.levels.len() {
             return Ok(());
@@ -546,12 +561,37 @@ fn merge_doclists(doclists: &[Vec<u8>]) -> Result<Vec<Fts5DoclistEntry>> {
             if last.rowid == entry.rowid {
                 last.deleted |= entry.deleted;
                 last.positions.extend(entry.positions);
+                normalize_positions(&mut last.positions);
                 continue;
             }
         }
         merged.push(entry);
     }
     Ok(merged)
+}
+
+fn normalize_doclist_entries(entries: &mut Vec<Fts5DoclistEntry>) {
+    entries.sort_by_key(|entry| entry.rowid);
+    let mut out: Vec<Fts5DoclistEntry> = Vec::new();
+    for entry in entries.drain(..) {
+        if let Some(last) = out.last_mut() {
+            if last.rowid == entry.rowid {
+                last.deleted |= entry.deleted;
+                last.positions.extend(entry.positions);
+                normalize_positions(&mut last.positions);
+                continue;
+            }
+        }
+        let mut entry = entry;
+        normalize_positions(&mut entry.positions);
+        out.push(entry);
+    }
+    *entries = out;
+}
+
+fn normalize_positions(positions: &mut Vec<Fts5Position>) {
+    positions.sort_by(|a, b| (a.column, a.offset).cmp(&(b.column, b.offset)));
+    positions.dedup_by(|a, b| a.column == b.column && a.offset == b.offset);
 }
 
 fn encode_poslist(positions: &[Fts5Position]) -> Result<Vec<u8>> {

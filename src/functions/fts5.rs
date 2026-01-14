@@ -254,7 +254,8 @@ pub fn func_snippet(args: &[Value]) -> Result<Value> {
     let expr = fts5::expr::parse_query(&query, table.tokenizer.as_ref())?;
 
     let mut chosen = None;
-    let mut best_hits = 0usize;
+    let mut best_score = 0usize;
+    let mut best_start = usize::MAX;
     for (idx, text) in values.iter().enumerate() {
         if col >= 0 && idx != col as usize {
             continue;
@@ -264,23 +265,28 @@ pub fn func_snippet(args: &[Value]) -> Result<Value> {
         if matches.is_empty() {
             continue;
         }
-        let hits = matches.len();
-        if hits > best_hits {
-            best_hits = hits;
-            chosen = Some((text.clone(), tokens, matches));
+        let (start_token, end_token, score) =
+            best_snippet_window(tokens.len(), &matches, max_tokens);
+        if score == 0 {
+            continue;
+        }
+        if score > best_score || (score == best_score && start_token < best_start) {
+            best_score = score;
+            best_start = start_token;
+            chosen = Some((text.clone(), tokens, matches, start_token, end_token));
             if col >= 0 {
                 break;
             }
         }
     }
 
-    let Some((text, tokens, matches)) = chosen else {
+    let Some((text, tokens, matches, start_token, end_token)) = chosen else {
         return Ok(Value::Text(String::new()));
     };
 
-    let first_hit = matches[0];
-    let start_token = first_hit.saturating_sub(max_tokens / 2);
-    let end_token = (start_token + max_tokens).min(tokens.len());
+    if tokens.is_empty() {
+        return Ok(Value::Text(String::new()));
+    }
     let start_byte = tokens[start_token].start;
     let end_byte = tokens[end_token - 1].end;
 
@@ -445,6 +451,44 @@ fn apply_highlight(
         out.push_str(&text[last..]);
     }
     out
+}
+
+fn best_snippet_window(
+    token_count: usize,
+    matches: &[usize],
+    max_tokens: usize,
+) -> (usize, usize, usize) {
+    if token_count == 0 || matches.is_empty() || max_tokens == 0 {
+        return (0, 0, 0);
+    }
+    if token_count <= max_tokens {
+        return (0, token_count, matches.len());
+    }
+
+    let mut hit_flags = vec![0u8; token_count];
+    for &idx in matches {
+        if idx < token_count {
+            hit_flags[idx] = 1;
+        }
+    }
+
+    let mut prefix = vec![0usize; token_count + 1];
+    for i in 0..token_count {
+        prefix[i + 1] = prefix[i] + hit_flags[i] as usize;
+    }
+
+    let mut best_start = 0usize;
+    let mut best_score = 0usize;
+    for start in 0..=token_count - max_tokens {
+        let end = start + max_tokens;
+        let score = prefix[end] - prefix[start];
+        if score > best_score {
+            best_score = score;
+            best_start = start;
+        }
+    }
+
+    (best_start, best_start + max_tokens, best_score)
 }
 
 fn count_tokens(table: &fts5::Fts5Table, values: &[String]) -> Result<usize> {

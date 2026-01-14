@@ -142,6 +142,10 @@ pub struct SelectCompiler<'s> {
     limit_done_label: Option<i32>,
     /// ORDER BY terms (when outputting to sorter)
     order_by_terms: Option<Vec<OrderingTerm>>,
+    /// Finalized aggregate result registers (for nested aggregate expressions)
+    agg_final_regs: Vec<i32>,
+    /// Current index into agg_final_regs when compiling expressions
+    agg_final_idx: usize,
 }
 
 impl<'s> SelectCompiler<'s> {
@@ -166,6 +170,8 @@ impl<'s> SelectCompiler<'s> {
             offset_counter_reg: None,
             limit_done_label: None,
             order_by_terms: None,
+            agg_final_regs: Vec::new(),
+            agg_final_idx: 0,
         }
     }
 
@@ -190,6 +196,8 @@ impl<'s> SelectCompiler<'s> {
             offset_counter_reg: None,
             limit_done_label: None,
             order_by_terms: None,
+            agg_final_regs: Vec::new(),
+            agg_final_idx: 0,
         }
     }
 
@@ -1724,26 +1732,48 @@ impl<'s> SelectCompiler<'s> {
                 }
             }
             Expr::Function(func_call) => {
-                // Compile function arguments
-                let arg_base = self.next_reg;
-                let argc = match &func_call.args {
-                    crate::parser::ast::FunctionArgs::Exprs(exprs) => {
-                        for arg in exprs {
-                            let reg = self.alloc_reg();
-                            self.compile_expr(arg, reg)?;
-                        }
-                        exprs.len()
-                    }
+                // Check if this is an aggregate function with pre-computed results
+                let name_upper = func_call.name.to_uppercase();
+                let arg_count = match &func_call.args {
+                    crate::parser::ast::FunctionArgs::Exprs(exprs) => exprs.len(),
                     crate::parser::ast::FunctionArgs::Star => 0,
                 };
+                // MIN/MAX with multiple args are scalar functions
+                let is_multi_arg_min_max =
+                    matches!(name_upper.as_str(), "MIN" | "MAX") && arg_count > 1;
+                let is_aggregate = !is_multi_arg_min_max
+                    && matches!(
+                        name_upper.as_str(),
+                        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
+                    );
 
-                self.emit(
-                    Opcode::Function,
-                    argc as i32,
-                    arg_base,
-                    dest_reg,
-                    P4::Text(func_call.name.clone()),
-                );
+                if is_aggregate && self.agg_final_idx < self.agg_final_regs.len() {
+                    // Use pre-computed aggregate result
+                    let agg_reg = self.agg_final_regs[self.agg_final_idx];
+                    self.agg_final_idx += 1;
+                    self.emit(Opcode::Copy, agg_reg, dest_reg, 0, P4::Unused);
+                } else {
+                    // Compile as scalar function
+                    let arg_base = self.next_reg;
+                    let argc = match &func_call.args {
+                        crate::parser::ast::FunctionArgs::Exprs(exprs) => {
+                            for arg in exprs {
+                                let reg = self.alloc_reg();
+                                self.compile_expr(arg, reg)?;
+                            }
+                            exprs.len()
+                        }
+                        crate::parser::ast::FunctionArgs::Star => 0,
+                    };
+
+                    self.emit(
+                        Opcode::Function,
+                        argc as i32,
+                        arg_base,
+                        dest_reg,
+                        P4::Text(func_call.name.clone()),
+                    );
+                }
             }
             Expr::IsNull {
                 expr: inner,
@@ -2273,74 +2303,105 @@ impl<'s> SelectCompiler<'s> {
         let mut agg_idx = 0;
         for col in columns {
             if let ResultColumn::Expr { expr, .. } = col {
-                if let Expr::Function(func_call) = expr {
-                    let name_upper = func_call.name.to_uppercase();
-                    if matches!(
-                        name_upper.as_str(),
-                        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
-                    ) {
-                        let reg = agg_regs[agg_idx];
+                self.accumulate_aggregates_in_expr(expr, agg_regs, &mut agg_idx)?;
+            }
+        }
+        Ok(())
+    }
 
-                        // Validate argument count for aggregate functions
-                        let arg_count = match &func_call.args {
-                            crate::parser::ast::FunctionArgs::Exprs(exprs) => exprs.len(),
-                            crate::parser::ast::FunctionArgs::Star => 0, // COUNT(*)
-                        };
+    /// Recursively accumulate aggregates in an expression
+    fn accumulate_aggregates_in_expr(
+        &mut self,
+        expr: &Expr,
+        agg_regs: &[i32],
+        agg_idx: &mut usize,
+    ) -> Result<()> {
+        match expr {
+            Expr::Function(func_call) => {
+                let name_upper = func_call.name.to_uppercase();
+                let arg_count = match &func_call.args {
+                    crate::parser::ast::FunctionArgs::Exprs(exprs) => exprs.len(),
+                    crate::parser::ast::FunctionArgs::Star => 0,
+                };
 
-                        // Check argument count limits
-                        // MIN/MAX with multiple args are scalar functions, not aggregates - skip them
-                        let (min_args, max_args, skip_if_exceeded) = match name_upper.as_str() {
-                            "COUNT" => (0, 1, false),
-                            "SUM" | "AVG" | "TOTAL" => (1, 1, false),
-                            "MIN" | "MAX" => (1, 1, true), // Multi-arg MIN/MAX are scalar functions
-                            "GROUP_CONCAT" => (1, 2, false),
-                            _ => (0, 255, false),
-                        };
+                // Check if this is an aggregate function
+                let is_multi_arg_min_max =
+                    matches!(name_upper.as_str(), "MIN" | "MAX") && arg_count > 1;
+                if is_multi_arg_min_max {
+                    return Ok(()); // Scalar function
+                }
 
-                        if arg_count < min_args {
-                            return Err(crate::error::Error::with_message(
-                                crate::error::ErrorCode::Error,
-                                format!(
-                                    "wrong number of arguments to function {}()",
-                                    name_upper.to_lowercase()
-                                ),
-                            ));
-                        }
-
-                        if arg_count > max_args {
-                            if skip_if_exceeded {
-                                // This is a scalar function (e.g., MIN(a, b, c)), not aggregate
-                                continue;
-                            }
-                            return Err(crate::error::Error::with_message(
-                                crate::error::ErrorCode::Error,
-                                format!(
-                                    "wrong number of arguments to function {}()",
-                                    name_upper.to_lowercase()
-                                ),
-                            ));
-                        }
-
-                        // Compile argument
-                        let arg_reg = self.alloc_reg();
-                        let mut has_arg = false;
-                        if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
-                            if !exprs.is_empty() {
-                                self.compile_expr(&exprs[0], arg_reg)?;
-                                has_arg = true;
-                            }
-                        }
-                        // For COUNT(*), initialize arg_reg with 1 so it's not NULL
-                        if !has_arg && name_upper == "COUNT" {
-                            self.emit(Opcode::Integer, 1, arg_reg, 0, P4::Unused);
-                        }
-
-                        // Emit aggregate step opcode
-                        self.emit(Opcode::AggStep, arg_reg, reg, 0, P4::Text(name_upper));
-                        agg_idx += 1;
+                if matches!(
+                    name_upper.as_str(),
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
+                ) {
+                    if *agg_idx >= agg_regs.len() {
+                        return Ok(()); // No more aggregate registers
                     }
+                    let reg = agg_regs[*agg_idx];
+
+                    // Check argument count limits
+                    let (min_args, max_args, skip_if_exceeded) = match name_upper.as_str() {
+                        "COUNT" => (0, 1, false),
+                        "SUM" | "AVG" | "TOTAL" => (1, 1, false),
+                        "MIN" | "MAX" => (1, 1, true),
+                        "GROUP_CONCAT" => (1, 2, false),
+                        _ => (0, 255, false),
+                    };
+
+                    if arg_count < min_args {
+                        return Err(crate::error::Error::with_message(
+                            crate::error::ErrorCode::Error,
+                            format!(
+                                "wrong number of arguments to function {}()",
+                                name_upper.to_lowercase()
+                            ),
+                        ));
+                    }
+
+                    if arg_count > max_args {
+                        if skip_if_exceeded {
+                            return Ok(());
+                        }
+                        return Err(crate::error::Error::with_message(
+                            crate::error::ErrorCode::Error,
+                            format!(
+                                "wrong number of arguments to function {}()",
+                                name_upper.to_lowercase()
+                            ),
+                        ));
+                    }
+
+                    // Compile argument
+                    let arg_reg = self.alloc_reg();
+                    let mut has_arg = false;
+                    if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
+                        if !exprs.is_empty() {
+                            self.compile_expr(&exprs[0], arg_reg)?;
+                            has_arg = true;
+                        }
+                    }
+                    // For COUNT(*), initialize arg_reg with 1 so it's not NULL
+                    if !has_arg && name_upper == "COUNT" {
+                        self.emit(Opcode::Integer, 1, arg_reg, 0, P4::Unused);
+                    }
+
+                    // Emit aggregate step opcode
+                    self.emit(Opcode::AggStep, arg_reg, reg, 0, P4::Text(name_upper));
+                    *agg_idx += 1;
                 }
             }
+            Expr::Binary { left, right, .. } => {
+                self.accumulate_aggregates_in_expr(left, agg_regs, agg_idx)?;
+                self.accumulate_aggregates_in_expr(right, agg_regs, agg_idx)?;
+            }
+            Expr::Unary { expr: inner, .. } => {
+                self.accumulate_aggregates_in_expr(inner, agg_regs, agg_idx)?;
+            }
+            Expr::Parens(inner) => {
+                self.accumulate_aggregates_in_expr(inner, agg_regs, agg_idx)?;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -2378,6 +2439,32 @@ impl<'s> SelectCompiler<'s> {
                     } else {
                         self.compile_expr(expr, dest_reg)?;
                     }
+                } else if self.expr_has_aggregate(expr) {
+                    // Expression contains nested aggregates - finalize them first
+                    let num_aggs = self.count_aggregates_in_expr(expr);
+                    self.agg_final_regs.clear();
+                    self.agg_final_idx = 0;
+
+                    // Emit AggFinal for each aggregate in this expression
+                    for _ in 0..num_aggs {
+                        if agg_idx < agg_regs.len() {
+                            let agg_reg = agg_regs[agg_idx];
+                            let result_reg = self.alloc_reg();
+                            // Get the aggregate name for this index
+                            let agg_name =
+                                self.get_aggregate_name_at_index(expr, self.agg_final_regs.len());
+                            self.emit(Opcode::AggFinal, agg_reg, result_reg, 0, P4::Text(agg_name));
+                            self.agg_final_regs.push(result_reg);
+                            agg_idx += 1;
+                        }
+                    }
+
+                    // Now compile the expression - it will use agg_final_regs
+                    self.compile_expr(expr, dest_reg)?;
+
+                    // Clear the aggregate context
+                    self.agg_final_regs.clear();
+                    self.agg_final_idx = 0;
                 } else {
                     self.compile_expr(expr, dest_reg)?;
                 }
@@ -2386,6 +2473,81 @@ impl<'s> SelectCompiler<'s> {
         }
 
         Ok((base_reg, count))
+    }
+
+    /// Count aggregates in an expression
+    fn count_aggregates_in_expr(&self, expr: &Expr) -> usize {
+        match expr {
+            Expr::Function(func_call) => {
+                let name_upper = func_call.name.to_uppercase();
+                let arg_count = match &func_call.args {
+                    crate::parser::ast::FunctionArgs::Exprs(exprs) => exprs.len(),
+                    crate::parser::ast::FunctionArgs::Star => 0,
+                };
+                let is_multi_arg_min_max =
+                    matches!(name_upper.as_str(), "MIN" | "MAX") && arg_count > 1;
+                if !is_multi_arg_min_max
+                    && matches!(
+                        name_upper.as_str(),
+                        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
+                    )
+                {
+                    1
+                } else {
+                    0
+                }
+            }
+            Expr::Binary { left, right, .. } => {
+                self.count_aggregates_in_expr(left) + self.count_aggregates_in_expr(right)
+            }
+            Expr::Unary { expr, .. } => self.count_aggregates_in_expr(expr),
+            Expr::Parens(inner) => self.count_aggregates_in_expr(inner),
+            _ => 0,
+        }
+    }
+
+    /// Get the name of the aggregate function at a given index in expression traversal order
+    fn get_aggregate_name_at_index(&self, expr: &Expr, target_idx: usize) -> String {
+        let mut current_idx = 0;
+        self.find_aggregate_name(expr, target_idx, &mut current_idx)
+            .unwrap_or_else(|| "COUNT".to_string())
+    }
+
+    fn find_aggregate_name(
+        &self,
+        expr: &Expr,
+        target_idx: usize,
+        current_idx: &mut usize,
+    ) -> Option<String> {
+        match expr {
+            Expr::Function(func_call) => {
+                let name_upper = func_call.name.to_uppercase();
+                let arg_count = match &func_call.args {
+                    crate::parser::ast::FunctionArgs::Exprs(exprs) => exprs.len(),
+                    crate::parser::ast::FunctionArgs::Star => 0,
+                };
+                let is_multi_arg_min_max =
+                    matches!(name_upper.as_str(), "MIN" | "MAX") && arg_count > 1;
+                if !is_multi_arg_min_max
+                    && matches!(
+                        name_upper.as_str(),
+                        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
+                    )
+                {
+                    if *current_idx == target_idx {
+                        return Some(name_upper);
+                    }
+                    *current_idx += 1;
+                }
+                None
+            }
+            Expr::Binary { left, right, .. } => self
+                .find_aggregate_name(left, target_idx, current_idx)
+                .or_else(|| self.find_aggregate_name(right, target_idx, current_idx)),
+            Expr::Unary { expr, .. } => self.find_aggregate_name(expr, target_idx, current_idx),
+            Expr::Parens(inner) => self.find_aggregate_name(inner, target_idx, current_idx),
+            _ => None,
+        }
     }
 
     fn reset_aggregates(&mut self, agg_regs: &[i32]) -> Result<()> {

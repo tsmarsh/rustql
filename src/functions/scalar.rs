@@ -10,6 +10,8 @@ use super::datetime::{
     func_current_date, func_current_time, func_current_timestamp, func_date, func_datetime,
     func_julianday, func_strftime, func_time, func_unixepoch,
 };
+#[cfg(feature = "fts3")]
+use super::fts3::{func_offsets, func_snippet};
 use super::printf::printf_format;
 
 // ============================================================================
@@ -73,6 +75,11 @@ pub fn get_scalar_function(name: &str) -> Option<ScalarFunc> {
         "CURRENT_DATE" => Some(func_current_date),
         "CURRENT_TIME" => Some(func_current_time),
         "CURRENT_TIMESTAMP" => Some(func_current_timestamp),
+
+        #[cfg(feature = "fts3")]
+        "SNIPPET" => Some(func_snippet),
+        #[cfg(feature = "fts3")]
+        "OFFSETS" => Some(func_offsets),
 
         _ => None,
     }

@@ -1746,27 +1746,31 @@ impl Vdbe {
             // Function Call (placeholder)
             // ================================================================
             Opcode::Function | Opcode::Function0 => {
-                // Placeholder: Would call the function
-                if let P4::FuncDef(ref name) = op.p4 {
-                    // Simple built-in function handling
-                    match name.as_str() {
-                        "current_time" => {
-                            // Placeholder time
-                            self.mem_mut(op.p2).set_str("12:00:00");
+                let name = match &op.p4 {
+                    P4::Text(text) => Some(text.as_str()),
+                    P4::FuncDef(text) => Some(text.as_str()),
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    if let Some(func) = crate::functions::get_scalar_function(name) {
+                        let argc = op.p1.max(0) as usize;
+                        let arg_base = op.p2;
+                        let mut args = Vec::with_capacity(argc);
+                        for i in 0..argc {
+                            let mem = self.mem(arg_base + i as i32);
+                            args.push(mem.to_value());
                         }
-                        "current_date" => {
-                            self.mem_mut(op.p2).set_str("2024-01-01");
+                        match func(&args) {
+                            Ok(value) => {
+                                *self.mem_mut(op.p3) = Mem::from_value(&value);
+                            }
+                            Err(_) => self.mem_mut(op.p3).set_null(),
                         }
-                        "current_timestamp" => {
-                            self.mem_mut(op.p2).set_str("2024-01-01 12:00:00");
-                        }
-                        _ => {
-                            // Unknown function returns NULL
-                            self.mem_mut(op.p2).set_null();
-                        }
+                    } else {
+                        self.mem_mut(op.p3).set_null();
                     }
                 } else {
-                    self.mem_mut(op.p2).set_null();
+                    self.mem_mut(op.p3).set_null();
                 }
             }
 

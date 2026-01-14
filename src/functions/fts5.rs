@@ -30,6 +30,16 @@ fn value_to_i64(value: &Value) -> i64 {
     }
 }
 
+fn value_to_f64(value: &Value) -> f64 {
+    match value {
+        Value::Integer(i) => *i as f64,
+        Value::Real(r) => *r,
+        Value::Text(s) => s.parse::<f64>().unwrap_or(0.0),
+        Value::Blob(b) => String::from_utf8_lossy(b).parse::<f64>().unwrap_or(0.0),
+        Value::Null => 0.0,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Fts5Context {
     table: String,
@@ -59,7 +69,7 @@ fn get_fts5_context() -> Option<Fts5Context> {
     guard.clone()
 }
 
-pub fn func_bm25(_args: &[Value]) -> Result<Value> {
+pub fn func_bm25(args: &[Value]) -> Result<Value> {
     let Some(ctx) = get_fts5_context() else {
         return Err(Error::with_message(
             ErrorCode::Error,
@@ -84,24 +94,62 @@ pub fn func_bm25(_args: &[Value]) -> Result<Value> {
     }
 
     let expr = fts5::expr::parse_query(&query, table.tokenizer.as_ref())?;
-    let (terms, prefixes) = collect_terms(&expr);
-    if terms.is_empty() && prefixes.is_empty() {
+    let phrases = collect_phrases(&expr);
+    if phrases.is_empty() {
         return Ok(Value::Real(0.0));
     }
 
-    let mut score = 0.0;
-    for value in values {
-        let tokens = table.tokenize(value)?;
-        for token in tokens {
-            if terms.iter().any(|term| term == &token.text) {
-                score += 1.0;
-            } else if prefixes.iter().any(|prefix| token.text.starts_with(prefix)) {
-                score += 1.0;
-            }
-        }
+    let rowids = table.all_rowids();
+    if rowids.is_empty() {
+        return Ok(Value::Real(0.0));
     }
 
-    Ok(Value::Real(score))
+    let avgdl = {
+        let mut total_tokens = 0usize;
+        for rowid in &rowids {
+            if let Some(row_values) = table.row_values(*rowid) {
+                total_tokens += count_tokens(&table, row_values)?;
+            }
+        }
+        if total_tokens == 0 {
+            return Ok(Value::Real(0.0));
+        }
+        total_tokens as f64 / rowids.len() as f64
+    };
+
+    let doc_len = count_tokens(&table, values)? as f64;
+    if doc_len == 0.0 {
+        return Ok(Value::Real(0.0));
+    }
+
+    let weights: Vec<f64> = args.iter().map(value_to_f64).collect();
+    let mut score = 0.0;
+    for phrase in &phrases {
+        let docfreq = table.expr_rowids(phrase)?.len();
+        if docfreq == 0 {
+            continue;
+        }
+
+        let mut freq = 0.0;
+        for pos in table.expr_positions_for_row(phrase, ctx.rowid)? {
+            let weight = weights.get(pos.column as usize).copied().unwrap_or(1.0);
+            freq += weight;
+        }
+        if freq == 0.0 {
+            continue;
+        }
+
+        let mut idf = ((rowids.len() as f64 - docfreq as f64 + 0.5) / (docfreq as f64 + 0.5)).ln();
+        if idf <= 0.0 {
+            idf = 1e-6;
+        }
+
+        let k1 = 1.2;
+        let b = 0.75;
+        score += idf * ((freq * (k1 + 1.0)) / (freq + k1 * (1.0 - b + b * doc_len / avgdl)));
+    }
+
+    Ok(Value::Real(-score))
 }
 
 /// highlight(text, column, open, close)
@@ -276,6 +324,32 @@ fn collect_terms(expr: &fts5::expr::Fts5Expr) -> (Vec<String>, Vec<String>) {
     (terms, prefixes)
 }
 
+fn collect_phrases(expr: &fts5::expr::Fts5Expr) -> Vec<fts5::expr::Fts5Expr> {
+    let mut phrases = Vec::new();
+    collect_phrases_inner(expr, &mut phrases);
+    phrases
+}
+
+fn collect_phrases_inner(expr: &fts5::expr::Fts5Expr, phrases: &mut Vec<fts5::expr::Fts5Expr>) {
+    match expr {
+        fts5::expr::Fts5Expr::Term(_)
+        | fts5::expr::Fts5Expr::Prefix(_)
+        | fts5::expr::Fts5Expr::Phrase(_)
+        | fts5::expr::Fts5Expr::Column(_, _) => phrases.push(expr.clone()),
+        fts5::expr::Fts5Expr::And(left, right)
+        | fts5::expr::Fts5Expr::Or(left, right)
+        | fts5::expr::Fts5Expr::Not(left, right) => {
+            collect_phrases_inner(left, phrases);
+            collect_phrases_inner(right, phrases);
+        }
+        fts5::expr::Fts5Expr::Near(items, _) => {
+            for item in items {
+                collect_phrases_inner(item, phrases);
+            }
+        }
+    }
+}
+
 fn collect_terms_inner(
     expr: &fts5::expr::Fts5Expr,
     terms: &mut Vec<String>,
@@ -343,4 +417,12 @@ fn apply_highlight(
         out.push_str(&text[last..]);
     }
     out
+}
+
+fn count_tokens(table: &fts5::Fts5Table, values: &[String]) -> Result<usize> {
+    let mut count = 0usize;
+    for value in values {
+        count += table.tokenize(value)?.len();
+    }
+    Ok(count)
 }

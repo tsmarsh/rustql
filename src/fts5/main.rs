@@ -182,7 +182,7 @@ impl Fts5Table {
         self.expr_rowids(&expr)
     }
 
-    fn expr_rowids(&self, expr: &Fts5Expr) -> Result<Vec<i64>> {
+    pub fn expr_rowids(&self, expr: &Fts5Expr) -> Result<Vec<i64>> {
         let mut rowids = match expr {
             Fts5Expr::Term(term) => entries_to_rowids(&self.index.lookup_term(term.as_bytes())?),
             Fts5Expr::Prefix(prefix) => {
@@ -251,18 +251,13 @@ impl Fts5Table {
         let mut filtered = Vec::new();
         for rowid in rowids.drain(..) {
             let mut positions = Vec::new();
-            let mut unsupported = false;
             for expr in exprs {
                 match self.expr_positions(expr, rowid)? {
                     Some(pos) => positions.push(pos),
-                    None => {
-                        unsupported = true;
-                        break;
-                    }
+                    None => break,
                 }
             }
-            if unsupported {
-                filtered.push(rowid);
+            if positions.len() != exprs.len() {
                 continue;
             }
 
@@ -280,7 +275,7 @@ impl Fts5Table {
         Ok(filtered)
     }
 
-    fn expr_positions(&self, expr: &Fts5Expr, rowid: i64) -> Result<Option<Vec<Fts5Position>>> {
+    pub fn expr_positions(&self, expr: &Fts5Expr, rowid: i64) -> Result<Option<Vec<Fts5Position>>> {
         match expr {
             Fts5Expr::Term(term) => Ok(term_positions(
                 &self.index.lookup_term(term.as_bytes())?,
@@ -325,6 +320,10 @@ impl Fts5Table {
             }
             _ => Ok(None),
         }
+    }
+
+    pub fn expr_positions_for_row(&self, expr: &Fts5Expr, rowid: i64) -> Result<Vec<Fts5Position>> {
+        Ok(self.expr_positions(expr, rowid)?.unwrap_or_default())
     }
 
     fn column_rowids(&self, name: &str, inner: &Fts5Expr) -> Result<Vec<i64>> {

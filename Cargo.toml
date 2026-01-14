@@ -5,6 +5,9 @@ edition = "2021"
 description = "SQLite3 database engine rewritten in Rust"
 license = "MIT OR Apache-2.0"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [features]
 default = ["fts5", "rtree", "session"]
 fts3 = []
@@ -12,6 +15,7 @@ fts5 = []
 rtree = []
 session = []
 json = []
+tcl = []
 
 [dependencies]
 bitflags = "2"

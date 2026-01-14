@@ -24,6 +24,9 @@ pub mod utf;
 pub mod util;
 pub mod vdbe;
 
+#[cfg(feature = "tcl")]
+pub mod tcl_ext;
+
 // Re-export main public types
 pub use error::{Error, Result};
 

@@ -10,6 +10,7 @@ use crate::vdbe::auxdata::{decode_record_header, deserialize_value, make_record,
 use crate::vdbe::mem::Mem;
 
 use super::fts3_write::{LeafNode, PendingTerms};
+use super::tokenizer::{create_tokenizer, parse_tokenize_arg};
 
 pub const FTS3_POS_END: u32 = 0;
 pub const FTS3_POS_COLUMN: u32 = 1;
@@ -217,8 +218,46 @@ pub trait Fts3Tokenizer: Send + Sync {
     fn tokenize(&self, text: &str) -> Result<Vec<Fts3Token>>;
 }
 
-#[derive(Default)]
-pub struct SimpleTokenizer;
+pub struct SimpleTokenizer {
+    delim: [bool; 128],
+}
+
+impl Default for SimpleTokenizer {
+    fn default() -> Self {
+        Self::new(&[]).unwrap_or_else(|_| Self {
+            delim: [false; 128],
+        })
+    }
+}
+
+impl SimpleTokenizer {
+    pub fn new(args: &[&str]) -> Result<Self> {
+        let mut tokenizer = Self {
+            delim: [false; 128],
+        };
+        if let Some(delims) = args.first() {
+            for ch in delims.bytes() {
+                if ch >= 0x80 {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        "simple tokenizer does not accept UTF-8 delimiters",
+                    ));
+                }
+                tokenizer.delim[ch as usize] = true;
+            }
+        } else {
+            for i in 1..0x80 {
+                let ch = i as u8;
+                tokenizer.delim[i] = !ch.is_ascii_alphanumeric();
+            }
+        }
+        Ok(tokenizer)
+    }
+
+    fn is_delim(&self, ch: u8) -> bool {
+        ch < 0x80 && self.delim[ch as usize]
+    }
+}
 
 impl Fts3Tokenizer for SimpleTokenizer {
     fn tokenize(&self, text: &str) -> Result<Vec<Fts3Token>> {
@@ -226,26 +265,31 @@ impl Fts3Tokenizer for SimpleTokenizer {
         let mut pos = 0i32;
         let mut idx = 0usize;
         let bytes = text.as_bytes();
+
         while idx < bytes.len() {
-            while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+            while idx < bytes.len() && self.is_delim(bytes[idx]) {
                 idx += 1;
-            }
-            if idx >= bytes.len() {
-                break;
             }
             let start = idx;
-            while idx < bytes.len() && !bytes[idx].is_ascii_whitespace() {
+            while idx < bytes.len() && !self.is_delim(bytes[idx]) {
                 idx += 1;
             }
-            let end = idx;
-            let token = &text[start..end];
-            tokens.push(Fts3Token {
-                text: token.to_string(),
-                position: pos,
-                start,
-                end,
-            });
-            pos += 1;
+            if idx > start {
+                let mut token_bytes = bytes[start..idx].to_vec();
+                for byte in &mut token_bytes {
+                    if (b'A'..=b'Z').contains(byte) {
+                        *byte = *byte - b'A' + b'a';
+                    }
+                }
+                let token = String::from_utf8_lossy(&token_bytes).to_string();
+                tokens.push(Fts3Token {
+                    text: token,
+                    position: pos,
+                    start,
+                    end: idx,
+                });
+                pos += 1;
+            }
         }
         Ok(tokens)
     }
@@ -557,6 +601,7 @@ impl Fts3Table {
         let mut prefixes = Vec::new();
         let mut has_content = true;
         let mut content_table = None;
+        let mut tokenizer: Box<dyn Fts3Tokenizer> = Box::new(SimpleTokenizer::default());
 
         let mut pending_prefix = false;
         for arg in args {
@@ -585,8 +630,11 @@ impl Fts3Table {
                     has_content = true;
                     content_table = Some(value.to_string());
                 }
-            } else if trimmed.starts_with("tokenize=") || trimmed.starts_with("TOKENIZE=") {
-                // Tokenizer options are parsed elsewhere; default tokenizer for now.
+            } else if let Some((name, args)) = parse_tokenize_arg(trimmed) {
+                let arg_refs: Vec<&str> = args.iter().map(|arg| arg.as_str()).collect();
+                if let Ok(tok) = create_tokenizer(&name, &arg_refs) {
+                    tokenizer = tok;
+                }
                 continue;
             } else if pending_prefix {
                 if let Ok(value) = trimmed.parse::<i32>() {
@@ -602,7 +650,7 @@ impl Fts3Table {
             }
         }
 
-        let mut table = Self::new(name, schema, columns, Box::new(SimpleTokenizer));
+        let mut table = Self::new(name, schema, columns, tokenizer);
         table.prefixes = prefixes;
         table.has_content = has_content;
         if has_content {
@@ -1809,7 +1857,7 @@ mod tests {
             "docs",
             "main",
             vec!["body".to_string()],
-            Box::new(SimpleTokenizer),
+            Box::new(SimpleTokenizer::default()),
         );
         table.prefixes = vec![2];
         table.insert(1, &["hello world"]).expect("insert");
@@ -1823,7 +1871,7 @@ mod tests {
             "docs",
             "main",
             vec!["body".to_string()],
-            Box::new(SimpleTokenizer),
+            Box::new(SimpleTokenizer::default()),
         );
         for i in 0..FTS3_MERGE_THRESHOLD {
             let rowid = i as i64 + 1;
@@ -1839,7 +1887,7 @@ mod tests {
             "docs",
             "main",
             vec!["body".to_string()],
-            Box::new(SimpleTokenizer),
+            Box::new(SimpleTokenizer::default()),
         );
         table.insert(1, &["alpha beta gamma"]).expect("insert");
         let rows = table.query_rowids("alpha NEAR beta").expect("query");

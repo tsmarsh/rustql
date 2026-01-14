@@ -678,7 +678,22 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
 
         #[cfg(feature = "fts3")]
         {
-            if module_name.eq_ignore_ascii_case("fts3") {
+            if module_name.eq_ignore_ascii_case("fts3tokenize") {
+                let args: Vec<String> = module_args
+                    .iter()
+                    .map(|arg| crate::fts3::fts3_dequote(arg))
+                    .collect();
+                let (tokenizer_name, tokenizer_args) = if args.is_empty() {
+                    ("simple".to_string(), Vec::new())
+                } else {
+                    (args[0].clone(), args[1..].to_vec())
+                };
+                let arg_refs: Vec<&str> = tokenizer_args.iter().map(|arg| arg.as_str()).collect();
+                let tokenizer = crate::fts3::create_tokenizer(&tokenizer_name, &arg_refs)
+                    .unwrap_or_else(|_| Box::new(crate::fts3::SimpleTokenizer::default()));
+                let table = crate::fts3::Fts3TokenizeTable::new(table_name.clone(), tokenizer);
+                crate::fts3::register_tokenize_table(table);
+            } else if module_name.eq_ignore_ascii_case("fts3") {
                 let table = crate::fts3::Fts3Table::from_virtual_spec(
                     table_name.clone(),
                     "main",
@@ -686,6 +701,24 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
                 );
                 crate::fts3::register_table(table);
             }
+        }
+
+        if module_name.eq_ignore_ascii_case("fts3tokenize") {
+            columns = ["input", "token", "start", "end", "position"]
+                .iter()
+                .map(|name| Column {
+                    name: name.to_string(),
+                    type_name: None,
+                    affinity: Affinity::Blob,
+                    not_null: false,
+                    not_null_conflict: None,
+                    default_value: None,
+                    collation: DEFAULT_COLLATION.to_string(),
+                    is_primary_key: false,
+                    is_hidden: false,
+                    generated: None,
+                })
+                .collect();
         }
 
         return Some(Table {

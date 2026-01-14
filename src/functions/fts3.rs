@@ -852,7 +852,7 @@ mod tests {
             "docs_snippet",
             "main",
             vec!["body".to_string()],
-            Box::new(fts3::SimpleTokenizer),
+            Box::new(fts3::SimpleTokenizer::default()),
         );
         table.insert(1, &["hello world"]).expect("insert");
         fts3::register_table(table);
@@ -875,7 +875,7 @@ mod tests {
             "docs_offsets",
             "main",
             vec!["body".to_string()],
-            Box::new(fts3::SimpleTokenizer),
+            Box::new(fts3::SimpleTokenizer::default()),
         );
         table.insert(1, &["alpha beta alpha"]).expect("insert");
         fts3::register_table(table);
@@ -898,7 +898,7 @@ mod tests {
             "docs",
             "main",
             vec!["body".to_string()],
-            Box::new(fts3::SimpleTokenizer),
+            Box::new(fts3::SimpleTokenizer::default()),
         );
         table.insert(1, &["alpha beta alpha"]).expect("insert");
         fts3::register_table(table);

@@ -121,6 +121,12 @@ pub struct VdbeCursor {
     pub vtab_rowids: Vec<i64>,
     /// Current index into virtual table rowids
     pub vtab_row_index: usize,
+    /// Tokenized rows for fts3tokenize virtual tables
+    #[cfg(feature = "fts3")]
+    pub vtab_tokens: Vec<crate::fts3::Fts3Token>,
+    /// Input string for fts3tokenize virtual tables
+    #[cfg(feature = "fts3")]
+    pub vtab_input: Option<String>,
     /// Sorter data - rows to be sorted (each row is a serialized record)
     pub sorter_data: Vec<Vec<u8>>,
     /// Sorter index - current position in sorted data
@@ -171,6 +177,10 @@ impl VdbeCursor {
             vtab_name: None,
             vtab_rowids: Vec::new(),
             vtab_row_index: 0,
+            #[cfg(feature = "fts3")]
+            vtab_tokens: Vec::new(),
+            #[cfg(feature = "fts3")]
+            vtab_input: None,
             sorter_data: Vec::new(),
             sorter_index: 0,
             sorter_sorted: false,
@@ -1358,36 +1368,75 @@ impl Vdbe {
 
                 let btree = self.btree.clone();
                 let schema = self.schema.clone();
+                let vtab_module = vtab_name.as_ref().and_then(|name| {
+                    schema.as_ref().and_then(|schema| {
+                        schema
+                            .read()
+                            .ok()
+                            .and_then(|guard| guard.table(name))
+                            .and_then(|table| table.virtual_module.clone())
+                    })
+                });
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if cursor.is_virtual {
                         #[allow(unused_variables)]
                         if let Some(ref vtab_name) = vtab_name {
                             #[cfg(feature = "fts3")]
                             {
-                                if let Some(table) = crate::fts3::get_table(vtab_name) {
-                                    if let Ok(mut table) = table.lock() {
-                                        if let (Some(ref btree), Some(ref schema)) =
-                                            (btree.as_ref(), schema.as_ref())
+                                if let Some(module) = vtab_module.as_ref() {
+                                    if module.eq_ignore_ascii_case("fts3tokenize") {
+                                        if let Some(table) =
+                                            crate::fts3::get_tokenize_table(vtab_name)
                                         {
-                                            if let Ok(schema_guard) = schema.read() {
-                                                table.ensure_loaded(btree, &schema_guard)?;
+                                            if let Ok(table) = table.lock() {
+                                                cursor.vtab_input = if query.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(query.clone())
+                                                };
+                                                let tokens = table.tokenize(&query)?;
+                                                cursor.vtab_tokens = tokens;
+                                                cursor.vtab_rowids =
+                                                    (0..cursor.vtab_tokens.len() as i64).collect();
+                                                cursor.vtab_row_index = 0;
+                                                if cursor.vtab_rowids.is_empty() {
+                                                    cursor.state = CursorState::AtEnd;
+                                                    cursor.rowid = None;
+                                                } else {
+                                                    cursor.state = CursorState::Valid;
+                                                    cursor.rowid = Some(cursor.vtab_rowids[0]);
+                                                }
                                             }
                                         }
-                                        if let Ok(rowids) = table.query_rowids(&query) {
-                                            cursor.vtab_rowids = rowids;
-                                            cursor.vtab_row_index = 0;
-                                            if cursor.vtab_rowids.is_empty() {
-                                                cursor.state = CursorState::AtEnd;
-                                                cursor.rowid = None;
-                                            } else {
-                                                cursor.state = CursorState::Valid;
-                                                cursor.rowid = Some(cursor.vtab_rowids[0]);
+                                    } else if module.eq_ignore_ascii_case("fts3") {
+                                        if let Some(table) = crate::fts3::get_table(vtab_name) {
+                                            if let Ok(mut table) = table.lock() {
+                                                if let (Some(ref btree), Some(ref schema)) =
+                                                    (btree.as_ref(), schema.as_ref())
+                                                {
+                                                    if let Ok(schema_guard) = schema.read() {
+                                                        table
+                                                            .ensure_loaded(btree, &schema_guard)?;
+                                                    }
+                                                }
+                                                if let Ok(rowids) = table.query_rowids(&query) {
+                                                    cursor.vtab_rowids = rowids;
+                                                    cursor.vtab_row_index = 0;
+                                                    if cursor.vtab_rowids.is_empty() {
+                                                        cursor.state = CursorState::AtEnd;
+                                                        cursor.rowid = None;
+                                                    } else {
+                                                        cursor.state = CursorState::Valid;
+                                                        cursor.rowid = Some(cursor.vtab_rowids[0]);
+                                                    }
+                                                }
                                             }
                                         }
+                                        self.vtab_query =
+                                            if query.is_empty() { None } else { Some(query) };
                                     }
                                 }
                             }
-                            self.vtab_query = if query.is_empty() { None } else { Some(query) };
                         }
                     }
                 }
@@ -1424,20 +1473,36 @@ impl Vdbe {
                             }
                         }
                     } else if cursor.is_virtual {
+                        let vtab_module = cursor.vtab_name.as_ref().and_then(|name| {
+                            schema.as_ref().and_then(|schema| {
+                                schema
+                                    .read()
+                                    .ok()
+                                    .and_then(|guard| guard.table(name))
+                                    .and_then(|table| table.virtual_module.clone())
+                            })
+                        });
                         if cursor.vtab_rowids.is_empty() {
                             if let Some(ref vtab_name) = cursor.vtab_name {
                                 #[cfg(feature = "fts3")]
                                 {
-                                    if let Some(table) = crate::fts3::get_table(vtab_name) {
-                                        if let Ok(mut table) = table.lock() {
-                                            if let (Some(ref btree), Some(ref schema)) =
-                                                (btree.as_ref(), schema.as_ref())
-                                            {
-                                                if let Ok(schema_guard) = schema.read() {
-                                                    table.ensure_loaded(btree, &schema_guard)?;
+                                    if let Some(module) = vtab_module.as_ref() {
+                                        if module.eq_ignore_ascii_case("fts3") {
+                                            if let Some(table) = crate::fts3::get_table(vtab_name) {
+                                                if let Ok(mut table) = table.lock() {
+                                                    if let (Some(ref btree), Some(ref schema)) =
+                                                        (btree.as_ref(), schema.as_ref())
+                                                    {
+                                                        if let Ok(schema_guard) = schema.read() {
+                                                            table.ensure_loaded(
+                                                                btree,
+                                                                &schema_guard,
+                                                            )?;
+                                                        }
+                                                    }
+                                                    cursor.vtab_rowids = table.all_rowids();
                                                 }
                                             }
-                                            cursor.vtab_rowids = table.all_rowids();
                                         }
                                     }
                                 }
@@ -1702,32 +1767,69 @@ impl Vdbe {
                             {
                                 let btree = self.btree.clone();
                                 let schema = self.schema.clone();
-                                if let Some(table) = crate::fts3::get_table(vtab_name) {
-                                    if let Ok(mut table) = table.lock() {
-                                        if let (Some(ref btree), Some(ref schema)) =
-                                            (btree.as_ref(), schema.as_ref())
-                                        {
-                                            if let Ok(schema_guard) = schema.read() {
-                                                table.ensure_loaded(btree, &schema_guard)?;
+                                let module = schema.as_ref().and_then(|schema| {
+                                    schema
+                                        .read()
+                                        .ok()
+                                        .and_then(|guard| guard.table(vtab_name))
+                                        .and_then(|table| table.virtual_module.clone())
+                                });
+                                if let Some(module) = module {
+                                    if module.eq_ignore_ascii_case("fts3tokenize") {
+                                        let idx = rowid as usize;
+                                        if let Some(token) = cursor.vtab_tokens.get(idx) {
+                                            match col_idx {
+                                                0 => {
+                                                    if let Some(ref input) = cursor.vtab_input {
+                                                        result = Mem::from_str(input);
+                                                    }
+                                                }
+                                                1 => result = Mem::from_str(&token.text),
+                                                2 => result = Mem::from_int(token.start as i64),
+                                                3 => result = Mem::from_int(token.end as i64),
+                                                4 => result = Mem::from_int(token.position as i64),
+                                                _ => result = Mem::new(),
                                             }
                                         }
-                                        let values = if let (Some(ref btree), Some(ref schema)) =
-                                            (btree.as_ref(), schema.as_ref())
-                                        {
-                                            if let Ok(schema_guard) = schema.read() {
-                                                table
-                                                    .load_row_values(btree, &schema_guard, rowid)
-                                                    .ok()
-                                                    .flatten()
-                                            } else {
-                                                table.row_values(rowid).map(|vals| vals.to_vec())
-                                            }
-                                        } else {
-                                            table.row_values(rowid).map(|vals| vals.to_vec())
-                                        };
-                                        if let Some(values) = values {
-                                            if let Some(value) = values.get(col_idx) {
-                                                result = Mem::from_str(value);
+                                    } else if module.eq_ignore_ascii_case("fts3") {
+                                        if let Some(table) = crate::fts3::get_table(vtab_name) {
+                                            if let Ok(mut table) = table.lock() {
+                                                if let (Some(ref btree), Some(ref schema)) =
+                                                    (btree.as_ref(), schema.as_ref())
+                                                {
+                                                    if let Ok(schema_guard) = schema.read() {
+                                                        table
+                                                            .ensure_loaded(btree, &schema_guard)?;
+                                                    }
+                                                }
+                                                let values =
+                                                    if let (Some(ref btree), Some(ref schema)) =
+                                                        (btree.as_ref(), schema.as_ref())
+                                                    {
+                                                        if let Ok(schema_guard) = schema.read() {
+                                                            table
+                                                                .load_row_values(
+                                                                    btree,
+                                                                    &schema_guard,
+                                                                    rowid,
+                                                                )
+                                                                .ok()
+                                                                .flatten()
+                                                        } else {
+                                                            table
+                                                                .row_values(rowid)
+                                                                .map(|vals| vals.to_vec())
+                                                        }
+                                                    } else {
+                                                        table
+                                                            .row_values(rowid)
+                                                            .map(|vals| vals.to_vec())
+                                                    };
+                                                if let Some(values) = values {
+                                                    if let Some(value) = values.get(col_idx) {
+                                                        result = Mem::from_str(value);
+                                                    }
+                                                }
                                             }
                                         }
                                     }

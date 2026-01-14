@@ -309,7 +309,7 @@ impl<'s> SelectCompiler<'s> {
     /// Compile a simple SELECT without aggregates
     fn compile_simple_select(&mut self, core: &SelectCore, dest: &SelectDest) -> Result<()> {
         let (fts3_filter, remaining_where) = match core.where_clause.as_deref() {
-            Some(expr) => self.split_fts3_match_filter(expr),
+            Some(expr) => self.split_virtual_filter(expr),
             None => (None, None),
         };
 
@@ -1305,6 +1305,33 @@ impl<'s> SelectCompiler<'s> {
         Ok(())
     }
 
+    fn split_virtual_filter(&self, expr: &Expr) -> (Option<Fts3MatchFilter>, Option<Expr>) {
+        if self.is_fts3tokenize_table() {
+            return self.split_fts3_tokenize_filter(expr);
+        }
+        self.split_fts3_match_filter(expr)
+    }
+
+    fn split_fts3_tokenize_filter(&self, expr: &Expr) -> (Option<Fts3MatchFilter>, Option<Expr>) {
+        if let Some(filter) = self.extract_fts3_tokenize_filter(expr) {
+            return (Some(filter), None);
+        }
+        if let Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } = expr
+        {
+            if let Some(filter) = self.extract_fts3_tokenize_filter(left) {
+                return (Some(filter), Some(*right.clone()));
+            }
+            if let Some(filter) = self.extract_fts3_tokenize_filter(right) {
+                return (Some(filter), Some(*left.clone()));
+            }
+        }
+        (None, Some(expr.clone()))
+    }
+
     fn split_fts3_match_filter(&self, expr: &Expr) -> (Option<Fts3MatchFilter>, Option<Expr>) {
         if let Some(filter) = self.extract_fts3_match_filter(expr) {
             return (Some(filter), None);
@@ -1414,6 +1441,71 @@ impl<'s> SelectCompiler<'s> {
             }
         }
         None
+    }
+
+    fn extract_fts3_tokenize_filter(&self, expr: &Expr) -> Option<Fts3MatchFilter> {
+        if self.tables.len() != 1 {
+            return None;
+        }
+        let table = self.tables.first()?;
+        let schema_table = table.schema_table.as_ref()?;
+        if !schema_table.is_virtual {
+            return None;
+        }
+        let module = schema_table
+            .virtual_module
+            .as_ref()
+            .map(|name| name.to_ascii_lowercase())?;
+        if module != "fts3tokenize" {
+            return None;
+        }
+
+        if let Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } = expr
+        {
+            if self.is_fts3tokenize_input_column(left, table) {
+                return Some(Fts3MatchFilter {
+                    cursor: table.cursor,
+                    pattern: (*right.clone()),
+                });
+            }
+            if self.is_fts3tokenize_input_column(right, table) {
+                return Some(Fts3MatchFilter {
+                    cursor: table.cursor,
+                    pattern: (*left.clone()),
+                });
+            }
+        }
+        None
+    }
+
+    fn is_fts3tokenize_table(&self) -> bool {
+        let Some(table) = self.tables.first() else {
+            return false;
+        };
+        let Some(schema_table) = table.schema_table.as_ref() else {
+            return false;
+        };
+        schema_table
+            .virtual_module
+            .as_ref()
+            .map(|name| name.eq_ignore_ascii_case("fts3tokenize"))
+            .unwrap_or(false)
+    }
+
+    fn is_fts3tokenize_input_column(&self, expr: &Expr, table: &TableInfo) -> bool {
+        let Expr::Column(col) = expr else {
+            return false;
+        };
+        if let Some(ref table_name) = col.table {
+            if !table_name.eq_ignore_ascii_case(&table.table_name) {
+                return false;
+            }
+        }
+        col.column.eq_ignore_ascii_case("input")
     }
 
     fn is_fts3_match(&self, expr: &Expr) -> bool {

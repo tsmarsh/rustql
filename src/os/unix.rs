@@ -181,7 +181,7 @@ impl Vfs for UnixVfs {
             flags,
             lock_type: UnsafeCell::new(LockType::None),
             shm: UnsafeCell::new(None),
-            dev_ino: (stat.st_dev, stat.st_ino),
+            dev_ino: (stat.st_dev as u64, stat.st_ino as u64),
             sector_size: 4096,
             device_chars: self.detect_device_characteristics(fd),
             delete_on_close,

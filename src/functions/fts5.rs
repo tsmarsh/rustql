@@ -1,6 +1,6 @@
 //! FTS5 helper functions (bm25/highlight/snippet).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use lazy_static::lazy_static;
@@ -199,9 +199,8 @@ pub fn func_highlight(args: &[Value]) -> Result<Value> {
         return Ok(Value::Text(text.clone()));
     }
     let expr = fts5::expr::parse_query(&query, table.tokenizer.as_ref())?;
-    let (terms, prefixes) = collect_terms(&expr);
     let tokens = table.tokenize(text)?;
-    let matches = match_indices(&tokens, &terms, &prefixes);
+    let matches = match_indices_for_expr(&expr, &table, ctx.rowid, col_idx as i32, &tokens)?;
     let highlighted = apply_highlight(text, &tokens, &matches, &open, &close);
     Ok(Value::Text(highlighted))
 }
@@ -253,20 +252,26 @@ pub fn func_snippet(args: &[Value]) -> Result<Value> {
         return Ok(Value::Text(String::new()));
     }
     let expr = fts5::expr::parse_query(&query, table.tokenizer.as_ref())?;
-    let (terms, prefixes) = collect_terms(&expr);
 
     let mut chosen = None;
+    let mut best_hits = 0usize;
     for (idx, text) in values.iter().enumerate() {
         if col >= 0 && idx != col as usize {
             continue;
         }
         let tokens = table.tokenize(text)?;
-        let matches = match_indices(&tokens, &terms, &prefixes);
+        let matches = match_indices_for_expr(&expr, &table, ctx.rowid, idx as i32, &tokens)?;
         if matches.is_empty() {
             continue;
         }
-        chosen = Some((text.clone(), tokens, matches));
-        break;
+        let hits = matches.len();
+        if hits > best_hits {
+            best_hits = hits;
+            chosen = Some((text.clone(), tokens, matches));
+            if col >= 0 {
+                break;
+            }
+        }
     }
 
     let Some((text, tokens, matches)) = chosen else {
@@ -317,13 +322,6 @@ pub fn func_snippet(args: &[Value]) -> Result<Value> {
     Ok(Value::Text(snippet))
 }
 
-fn collect_terms(expr: &fts5::expr::Fts5Expr) -> (Vec<String>, Vec<String>) {
-    let mut terms = Vec::new();
-    let mut prefixes = Vec::new();
-    collect_terms_inner(expr, &mut terms, &mut prefixes);
-    (terms, prefixes)
-}
-
 fn collect_phrases(expr: &fts5::expr::Fts5Expr) -> Vec<fts5::expr::Fts5Expr> {
     let mut phrases = Vec::new();
     collect_phrases_inner(expr, &mut phrases);
@@ -350,44 +348,74 @@ fn collect_phrases_inner(expr: &fts5::expr::Fts5Expr, phrases: &mut Vec<fts5::ex
     }
 }
 
-fn collect_terms_inner(
+fn match_indices_for_expr(
     expr: &fts5::expr::Fts5Expr,
-    terms: &mut Vec<String>,
-    prefixes: &mut Vec<String>,
-) {
+    table: &fts5::Fts5Table,
+    rowid: i64,
+    column: i32,
+    tokens: &[fts5::tokenizer::Fts5Token],
+) -> Result<Vec<usize>> {
+    let mut matches = Vec::new();
+    let pos_map: HashMap<i32, usize> = tokens
+        .iter()
+        .enumerate()
+        .map(|(idx, token)| (token.position, idx))
+        .collect();
+    collect_matches(expr, table, rowid, column, tokens, &pos_map, &mut matches)?;
+    matches.sort_unstable();
+    matches.dedup();
+    Ok(matches)
+}
+
+fn collect_matches(
+    expr: &fts5::expr::Fts5Expr,
+    table: &fts5::Fts5Table,
+    rowid: i64,
+    column: i32,
+    tokens: &[fts5::tokenizer::Fts5Token],
+    pos_map: &HashMap<i32, usize>,
+    matches: &mut Vec<usize>,
+) -> Result<()> {
     match expr {
-        fts5::expr::Fts5Expr::Term(term) => terms.push(term.clone()),
-        fts5::expr::Fts5Expr::Prefix(prefix) => prefixes.push(prefix.clone()),
-        fts5::expr::Fts5Expr::Phrase(items) => terms.extend(items.iter().cloned()),
-        fts5::expr::Fts5Expr::Column(_, inner) => collect_terms_inner(inner, terms, prefixes),
-        fts5::expr::Fts5Expr::And(left, right)
-        | fts5::expr::Fts5Expr::Or(left, right)
-        | fts5::expr::Fts5Expr::Not(left, right) => {
-            collect_terms_inner(left, terms, prefixes);
-            collect_terms_inner(right, terms, prefixes);
+        fts5::expr::Fts5Expr::Term(_)
+        | fts5::expr::Fts5Expr::Prefix(_)
+        | fts5::expr::Fts5Expr::Phrase(_)
+        | fts5::expr::Fts5Expr::Column(_, _) => {
+            let positions = table.expr_positions_for_row(expr, rowid)?;
+            let phrase_len = phrase_length(expr);
+            for pos in positions {
+                if pos.column != column {
+                    continue;
+                }
+                if let Some(start_idx) = pos_map.get(&pos.offset) {
+                    for idx in *start_idx..(*start_idx + phrase_len).min(tokens.len()) {
+                        matches.push(idx);
+                    }
+                }
+            }
         }
-        fts5::expr::Fts5Expr::Near(exprs, _) => {
-            for expr in exprs {
-                collect_terms_inner(expr, terms, prefixes);
+        fts5::expr::Fts5Expr::And(left, right) | fts5::expr::Fts5Expr::Or(left, right) => {
+            collect_matches(left, table, rowid, column, tokens, pos_map, matches)?;
+            collect_matches(right, table, rowid, column, tokens, pos_map, matches)?;
+        }
+        fts5::expr::Fts5Expr::Not(left, _) => {
+            collect_matches(left, table, rowid, column, tokens, pos_map, matches)?;
+        }
+        fts5::expr::Fts5Expr::Near(items, _) => {
+            for item in items {
+                collect_matches(item, table, rowid, column, tokens, pos_map, matches)?;
             }
         }
     }
+    Ok(())
 }
 
-fn match_indices(
-    tokens: &[fts5::tokenizer::Fts5Token],
-    terms: &[String],
-    prefixes: &[String],
-) -> Vec<usize> {
-    let mut matches = Vec::new();
-    for (idx, token) in tokens.iter().enumerate() {
-        if terms.iter().any(|term| term == &token.text)
-            || prefixes.iter().any(|prefix| token.text.starts_with(prefix))
-        {
-            matches.push(idx);
-        }
+fn phrase_length(expr: &fts5::expr::Fts5Expr) -> usize {
+    match expr {
+        fts5::expr::Fts5Expr::Phrase(terms) => terms.len().max(1),
+        fts5::expr::Fts5Expr::Column(_, inner) => phrase_length(inner),
+        _ => 1,
     }
-    matches
 }
 
 fn apply_highlight(

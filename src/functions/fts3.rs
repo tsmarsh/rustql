@@ -109,17 +109,10 @@ pub fn func_offsets(args: &[Value]) -> Result<Value> {
 
 /// matchinfo(text, query)
 pub fn func_matchinfo(args: &[Value]) -> Result<Value> {
-    if args.is_empty() || args.len() > 2 {
+    if args.len() != 2 {
         return Err(Error::with_message(
             ErrorCode::Error,
-            "matchinfo() expects 1 or 2 arguments",
-        ));
-    }
-
-    if args.len() == 1 {
-        return Err(Error::with_message(
-            ErrorCode::Error,
-            "matchinfo() requires query context",
+            "matchinfo() expects 2 arguments",
         ));
     }
 

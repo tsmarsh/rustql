@@ -287,6 +287,10 @@ pub struct Vdbe {
 
     /// Active virtual table query string (for FTS helpers)
     vtab_query: Option<String>,
+    /// Active virtual table name for FTS helpers
+    vtab_context_name: Option<String>,
+    /// Active virtual table rowid for FTS helpers
+    vtab_context_rowid: Option<i64>,
 
     // ========================================================================
     // Trigger Context
@@ -344,6 +348,8 @@ impl Vdbe {
             deferred_fk_counter: 0,
             fk_enabled: true,
             vtab_query: None,
+            vtab_context_name: None,
+            vtab_context_rowid: None,
             trigger_old_row: None,
             trigger_new_row: None,
             trigger_depth: 0,
@@ -1586,6 +1592,10 @@ impl Vdbe {
                 if let Some(value) = sqlite_master_value {
                     *self.mem_mut(op.p3) = value;
                 } else if let Some(value) = vtab_value {
+                    if let Some(cursor) = self.cursor(op.p1) {
+                        self.vtab_context_name = cursor.vtab_name.clone();
+                        self.vtab_context_rowid = cursor.rowid;
+                    }
                     *self.mem_mut(op.p3) = value;
                 } else if let Some(cursor) = self.cursor(op.p1) {
                     if cursor.null_row {
@@ -1765,13 +1775,41 @@ impl Vdbe {
                             let mem = self.mem(arg_base + i as i32);
                             args.push(mem.to_value());
                         }
-                        if (name.eq_ignore_ascii_case("snippet")
+                        if name.eq_ignore_ascii_case("snippet")
                             || name.eq_ignore_ascii_case("offsets")
-                            || name.eq_ignore_ascii_case("matchinfo"))
-                            && args.len() == 1
+                            || name.eq_ignore_ascii_case("matchinfo")
                         {
-                            if let Some(query) = self.vtab_query.clone() {
-                                args.push(Value::Text(query));
+                            let mut text = None;
+                            if let (Some(vtab_name), Some(rowid)) =
+                                (&self.vtab_context_name, self.vtab_context_rowid)
+                            {
+                                #[cfg(feature = "fts3")]
+                                {
+                                    if let Some(table) = crate::fts3::get_table(vtab_name) {
+                                        if let Ok(table) = table.lock() {
+                                            if let Some(values) = table.row_values(rowid) {
+                                                text = Some(Value::Text(values.join(" ")));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if args.is_empty() {
+                                if let Some(text) = text {
+                                    args.push(text);
+                                }
+                                if let Some(query) = self.vtab_query.clone() {
+                                    args.push(Value::Text(query));
+                                }
+                            } else if args.len() == 1 {
+                                if let Some(text) = text {
+                                    let query = args.remove(0);
+                                    args.push(text);
+                                    args.push(query);
+                                } else if let Some(query) = self.vtab_query.clone() {
+                                    args.push(Value::Text(query));
+                                }
                             }
                         }
                         match func(&args) {

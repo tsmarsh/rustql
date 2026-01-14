@@ -178,6 +178,7 @@ Output includes: commit info, story changes (created, moved, edited, deleted), a
 - `sqlite3/src/parse.y` is a Lemon grammar (not yacc/bison). Rust cannot consume Lemon directly.
 - If translating the parser, prefer a Rust-native generator like `lalrpop` or a hand-written parser; keep `parse.y` as the source of truth.
 - SQLite’s “Why C?” rationale (`https://sqlite.org/whyc.html`) is important context; we intentionally diverge by using Rust while preserving behavior and design intent.
+- For FTS and other extensions, **do not** implement placeholder or approximate behavior. Port directly from the SQLite C sources in `sqlite3/ext/` and keep semantics aligned.
 
 ## Agent Best Practices (Team Workflow)
 

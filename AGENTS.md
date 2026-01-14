@@ -30,6 +30,7 @@ Run commands from a separate build directory when possible:
 - SQLite’s “Why C?” rationale (`https://sqlite.org/whyc.html`) is core context; we intentionally diverge by using Rust.
 - Preserve SQLite’s observable behavior, performance intent, and architectural shape unless a change is explicitly agreed.
 - Favor mechanical translations over refactors; keep control flow and error handling closely aligned to upstream C.
+- For FTS and other extensions, **do not** implement placeholder or approximate behavior. Port directly from the SQLite C sources in `sqlite3/ext/` and keep semantics aligned.
 
 ## Testing Guidelines
 - The primary framework is Tcl via the `testfixture` binary.

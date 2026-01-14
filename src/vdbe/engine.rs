@@ -5,10 +5,12 @@
 //! loop and manages the virtual machine state.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use crate::error::{Error, ErrorCode, Result};
+use crate::functions::aggregate::AggregateState;
 use crate::schema::Schema;
 use crate::storage::btree::{BtCursor, Btree, BtreeCursorFlags, BtreeInsertFlags, BtreePayload};
 use crate::types::{ColumnType, Pgno, Value};
@@ -310,6 +312,15 @@ pub struct Vdbe {
     /// Saved program state for subprogram execution
     /// (parent ops, parent pc) - allows returning from trigger
     subprogram_stack: Vec<(Vec<VdbeOp>, i32, i32)>, // (ops, pc, mem_base)
+
+    /// Aggregate function contexts, keyed by accumulator register
+    agg_contexts: HashMap<i32, AggregateState>,
+
+    /// Last comparison result (for Compare/Jump opcodes)
+    last_compare: std::cmp::Ordering,
+
+    /// Tracking which Once opcodes have been executed
+    once_flags: std::collections::HashSet<i32>,
 }
 
 impl Default for Vdbe {
@@ -355,6 +366,9 @@ impl Vdbe {
             trigger_depth: 0,
             max_trigger_depth: 1000,
             subprogram_stack: Vec::new(),
+            agg_contexts: HashMap::new(),
+            last_compare: std::cmp::Ordering::Equal,
+            once_flags: std::collections::HashSet::new(),
         }
     }
 
@@ -879,6 +893,39 @@ impl Vdbe {
                 // Do nothing
             }
 
+            Opcode::IfPos => {
+                // IfPos P1 P2 P3: If r[P1] > 0 then r[P1] -= P3, jump to P2
+                let val = self.mem(op.p1).to_int();
+                if val > 0 {
+                    self.mem_mut(op.p1).set_int(val - op.p3 as i64);
+                    self.pc = op.p2;
+                }
+            }
+
+            Opcode::DecrJumpZero => {
+                // DecrJumpZero P1 P2: Decrement r[P1], jump to P2 if it becomes zero or less
+                let val = self.mem(op.p1).to_int();
+                let new_val = val - 1;
+                self.mem_mut(op.p1).set_int(new_val);
+                if new_val <= 0 {
+                    self.pc = op.p2;
+                }
+            }
+
+            Opcode::OffsetLimit => {
+                // OffsetLimit P1 P2 P3: If r[P1] > 0, subtract r[P3] from r[P1] and store in r[P2]
+                // Used for computing remaining LIMIT after OFFSET
+                let limit = self.mem(op.p1).to_int();
+                let offset = self.mem(op.p3).to_int();
+                if limit < 0 {
+                    // Negative limit means no limit
+                    self.mem_mut(op.p2).set_int(-1);
+                } else {
+                    self.mem_mut(op.p2)
+                        .set_int(limit.saturating_sub(offset).max(0));
+                }
+            }
+
             // ================================================================
             // Data Movement
             // ================================================================
@@ -994,28 +1041,32 @@ impl Vdbe {
             }
 
             Opcode::Lt => {
-                let cmp = self.mem(op.p3).compare(self.mem(op.p1));
+                // Lt P1, P2, P3: jump to P2 if r[P1] < r[P3]
+                let cmp = self.mem(op.p1).compare(self.mem(op.p3));
                 if cmp == Ordering::Less {
                     self.pc = op.p2;
                 }
             }
 
             Opcode::Le => {
-                let cmp = self.mem(op.p3).compare(self.mem(op.p1));
+                // Le P1, P2, P3: jump to P2 if r[P1] <= r[P3]
+                let cmp = self.mem(op.p1).compare(self.mem(op.p3));
                 if cmp != Ordering::Greater {
                     self.pc = op.p2;
                 }
             }
 
             Opcode::Gt => {
-                let cmp = self.mem(op.p3).compare(self.mem(op.p1));
+                // Gt P1, P2, P3: jump to P2 if r[P1] > r[P3]
+                let cmp = self.mem(op.p1).compare(self.mem(op.p3));
                 if cmp == Ordering::Greater {
                     self.pc = op.p2;
                 }
             }
 
             Opcode::Ge => {
-                let cmp = self.mem(op.p3).compare(self.mem(op.p1));
+                // Ge P1, P2, P3: jump to P2 if r[P1] >= r[P3]
+                let cmp = self.mem(op.p1).compare(self.mem(op.p3));
                 if cmp != Ordering::Less {
                     self.pc = op.p2;
                 }
@@ -1028,6 +1079,12 @@ impl Vdbe {
                 let mut result = self.mem(op.p2).clone();
                 result.add(self.mem(op.p1))?;
                 self.set_mem(op.p3, result);
+            }
+
+            Opcode::AddImm => {
+                // AddImm P1 P2: Add immediate P2 to register P1
+                let val = self.mem(op.p1).to_int();
+                self.mem_mut(op.p1).set_int(val + op.p2 as i64);
             }
 
             Opcode::Subtract => {
@@ -1279,6 +1336,7 @@ impl Vdbe {
 
             Opcode::VFilter => {
                 // Apply filter to virtual table cursor P1 (P4 = query string)
+                // Extract query from P4 or memory before getting mutable cursor
                 let mut query = match &op.p4 {
                     P4::Text(text) => text.clone(),
                     P4::Vtab(text) => text.clone(),
@@ -1294,7 +1352,8 @@ impl Vdbe {
 
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if cursor.is_virtual {
-                        if let Some(vtab_name) = vtab_name.as_ref() {
+                        #[allow(unused_variables)]
+                        if let Some(ref vtab_name) = vtab_name {
                             #[cfg(feature = "fts3")]
                             {
                                 if let Some(table) = crate::fts3::get_table(vtab_name) {
@@ -1623,10 +1682,10 @@ impl Vdbe {
                                         for i in 0..col_idx {
                                             data_offset += types[i].size();
                                         }
+                                        // Deserialize the value (with bounds check)
                                         if data_offset >= payload.len() {
                                             self.mem_mut(op.p3).set_null();
                                         } else {
-                                            // Deserialize the value
                                             let col_data = &payload[data_offset..];
                                             match crate::vdbe::auxdata::deserialize_value(
                                                 col_data,
@@ -1765,15 +1824,72 @@ impl Vdbe {
             }
 
             // ================================================================
-            // Aggregation (placeholder)
+            // Aggregation
             // ================================================================
             Opcode::AggStep | Opcode::AggStep0 => {
-                // Placeholder: Would call aggregate step function
+                // As emitted by compiler:
+                // P1 = argument register (single arg)
+                // P2 = accumulator register
+                // P3 = 0 (unused)
+                // P4 = function name
+                let func_name = match &op.p4 {
+                    P4::Text(s) => s.as_str(),
+                    P4::FuncDef(s) => s.as_str(),
+                    _ => "",
+                };
+
+                let arg_reg = op.p1;
+                let acc_reg = op.p2;
+
+                // Get argument value
+                let arg = self.mem(arg_reg).to_value();
+                let args = vec![arg];
+
+                // Get or create aggregate state
+                let state = self.agg_contexts.entry(acc_reg).or_insert_with(|| {
+                    AggregateState::new(func_name).unwrap_or(AggregateState::Count { count: 0 })
+                });
+
+                // Call step function
+                let _ = state.step(&args);
             }
 
             Opcode::AggFinal | Opcode::AggValue => {
-                // Placeholder: Would call aggregate final function
-                self.mem_mut(op.p1).set_null();
+                // As emitted by compiler:
+                // P1 = accumulator register (source)
+                // P2 = destination register (where result goes)
+                // P3 = 0 (unused)
+                // P4 = function name
+                let acc_reg = op.p1;
+                let dest_reg = op.p2;
+
+                let func_name = match &op.p4 {
+                    P4::Text(s) => s.as_str(),
+                    P4::FuncDef(s) => s.as_str(),
+                    _ => "",
+                };
+
+                if let Some(state) = self.agg_contexts.remove(&acc_reg) {
+                    // Finalize and store result
+                    match state.finalize() {
+                        Ok(value) => {
+                            *self.mem_mut(dest_reg) = Mem::from_value(&value);
+                        }
+                        Err(_) => {
+                            self.mem_mut(dest_reg).set_null();
+                        }
+                    }
+                } else {
+                    // No state means no rows were processed
+                    // For COUNT, should return 0; for others, NULL
+                    if func_name.eq_ignore_ascii_case("COUNT") {
+                        self.mem_mut(dest_reg).set_int(0);
+                    } else if func_name.eq_ignore_ascii_case("TOTAL") {
+                        self.mem_mut(dest_reg).set_real(0.0);
+                    } else {
+                        self.mem_mut(dest_reg).set_null();
+                    }
+                }
             }
 
             // ================================================================
@@ -2005,13 +2121,16 @@ impl Vdbe {
                                 {
                                     if let Some(table) = crate::fts3::get_table(vtab_name) {
                                         if let Ok(mut table) = table.lock() {
-                                            let values = table
-                                                .row_values(rowid)
-                                                .map(|vals| vals.to_vec())
-                                                .unwrap_or_default();
-                                            let refs: Vec<&str> =
-                                                values.iter().map(|value| value.as_str()).collect();
-                                            let _ = table.delete(rowid, &refs);
+                                            // Clone values to avoid borrow conflict with delete
+                                            let values: Option<Vec<String>> =
+                                                table.row_values(rowid).map(|v| v.to_vec());
+                                            if let Some(values) = values {
+                                                let refs: Vec<&str> = values
+                                                    .iter()
+                                                    .map(|value| value.as_str())
+                                                    .collect();
+                                                let _ = table.delete(rowid, &refs);
+                                            }
                                         }
                                     }
                                 }
@@ -2138,24 +2257,207 @@ impl Vdbe {
                 // Placeholder: Savepoint operations
             }
 
-            Opcode::Cast | Opcode::Affinity => {
-                // Placeholder: Type conversion
+            Opcode::Cast => {
+                // Cast P1 P2: Convert value in P1 to affinity in P2
+                // P2 is an affinity character: 'A'=BLOB, 'B'=TEXT, 'C'=NUMERIC, 'D'=INTEGER, 'E'=REAL
+                let affinity = match op.p2 as u8 {
+                    b'A' => crate::schema::Affinity::Blob,
+                    b'B' => crate::schema::Affinity::Text,
+                    b'C' => crate::schema::Affinity::Numeric,
+                    b'D' => crate::schema::Affinity::Integer,
+                    b'E' => crate::schema::Affinity::Real,
+                    _ => crate::schema::Affinity::Blob,
+                };
+                self.mem_mut(op.p1).apply_affinity(affinity);
             }
 
-            Opcode::Compare | Opcode::Jump | Opcode::Once => {
-                // Placeholder: Advanced comparison
+            Opcode::Affinity => {
+                // Affinity P1 P2 P3 P4: Apply affinities to range of registers
+                // P1 = first register, P2 = count, P4 = affinity string
+                if let P4::Text(affinity_str) = &op.p4 {
+                    for (i, ch) in affinity_str.chars().take(op.p2 as usize).enumerate() {
+                        let affinity = match ch {
+                            'A' => crate::schema::Affinity::Blob,
+                            'B' => crate::schema::Affinity::Text,
+                            'C' => crate::schema::Affinity::Numeric,
+                            'D' => crate::schema::Affinity::Integer,
+                            'E' => crate::schema::Affinity::Real,
+                            _ => crate::schema::Affinity::Blob,
+                        };
+                        self.mem_mut(op.p1 + i as i32).apply_affinity(affinity);
+                    }
+                }
             }
 
-            Opcode::Between | Opcode::Like | Opcode::Glob | Opcode::Regexp => {
-                // Placeholder: Pattern matching
+            Opcode::Compare => {
+                // Compare P1 P2 P3: Compare registers [P1..P1+P3] with [P2..P2+P3]
+                // Store result for following Jump opcode
+                let num_regs = op.p3 as usize;
+                let mut cmp_result = std::cmp::Ordering::Equal;
+                for i in 0..num_regs {
+                    let left = self.mem(op.p1 + i as i32);
+                    let right = self.mem(op.p2 + i as i32);
+                    cmp_result = left.compare(right);
+                    if cmp_result != std::cmp::Ordering::Equal {
+                        break;
+                    }
+                }
+                self.last_compare = cmp_result;
+            }
+
+            Opcode::Jump => {
+                // Jump P1 P2 P3: Based on last Compare result
+                // Jump to P1 if <, P2 if ==, P3 if >
+                match self.last_compare {
+                    std::cmp::Ordering::Less => {
+                        if op.p1 != 0 {
+                            self.pc = op.p1;
+                        }
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if op.p2 != 0 {
+                            self.pc = op.p2;
+                        }
+                    }
+                    std::cmp::Ordering::Greater => {
+                        if op.p3 != 0 {
+                            self.pc = op.p3;
+                        }
+                    }
+                }
+            }
+
+            Opcode::Once => {
+                // Once P1 P2: Jump to P2 if this is not the first time P1 is executed
+                // Use a set to track which Once opcodes have been executed
+                let once_id = op.p1;
+                if self.once_flags.contains(&once_id) {
+                    self.pc = op.p2;
+                } else {
+                    self.once_flags.insert(once_id);
+                }
+            }
+
+            Opcode::Like => {
+                // LIKE P1 P2 P3 P4
+                // Compare text in P1 against pattern in P3
+                // Store result (1 for match, 0 for no match) in P2
+                // P4 may contain escape character
+                let text = self.mem(op.p1).to_value();
+                let pattern = self.mem(op.p3).to_value();
+
+                // Handle NULL - LIKE returns NULL if either operand is NULL
+                if matches!(text, Value::Null) || matches!(pattern, Value::Null) {
+                    self.mem_mut(op.p2).set_null();
+                } else {
+                    let args = vec![text, pattern];
+                    match crate::functions::scalar::func_like(&args) {
+                        Ok(Value::Integer(result)) => {
+                            self.mem_mut(op.p2).set_int(result);
+                        }
+                        _ => {
+                            self.mem_mut(op.p2).set_int(0);
+                        }
+                    }
+                }
+            }
+
+            Opcode::Glob => {
+                // GLOB P1 P2 P3
+                // Compare text in P1 against glob pattern in P3
+                // Store result (1 for match, 0 for no match) in P2
+                let text = self.mem(op.p1).to_value();
+                let pattern = self.mem(op.p3).to_value();
+
+                if matches!(text, Value::Null) || matches!(pattern, Value::Null) {
+                    self.mem_mut(op.p2).set_null();
+                } else {
+                    let args = vec![text, pattern];
+                    match crate::functions::scalar::func_glob(&args) {
+                        Ok(Value::Integer(result)) => {
+                            self.mem_mut(op.p2).set_int(result);
+                        }
+                        _ => {
+                            self.mem_mut(op.p2).set_int(0);
+                        }
+                    }
+                }
+            }
+
+            Opcode::Between | Opcode::Regexp => {
+                // Placeholder: Advanced pattern matching
             }
 
             Opcode::IfNullRow | Opcode::EndCoroutine => {
                 // Placeholder: Advanced control flow
             }
 
-            Opcode::And | Opcode::Or => {
-                // These are typically handled inline by the compiler
+            Opcode::And => {
+                // P3 = P1 AND P2 (with SQL three-valued logic for NULL)
+                // NULL AND FALSE = FALSE
+                // NULL AND TRUE = NULL
+                // FALSE AND anything = FALSE
+                // TRUE AND TRUE = TRUE
+                let left = self.mem(op.p1);
+                let right = self.mem(op.p2);
+
+                let result = match (left.is_null(), right.is_null()) {
+                    (true, true) => Mem::new(), // NULL AND NULL = NULL
+                    (true, false) => {
+                        if right.is_truthy() {
+                            Mem::new() // NULL AND TRUE = NULL
+                        } else {
+                            Mem::from_int(0) // NULL AND FALSE = FALSE
+                        }
+                    }
+                    (false, true) => {
+                        if left.is_truthy() {
+                            Mem::new() // TRUE AND NULL = NULL
+                        } else {
+                            Mem::from_int(0) // FALSE AND NULL = FALSE
+                        }
+                    }
+                    (false, false) => Mem::from_int(if left.is_truthy() && right.is_truthy() {
+                        1
+                    } else {
+                        0
+                    }),
+                };
+                *self.mem_mut(op.p3) = result;
+            }
+
+            Opcode::Or => {
+                // P3 = P1 OR P2 (with SQL three-valued logic for NULL)
+                // NULL OR TRUE = TRUE
+                // NULL OR FALSE = NULL
+                // TRUE OR anything = TRUE
+                // FALSE OR FALSE = FALSE
+                let left = self.mem(op.p1);
+                let right = self.mem(op.p2);
+
+                let result = match (left.is_null(), right.is_null()) {
+                    (true, true) => Mem::new(), // NULL OR NULL = NULL
+                    (true, false) => {
+                        if right.is_truthy() {
+                            Mem::from_int(1) // NULL OR TRUE = TRUE
+                        } else {
+                            Mem::new() // NULL OR FALSE = NULL
+                        }
+                    }
+                    (false, true) => {
+                        if left.is_truthy() {
+                            Mem::from_int(1) // TRUE OR NULL = TRUE
+                        } else {
+                            Mem::new() // FALSE OR NULL = NULL
+                        }
+                    }
+                    (false, false) => Mem::from_int(if left.is_truthy() || right.is_truthy() {
+                        1
+                    } else {
+                        0
+                    }),
+                };
+                *self.mem_mut(op.p3) = result;
             }
 
             Opcode::CreateBtree => {
@@ -2487,8 +2789,11 @@ impl Vdbe {
             #[cfg(feature = "fts3")]
             {
                 if module_name.eq_ignore_ascii_case("fts3") {
-                    let table =
-                        crate::fts3::Fts3Table::from_virtual_spec(table_name.clone(), "main", &module_args);
+                    let table = crate::fts3::Fts3Table::from_virtual_spec(
+                        table_name.clone(),
+                        "main",
+                        &module_args,
+                    );
                     crate::fts3::register_table(table);
                 }
             }
@@ -2786,7 +3091,7 @@ mod tests {
         let mut vdbe = Vdbe::from_ops(vec![
             VdbeOp::new(Opcode::Integer, 10, 1, 0), // r1 = 10
             VdbeOp::new(Opcode::Integer, 5, 2, 0),  // r2 = 5
-            VdbeOp::new(Opcode::Lt, 1, 5, 2),       // if r2 < r1, goto 5
+            VdbeOp::new(Opcode::Lt, 2, 5, 1),       // if r[2] < r[1] (5 < 10), goto 5
             VdbeOp::new(Opcode::Integer, 0, 3, 0),  // r3 = 0 (not taken)
             VdbeOp::new(Opcode::Goto, 0, 6, 0),
             VdbeOp::new(Opcode::Integer, 1, 3, 0), // r3 = 1 (taken)

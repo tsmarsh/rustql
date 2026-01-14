@@ -62,8 +62,14 @@ pub fn func_snippet(args: &[Value]) -> Result<Value> {
 
     let text = value_to_string(&args[0]);
     let query = value_to_string(&args[1]);
-    let start = args.get(2).map(value_to_string).unwrap_or_else(|| "<b>".to_string());
-    let end = args.get(3).map(value_to_string).unwrap_or_else(|| "</b>".to_string());
+    let start = args
+        .get(2)
+        .map(value_to_string)
+        .unwrap_or_else(|| "<b>".to_string());
+    let end = args
+        .get(3)
+        .map(value_to_string)
+        .unwrap_or_else(|| "</b>".to_string());
     let ellipsis = args
         .get(4)
         .map(value_to_string)

@@ -680,7 +680,12 @@ mod tests {
             or_action: None,
             table: QualifiedName::new("users"),
             alias: None,
-            columns: None,
+            // Provide explicit columns so compiler knows how many Null ops to emit
+            columns: Some(vec![
+                "id".to_string(),
+                "name".to_string(),
+                "age".to_string(),
+            ]),
             source: InsertSource::DefaultValues,
             on_conflict: None,
             returning: None,

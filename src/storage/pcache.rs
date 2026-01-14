@@ -167,6 +167,11 @@ impl PCache {
         self.cache.shrink();
     }
 
+    /// Get the total reference count sum across all pages
+    pub fn ref_count(&self) -> i64 {
+        self.n_ref_sum
+    }
+
     fn manage_dirty_list(&mut self, page: NonNull<PgHdr>, op: DirtyListOp) {
         match op {
             DirtyListOp::Remove => self.remove_dirty(page),

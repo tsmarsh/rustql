@@ -121,6 +121,256 @@ impl Vfs for StubVfs {
 }
 
 // ============================================================================
+// File-based VFS Implementation
+// ============================================================================
+
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
+
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+
+/// File-based VFS file that performs real disk I/O
+pub struct FileVfsFile {
+    file: File,
+    path: String,
+    lock_level: LockLevel,
+}
+
+impl FileVfsFile {
+    fn new(file: File, path: String) -> Self {
+        Self {
+            file,
+            path,
+            lock_level: LockLevel::None,
+        }
+    }
+}
+
+impl VfsFile for FileVfsFile {
+    fn read(&mut self, buf: &mut [u8], offset: DbOffset) -> Result<usize> {
+        self.file
+            .seek(SeekFrom::Start(offset as u64))
+            .map_err(|e| Error::with_message(ErrorCode::IoErr, e.to_string()))?;
+        self.file
+            .read(buf)
+            .map_err(|e| Error::with_message(ErrorCode::IoErr, e.to_string()))
+    }
+
+    fn write(&mut self, buf: &[u8], offset: DbOffset) -> Result<()> {
+        self.file
+            .seek(SeekFrom::Start(offset as u64))
+            .map_err(|e| Error::with_message(ErrorCode::IoErr, e.to_string()))?;
+        self.file
+            .write_all(buf)
+            .map_err(|e| Error::with_message(ErrorCode::IoErr, e.to_string()))
+    }
+
+    fn truncate(&mut self, size: DbOffset) -> Result<()> {
+        self.file
+            .set_len(size as u64)
+            .map_err(|e| Error::with_message(ErrorCode::IoErr, e.to_string()))
+    }
+
+    fn sync(&mut self, _flags: SyncFlags) -> Result<()> {
+        self.file
+            .sync_all()
+            .map_err(|e| Error::with_message(ErrorCode::IoErr, e.to_string()))
+    }
+
+    fn file_size(&self) -> Result<DbOffset> {
+        self.file
+            .metadata()
+            .map(|m| m.len() as DbOffset)
+            .map_err(|e| Error::with_message(ErrorCode::IoErr, e.to_string()))
+    }
+
+    #[cfg(unix)]
+    fn lock(&mut self, level: LockLevel) -> Result<()> {
+        use libc::{flock, LOCK_EX, LOCK_NB, LOCK_SH, LOCK_UN};
+
+        if level <= self.lock_level {
+            return Ok(());
+        }
+
+        let fd = self.file.as_raw_fd();
+        let operation = match level {
+            LockLevel::None => LOCK_UN,
+            LockLevel::Shared => LOCK_SH | LOCK_NB,
+            LockLevel::Reserved | LockLevel::Pending | LockLevel::Exclusive => LOCK_EX | LOCK_NB,
+        };
+
+        let result = unsafe { flock(fd, operation) };
+        if result != 0 {
+            let errno = std::io::Error::last_os_error();
+            if errno.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Err(Error::new(ErrorCode::Busy));
+            }
+            return Err(Error::with_message(ErrorCode::IoErr, errno.to_string()));
+        }
+
+        self.lock_level = level;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn lock(&mut self, level: LockLevel) -> Result<()> {
+        // On non-Unix platforms, just track the level (simplified)
+        self.lock_level = level;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn unlock(&mut self, level: LockLevel) -> Result<()> {
+        use libc::{flock, LOCK_UN};
+
+        if level >= self.lock_level {
+            return Ok(());
+        }
+
+        if level == LockLevel::None {
+            let fd = self.file.as_raw_fd();
+            let result = unsafe { flock(fd, LOCK_UN) };
+            if result != 0 {
+                return Err(Error::with_message(
+                    ErrorCode::IoErr,
+                    std::io::Error::last_os_error().to_string(),
+                ));
+            }
+        }
+
+        self.lock_level = level;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn unlock(&mut self, level: LockLevel) -> Result<()> {
+        self.lock_level = level;
+        Ok(())
+    }
+
+    fn check_reserved_lock(&self) -> Result<bool> {
+        // Check if another process has a reserved or higher lock
+        // For simplicity, return false (assume no contention)
+        Ok(false)
+    }
+
+    fn sector_size(&self) -> i32 {
+        4096
+    }
+
+    fn device_characteristics(&self) -> DeviceCharacteristics {
+        DeviceCharacteristics::empty()
+    }
+}
+
+/// File-based VFS that performs real disk I/O
+pub struct FileVfs;
+
+impl Vfs for FileVfs {
+    type File = FileVfsFile;
+
+    fn open(&self, path: &str, flags: OpenFlags) -> Result<Self::File> {
+        let mut options = OpenOptions::new();
+
+        if flags.contains(OpenFlags::READONLY) {
+            options.read(true);
+        } else if flags.contains(OpenFlags::READWRITE) {
+            options.read(true).write(true);
+        }
+
+        if flags.contains(OpenFlags::CREATE) {
+            options.create(true);
+        }
+
+        let file = options
+            .open(path)
+            .map_err(|e| Error::with_message(ErrorCode::CantOpen, e.to_string()))?;
+
+        Ok(FileVfsFile::new(file, path.to_string()))
+    }
+
+    fn delete(&self, path: &str, _sync_dir: bool) -> Result<()> {
+        if Path::new(path).exists() {
+            std::fs::remove_file(path)
+                .map_err(|e| Error::with_message(ErrorCode::IoErr, e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn access(&self, path: &str, flags: AccessFlags) -> Result<bool> {
+        let path = Path::new(path);
+        if !path.exists() {
+            return Ok(false);
+        }
+
+        match flags {
+            AccessFlags::EXISTS => Ok(true),
+            AccessFlags::READ => {
+                // Check if readable by trying to open
+                File::open(path).map(|_| true).or(Ok(false))
+            }
+            AccessFlags::READWRITE => {
+                // Check if writable by trying to open for write
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .map(|_| true)
+                    .or(Ok(false))
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn full_pathname(&self, path: &str) -> Result<String> {
+        std::fs::canonicalize(path)
+            .map(|p| p.to_string_lossy().to_string())
+            .or_else(|_| Ok(path.to_string()))
+    }
+
+    fn randomness(&self, buf: &mut [u8]) -> i32 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+
+        // Simple xorshift PRNG
+        let mut state = seed;
+        for byte in buf.iter_mut() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = (state & 0xFF) as u8;
+        }
+        buf.len() as i32
+    }
+
+    fn sleep(&self, microseconds: i32) -> i32 {
+        std::thread::sleep(std::time::Duration::from_micros(microseconds as u64));
+        microseconds
+    }
+
+    fn current_time(&self) -> f64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let duration = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        2440587.5 + (duration.as_secs_f64() / 86400.0)
+    }
+
+    fn current_time_i64(&self) -> i64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let duration = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        duration.as_millis() as i64
+    }
+}
+
+// ============================================================================
 // Transaction State
 // ============================================================================
 

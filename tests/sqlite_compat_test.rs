@@ -202,3 +202,48 @@ fn test_progress_report() {
 
 // Re-export for use by other test modules
 pub use sqlite_compat::runner::TestDatabase;
+
+#[test]
+fn test_where_clause_filtering() {
+    let db = match RustqlTestDb::new("/tmp/rustql_where_test.db") {
+        Ok(db) => db,
+        Err(e) => {
+            println!("Failed to create database: {}", e);
+            return;
+        }
+    };
+    let mut db = db;
+
+    // Setup
+    let _ = db.exec_sql("CREATE TABLE t1(w INT, x INT, y INT)");
+    let _ = db.exec_sql("INSERT INTO t1 VALUES(1, 10, 100)");
+    let _ = db.exec_sql("INSERT INTO t1 VALUES(2, 20, 200)");
+    let _ = db.exec_sql("INSERT INTO t1 VALUES(3, 30, 300)");
+    let _ = db.exec_sql("INSERT INTO t1 VALUES(4, 40, 400)");
+
+    // Test WHERE clause
+    match db.exec_sql("SELECT w, x, y FROM t1 WHERE w = 2") {
+        Ok(result) => {
+            println!("WHERE test result: {:?}", result);
+            if result == vec!["2", "20", "200"] {
+                println!("PASS: WHERE clause filtering works!");
+            } else {
+                println!("FAIL: Expected [2, 20, 200], got {:?}", result);
+            }
+        }
+        Err(e) => println!("ERROR: {}", e),
+    }
+
+    // Test aggregate with WHERE
+    match db.exec_sql("SELECT COUNT(*) FROM t1 WHERE w > 2") {
+        Ok(result) => {
+            println!("COUNT with WHERE result: {:?}", result);
+            if result == vec!["2"] {
+                println!("PASS: COUNT with WHERE works!");
+            } else {
+                println!("FAIL: Expected [2], got {:?}", result);
+            }
+        }
+        Err(e) => println!("ERROR: {}", e),
+    }
+}

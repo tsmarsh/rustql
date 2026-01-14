@@ -1373,11 +1373,21 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_deferrable(&mut self) -> Result<Option<Deferrable>> {
-        let not = self.match_token(TokenKind::Not);
-        if !self.match_token(TokenKind::Deferrable) {
-            if not {
-                return Err(self.error("expected DEFERRABLE after NOT"));
+        // Check for NOT DEFERRABLE or DEFERRABLE
+        // Must peek ahead to avoid consuming NOT that belongs to NOT NULL, etc.
+        let not = if self.current().kind == TokenKind::Not {
+            // Only consume NOT if DEFERRABLE follows
+            if self.peek().kind == TokenKind::Deferrable {
+                self.advance(); // consume NOT
+                true
+            } else {
+                return Ok(None); // NOT is for something else (like NOT NULL)
             }
+        } else {
+            false
+        };
+
+        if !self.match_token(TokenKind::Deferrable) {
             return Ok(None);
         }
 

@@ -77,6 +77,15 @@ pub enum Opcode {
     /// Yield coroutine and jump if done
     Yield,
 
+    /// If r[P1] > 0 then r[P1] -= P3, jump to P2
+    IfPos,
+
+    /// Decrement r[P1], jump to P2 if result <= 0
+    DecrJumpZero,
+
+    /// Compute remaining LIMIT after OFFSET
+    OffsetLimit,
+
     // ========================================================================
     // Register Operations
     // ========================================================================
@@ -115,6 +124,9 @@ pub enum Opcode {
 
     /// Increment register P1 by P2
     Add,
+
+    /// Add immediate P2 to register P1
+    AddImm,
 
     /// P3 = P2 - P1
     Subtract,
@@ -545,6 +557,9 @@ impl Opcode {
             Opcode::Return => "Return",
             Opcode::EndCoroutine => "EndCoroutine",
             Opcode::Yield => "Yield",
+            Opcode::IfPos => "IfPos",
+            Opcode::DecrJumpZero => "DecrJumpZero",
+            Opcode::OffsetLimit => "OffsetLimit",
             Opcode::Copy => "Copy",
             Opcode::Move => "Move",
             Opcode::SCopy => "SCopy",
@@ -557,6 +572,7 @@ impl Opcode {
             Opcode::Blob => "Blob",
             Opcode::Variable => "Variable",
             Opcode::Add => "Add",
+            Opcode::AddImm => "AddImm",
             Opcode::Subtract => "Subtract",
             Opcode::Multiply => "Multiply",
             Opcode::Divide => "Divide",
@@ -650,6 +666,7 @@ impl Opcode {
             Opcode::Param => "Param",
             Opcode::TriggerTest => "TriggerTest",
             Opcode::TriggerProlog => "TriggerProlog",
+            Opcode::VFilter => "VFilter",
             Opcode::MaxOpcode => "MaxOpcode",
         }
     }

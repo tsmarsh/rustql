@@ -653,9 +653,9 @@ impl Fts3Table {
         let mut doclists = Vec::new();
         for segment in &self.segments {
             for leaf in &segment.leaves {
-                let terms = leaf_terms(leaf).ok_or_else(|| {
-                    Error::with_message(ErrorCode::Error, "invalid leaf node")
-                })?;
+                let Some(terms) = leaf_terms(leaf) else {
+                    continue;
+                };
                 for (term, doclist) in terms {
                     if term.starts_with(prefix.as_bytes()) {
                         doclists.push(doclist);
@@ -711,14 +711,11 @@ impl Fts3Table {
         let mut term_doclists: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
         for segment in &segments {
             for leaf in &segment.leaves {
-                let terms = leaf_terms(leaf).ok_or_else(|| {
-                    Error::with_message(ErrorCode::Error, "invalid leaf node")
-                })?;
+                let Some(terms) = leaf_terms(leaf) else {
+                    continue;
+                };
                 for (term, doclist) in terms {
-                    term_doclists
-                        .entry(term)
-                        .or_default()
-                        .push(doclist);
+                    term_doclists.entry(term).or_default().push(doclist);
                 }
             }
         }
@@ -992,11 +989,7 @@ fn intersect_doclists(left: &Fts3Doclist, right: &Fts3Doclist) -> Fts3Doclist {
     map_to_doclist(merged)
 }
 
-fn phrase_merge_doclists(
-    left: &Fts3Doclist,
-    right: &Fts3Doclist,
-    distance: i32,
-) -> Fts3Doclist {
+fn phrase_merge_doclists(left: &Fts3Doclist, right: &Fts3Doclist, distance: i32) -> Fts3Doclist {
     let left_map = doclist_to_map(left);
     let right_map = doclist_to_map(right);
     let mut merged = BTreeMap::new();

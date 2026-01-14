@@ -127,6 +127,12 @@ pub struct SelectCompiler<'s> {
     result_column_names: Vec<String>,
     /// Schema for name resolution (optional)
     schema: Option<&'s crate::schema::Schema>,
+    /// Register holding the remaining LIMIT counter (None if no limit)
+    limit_counter_reg: Option<i32>,
+    /// Register holding the remaining OFFSET counter (None if no offset)
+    offset_counter_reg: Option<i32>,
+    /// Label to jump to when LIMIT is exhausted
+    limit_done_label: Option<i32>,
 }
 
 impl<'s> SelectCompiler<'s> {
@@ -147,6 +153,9 @@ impl<'s> SelectCompiler<'s> {
             group_by_regs: Vec::new(),
             result_column_names: Vec::new(),
             schema: None,
+            limit_counter_reg: None,
+            offset_counter_reg: None,
+            limit_done_label: None,
         }
     }
 
@@ -167,6 +176,9 @@ impl<'s> SelectCompiler<'s> {
             group_by_regs: Vec::new(),
             result_column_names: Vec::new(),
             schema: Some(schema),
+            limit_counter_reg: None,
+            offset_counter_reg: None,
+            limit_done_label: None,
         }
     }
 
@@ -205,17 +217,18 @@ impl<'s> SelectCompiler<'s> {
             (dest.clone(), None, None)
         };
 
+        // Handle LIMIT/OFFSET - must set up counter BEFORE body compilation
+        // so output_row_with_limit can use it
+        if let Some(limit) = &select.limit {
+            self.compile_limit(limit)?;
+        }
+
         // Compile the body with appropriate destination
         self.compile_body(&select.body, &actual_dest)?;
 
         // Handle ORDER BY output (after body has populated sorter)
         if let (Some(sorter_cursor), Some(order_by)) = (sorter_cursor, order_by_cols) {
             self.compile_order_by_output(&order_by, sorter_cursor, dest)?;
-        }
-
-        // Handle LIMIT/OFFSET
-        if let Some(limit) = &select.limit {
-            self.compile_limit(limit)?;
         }
 
         // Add Halt opcode
@@ -295,13 +308,7 @@ impl<'s> SelectCompiler<'s> {
                 if filter.cursor == *cursor {
                     match &filter.pattern {
                         Expr::Literal(Literal::String(text)) => {
-                            self.emit(
-                                Opcode::VFilter,
-                                *cursor,
-                                0,
-                                0,
-                                P4::Text(text.clone()),
-                            );
+                            self.emit(Opcode::VFilter, *cursor, 0, 0, P4::Text(text.clone()));
                         }
                         expr => {
                             let reg = self.alloc_reg();
@@ -316,8 +323,9 @@ impl<'s> SelectCompiler<'s> {
             rewind_labels.push(label);
         }
 
-        // Inner loop start
-        let loop_start = self.current_addr();
+        // Inner loop start - use a label to avoid conflict with resolve_labels
+        let loop_start_label = self.alloc_label();
+        self.resolve_label(loop_start_label, self.current_addr());
 
         // Evaluate WHERE clause
         let where_skip_label = if let Some(where_expr) = remaining_where.as_ref() {
@@ -361,10 +369,18 @@ impl<'s> SelectCompiler<'s> {
             );
         }
 
-        // Output the row
-        self.output_row(dest, result_regs.0, result_regs.1)?;
+        // Create a loop continuation label for OFFSET skip
+        let loop_continue_label = self.alloc_label();
 
-        // WHERE skip target
+        // Output the row (with LIMIT/OFFSET if applicable)
+        if self.limit_counter_reg.is_some() || self.offset_counter_reg.is_some() {
+            self.output_row_with_limit(dest, result_regs.0, result_regs.1, loop_continue_label)?;
+        } else {
+            self.output_row(dest, result_regs.0, result_regs.1)?;
+        }
+
+        // Loop continuation target (for WHERE skip, DISTINCT skip, OFFSET skip)
+        self.resolve_label(loop_continue_label, self.current_addr());
         if let Some(label) = where_skip_label {
             self.resolve_label(label, self.current_addr());
         }
@@ -376,7 +392,7 @@ impl<'s> SelectCompiler<'s> {
 
         // Generate Next for each table (in reverse order for nested loops)
         for (i, cursor) in table_cursors.iter().enumerate().rev() {
-            self.emit(Opcode::Next, *cursor, loop_start as i32, 0, P4::Unused);
+            self.emit(Opcode::Next, *cursor, loop_start_label, 0, P4::Unused);
             self.resolve_label(rewind_labels[i], self.current_addr());
         }
 
@@ -387,6 +403,11 @@ impl<'s> SelectCompiler<'s> {
 
         if let Some(cursor) = distinct_cursor {
             self.emit(Opcode::Close, cursor, 0, 0, P4::Unused);
+        }
+
+        // Resolve LIMIT done label (jump here when limit exhausted)
+        if let Some(done_label) = self.limit_done_label {
+            self.resolve_label(done_label, self.current_addr());
         }
 
         Ok(())
@@ -437,7 +458,9 @@ impl<'s> SelectCompiler<'s> {
             rewind_labels.push(label);
         }
 
-        let loop_start = self.current_addr();
+        // Use label to avoid collision with resolve_labels
+        let loop_start_label = self.alloc_label();
+        self.resolve_label(loop_start_label, self.current_addr());
 
         // Evaluate WHERE clause
         let where_skip_label = if let Some(where_expr) = &core.where_clause {
@@ -476,7 +499,7 @@ impl<'s> SelectCompiler<'s> {
 
         // Next loop
         for (i, cursor) in table_cursors.iter().enumerate().rev() {
-            self.emit(Opcode::Next, *cursor, loop_start as i32, 0, P4::Unused);
+            self.emit(Opcode::Next, *cursor, loop_start_label, 0, P4::Unused);
             self.resolve_label(rewind_labels[i], self.current_addr());
         }
 
@@ -613,7 +636,9 @@ impl<'s> SelectCompiler<'s> {
             rewind_labels.push(label);
         }
 
-        let loop_start = self.current_addr();
+        // Use label to avoid collision with resolve_labels
+        let loop_start_label = self.alloc_label();
+        self.resolve_label(loop_start_label, self.current_addr());
 
         // Evaluate WHERE clause
         let where_skip_label = if let Some(where_expr) = &core.where_clause {
@@ -634,7 +659,7 @@ impl<'s> SelectCompiler<'s> {
 
         // Next loop
         for (i, cursor) in table_cursors.iter().enumerate().rev() {
-            self.emit(Opcode::Next, *cursor, loop_start as i32, 0, P4::Unused);
+            self.emit(Opcode::Next, *cursor, loop_start_label, 0, P4::Unused);
             self.resolve_label(rewind_labels[i], self.current_addr());
         }
 
@@ -678,7 +703,9 @@ impl<'s> SelectCompiler<'s> {
             rewind_labels.push(label);
         }
 
-        let loop_start = self.current_addr();
+        // Use label to avoid collision with resolve_labels
+        let loop_start_label = self.alloc_label();
+        self.resolve_label(loop_start_label, self.current_addr());
 
         // Evaluate WHERE clause
         let where_skip_label = if let Some(where_expr) = &core.where_clause {
@@ -720,7 +747,7 @@ impl<'s> SelectCompiler<'s> {
 
         // Next loop (in reverse order)
         for (i, cursor) in table_cursors.iter().enumerate().rev() {
-            self.emit(Opcode::Next, *cursor, loop_start as i32, 0, P4::Unused);
+            self.emit(Opcode::Next, *cursor, loop_start_label, 0, P4::Unused);
             self.resolve_label(rewind_labels[i], self.current_addr());
         }
 
@@ -752,7 +779,9 @@ impl<'s> SelectCompiler<'s> {
             P4::Unused,
         );
 
-        let sorter_loop_start = self.current_addr();
+        // Use label to avoid collision with resolve_labels
+        let sorter_loop_start_label = self.alloc_label();
+        self.resolve_label(sorter_loop_start_label, self.current_addr());
 
         // Get current row from sorter
         let sorter_data_reg = self.alloc_reg();
@@ -836,7 +865,7 @@ impl<'s> SelectCompiler<'s> {
         self.emit(
             Opcode::SorterNext,
             sorter_cursor,
-            sorter_loop_start as i32,
+            sorter_loop_start_label,
             0,
             P4::Unused,
         );
@@ -1377,32 +1406,56 @@ impl<'s> SelectCompiler<'s> {
                 }
             }
             Expr::Column(col_ref) => {
-                // Use column_index if available from resolver
-                let col_idx = col_ref.column_index.unwrap_or(0);
-
-                // Find the table and column
-                if let Some(table) = &col_ref.table {
+                // Find the table and column index
+                let (cursor, col_idx) = if let Some(table) = &col_ref.table {
                     if let Some(tinfo) = self.tables.iter().find(|t| t.name == *table) {
-                        self.emit(
-                            Opcode::Column,
-                            tinfo.cursor,
-                            col_idx,
-                            dest_reg,
-                            P4::Text(col_ref.column.clone()),
-                        );
+                        // Use column_index if set, otherwise look up from schema
+                        let idx = col_ref.column_index.unwrap_or_else(|| {
+                            tinfo
+                                .schema_table
+                                .as_ref()
+                                .and_then(|st| {
+                                    st.columns
+                                        .iter()
+                                        .position(|c| c.name.eq_ignore_ascii_case(&col_ref.column))
+                                })
+                                .map(|i| i as i32)
+                                .unwrap_or(0)
+                        });
+                        (tinfo.cursor, idx)
+                    } else {
+                        // Table not found, use defaults
+                        (0, col_ref.column_index.unwrap_or(0))
                     }
                 } else {
-                    // Search all tables for column
-                    if let Some(tinfo) = self.tables.first() {
-                        self.emit(
-                            Opcode::Column,
-                            tinfo.cursor,
-                            col_idx,
-                            dest_reg,
-                            P4::Text(col_ref.column.clone()),
-                        );
+                    // No table specified - search all tables for column
+                    let mut found = None;
+                    for tinfo in &self.tables {
+                        if let Some(st) = &tinfo.schema_table {
+                            if let Some(idx) = st
+                                .columns
+                                .iter()
+                                .position(|c| c.name.eq_ignore_ascii_case(&col_ref.column))
+                            {
+                                found = Some((tinfo.cursor, idx as i32));
+                                break;
+                            }
+                        }
                     }
-                }
+                    found.unwrap_or_else(|| {
+                        // Fallback to first table with col_idx=0
+                        let cursor = self.tables.first().map(|t| t.cursor).unwrap_or(0);
+                        (cursor, col_ref.column_index.unwrap_or(0))
+                    })
+                };
+
+                self.emit(
+                    Opcode::Column,
+                    cursor,
+                    col_idx,
+                    dest_reg,
+                    P4::Text(col_ref.column.clone()),
+                );
             }
             Expr::Binary { op, left, right } => {
                 let left_reg = self.alloc_reg();
@@ -1579,6 +1632,138 @@ impl<'s> SelectCompiler<'s> {
                 self.next_cursor = subcompiler.next_cursor;
                 // In real implementation, inline the ops
             }
+            Expr::Like {
+                expr: text_expr,
+                pattern,
+                op,
+                negated,
+                ..
+            } => {
+                // Compile LIKE/GLOB expression
+                let text_reg = self.alloc_reg();
+                let pattern_reg = self.alloc_reg();
+                self.compile_expr(text_expr, text_reg)?;
+                self.compile_expr(pattern, pattern_reg)?;
+
+                let opcode = match op {
+                    crate::parser::ast::LikeOp::Like => Opcode::Like,
+                    crate::parser::ast::LikeOp::Glob => Opcode::Glob,
+                    _ => Opcode::Like, // Fallback for Regexp/Match
+                };
+
+                // Like opcode: P1=text, P2=result, P3=pattern
+                self.emit(opcode, text_reg, dest_reg, pattern_reg, P4::Unused);
+
+                if *negated {
+                    // Negate the result
+                    self.emit(Opcode::Not, dest_reg, dest_reg, 0, P4::Unused);
+                }
+            }
+            Expr::In {
+                expr: val_expr,
+                list,
+                negated,
+            } => {
+                // Compile IN expression
+                let val_reg = self.alloc_reg();
+                self.compile_expr(val_expr, val_reg)?;
+
+                match list {
+                    crate::parser::ast::InList::Values(values) => {
+                        if values.is_empty() {
+                            // Empty list - always false
+                            self.emit(
+                                Opcode::Integer,
+                                if *negated { 1 } else { 0 },
+                                dest_reg,
+                                0,
+                                P4::Unused,
+                            );
+                        } else {
+                            let match_label = self.alloc_label();
+                            let end_label = self.alloc_label();
+
+                            for value in values {
+                                let cmp_reg = self.alloc_reg();
+                                self.compile_expr(value, cmp_reg)?;
+                                // If equal, jump to match
+                                self.emit(Opcode::Eq, val_reg, match_label, cmp_reg, P4::Unused);
+                            }
+
+                            // No match found
+                            self.emit(
+                                Opcode::Integer,
+                                if *negated { 1 } else { 0 },
+                                dest_reg,
+                                0,
+                                P4::Unused,
+                            );
+                            self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+
+                            // Match found
+                            self.resolve_label(match_label, self.current_addr());
+                            self.emit(
+                                Opcode::Integer,
+                                if *negated { 0 } else { 1 },
+                                dest_reg,
+                                0,
+                                P4::Unused,
+                            );
+
+                            self.resolve_label(end_label, self.current_addr());
+                        }
+                    }
+                    _ => {
+                        // Subquery or table - not yet implemented, return NULL
+                        self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                    }
+                }
+            }
+            Expr::Between {
+                expr: val_expr,
+                low,
+                high,
+                negated,
+            } => {
+                // Compile BETWEEN: val >= low AND val <= high
+                let val_reg = self.alloc_reg();
+                let low_reg = self.alloc_reg();
+                let high_reg = self.alloc_reg();
+
+                self.compile_expr(val_expr, val_reg)?;
+                self.compile_expr(low, low_reg)?;
+                self.compile_expr(high, high_reg)?;
+
+                let fail_label = self.alloc_label();
+                let end_label = self.alloc_label();
+
+                // Check val >= low (fail if val < low)
+                self.emit(Opcode::Lt, val_reg, fail_label, low_reg, P4::Unused);
+                // Check val <= high (fail if val > high)
+                self.emit(Opcode::Gt, val_reg, fail_label, high_reg, P4::Unused);
+
+                // Success - in range
+                self.emit(
+                    Opcode::Integer,
+                    if *negated { 0 } else { 1 },
+                    dest_reg,
+                    0,
+                    P4::Unused,
+                );
+                self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+
+                // Fail - not in range
+                self.resolve_label(fail_label, self.current_addr());
+                self.emit(
+                    Opcode::Integer,
+                    if *negated { 1 } else { 0 },
+                    dest_reg,
+                    0,
+                    P4::Unused,
+                );
+
+                self.resolve_label(end_label, self.current_addr());
+            }
             _ => {
                 // For other expression types, emit NULL as placeholder
                 self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
@@ -1604,8 +1789,9 @@ impl<'s> SelectCompiler<'s> {
             P4::Unused,
         );
 
-        // Loop through sorted rows
-        let sorter_loop_start = self.current_addr();
+        // Loop through sorted rows - use label to avoid collision with resolve_labels
+        let sorter_loop_start_label = self.alloc_label();
+        self.resolve_label(sorter_loop_start_label, self.current_addr());
 
         // Get the row data from sorter into a register
         let record_reg = self.alloc_reg();
@@ -1640,7 +1826,7 @@ impl<'s> SelectCompiler<'s> {
         self.emit(
             Opcode::SorterNext,
             sorter_cursor,
-            sorter_loop_start as i32,
+            sorter_loop_start_label,
             0,
             P4::Unused,
         );
@@ -1659,12 +1845,54 @@ impl<'s> SelectCompiler<'s> {
         // Store limit in a register for checking during result output
         let limit_reg = self.alloc_reg();
         self.compile_expr(&limit.limit, limit_reg)?;
+        self.limit_counter_reg = Some(limit_reg);
+
+        // Allocate label to jump to when limit exhausted
+        self.limit_done_label = Some(self.alloc_label());
 
         if let Some(offset) = &limit.offset {
             let offset_reg = self.alloc_reg();
             self.compile_expr(offset, offset_reg)?;
-            // Subtract offset from limit for combined processing
-            self.emit(Opcode::Add, limit_reg, offset_reg, limit_reg, P4::Unused);
+            self.offset_counter_reg = Some(offset_reg);
+        }
+
+        Ok(())
+    }
+
+    /// Output a row with LIMIT/OFFSET enforcement.
+    /// skip_label: where to jump if still in OFFSET phase (skip this row)
+    fn output_row_with_limit(
+        &mut self,
+        dest: &SelectDest,
+        base_reg: i32,
+        count: usize,
+        skip_label: i32,
+    ) -> Result<()> {
+        // Handle OFFSET: skip rows until offset counter reaches 0
+        if let Some(offset_reg) = self.offset_counter_reg {
+            let after_offset = self.alloc_label();
+            // If offset <= 0, skip the offset decrement
+            self.emit(Opcode::IfNot, offset_reg, after_offset, 0, P4::Unused);
+            // Decrement offset and skip this row
+            self.emit(Opcode::AddImm, offset_reg, -1, 0, P4::Unused);
+            self.emit(Opcode::Goto, 0, skip_label, 0, P4::Unused);
+            self.resolve_label(after_offset, self.current_addr());
+        }
+
+        // Handle LIMIT: check if we've output enough rows
+        if let Some(limit_reg) = self.limit_counter_reg {
+            if let Some(done_label) = self.limit_done_label {
+                // If limit <= 0, we're done
+                self.emit(Opcode::IfNot, limit_reg, done_label, 0, P4::Unused);
+            }
+        }
+
+        // Output the row
+        self.output_row(dest, base_reg, count)?;
+
+        // Decrement limit after output
+        if let Some(limit_reg) = self.limit_counter_reg {
+            self.emit(Opcode::AddImm, limit_reg, -1, 0, P4::Unused);
         }
 
         Ok(())
@@ -1795,10 +2023,16 @@ impl<'s> SelectCompiler<'s> {
 
                         // Compile argument
                         let arg_reg = self.alloc_reg();
+                        let mut has_arg = false;
                         if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
                             if !exprs.is_empty() {
                                 self.compile_expr(&exprs[0], arg_reg)?;
+                                has_arg = true;
                             }
+                        }
+                        // For COUNT(*), initialize arg_reg with 1 so it's not NULL
+                        if !has_arg && name_upper == "COUNT" {
+                            self.emit(Opcode::Integer, 1, arg_reg, 0, P4::Unused);
                         }
 
                         // Emit aggregate step opcode
@@ -1937,7 +2171,10 @@ impl<'s> SelectCompiler<'s> {
     fn output_ephemeral_table(&mut self, cursor: i32, dest: &SelectDest) -> Result<()> {
         let done_label = self.alloc_label();
         self.emit(Opcode::Rewind, cursor, done_label, 0, P4::Unused);
-        let loop_start = self.current_addr();
+
+        // Use label to avoid collision with resolve_labels
+        let loop_start_label = self.alloc_label();
+        self.resolve_label(loop_start_label, self.current_addr());
 
         // Get row from ephemeral table
         let data_reg = self.alloc_reg();
@@ -1946,7 +2183,7 @@ impl<'s> SelectCompiler<'s> {
         // Output based on destination
         self.output_row(dest, data_reg, 1)?;
 
-        self.emit(Opcode::Next, cursor, loop_start as i32, 0, P4::Unused);
+        self.emit(Opcode::Next, cursor, loop_start_label, 0, P4::Unused);
         self.resolve_label(done_label, self.current_addr());
 
         Ok(())
@@ -2195,5 +2432,56 @@ mod tests {
         // Should have OpenEphemeral for union processing
         let has_ephemeral = ops.iter().any(|op| op.opcode == Opcode::OpenEphemeral);
         assert!(has_ephemeral);
+    }
+
+    #[test]
+    fn test_compile_select_with_limit() {
+        use crate::parser::ast::LimitClause;
+
+        let select = SelectStmt {
+            with: None,
+            body: SelectBody::Select(SelectCore {
+                distinct: Distinct::All,
+                columns: vec![ResultColumn::Expr {
+                    expr: Expr::Literal(Literal::Integer(1)),
+                    alias: None,
+                }],
+                from: Some(FromClause {
+                    tables: vec![TableRef::Table {
+                        name: QualifiedName::new("test"),
+                        alias: None,
+                        indexed_by: None,
+                    }],
+                }),
+                where_clause: None,
+                group_by: None,
+                having: None,
+                window: None,
+            }),
+            order_by: None,
+            limit: Some(LimitClause {
+                limit: Box::new(Expr::Literal(Literal::Integer(10))),
+                offset: None,
+            }),
+        };
+
+        let ops = compile_select(&select).unwrap();
+
+        // Should have Integer to load the limit
+        let has_integer = ops
+            .iter()
+            .any(|op| op.opcode == Opcode::Integer && op.p1 == 10);
+        assert!(
+            has_integer,
+            "Should have Integer opcode to load LIMIT value 10"
+        );
+
+        // Should have IfNot opcode for limit check
+        let has_ifnot = ops.iter().any(|op| op.opcode == Opcode::IfNot);
+        assert!(has_ifnot, "Should have IfNot opcode for limit check");
+
+        // Should have AddImm to decrement limit counter
+        let has_addimm = ops.iter().any(|op| op.opcode == Opcode::AddImm);
+        assert!(has_addimm, "Should have AddImm opcode to decrement limit");
     }
 }

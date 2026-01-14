@@ -116,16 +116,29 @@ pub fn func_matchinfo(args: &[Value]) -> Result<Value> {
         ));
     }
 
-    let query = if args.len() == 1 {
-        value_to_string(&args[0])
-    } else {
-        value_to_string(&args[1])
-    };
-    let terms = tokenize_query(&query);
-    let mut buf = Vec::with_capacity(terms.len() * 4);
-    for _ in terms {
-        buf.extend_from_slice(&0u32.to_le_bytes());
+    if args.len() == 1 {
+        return Err(Error::with_message(
+            ErrorCode::Error,
+            "matchinfo() requires query context",
+        ));
     }
+
+    let text = value_to_string(&args[0]);
+    let query = value_to_string(&args[1]);
+    let lower_text = text.to_ascii_lowercase();
+    let terms = tokenize_query(&query);
+
+    let mut buf = Vec::with_capacity(terms.len() * 4);
+    for term in terms {
+        let mut count = 0u32;
+        let mut start = 0usize;
+        while let Some(pos) = lower_text[start..].find(&term) {
+            count += 1;
+            start += pos + term.len();
+        }
+        buf.extend_from_slice(&count.to_le_bytes());
+    }
+
     Ok(Value::Blob(buf))
 }
 
@@ -161,10 +174,19 @@ mod tests {
 
     #[test]
     fn test_matchinfo_basic() {
-        let args = [Value::Text("alpha beta".to_string())];
+        let args = [
+            Value::Text("alpha beta alpha".to_string()),
+            Value::Text("alpha beta".to_string()),
+        ];
         let result = func_matchinfo(&args).expect("matchinfo");
         match result {
-            Value::Blob(blob) => assert_eq!(blob.len(), 8),
+            Value::Blob(blob) => {
+                assert_eq!(blob.len(), 8);
+                let alpha = u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]);
+                let beta = u32::from_le_bytes([blob[4], blob[5], blob[6], blob[7]]);
+                assert_eq!(alpha, 2);
+                assert_eq!(beta, 1);
+            }
             _ => panic!("expected blob"),
         }
     }

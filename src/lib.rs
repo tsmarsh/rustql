@@ -11,6 +11,8 @@ pub mod error;
 pub mod executor;
 #[cfg(feature = "fts3")]
 pub mod fts3;
+#[cfg(feature = "fts5")]
+pub mod fts5;
 pub mod functions;
 pub mod mem;
 pub mod os;

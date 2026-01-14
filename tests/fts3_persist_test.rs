@@ -9,6 +9,7 @@ use rustql::{
 };
 use std::fs;
 use std::sync::Once;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn exec_sql(conn: &mut SqliteConnection, sql: &str) -> Result<Vec<Vec<String>>, String> {
     let mut all_rows = Vec::new();
@@ -69,16 +70,27 @@ fn init_sqlite() {
     });
 }
 
+fn temp_db_path(tag: &str) -> String {
+    let mut path = std::env::temp_dir();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = std::process::id();
+    path.push(format!("rustql_fts3_{}_{}_{}.db", tag, pid, nanos));
+    path.to_string_lossy().to_string()
+}
+
 #[test]
 fn test_fts3_persists_internal_content() {
     init_sqlite();
-    let path = "/tmp/rustql_fts3_persist.db";
-    let _ = fs::remove_file(path);
+    let path = temp_db_path("persist_internal");
+    let _ = fs::remove_file(&path);
     let _ = fs::remove_file(format!("{}-journal", path));
     let _ = fs::remove_file(format!("{}-wal", path));
     let _ = fs::remove_file(format!("{}-shm", path));
 
-    let mut conn = sqlite3_open(path).expect("open db");
+    let mut conn = sqlite3_open(&path).expect("open db");
     exec_sql(
         &mut conn,
         "CREATE VIRTUAL TABLE docs_internal USING fts3(title, body);
@@ -88,7 +100,7 @@ fn test_fts3_persists_internal_content() {
     .expect("setup");
     sqlite3_close(conn).expect("close");
 
-    let mut conn = sqlite3_open(path).expect("reopen");
+    let mut conn = sqlite3_open(&path).expect("reopen");
     let rows = exec_sql(
         &mut conn,
         "SELECT rowid FROM docs_internal WHERE docs_internal MATCH 'hello';",
@@ -109,13 +121,13 @@ fn test_fts3_persists_internal_content() {
 #[test]
 fn test_fts3_persists_external_content() {
     init_sqlite();
-    let path = "/tmp/rustql_fts3_external_content.db";
-    let _ = fs::remove_file(path);
+    let path = temp_db_path("persist_external");
+    let _ = fs::remove_file(&path);
     let _ = fs::remove_file(format!("{}-journal", path));
     let _ = fs::remove_file(format!("{}-wal", path));
     let _ = fs::remove_file(format!("{}-shm", path));
 
-    let mut conn = sqlite3_open(path).expect("open db");
+    let mut conn = sqlite3_open(&path).expect("open db");
     exec_sql(
         &mut conn,
         "CREATE TABLE content_external(docid INTEGER PRIMARY KEY, title, body);
@@ -127,7 +139,7 @@ fn test_fts3_persists_external_content() {
     assert_eq!(rows, vec![vec!["1".to_string()]]);
     sqlite3_close(conn).expect("close");
 
-    let mut conn = sqlite3_open(path).expect("reopen");
+    let mut conn = sqlite3_open(&path).expect("reopen");
     let rows = exec_sql(
         &mut conn,
         "SELECT rowid FROM docs_external WHERE docs_external MATCH 'alpha';",

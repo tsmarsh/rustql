@@ -1595,6 +1595,13 @@ impl Vdbe {
                     if let Some(cursor) = self.cursor(op.p1) {
                         self.vtab_context_name = cursor.vtab_name.clone();
                         self.vtab_context_rowid = cursor.rowid;
+                        #[cfg(feature = "fts3")]
+                        {
+                            crate::functions::fts3::set_fts3_context(
+                                self.vtab_context_name.clone(),
+                                self.vtab_context_rowid,
+                            );
+                        }
                     }
                     *self.mem_mut(op.p3) = value;
                 } else if let Some(cursor) = self.cursor(op.p1) {

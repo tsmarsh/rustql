@@ -210,20 +210,49 @@ impl<'a> Iterator for DoclistIter<'a> {
 }
 
 pub trait Fts3Tokenizer: Send + Sync {
-    fn tokenize(&self, text: &str) -> Result<Vec<String>>;
+    fn tokenize(&self, text: &str) -> Result<Vec<Fts3Token>>;
 }
 
 #[derive(Default)]
 pub struct SimpleTokenizer;
 
 impl Fts3Tokenizer for SimpleTokenizer {
-    fn tokenize(&self, text: &str) -> Result<Vec<String>> {
-        Ok(text
-            .split_whitespace()
-            .filter(|token| !token.is_empty())
-            .map(|token| token.to_string())
-            .collect())
+    fn tokenize(&self, text: &str) -> Result<Vec<Fts3Token>> {
+        let mut tokens = Vec::new();
+        let mut pos = 0i32;
+        let mut idx = 0usize;
+        let bytes = text.as_bytes();
+        while idx < bytes.len() {
+            while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+                idx += 1;
+            }
+            if idx >= bytes.len() {
+                break;
+            }
+            let start = idx;
+            while idx < bytes.len() && !bytes[idx].is_ascii_whitespace() {
+                idx += 1;
+            }
+            let end = idx;
+            let token = &text[start..end];
+            tokens.push(Fts3Token {
+                text: token.to_string(),
+                position: pos,
+                start,
+                end,
+            });
+            pos += 1;
+        }
+        Ok(tokens)
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct Fts3Token {
+    pub text: String,
+    pub position: i32,
+    pub start: usize,
+    pub end: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -375,7 +404,7 @@ impl Fts3Table {
         table
     }
 
-    pub fn tokenize(&self, text: &str) -> Result<Vec<String>> {
+    pub fn tokenize(&self, text: &str) -> Result<Vec<Fts3Token>> {
         self.tokenizer.tokenize(text)
     }
 
@@ -383,13 +412,13 @@ impl Fts3Table {
         let mut pending = PendingTerms::new();
         for (col_idx, value) in values.iter().enumerate() {
             let tokens = self.tokenize(value)?;
-            for (pos, token) in tokens.into_iter().enumerate() {
-                pending.add(&token, rowid, col_idx as i32, pos as i32);
+            for token in tokens {
+                pending.add(&token.text, rowid, col_idx as i32, token.position);
                 for prefix in &self.prefixes {
                     let prefix_len = *prefix as usize;
-                    if token.len() >= prefix_len {
-                        let prefix_term = format!("{}*", &token[..prefix_len]);
-                        pending.add(&prefix_term, rowid, col_idx as i32, pos as i32);
+                    if token.text.len() >= prefix_len {
+                        let prefix_term = format!("{}*", &token.text[..prefix_len]);
+                        pending.add(&prefix_term, rowid, col_idx as i32, token.position);
                     }
                 }
             }
@@ -407,11 +436,11 @@ impl Fts3Table {
         for value in values {
             let tokens = self.tokenize(value)?;
             for token in tokens {
-                pending.add_delete(&token, rowid);
+                pending.add_delete(&token.text, rowid);
                 for prefix in &self.prefixes {
                     let prefix_len = *prefix as usize;
-                    if token.len() >= prefix_len {
-                        let prefix_term = format!("{}*", &token[..prefix_len]);
+                    if token.text.len() >= prefix_len {
+                        let prefix_term = format!("{}*", &token.text[..prefix_len]);
                         pending.add_delete(&prefix_term, rowid);
                     }
                 }
@@ -575,6 +604,31 @@ impl Fts3Table {
         }
     }
 
+    pub fn matchinfo(&self, query: &str, rowid: i64) -> Result<Vec<u8>> {
+        let expr = self.parse_query(query)?;
+        let mut phrases = Vec::new();
+        collect_phrase_exprs(&expr, &mut phrases);
+
+        let n_phrase = phrases.len() as u32;
+        let n_col = self.columns.len() as u32;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&n_phrase.to_le_bytes());
+        buf.extend_from_slice(&n_col.to_le_bytes());
+
+        for phrase in phrases {
+            let doclist = self.evaluate_expr(&phrase)?;
+            for col in 0..n_col {
+                let stats = matchinfo_stats(&doclist, col as i32, rowid);
+                buf.extend_from_slice(&stats.hits_this_row.to_le_bytes());
+                buf.extend_from_slice(&stats.hits_all.to_le_bytes());
+                buf.extend_from_slice(&stats.docs_with_hits.to_le_bytes());
+            }
+        }
+
+        Ok(buf)
+    }
+
     fn lookup_term(&self, term: &str) -> Result<Fts3Doclist> {
         let term_bytes = term.as_bytes();
         let mut segments: Vec<&Fts3Segment> = self.segments.iter().collect();
@@ -697,6 +751,56 @@ impl Fts3Table {
             .retain(|seg| seg.level != level || !segments.iter().any(|s| s.idx == seg.idx));
         self.segments.push(new_segment);
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MatchStats {
+    hits_this_row: u32,
+    hits_all: u32,
+    docs_with_hits: u32,
+}
+
+fn collect_phrase_exprs(expr: &Fts3Expr, out: &mut Vec<Fts3Expr>) {
+    match expr {
+        Fts3Expr::Term(_) | Fts3Expr::Prefix(_) | Fts3Expr::Phrase(_) => out.push(expr.clone()),
+        Fts3Expr::And(left, right)
+        | Fts3Expr::Or(left, right)
+        | Fts3Expr::Not(left, right)
+        | Fts3Expr::Near(left, right, _) => {
+            collect_phrase_exprs(left, out);
+            collect_phrase_exprs(right, out);
+        }
+    }
+}
+
+fn matchinfo_stats(doclist: &Fts3Doclist, column: i32, rowid: i64) -> MatchStats {
+    let mut hits_this_row = 0usize;
+    let mut hits_all = 0usize;
+    let mut docs_with_hits = 0usize;
+
+    for entry in doclist.iter() {
+        let mut hits_in_row = 0usize;
+        for pos in entry.positions {
+            if pos.column == column {
+                hits_in_row += 1;
+            }
+        }
+
+        if entry.rowid == rowid {
+            hits_this_row = hits_in_row;
+        }
+
+        if hits_in_row > 0 {
+            hits_all += hits_in_row;
+            docs_with_hits += 1;
+        }
+    }
+
+    MatchStats {
+        hits_this_row: hits_this_row.min(u32::MAX as usize) as u32,
+        hits_all: hits_all.min(u32::MAX as usize) as u32,
+        docs_with_hits: docs_with_hits.min(u32::MAX as usize) as u32,
     }
 }
 

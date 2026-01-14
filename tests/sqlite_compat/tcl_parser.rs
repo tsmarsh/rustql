@@ -395,6 +395,34 @@ pub fn extract_sql_from_script(script: &str) -> Vec<SqlCommand> {
                 });
                 i = new_i;
             }
+        } else if remaining.starts_with("catch") && !remaining.starts_with("catchsql") {
+            // Handle "catch {execsql {SQL}}" or "set v [catch {execsql {SQL}} msg]" pattern
+            // Skip to the opening brace
+            i += 5;
+            while i < chars.len() && chars[i] != '{' {
+                i += 1;
+            }
+            if i < chars.len() && chars[i] == '{' {
+                // Extract the inner content
+                let (inner, new_i) = extract_braced_content(&chars, i);
+                i = new_i;
+                // Now parse the inner content for execsql
+                let inner_chars: Vec<char> = inner.chars().collect();
+                let inner_remaining: String = inner_chars.iter().collect();
+                if inner_remaining.starts_with("execsql") {
+                    let mut j = 7;
+                    while j < inner_chars.len() && inner_chars[j].is_whitespace() {
+                        j += 1;
+                    }
+                    if j < inner_chars.len() && inner_chars[j] == '{' {
+                        let (sql, _) = extract_braced_content(&inner_chars, j);
+                        commands.push(SqlCommand {
+                            sql,
+                            expects_error: true,
+                        });
+                    }
+                }
+            }
         } else {
             i += 1;
         }

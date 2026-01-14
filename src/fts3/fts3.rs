@@ -270,6 +270,206 @@ pub enum Fts3Expr {
     Near(Box<Fts3Expr>, Box<Fts3Expr>, i32),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Fts3QueryToken {
+    Word(String),
+    Phrase(String),
+    LParen,
+    RParen,
+    And,
+    Or,
+    Not,
+    Near(i32),
+}
+
+struct Fts3QueryParser<'a> {
+    tokenizer: &'a dyn Fts3Tokenizer,
+    tokens: Vec<Fts3QueryToken>,
+    pos: usize,
+}
+
+impl<'a> Fts3QueryParser<'a> {
+    fn new(expr: &'a str, tokenizer: &'a dyn Fts3Tokenizer) -> Result<Self> {
+        let tokens = tokenize_query(expr)?;
+        Ok(Self {
+            tokenizer,
+            tokens,
+            pos: 0,
+        })
+    }
+
+    fn parse(&mut self) -> Result<Fts3Expr> {
+        let expr = self.parse_or()?;
+        if self.peek().is_some() {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                "unexpected token in query",
+            ));
+        }
+        Ok(expr)
+    }
+
+    fn parse_or(&mut self) -> Result<Fts3Expr> {
+        let mut expr = self.parse_and()?;
+        while self.consume_if(&Fts3QueryToken::Or) {
+            let right = self.parse_and()?;
+            expr = Fts3Expr::Or(Box::new(expr), Box::new(right));
+        }
+        Ok(expr)
+    }
+
+    fn parse_and(&mut self) -> Result<Fts3Expr> {
+        let mut expr = self.parse_near()?;
+        loop {
+            if self.consume_if(&Fts3QueryToken::And) {
+                let right = self.parse_near()?;
+                expr = Fts3Expr::And(Box::new(expr), Box::new(right));
+                continue;
+            }
+            if self.consume_if(&Fts3QueryToken::Not) {
+                let right = self.parse_near()?;
+                expr = Fts3Expr::Not(Box::new(expr), Box::new(right));
+                continue;
+            }
+            if self.next_starts_expr() {
+                let right = self.parse_near()?;
+                expr = Fts3Expr::And(Box::new(expr), Box::new(right));
+                continue;
+            }
+            break;
+        }
+        Ok(expr)
+    }
+
+    fn parse_near(&mut self) -> Result<Fts3Expr> {
+        let mut expr = self.parse_primary()?;
+        loop {
+            let distance = match self.peek() {
+                Some(Fts3QueryToken::Near(distance)) => *distance,
+                _ => break,
+            };
+            self.advance();
+            let right = self.parse_primary()?;
+            expr = Fts3Expr::Near(Box::new(expr), Box::new(right), distance);
+        }
+        Ok(expr)
+    }
+
+    fn parse_primary(&mut self) -> Result<Fts3Expr> {
+        match self.peek() {
+            Some(Fts3QueryToken::Word(_)) => {
+                let token = self.advance().cloned().unwrap();
+                self.parse_word(token)
+            }
+            Some(Fts3QueryToken::Phrase(_)) => {
+                let token = self.advance().cloned().unwrap();
+                self.parse_phrase(token)
+            }
+            Some(Fts3QueryToken::LParen) => {
+                self.advance();
+                let expr = self.parse_or()?;
+                if !self.consume_if(&Fts3QueryToken::RParen) {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        "unterminated parenthesis in query",
+                    ));
+                }
+                Ok(expr)
+            }
+            _ => Err(Error::with_message(
+                ErrorCode::Error,
+                "expected term in query",
+            )),
+        }
+    }
+
+    fn parse_word(&self, token: Fts3QueryToken) -> Result<Fts3Expr> {
+        let Fts3QueryToken::Word(text) = token else {
+            return Err(Error::with_message(ErrorCode::Error, "expected word token"));
+        };
+        if let Some(stripped) = text.strip_suffix('*') {
+            if stripped.is_empty() {
+                return Err(Error::with_message(
+                    ErrorCode::Error,
+                    "invalid prefix query",
+                ));
+            }
+            let tokens = self.tokenizer.tokenize(stripped)?;
+            if tokens.len() != 1 {
+                return Err(Error::with_message(
+                    ErrorCode::Error,
+                    "invalid prefix query",
+                ));
+            }
+            return Ok(Fts3Expr::Prefix(tokens[0].text.clone()));
+        }
+
+        let tokens = self.tokenizer.tokenize(&text)?;
+        if tokens.is_empty() {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                "invalid term in query",
+            ));
+        }
+        if tokens.len() == 1 {
+            Ok(Fts3Expr::Term(tokens[0].text.clone()))
+        } else {
+            Ok(Fts3Expr::Phrase(
+                tokens.into_iter().map(|t| t.text).collect(),
+            ))
+        }
+    }
+
+    fn parse_phrase(&self, token: Fts3QueryToken) -> Result<Fts3Expr> {
+        let Fts3QueryToken::Phrase(text) = token else {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                "expected phrase token",
+            ));
+        };
+        let tokens = self.tokenizer.tokenize(&text)?;
+        if tokens.is_empty() {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                "empty phrase in query",
+            ));
+        }
+        Ok(Fts3Expr::Phrase(
+            tokens.into_iter().map(|t| t.text).collect(),
+        ))
+    }
+
+    fn next_starts_expr(&self) -> bool {
+        matches!(
+            self.peek(),
+            Some(Fts3QueryToken::Word(_))
+                | Some(Fts3QueryToken::Phrase(_))
+                | Some(Fts3QueryToken::LParen)
+        )
+    }
+
+    fn peek(&self) -> Option<&Fts3QueryToken> {
+        self.tokens.get(self.pos)
+    }
+
+    fn advance(&mut self) -> Option<&Fts3QueryToken> {
+        let token = self.tokens.get(self.pos);
+        if token.is_some() {
+            self.pos += 1;
+        }
+        token
+    }
+
+    fn consume_if(&mut self, expected: &Fts3QueryToken) -> bool {
+        if self.peek() == Some(expected) {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Fts3Index {
     pub segments: String,
@@ -662,44 +862,9 @@ impl Fts3Table {
             return Err(Error::with_message(ErrorCode::Error, "empty query"));
         }
 
-        if let Some((left, right, distance)) = split_near(expr) {
-            return Ok(Fts3Expr::Near(
-                Box::new(self.parse_query(left)?),
-                Box::new(self.parse_query(right)?),
-                distance,
-            ));
-        }
-        if let Some((left, right)) = split_keyword(expr, " OR ") {
-            return Ok(Fts3Expr::Or(
-                Box::new(self.parse_query(left)?),
-                Box::new(self.parse_query(right)?),
-            ));
-        }
-        if let Some((left, right)) = split_keyword(expr, " AND ") {
-            return Ok(Fts3Expr::And(
-                Box::new(self.parse_query(left)?),
-                Box::new(self.parse_query(right)?),
-            ));
-        }
-        if let Some((left, right)) = split_keyword(expr, " NOT ") {
-            return Ok(Fts3Expr::Not(
-                Box::new(self.parse_query(left)?),
-                Box::new(self.parse_query(right)?),
-            ));
-        }
-
-        let tokens: Vec<&str> = expr.split_whitespace().collect();
-        if tokens.len() > 1 {
-            return Ok(Fts3Expr::Phrase(
-                tokens.iter().map(|t| t.to_string()).collect(),
-            ));
-        }
-
-        if let Some(stripped) = expr.strip_suffix('*') {
-            return Ok(Fts3Expr::Prefix(stripped.to_string()));
-        }
-
-        Ok(Fts3Expr::Term(expr.to_string()))
+        let mut parser = Fts3QueryParser::new(expr, self.tokenizer.as_ref())?;
+        let parsed = parser.parse()?;
+        Ok(parsed)
     }
 
     pub fn evaluate_expr(&self, expr: &Fts3Expr) -> Result<Fts3Doclist> {
@@ -1209,46 +1374,86 @@ fn matchinfo_stats(doclist: &Fts3Doclist, column: i32, rowid: i64) -> MatchStats
     }
 }
 
-fn split_keyword<'a>(expr: &'a str, keyword: &str) -> Option<(&'a str, &'a str)> {
-    let upper = expr.to_ascii_uppercase();
-    let upper_keyword = keyword.to_ascii_uppercase();
-    if let Some(pos) = upper.find(&upper_keyword) {
-        let left = expr[..pos].trim();
-        let right = expr[pos + keyword.len()..].trim();
-        if !left.is_empty() && !right.is_empty() {
-            return Some((left, right));
-        }
-    }
-    None
-}
+fn tokenize_query(expr: &str) -> Result<Vec<Fts3QueryToken>> {
+    let mut tokens = Vec::new();
+    let mut iter = expr.char_indices().peekable();
 
-fn split_near(expr: &str) -> Option<(&str, &str, i32)> {
-    let upper = expr.to_ascii_uppercase();
-    if let Some(pos) = upper.find(" NEAR/") {
-        let left = expr[..pos].trim();
-        let rest = &expr[pos + 6..];
-        let mut distance_str = String::new();
-        for ch in rest.chars() {
-            if ch.is_ascii_digit() {
-                distance_str.push(ch);
-            } else {
+    while let Some((_, ch)) = iter.next() {
+        if ch.is_ascii_whitespace() {
+            continue;
+        }
+
+        if ch == '(' {
+            tokens.push(Fts3QueryToken::LParen);
+            continue;
+        }
+        if ch == ')' {
+            tokens.push(Fts3QueryToken::RParen);
+            continue;
+        }
+        if ch == '"' {
+            let mut phrase = String::new();
+            let mut closed = false;
+            while let Some((_, ch)) = iter.next() {
+                if ch == '"' {
+                    if let Some((_, next_ch)) = iter.peek() {
+                        if *next_ch == '"' {
+                            iter.next();
+                            phrase.push('"');
+                            continue;
+                        }
+                    }
+                    closed = true;
+                    break;
+                }
+                phrase.push(ch);
+            }
+            if !closed {
+                return Err(Error::with_message(
+                    ErrorCode::Error,
+                    "unterminated phrase in query",
+                ));
+            }
+            tokens.push(Fts3QueryToken::Phrase(phrase));
+            continue;
+        }
+
+        let mut word = String::new();
+        word.push(ch);
+        while let Some((_, next_ch)) = iter.peek() {
+            if next_ch.is_ascii_whitespace()
+                || *next_ch == '('
+                || *next_ch == ')'
+                || *next_ch == '"'
+            {
                 break;
             }
+            word.push(*next_ch);
+            iter.next();
         }
-        let distance = distance_str.parse::<i32>().unwrap_or(10);
-        let right = rest[distance_str.len()..].trim();
-        if !left.is_empty() && !right.is_empty() {
-            return Some((left, right, distance));
+
+        let upper = word.to_ascii_uppercase();
+        if upper == "AND" {
+            tokens.push(Fts3QueryToken::And);
+        } else if upper == "OR" {
+            tokens.push(Fts3QueryToken::Or);
+        } else if upper == "NOT" {
+            tokens.push(Fts3QueryToken::Not);
+        } else if upper == "NEAR" {
+            tokens.push(Fts3QueryToken::Near(10));
+        } else if let Some(distance_str) = upper.strip_prefix("NEAR/") {
+            if !distance_str.is_empty() && distance_str.chars().all(|c| c.is_ascii_digit()) {
+                let distance = distance_str.parse::<i32>().unwrap_or(10);
+                tokens.push(Fts3QueryToken::Near(distance));
+            } else {
+                tokens.push(Fts3QueryToken::Word(word));
+            }
+        } else {
+            tokens.push(Fts3QueryToken::Word(word));
         }
     }
-    if let Some(pos) = upper.find(" NEAR ") {
-        let left = expr[..pos].trim();
-        let right = expr[pos + 6..].trim();
-        if !left.is_empty() && !right.is_empty() {
-            return Some((left, right, 10));
-        }
-    }
-    None
+
+    Ok(tokens)
 }
 
 fn leaf_find_term(leaf: &[u8], term: &[u8]) -> Option<Vec<u8>> {

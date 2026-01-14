@@ -1563,7 +1563,7 @@ impl Schema {
             }
             return Err(Error::with_message(
                 ErrorCode::Error,
-                format!("index {} already exists", stmt.name.name),
+                format!("there is already an index named {}", stmt.name.name),
             ));
         }
 

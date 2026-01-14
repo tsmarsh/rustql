@@ -1579,6 +1579,19 @@ impl Vdbe {
             Opcode::Column => {
                 // Read column P2 from cursor P1 into register P3
                 // If P4 is a column name and P2 is 0, look up index by name
+                if op.p2 < 0 {
+                    if let Some(cursor) = self.cursor(op.p1) {
+                        if let Some(rowid) = cursor.rowid {
+                            self.mem_mut(op.p3).set_int(rowid);
+                        } else {
+                            self.mem_mut(op.p3).set_null();
+                        }
+                    } else {
+                        self.mem_mut(op.p3).set_null();
+                    }
+                    return Ok(ExecResult::Continue);
+                }
+
                 let mut col_idx = op.p2 as usize;
 
                 // Try to resolve column index by name if P4 contains a column name
@@ -2642,7 +2655,7 @@ impl Vdbe {
                             let if_not_exists = sql.to_uppercase().contains("IF NOT EXISTS");
 
                             // Parse CREATE TABLE SQL and register the table
-                            if let Some(table) = self.parse_create_table_sql(sql, root_page) {
+                            if let Some(table) = crate::schema::parse_create_sql(sql, root_page) {
                                 let table_name_lower = table.name.to_lowercase();
 
                                 // Check for reserved internal names (sqlite_*)
@@ -2887,191 +2900,6 @@ impl Vdbe {
         }
 
         Ok(ExecResult::Continue)
-    }
-
-    /// Parse CREATE TABLE SQL and build a Table struct
-    fn parse_create_table_sql(&self, sql: &str, root_page: u32) -> Option<crate::schema::Table> {
-        use crate::schema::{Affinity, Column, Table};
-
-        // Simple parser for CREATE TABLE name (col1 type, col2 type, ...)
-        let sql_upper = sql.to_uppercase();
-        if sql_upper.starts_with("CREATE VIRTUAL TABLE") {
-            let mut after_create = sql["CREATE VIRTUAL TABLE".len()..].trim();
-            let after_upper = after_create.to_uppercase();
-            if after_upper.starts_with("IF NOT EXISTS") {
-                after_create = after_create[13..].trim();
-            }
-
-            let using_pos = after_create
-                .to_uppercase()
-                .find("USING")
-                .unwrap_or(after_create.len());
-            let table_name = after_create[..using_pos].trim().to_string();
-            let mut columns = Vec::new();
-
-            let mut module_name = String::new();
-            let mut module_args: Vec<String> = Vec::new();
-            if using_pos < after_create.len() {
-                let after_using = after_create[using_pos + 5..].trim();
-                if let Some(paren_pos) = after_using.find('(') {
-                    module_name = after_using[..paren_pos].trim().to_string();
-                    let args = after_using[paren_pos + 1..].trim();
-                    let args = args.strip_suffix(')')?;
-                    for arg in args.split(',') {
-                        let name = arg.trim();
-                        if name.is_empty() {
-                            continue;
-                        }
-                        module_args.push(name.to_string());
-                        if !name.contains('=') {
-                            columns.push(Column {
-                                name: name.to_string(),
-                                type_name: None,
-                                affinity: Affinity::Blob,
-                                not_null: false,
-                                not_null_conflict: None,
-                                default_value: None,
-                                collation: "BINARY".to_string(),
-                                is_primary_key: false,
-                                is_hidden: false,
-                                generated: None,
-                            });
-                        }
-                    }
-                } else {
-                    module_name = after_using.trim().to_string();
-                }
-            }
-
-            #[cfg(feature = "fts3")]
-            {
-                if module_name.eq_ignore_ascii_case("fts3") {
-                    let table = crate::fts3::Fts3Table::from_virtual_spec(
-                        table_name.clone(),
-                        "main",
-                        &module_args,
-                    );
-                    crate::fts3::register_table(table);
-                }
-            }
-
-            return Some(Table {
-                name: table_name,
-                db_idx: 0,
-                root_page,
-                columns,
-                primary_key: None,
-                indexes: Vec::new(),
-                foreign_keys: Vec::new(),
-                checks: Vec::new(),
-                without_rowid: false,
-                strict: false,
-                is_virtual: true,
-                virtual_module: if module_name.is_empty() {
-                    None
-                } else {
-                    Some(module_name)
-                },
-                virtual_args: module_args,
-                autoincrement: false,
-                sql: Some(sql.to_string()),
-                row_estimate: 0,
-            });
-        }
-
-        if !sql_upper.starts_with("CREATE TABLE") {
-            return None;
-        }
-
-        // Extract table name
-        let after_create = sql[12..].trim(); // Skip "CREATE TABLE"
-        let after_create = if after_create.to_uppercase().starts_with("IF NOT EXISTS") {
-            after_create[13..].trim()
-        } else {
-            after_create
-        };
-
-        let paren_pos = after_create.find('(')?;
-        let table_name = after_create[..paren_pos].trim().to_string();
-        let columns_str = after_create[paren_pos + 1..].trim();
-        let columns_str = columns_str.strip_suffix(')')?;
-
-        // Parse columns
-        let mut columns = Vec::new();
-        for col_def in columns_str.split(',') {
-            let col_def = col_def.trim();
-            if col_def.is_empty() {
-                continue;
-            }
-
-            let parts: Vec<&str> = col_def.split_whitespace().collect();
-            if parts.is_empty() {
-                continue;
-            }
-
-            let name = parts[0].to_string();
-            let type_name = if parts.len() > 1 {
-                Some(parts[1].to_string())
-            } else {
-                None
-            };
-
-            // Determine affinity from type name
-            let affinity = if let Some(ref tn) = type_name {
-                let tn_upper = tn.to_uppercase();
-                if tn_upper.contains("INT") {
-                    Affinity::Integer
-                } else if tn_upper.contains("CHAR")
-                    || tn_upper.contains("CLOB")
-                    || tn_upper.contains("TEXT")
-                {
-                    Affinity::Text
-                } else if tn_upper.contains("BLOB") || tn_upper.is_empty() {
-                    Affinity::Blob
-                } else if tn_upper.contains("REAL")
-                    || tn_upper.contains("FLOA")
-                    || tn_upper.contains("DOUB")
-                {
-                    Affinity::Real
-                } else {
-                    Affinity::Numeric
-                }
-            } else {
-                Affinity::Blob
-            };
-
-            columns.push(Column {
-                name,
-                type_name,
-                affinity,
-                not_null: false,
-                not_null_conflict: None,
-                default_value: None,
-                collation: "BINARY".to_string(),
-                is_primary_key: false,
-                is_hidden: false,
-                generated: None,
-            });
-        }
-
-        Some(Table {
-            name: table_name,
-            db_idx: 0, // main database
-            root_page,
-            columns,
-            primary_key: None,
-            indexes: Vec::new(),
-            foreign_keys: Vec::new(),
-            checks: Vec::new(),
-            without_rowid: false,
-            strict: false,
-            is_virtual: false,
-            virtual_module: None,
-            virtual_args: Vec::new(),
-            autoincrement: false,
-            sql: Some(sql.to_string()),
-            row_estimate: 0,
-        })
     }
 
     /// Decode a record's raw bytes into Value vector

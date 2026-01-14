@@ -477,22 +477,35 @@ fn write_u16(data: &mut [u8], offset: usize, value: u16) -> Result<()> {
     Ok(())
 }
 
-fn write_varint(mut value: u64, out: &mut Vec<u8>) {
+fn write_varint(value: u64, out: &mut Vec<u8>) {
     if value <= 0x7f {
         out.push(value as u8);
-        return;
+    } else if value <= 0x3fff {
+        out.push(((value >> 7) | 0x80) as u8);
+        out.push((value & 0x7f) as u8);
+    } else if value <= 0x1fffff {
+        out.push(((value >> 14) | 0x80) as u8);
+        out.push(((value >> 7) | 0x80) as u8);
+        out.push((value & 0x7f) as u8);
+    } else if value <= 0x0fffffff {
+        out.push(((value >> 21) | 0x80) as u8);
+        out.push(((value >> 14) | 0x80) as u8);
+        out.push(((value >> 7) | 0x80) as u8);
+        out.push((value & 0x7f) as u8);
+    } else {
+        let len = 9;
+        let mut buf = [0u8; 9];
+        let mut v = value;
+        for i in (0..len).rev() {
+            if i == len - 1 {
+                buf[i] = (v & 0x7f) as u8;
+            } else {
+                buf[i] = ((v & 0x7f) | 0x80) as u8;
+            }
+            v >>= 7;
+        }
+        out.extend_from_slice(&buf);
     }
-
-    let mut buf = [0u8; 9];
-    let mut i = 8;
-    buf[i] = (value & 0xff) as u8;
-    value >>= 8;
-    while value > 0 {
-        i -= 1;
-        buf[i] = ((value & 0x7f) as u8) | 0x80;
-        value >>= 7;
-    }
-    out.extend_from_slice(&buf[i..]);
 }
 
 struct OverflowChain {
@@ -2413,6 +2426,17 @@ impl Btree {
     pub fn commit(&mut self) -> Result<()> {
         self.commit_phase_one(None)?;
         self.commit_phase_two(false)
+    }
+
+    pub fn commit_shared(&self) -> Result<()> {
+        let mut shared = self
+            .shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
+        shared.pager.commit_phase_one(None)?;
+        shared.pager.commit_phase_two()?;
+        shared.in_transaction = TransState::None;
+        Ok(())
     }
 
     /// sqlite3BtreeRollback

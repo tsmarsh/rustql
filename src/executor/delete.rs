@@ -391,18 +391,24 @@ impl DeleteCompiler {
                 }
             },
             Expr::Column(col_ref) => {
-                let col_idx = if let Some(&idx) = self.column_map.get(&col_ref.column) {
-                    idx
+                let col_idx = col_ref.column_index.unwrap_or_else(|| {
+                    if let Some(&idx) = self.column_map.get(&col_ref.column) {
+                        idx as i32
+                    } else {
+                        self.get_column_index(&col_ref.column) as i32
+                    }
+                });
+                if col_idx < 0 {
+                    self.emit(Opcode::Rowid, self.table_cursor, dest_reg, 0, P4::Unused);
                 } else {
-                    self.get_column_index(&col_ref.column)
-                };
-                self.emit(
-                    Opcode::Column,
-                    self.table_cursor,
-                    col_idx as i32,
-                    dest_reg,
-                    P4::Unused,
-                );
+                    self.emit(
+                        Opcode::Column,
+                        self.table_cursor,
+                        col_idx,
+                        dest_reg,
+                        P4::Unused,
+                    );
+                }
             }
             Expr::Binary { op, left, right } => {
                 let left_reg = self.alloc_reg();

@@ -806,8 +806,19 @@ impl<'s> StatementCompiler<'s> {
             0,
             reg_root_page, // root page register
             0,
-            P4::Text(create_sql),
+            P4::Text(create_sql.clone()),
         ));
+
+        let cursor_id = 0;
+        self.append_sqlite_master_open(&mut ops, cursor_id);
+        self.append_sqlite_master_insert(
+            &mut ops,
+            cursor_id,
+            &create.name.name,
+            reg_root_page,
+            &create_sql,
+        );
+        self.append_sqlite_master_close(&mut ops, cursor_id);
 
         // 4: Goto end
         ops.push(Self::make_op(Opcode::Goto, 0, 1, 0, P4::Unused));
@@ -826,9 +837,12 @@ impl<'s> StatementCompiler<'s> {
         let reg_root_page = 1;
         ops.push(Self::make_op(Opcode::Init, 0, 2, 0, P4::Unused));
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
+        let sqlite_master_cursor = 0;
+        self.append_sqlite_master_open(&mut ops, sqlite_master_cursor);
+
         if create.module.eq_ignore_ascii_case("fts3") {
             let shadow_tables = self.build_fts3_shadow_tables(create);
-            for sql in shadow_tables {
+            for (table_name, sql) in shadow_tables {
                 ops.push(Self::make_op(
                     Opcode::CreateBtree,
                     0,
@@ -841,8 +855,15 @@ impl<'s> StatementCompiler<'s> {
                     0,
                     reg_root_page,
                     0,
-                    P4::Text(sql),
+                    P4::Text(sql.clone()),
                 ));
+                self.append_sqlite_master_insert(
+                    &mut ops,
+                    sqlite_master_cursor,
+                    &table_name,
+                    reg_root_page,
+                    &sql,
+                );
             }
         }
 
@@ -860,8 +881,16 @@ impl<'s> StatementCompiler<'s> {
             0,
             reg_root_page,
             0,
-            P4::Text(create_sql),
+            P4::Text(create_sql.clone()),
         ));
+        self.append_sqlite_master_insert(
+            &mut ops,
+            sqlite_master_cursor,
+            &create.name.name,
+            reg_root_page,
+            &create_sql,
+        );
+        self.append_sqlite_master_close(&mut ops, sqlite_master_cursor);
         ops.push(Self::make_op(Opcode::Goto, 0, 1, 0, P4::Unused));
 
         Ok(ops)
@@ -912,33 +941,46 @@ impl<'s> StatementCompiler<'s> {
         sql
     }
 
-    fn build_fts3_shadow_tables(&self, create: &CreateVirtualTableStmt) -> Vec<String> {
+    fn build_fts3_shadow_tables(&self, create: &CreateVirtualTableStmt) -> Vec<(String, String)> {
         let (columns, has_content, internal_content) =
             self.parse_fts3_virtual_columns(&create.args);
         let mut tables = Vec::new();
         let name = &create.name.name;
 
         if has_content && internal_content {
-            let mut sql = format!("CREATE TABLE {}_content (docid INTEGER PRIMARY KEY", name);
+            let table_name = format!("{}_content", name);
+            let mut sql = format!("CREATE TABLE {} (docid INTEGER PRIMARY KEY", table_name);
             for column in &columns {
                 sql.push_str(", ");
                 sql.push_str(column);
             }
             sql.push(')');
-            tables.push(sql);
+            tables.push((table_name, sql));
         }
 
-        tables.push(format!(
-            "CREATE TABLE {}_segments (blockid INTEGER PRIMARY KEY, block BLOB)",
-            name
+        let segments_name = format!("{}_segments", name);
+        tables.push((
+            segments_name.clone(),
+            format!(
+                "CREATE TABLE {} (blockid INTEGER PRIMARY KEY, block BLOB)",
+                segments_name
+            ),
         ));
-        tables.push(format!(
-            "CREATE TABLE {}_segdir (level INTEGER, idx INTEGER, start_block INTEGER, leaves_end_block INTEGER, end_block INTEGER, root BLOB)",
-            name
+        let segdir_name = format!("{}_segdir", name);
+        tables.push((
+            segdir_name.clone(),
+            format!(
+                "CREATE TABLE {} (level INTEGER, idx INTEGER, start_block INTEGER, leaves_end_block INTEGER, end_block INTEGER, root BLOB)",
+                segdir_name
+            ),
         ));
-        tables.push(format!(
-            "CREATE TABLE {}_stat (id INTEGER PRIMARY KEY, value BLOB)",
-            name
+        let stat_name = format!("{}_stat", name);
+        tables.push((
+            stat_name.clone(),
+            format!(
+                "CREATE TABLE {} (id INTEGER PRIMARY KEY, value BLOB)",
+                stat_name
+            ),
         ));
 
         tables
@@ -988,6 +1030,93 @@ impl<'s> StatementCompiler<'s> {
         }
 
         (columns, has_content, internal_content)
+    }
+
+    fn append_sqlite_master_open(&self, ops: &mut Vec<VdbeOp>, cursor_id: i32) {
+        ops.push(Self::make_op(
+            Opcode::OpenWrite,
+            cursor_id,
+            1,
+            5,
+            P4::Text("sqlite_master".to_string()),
+        ));
+    }
+
+    fn append_sqlite_master_close(&self, ops: &mut Vec<VdbeOp>, cursor_id: i32) {
+        ops.push(Self::make_op(Opcode::Close, cursor_id, 0, 0, P4::Unused));
+    }
+
+    fn append_sqlite_master_insert(
+        &self,
+        ops: &mut Vec<VdbeOp>,
+        cursor_id: i32,
+        table_name: &str,
+        reg_root_page: i32,
+        create_sql: &str,
+    ) {
+        let reg_type = 2;
+        let reg_name = 3;
+        let reg_tbl = 4;
+        let reg_root = 5;
+        let reg_sql = 6;
+        let reg_record = 7;
+        let reg_rowid = 8;
+        ops.push(Self::make_op(
+            Opcode::String8,
+            0,
+            reg_type,
+            0,
+            P4::Text("table".to_string()),
+        ));
+        ops.push(Self::make_op(
+            Opcode::String8,
+            0,
+            reg_name,
+            0,
+            P4::Text(table_name.to_string()),
+        ));
+        ops.push(Self::make_op(
+            Opcode::String8,
+            0,
+            reg_tbl,
+            0,
+            P4::Text(table_name.to_string()),
+        ));
+        ops.push(Self::make_op(
+            Opcode::Copy,
+            reg_root_page,
+            reg_root,
+            0,
+            P4::Unused,
+        ));
+        ops.push(Self::make_op(
+            Opcode::String8,
+            0,
+            reg_sql,
+            0,
+            P4::Text(create_sql.to_string()),
+        ));
+        ops.push(Self::make_op(
+            Opcode::MakeRecord,
+            reg_type,
+            5,
+            reg_record,
+            P4::Unused,
+        ));
+        ops.push(Self::make_op(
+            Opcode::NewRowid,
+            cursor_id,
+            reg_rowid,
+            0,
+            P4::Unused,
+        ));
+        ops.push(Self::make_op(
+            Opcode::Insert,
+            cursor_id,
+            reg_record,
+            reg_rowid,
+            P4::Text("sqlite_master".to_string()),
+        ));
     }
 
     fn compile_create_index(&mut self, create: &CreateIndexStmt) -> Result<Vec<VdbeOp>> {

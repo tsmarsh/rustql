@@ -363,20 +363,20 @@ impl UpdateCompiler {
             },
             Expr::Column(col_ref) => {
                 // Column reference - look up in current row
-                if let Some(&col_idx) = self.column_map.get(&col_ref.column) {
-                    self.emit(
-                        Opcode::Column,
-                        self.table_cursor,
-                        col_idx as i32,
-                        dest_reg,
-                        P4::Unused,
-                    );
+                let col_idx = col_ref.column_index.unwrap_or_else(|| {
+                    if let Some(&idx) = self.column_map.get(&col_ref.column) {
+                        idx as i32
+                    } else {
+                        self.get_column_index(&col_ref.column) as i32
+                    }
+                });
+                if col_idx < 0 {
+                    self.emit(Opcode::Rowid, self.table_cursor, dest_reg, 0, P4::Unused);
                 } else {
-                    let col_idx = self.get_column_index(&col_ref.column);
                     self.emit(
                         Opcode::Column,
                         self.table_cursor,
-                        col_idx as i32,
+                        col_idx,
                         dest_reg,
                         P4::Unused,
                     );

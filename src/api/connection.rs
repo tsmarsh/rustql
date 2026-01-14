@@ -8,13 +8,15 @@ use std::sync::{Arc, RwLock};
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::functions::{get_aggregate_function, get_scalar_function, AggregateInfo, ScalarFunc};
-use crate::schema::{Encoding, Schema};
-use crate::storage::btree::{Btree, BtreeOpenFlags};
+use crate::schema::{parse_create_sql, Encoding, Schema};
+use crate::storage::btree::{Btree, BtreeCursorFlags, BtreeOpenFlags, CursorState};
 use crate::storage::pager::{JournalMode, LockingMode, DEFAULT_PAGE_SIZE};
 use crate::types::{
     AccessFlags, DbOffset, DeviceCharacteristics, LockLevel, OpenFlags, RowId, SyncFlags, Value,
     Vfs, VfsFile,
 };
+use crate::vdbe::auxdata::{decode_record_header, deserialize_value, SerialType};
+use crate::vdbe::mem::Mem;
 
 use super::config::{sqlite3_initialize, DbConfigOption};
 
@@ -153,9 +155,21 @@ impl VfsFile for FileVfsFile {
         self.file
             .seek(SeekFrom::Start(offset as u64))
             .map_err(|e| Error::with_message(ErrorCode::IoErr, e.to_string()))?;
-        self.file
-            .read(buf)
-            .map_err(|e| Error::with_message(ErrorCode::IoErr, e.to_string()))
+        let mut read_total = 0usize;
+        while read_total < buf.len() {
+            let n = self
+                .file
+                .read(&mut buf[read_total..])
+                .map_err(|e| Error::with_message(ErrorCode::IoErr, e.to_string()))?;
+            if n == 0 {
+                break;
+            }
+            read_total += n;
+        }
+        if read_total < buf.len() {
+            buf[read_total..].fill(0);
+        }
+        Ok(read_total)
     }
 
     fn write(&mut self, buf: &[u8], offset: DbOffset) -> Result<()> {
@@ -1119,11 +1133,25 @@ pub fn sqlite3_open_v2(
         }
 
         // Open the btree
-        let vfs = StubVfs;
         let btree_path = if is_memory { "" } else { &path };
-        match Btree::open(&vfs, btree_path, None, btree_flags, final_flags) {
+        let open_result = if is_memory {
+            let vfs = StubVfs;
+            Btree::open(&vfs, btree_path, None, btree_flags, final_flags)
+        } else {
+            let vfs = FileVfs;
+            Btree::open(&vfs, btree_path, None, btree_flags, final_flags)
+        };
+
+        match open_result {
             Ok(btree) => {
                 main_db.btree = Some(btree);
+                if let (Some(ref btree), Some(ref schema)) =
+                    (main_db.btree.as_ref(), main_db.schema.as_ref())
+                {
+                    if let Ok(mut schema_guard) = schema.write() {
+                        load_schema_from_btree(btree, &mut schema_guard)?;
+                    }
+                }
             }
             Err(e) => {
                 // For new/empty databases, continue without btree for now
@@ -1145,6 +1173,65 @@ pub fn sqlite3_open16(filename: &[u16]) -> Result<Box<SqliteConnection>> {
     sqlite3_open(&filename)
 }
 
+fn load_schema_from_btree(btree: &Arc<Btree>, schema: &mut Schema) -> Result<()> {
+    let mut cursor = btree.cursor(1, BtreeCursorFlags::empty(), None)?;
+    let empty = cursor.first()?;
+    if empty {
+        return Ok(());
+    }
+
+    loop {
+        let payload = cursor.info.payload.clone().unwrap_or_default();
+        let values = decode_record_values(&payload, 5)?;
+        let sql = values.get(4).map(Mem::to_str).unwrap_or_default();
+        let root_page = values.get(3).map(Mem::to_int).unwrap_or(0) as u32;
+
+        if let Some(table) = parse_create_sql(&sql, root_page) {
+            let name = table.name.to_lowercase();
+            schema.tables.entry(name).or_insert_with(|| Arc::new(table));
+        }
+
+        cursor.next(0)?;
+        if cursor.state != CursorState::Valid {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn decode_record_values(payload: &[u8], expected_cols: usize) -> Result<Vec<Mem>> {
+    if payload.is_empty() {
+        return Ok(vec![Mem::new(); expected_cols]);
+    }
+
+    let (types, header_size) = decode_record_header(payload)?;
+    let mut offset = header_size;
+    let mut values = Vec::with_capacity(expected_cols.max(types.len()));
+
+    for serial_type in types {
+        let size = match serial_type {
+            SerialType::Blob(n) | SerialType::Text(n) => n as usize,
+            _ => serial_type.size(),
+        };
+        if offset + size > payload.len() {
+            return Err(Error::with_message(
+                ErrorCode::Corrupt,
+                "record payload truncated",
+            ));
+        }
+        let mem = deserialize_value(&payload[offset..offset + size], &serial_type)?;
+        values.push(mem);
+        offset += size;
+    }
+
+    if expected_cols > values.len() {
+        values.resize_with(expected_cols, Mem::new);
+    }
+
+    Ok(values)
+}
+
 /// sqlite3_close - Close a database connection
 ///
 /// Closes the database connection and releases all resources.
@@ -1156,7 +1243,9 @@ pub fn sqlite3_close(mut conn: Box<SqliteConnection>) -> Result<()> {
     // Close all databases
     for db in &mut conn.dbs {
         // Close btree connections
-        db.btree = None;
+        if let Some(btree) = db.btree.take() {
+            let _ = btree.commit_shared();
+        }
         db.schema = None;
     }
 

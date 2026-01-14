@@ -1488,13 +1488,17 @@ impl<'s> SelectCompiler<'s> {
                     })
                 };
 
-                self.emit(
-                    Opcode::Column,
-                    cursor,
-                    col_idx,
-                    dest_reg,
-                    P4::Text(col_ref.column.clone()),
-                );
+                if col_idx < 0 {
+                    self.emit(Opcode::Rowid, cursor, dest_reg, 0, P4::Unused);
+                } else {
+                    self.emit(
+                        Opcode::Column,
+                        cursor,
+                        col_idx,
+                        dest_reg,
+                        P4::Text(col_ref.column.clone()),
+                    );
+                }
             }
             Expr::Binary { op, left, right } => {
                 let left_reg = self.alloc_reg();

@@ -1013,6 +1013,24 @@ impl Fts3Table {
             segdir_rowid += 1;
         }
 
+        if let Some(stat_root) = stat_root {
+            let mut stat_cursor = btree.cursor(stat_root, BtreeCursorFlags::WRCSR, None)?;
+            let mut stat_value = Vec::new();
+            fts3_put_varint_u64(&mut stat_value, self.content.len() as u64);
+            fts3_put_varint_u64(&mut stat_value, self.columns.len() as u64);
+            let mems = vec![Mem::from_int(0), Mem::from_blob(&stat_value)];
+            let record = make_record(&mems, 0, mems.len() as i32);
+            let payload = BtreePayload {
+                key: None,
+                n_key: 0,
+                data: Some(record.clone()),
+                mem: Vec::new(),
+                n_data: record.len() as i32,
+                n_zero: 0,
+            };
+            btree.insert(&mut stat_cursor, &payload, BtreeInsertFlags::empty(), 0)?;
+        }
+
         Ok(())
     }
 }

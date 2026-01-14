@@ -1042,7 +1042,21 @@ impl<'a> Parser<'a> {
             if !self.check(TokenKind::RParen) {
                 loop {
                     if self.check(TokenKind::Identifier) {
-                        args.push(self.expect_identifier()?);
+                        let key = self.expect_identifier()?;
+                        if self.match_token(TokenKind::Eq) {
+                            if self.check(TokenKind::Identifier) {
+                                let value = self.expect_identifier()?;
+                                args.push(format!("{}={}", key, value));
+                            } else if self.check(TokenKind::String) {
+                                let value = self.current_text().to_string();
+                                self.advance();
+                                args.push(format!("{}={}", key, value));
+                            } else {
+                                return Err(self.error("expected identifier or string after '='"));
+                            }
+                        } else {
+                            args.push(key);
+                        }
                     } else if self.check(TokenKind::String) {
                         args.push(self.current_text().to_string());
                         self.advance();

@@ -846,6 +846,10 @@ impl Pager {
             page.flags.insert(PgFlags::DIRTY);
         }
 
+        if let Some(cache_page) = self.pcache.fetch(page.pgno, false) {
+            self.pcache.make_dirty(cache_page);
+        }
+
         Ok(())
     }
 

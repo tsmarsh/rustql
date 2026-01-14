@@ -257,6 +257,12 @@ pub enum Opcode {
     /// Jump if cursor P1 not pointing to valid row
     NotExists,
 
+    /// Check if record P3 exists in index P1, jump to P2 if found
+    Found,
+
+    /// Check if record P3 does not exist in index P1, jump to P2 if not found
+    NotFound,
+
     /// Delete row at cursor P1
     Delete,
 
@@ -489,6 +495,8 @@ impl Opcode {
                 | Opcode::SeekLE
                 | Opcode::SeekLT
                 | Opcode::NotExists
+                | Opcode::Found
+                | Opcode::NotFound
                 | Opcode::IdxGE
                 | Opcode::IdxGT
                 | Opcode::IdxLE
@@ -518,6 +526,8 @@ impl Opcode {
                 | Opcode::SeekLE
                 | Opcode::SeekLT
                 | Opcode::NotExists
+                | Opcode::Found
+                | Opcode::NotFound
                 | Opcode::Delete
                 | Opcode::Column
                 | Opcode::Rowid
@@ -613,6 +623,8 @@ impl Opcode {
             Opcode::SeekLT => "SeekLT",
             Opcode::SeekNull => "SeekNull",
             Opcode::NotExists => "NotExists",
+            Opcode::Found => "Found",
+            Opcode::NotFound => "NotFound",
             Opcode::VFilter => "VFilter",
             Opcode::Delete => "Delete",
             Opcode::ResetSorter => "ResetSorter",

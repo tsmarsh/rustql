@@ -323,3 +323,47 @@ fn test_where_clause_filtering() {
         Err(e) => println!("ERROR: {}", e),
     }
 }
+
+#[test]
+fn test_distinct() {
+    let db = match RustqlTestDb::new("/tmp/rustql_distinct_test.db") {
+        Ok(db) => db,
+        Err(e) => {
+            println!("Failed to create database: {}", e);
+            return;
+        }
+    };
+    let mut db = db;
+
+    // Setup - table with duplicate values
+    let _ = db.exec_sql("CREATE TABLE t1(a INTEGER, b TEXT)");
+    let _ = db.exec_sql("INSERT INTO t1 VALUES(1, 'one')");
+    let _ = db.exec_sql("INSERT INTO t1 VALUES(2, 'two')");
+    let _ = db.exec_sql("INSERT INTO t1 VALUES(1, 'one')");
+    let _ = db.exec_sql("INSERT INTO t1 VALUES(3, 'three')");
+    let _ = db.exec_sql("INSERT INTO t1 VALUES(2, 'two')");
+
+    // Test without DISTINCT
+    println!("Without DISTINCT:");
+    match db.exec_sql("SELECT a FROM t1 ORDER BY a") {
+        Ok(result) => {
+            println!("  Result: {:?}", result);
+            println!("  Expected: [1, 1, 2, 2, 3]");
+        }
+        Err(e) => println!("  ERROR: {}", e),
+    }
+
+    // Test with DISTINCT
+    println!("\nWith DISTINCT:");
+    match db.exec_sql("SELECT DISTINCT a FROM t1 ORDER BY a") {
+        Ok(result) => {
+            println!("  Result: {:?}", result);
+            if result == vec!["1", "2", "3"] {
+                println!("  PASS: DISTINCT works!");
+            } else {
+                println!("  FAIL: Expected [1, 2, 3], got {:?}", result);
+            }
+        }
+        Err(e) => println!("  ERROR: {}", e),
+    }
+}

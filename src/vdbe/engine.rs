@@ -127,6 +127,8 @@ pub struct VdbeCursor {
     pub sorter_index: usize,
     /// Has the sorter been sorted?
     pub sorter_sorted: bool,
+    /// Ephemeral index data - used for DISTINCT and index operations
+    pub ephemeral_set: std::collections::HashSet<Vec<u8>>,
 }
 
 impl std::fmt::Debug for VdbeCursor {
@@ -170,6 +172,7 @@ impl VdbeCursor {
             sorter_data: Vec::new(),
             sorter_index: 0,
             sorter_sorted: false,
+            ephemeral_set: std::collections::HashSet::new(),
         }
     }
 
@@ -2105,6 +2108,38 @@ impl Vdbe {
                 }
             }
 
+            Opcode::Found => {
+                // Found P1 P2 P3: If record P3 exists in ephemeral index P1, jump to P2
+                let record = self.mem(op.p3).to_blob();
+                let mut found = false;
+
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    if cursor.is_ephemeral {
+                        found = cursor.ephemeral_set.contains(&record);
+                    }
+                }
+
+                if found {
+                    self.pc = op.p2;
+                }
+            }
+
+            Opcode::NotFound => {
+                // NotFound P1 P2 P3: If record P3 does NOT exist in ephemeral index P1, jump to P2
+                let record = self.mem(op.p3).to_blob();
+                let mut found = false;
+
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    if cursor.is_ephemeral {
+                        found = cursor.ephemeral_set.contains(&record);
+                    }
+                }
+
+                if !found {
+                    self.pc = op.p2;
+                }
+            }
+
             Opcode::Delete => {
                 // Delete P1 P2 P3 P4 P5: Delete the current row from cursor P1
                 // P2 = jump destination on constraint violation
@@ -2183,14 +2218,7 @@ impl Vdbe {
             | Opcode::SeekGT
             | Opcode::SeekLE
             | Opcode::SeekLT
-            | Opcode::SeekNull
-            | Opcode::IdxGE
-            | Opcode::IdxGT
-            | Opcode::IdxLE
-            | Opcode::IdxLT
-            | Opcode::IdxRowid
-            | Opcode::IdxInsert
-            | Opcode::IdxDelete => {
+            | Opcode::SeekNull => {
                 // Placeholder: These need btree integration for index operations
             }
 
@@ -2394,6 +2422,60 @@ impl Vdbe {
 
             Opcode::IfNullRow | Opcode::EndCoroutine => {
                 // Placeholder: Advanced control flow
+            }
+
+            // ================================================================
+            // Index Operations (for ephemeral tables and DISTINCT)
+            // ================================================================
+            Opcode::IdxGE => {
+                // IdxGE P1 P2 P3 P4: Check if record exists in ephemeral index
+                // For ephemeral tables: jump to P2 if record P3 exists in cursor P1
+                // P4 = number of key columns
+                let record = self.mem(op.p3).to_blob();
+                let mut found = false;
+
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    if cursor.is_ephemeral {
+                        found = cursor.ephemeral_set.contains(&record);
+                    }
+                }
+
+                if found {
+                    self.pc = op.p2;
+                }
+            }
+
+            Opcode::IdxGT | Opcode::IdxLE | Opcode::IdxLT => {
+                // Placeholder: Index range scans
+                // For ephemeral tables, these are typically not used
+            }
+
+            Opcode::IdxInsert => {
+                // IdxInsert P1 P2 P3: Insert record P2 into ephemeral index P1
+                let record = self.mem(op.p2).to_blob();
+
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    if cursor.is_ephemeral {
+                        cursor.ephemeral_set.insert(record);
+                    }
+                }
+            }
+
+            Opcode::IdxDelete => {
+                // IdxDelete P1 P2 P3: Delete record from ephemeral index
+                let record = self.mem(op.p2).to_blob();
+
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    if cursor.is_ephemeral {
+                        cursor.ephemeral_set.remove(&record);
+                    }
+                }
+            }
+
+            Opcode::IdxRowid => {
+                // IdxRowid P1 P2: Get rowid from index cursor
+                // Placeholder for ephemeral tables
+                self.mem_mut(op.p2).set_null();
             }
 
             Opcode::And => {

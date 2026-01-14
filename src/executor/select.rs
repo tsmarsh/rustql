@@ -346,7 +346,7 @@ impl<'s> SelectCompiler<'s> {
         let result_regs = self.compile_result_columns(&core.columns)?;
 
         // Handle DISTINCT
-        if let Some(distinct_cursor) = distinct_cursor {
+        let distinct_skip_label = if let Some(distinct_cursor) = distinct_cursor {
             let skip_label = self.alloc_label();
             // Make record for lookup
             let record_reg = self.alloc_reg();
@@ -373,7 +373,10 @@ impl<'s> SelectCompiler<'s> {
                 0,
                 P4::Unused,
             );
-        }
+            Some(skip_label)
+        } else {
+            None
+        };
 
         // Create a loop continuation label for OFFSET skip
         let loop_continue_label = self.alloc_label();
@@ -392,8 +395,8 @@ impl<'s> SelectCompiler<'s> {
         }
 
         // DISTINCT skip target
-        if distinct_cursor.is_some() {
-            // Label was already emitted inline
+        if let Some(label) = distinct_skip_label {
+            self.resolve_label(label, self.current_addr());
         }
 
         // Generate Next for each table (in reverse order for nested loops)

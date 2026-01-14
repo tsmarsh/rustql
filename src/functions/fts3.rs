@@ -625,11 +625,7 @@ fn matchinfo_format_valid(format: &str) -> bool {
         .all(|ch| matches!(ch, 'p' | 'c' | 'n' | 'a' | 'l' | 's' | 'x' | 'y' | 'b'))
 }
 
-fn current_row_lengths(
-    table: &fts3::Fts3Table,
-    rowid: i64,
-    n_col: usize,
-) -> Result<Vec<u32>> {
+fn current_row_lengths(table: &fts3::Fts3Table, rowid: i64, n_col: usize) -> Result<Vec<u32>> {
     let mut lengths = vec![0u32; n_col];
     if let Some(values) = table.row_values(rowid) {
         for (idx, value) in values.iter().enumerate().take(n_col) {
@@ -640,11 +636,7 @@ fn current_row_lengths(
     Ok(lengths)
 }
 
-fn average_lengths(
-    table: &fts3::Fts3Table,
-    n_col: usize,
-    n_doc: u32,
-) -> Result<Vec<u32>> {
+fn average_lengths(table: &fts3::Fts3Table, n_col: usize, n_doc: u32) -> Result<Vec<u32>> {
     let mut totals = vec![0u64; n_col];
     if n_doc == 0 {
         return Ok(vec![0u32; n_col]);
@@ -691,11 +683,7 @@ fn lcs_for_column(
         }
         sequences.extend(next);
     }
-    sequences
-        .iter()
-        .map(|(_, len)| *len)
-        .max()
-        .unwrap_or(0)
+    sequences.iter().map(|(_, len)| *len).max().unwrap_or(0)
 }
 
 /// matchinfo(text, query)

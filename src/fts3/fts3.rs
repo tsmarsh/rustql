@@ -1,8 +1,13 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::error::{Error, ErrorCode, Result};
+use crate::schema::Schema;
+use crate::storage::btree::{Btree, BtreeCursorFlags, BtreeInsertFlags, BtreePayload, CursorState};
+use crate::vdbe::auxdata::{decode_record_header, deserialize_value, make_record, SerialType};
+use crate::vdbe::mem::Mem;
 
 use super::fts3_write::{LeafNode, PendingTerms};
 
@@ -301,6 +306,7 @@ pub struct Fts3Table {
     pub index: Fts3Index,
     pub segments: Vec<Fts3Segment>,
     pub content: HashMap<i64, Vec<String>>,
+    pub loaded_from_storage: bool,
 }
 
 pub struct Fts3Cursor {
@@ -319,6 +325,7 @@ impl Fts3Table {
     ) -> Self {
         let name = name.into();
         let schema = schema.into();
+        let content_table = Some(format!("{}_content", name));
         Self {
             name: name.clone(),
             schema,
@@ -326,7 +333,7 @@ impl Fts3Table {
             tokenizer,
             has_langid: false,
             has_content: true,
-            content_table: None,
+            content_table,
             prefixes: Vec::new(),
             index: Fts3Index {
                 segments: format!("{}_segments", name),
@@ -335,6 +342,7 @@ impl Fts3Table {
             },
             segments: Vec::new(),
             content: HashMap::new(),
+            loaded_from_storage: false,
         }
     }
 
@@ -397,7 +405,14 @@ impl Fts3Table {
         let mut table = Self::new(name, schema, columns, Box::new(SimpleTokenizer));
         table.prefixes = prefixes;
         table.has_content = has_content;
-        table.content_table = content_table;
+        if has_content {
+            table.content_table = match content_table {
+                Some(name) => Some(name),
+                None => Some(format!("{}_content", table.name)),
+            };
+        } else {
+            table.content_table = None;
+        }
         table
     }
 
@@ -406,6 +421,9 @@ impl Fts3Table {
     }
 
     pub fn insert(&mut self, rowid: i64, values: &[&str]) -> Result<()> {
+        if self.has_content && self.content_table.is_none() {
+            self.content_table = Some(format!("{}_content", self.name));
+        }
         let mut pending = PendingTerms::new();
         for (col_idx, value) in values.iter().enumerate() {
             let tokens = self.tokenize(value)?;
@@ -429,6 +447,9 @@ impl Fts3Table {
     }
 
     pub fn delete(&mut self, rowid: i64, values: &[&str]) -> Result<()> {
+        if self.has_content && self.content_table.is_none() {
+            self.content_table = Some(format!("{}_content", self.name));
+        }
         let mut pending = PendingTerms::new();
         for value in values {
             let tokens = self.tokenize(value)?;
@@ -447,6 +468,89 @@ impl Fts3Table {
             self.content.remove(&rowid);
         }
         self.flush_pending(pending)?;
+        Ok(())
+    }
+
+    pub fn ensure_loaded(&mut self, btree: &Arc<Btree>, schema: &Schema) -> Result<()> {
+        if self.loaded_from_storage {
+            return Ok(());
+        }
+
+        let seg_root = find_table_root(schema, &self.index.segments);
+        let dir_root = find_table_root(schema, &self.index.segdir);
+        if let (Some(seg_root), Some(dir_root)) = (seg_root, dir_root) {
+            self.load_segments(btree, seg_root, dir_root)?;
+        }
+
+        if self.has_content {
+            if let Some(ref content_table) = self.content_table {
+                if let Some(root) = find_table_root(schema, content_table) {
+                    self.load_content(btree, root)?;
+                }
+            }
+        }
+
+        self.loaded_from_storage = true;
+        Ok(())
+    }
+
+    pub fn insert_with_storage(
+        &mut self,
+        rowid: i64,
+        values: &[&str],
+        btree: &Arc<Btree>,
+        schema: &Schema,
+    ) -> Result<()> {
+        self.ensure_loaded(btree, schema)?;
+        self.insert(rowid, values)?;
+
+        if self.has_content {
+            if let Some(ref content_table) = self.content_table {
+                if let Some(root) = find_table_root(schema, content_table) {
+                    let values_owned: Vec<String> =
+                        values.iter().map(|s| (*s).to_string()).collect();
+                    self.persist_content_row(btree, root, rowid, &values_owned)?;
+                }
+            }
+        }
+
+        if let (Some(seg_root), Some(dir_root)) = (
+            find_table_root(schema, &self.index.segments),
+            find_table_root(schema, &self.index.segdir),
+        ) {
+            let stat_root = find_table_root(schema, &self.index.stat);
+            self.persist_segments(btree, seg_root, dir_root, stat_root)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn delete_with_storage(
+        &mut self,
+        rowid: i64,
+        values: &[&str],
+        btree: &Arc<Btree>,
+        schema: &Schema,
+    ) -> Result<()> {
+        self.ensure_loaded(btree, schema)?;
+        self.delete(rowid, values)?;
+
+        if self.has_content {
+            if let Some(ref content_table) = self.content_table {
+                if let Some(root) = find_table_root(schema, content_table) {
+                    self.delete_content_row(btree, root, rowid)?;
+                }
+            }
+        }
+
+        if let (Some(seg_root), Some(dir_root)) = (
+            find_table_root(schema, &self.index.segments),
+            find_table_root(schema, &self.index.segdir),
+        ) {
+            let stat_root = find_table_root(schema, &self.index.stat);
+            self.persist_segments(btree, seg_root, dir_root, stat_root)?;
+        }
+
         Ok(())
     }
 
@@ -751,6 +855,244 @@ impl Fts3Table {
         self.segments.push(new_segment);
         Ok(())
     }
+
+    fn load_content(&mut self, btree: &Arc<Btree>, root_page: u32) -> Result<()> {
+        let rows = scan_table(btree, root_page, self.columns.len() + 1)?;
+        self.content.clear();
+
+        for (rowid, values) in rows {
+            let docid = values.get(0).map(|value| value.to_int()).unwrap_or(rowid);
+            let mut cols = Vec::with_capacity(self.columns.len());
+            for idx in 0..self.columns.len() {
+                let value = values.get(idx + 1).map_or(String::new(), Mem::to_str);
+                cols.push(value);
+            }
+            self.content.insert(docid, cols);
+        }
+
+        Ok(())
+    }
+
+    fn load_segments(&mut self, btree: &Arc<Btree>, seg_root: u32, dir_root: u32) -> Result<()> {
+        let mut block_map: BTreeMap<i64, Vec<u8>> = BTreeMap::new();
+        let segment_rows = scan_table(btree, seg_root, 2)?;
+        for (rowid, values) in segment_rows {
+            let blockid = values.get(0).map(|value| value.to_int()).unwrap_or(rowid);
+            let block = values
+                .get(1)
+                .map(|value| value.to_blob())
+                .unwrap_or_default();
+            block_map.insert(blockid, block);
+        }
+
+        let mut segments = Vec::new();
+        let segdir_rows = scan_table(btree, dir_root, 6)?;
+        for (_rowid, values) in segdir_rows {
+            let level = values.get(0).map_or(0, Mem::to_int) as i32;
+            let idx = values.get(1).map_or(0, Mem::to_int) as i32;
+            let start_block = values.get(2).map_or(0, Mem::to_int);
+            let leaves_end_block = values.get(3).map_or(start_block, Mem::to_int);
+            let _end_block = values.get(4).map_or(leaves_end_block, Mem::to_int);
+
+            let mut leaves = Vec::new();
+            if start_block > 0 && leaves_end_block >= start_block {
+                for blockid in start_block..=leaves_end_block {
+                    if let Some(block) = block_map.get(&blockid) {
+                        leaves.push(block.clone());
+                    }
+                }
+            }
+
+            if !leaves.is_empty() {
+                segments.push(Fts3Segment { level, idx, leaves });
+            }
+        }
+
+        self.segments = segments;
+        Ok(())
+    }
+
+    fn persist_content_row(
+        &self,
+        btree: &Arc<Btree>,
+        root_page: u32,
+        rowid: i64,
+        values: &[String],
+    ) -> Result<()> {
+        let mut cursor = btree.cursor(root_page, BtreeCursorFlags::WRCSR, None)?;
+        if cursor.table_moveto(rowid, false)? == 0 {
+            btree.delete(&mut cursor, BtreeInsertFlags::empty())?;
+        }
+
+        let mut mems = Vec::with_capacity(values.len() + 1);
+        mems.push(Mem::from_int(rowid));
+        for value in values {
+            mems.push(Mem::from_str(value));
+        }
+
+        let record = make_record(&mems, 0, mems.len() as i32);
+        let payload = BtreePayload {
+            key: None,
+            n_key: rowid,
+            data: Some(record.clone()),
+            mem: Vec::new(),
+            n_data: record.len() as i32,
+            n_zero: 0,
+        };
+        btree.insert(&mut cursor, &payload, BtreeInsertFlags::empty(), 0)?;
+        Ok(())
+    }
+
+    fn delete_content_row(&self, btree: &Arc<Btree>, root_page: u32, rowid: i64) -> Result<()> {
+        let mut cursor = btree.cursor(root_page, BtreeCursorFlags::WRCSR, None)?;
+        if cursor.table_moveto(rowid, false)? == 0 {
+            btree.delete(&mut cursor, BtreeInsertFlags::empty())?;
+        }
+        Ok(())
+    }
+
+    fn persist_segments(
+        &self,
+        btree: &Arc<Btree>,
+        seg_root: u32,
+        dir_root: u32,
+        stat_root: Option<u32>,
+    ) -> Result<()> {
+        clear_table_by_scan(btree, seg_root)?;
+        clear_table_by_scan(btree, dir_root)?;
+        if let Some(stat_root) = stat_root {
+            clear_table_by_scan(btree, stat_root)?;
+        }
+
+        let mut blockid = 1i64;
+        let mut segdir_rowid = 1i64;
+        let mut seg_cursor = btree.cursor(seg_root, BtreeCursorFlags::WRCSR, None)?;
+        let mut dir_cursor = btree.cursor(dir_root, BtreeCursorFlags::WRCSR, None)?;
+
+        for segment in &self.segments {
+            if segment.leaves.is_empty() {
+                continue;
+            }
+            let start_block = blockid;
+            for leaf in &segment.leaves {
+                let mems = vec![Mem::from_int(blockid), Mem::from_blob(leaf)];
+                let record = make_record(&mems, 0, mems.len() as i32);
+                let payload = BtreePayload {
+                    key: None,
+                    n_key: blockid,
+                    data: Some(record.clone()),
+                    mem: Vec::new(),
+                    n_data: record.len() as i32,
+                    n_zero: 0,
+                };
+                btree.insert(&mut seg_cursor, &payload, BtreeInsertFlags::empty(), 0)?;
+                blockid += 1;
+            }
+
+            let end_block = blockid - 1;
+            let leaves_end_block = end_block;
+            let root = Vec::new();
+            let mems = vec![
+                Mem::from_int(segment.level as i64),
+                Mem::from_int(segment.idx as i64),
+                Mem::from_int(start_block),
+                Mem::from_int(leaves_end_block),
+                Mem::from_int(end_block),
+                Mem::from_blob(&root),
+            ];
+            let record = make_record(&mems, 0, mems.len() as i32);
+            let payload = BtreePayload {
+                key: None,
+                n_key: segdir_rowid,
+                data: Some(record.clone()),
+                mem: Vec::new(),
+                n_data: record.len() as i32,
+                n_zero: 0,
+            };
+            btree.insert(&mut dir_cursor, &payload, BtreeInsertFlags::empty(), 0)?;
+            segdir_rowid += 1;
+        }
+
+        Ok(())
+    }
+}
+
+fn find_table_root(schema: &Schema, name: &str) -> Option<u32> {
+    schema
+        .tables
+        .get(&name.to_ascii_lowercase())
+        .map(|table| table.root_page)
+}
+
+fn scan_table(
+    btree: &Arc<Btree>,
+    root_page: u32,
+    expected_cols: usize,
+) -> Result<Vec<(i64, Vec<Mem>)>> {
+    let mut cursor = btree.cursor(root_page, BtreeCursorFlags::empty(), None)?;
+    let empty = cursor.first()?;
+    if empty {
+        return Ok(Vec::new());
+    }
+
+    let mut rows = Vec::new();
+    loop {
+        let rowid = cursor.n_key;
+        let payload = cursor.info.payload.clone().unwrap_or_default();
+        let values = decode_record_values(&payload, expected_cols)?;
+        rows.push((rowid, values));
+
+        cursor.next(0)?;
+        if cursor.state != CursorState::Valid {
+            break;
+        }
+    }
+
+    Ok(rows)
+}
+
+fn decode_record_values(payload: &[u8], expected_cols: usize) -> Result<Vec<Mem>> {
+    if payload.is_empty() {
+        return Ok(vec![Mem::new(); expected_cols]);
+    }
+
+    let (types, header_size) = decode_record_header(payload)?;
+    let mut offset = header_size;
+    let mut values = Vec::with_capacity(expected_cols.max(types.len()));
+
+    for serial_type in types {
+        let size = match serial_type {
+            SerialType::Blob(n) | SerialType::Text(n) => n as usize,
+            _ => serial_type.size(),
+        };
+        if offset + size > payload.len() {
+            return Err(Error::with_message(
+                ErrorCode::Corrupt,
+                "record payload truncated",
+            ));
+        }
+        let mem = deserialize_value(&payload[offset..offset + size], &serial_type)?;
+        values.push(mem);
+        offset += size;
+    }
+
+    if expected_cols > values.len() {
+        values.resize_with(expected_cols, Mem::new);
+    }
+
+    Ok(values)
+}
+
+fn clear_table_by_scan(btree: &Arc<Btree>, root_page: u32) -> Result<()> {
+    let mut cursor = btree.cursor(root_page, BtreeCursorFlags::WRCSR, None)?;
+    loop {
+        let empty = cursor.first()?;
+        if empty {
+            break;
+        }
+        btree.delete(&mut cursor, BtreeInsertFlags::empty())?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -819,11 +819,33 @@ impl<'s> StatementCompiler<'s> {
         &mut self,
         create: &CreateVirtualTableStmt,
     ) -> Result<Vec<VdbeOp>> {
+        use crate::storage::btree::BTREE_INTKEY;
+
         let mut ops = Vec::new();
 
         let reg_root_page = 1;
         ops.push(Self::make_op(Opcode::Init, 0, 2, 0, P4::Unused));
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
+        if create.module.eq_ignore_ascii_case("fts3") {
+            let shadow_tables = self.build_fts3_shadow_tables(create);
+            for sql in shadow_tables {
+                ops.push(Self::make_op(
+                    Opcode::CreateBtree,
+                    0,
+                    reg_root_page,
+                    BTREE_INTKEY as i32,
+                    P4::Unused,
+                ));
+                ops.push(Self::make_op(
+                    Opcode::ParseSchema,
+                    0,
+                    reg_root_page,
+                    0,
+                    P4::Text(sql),
+                ));
+            }
+        }
+
         ops.push(Self::make_op(
             Opcode::Integer,
             0,
@@ -888,6 +910,84 @@ impl<'s> StatementCompiler<'s> {
             sql.push(')');
         }
         sql
+    }
+
+    fn build_fts3_shadow_tables(&self, create: &CreateVirtualTableStmt) -> Vec<String> {
+        let (columns, has_content, internal_content) =
+            self.parse_fts3_virtual_columns(&create.args);
+        let mut tables = Vec::new();
+        let name = &create.name.name;
+
+        if has_content && internal_content {
+            let mut sql = format!("CREATE TABLE {}_content (docid INTEGER PRIMARY KEY", name);
+            for column in &columns {
+                sql.push_str(", ");
+                sql.push_str(column);
+            }
+            sql.push(')');
+            tables.push(sql);
+        }
+
+        tables.push(format!(
+            "CREATE TABLE {}_segments (blockid INTEGER PRIMARY KEY, block BLOB)",
+            name
+        ));
+        tables.push(format!(
+            "CREATE TABLE {}_segdir (level INTEGER, idx INTEGER, start_block INTEGER, leaves_end_block INTEGER, end_block INTEGER, root BLOB)",
+            name
+        ));
+        tables.push(format!(
+            "CREATE TABLE {}_stat (id INTEGER PRIMARY KEY, value BLOB)",
+            name
+        ));
+
+        tables
+    }
+
+    fn parse_fts3_virtual_columns(&self, args: &[String]) -> (Vec<String>, bool, bool) {
+        let mut columns = Vec::new();
+        let mut has_content = true;
+        let mut internal_content = true;
+        let mut pending_prefix = false;
+
+        for arg in args {
+            let trimmed = arg.trim();
+            if let Some(value) = trimmed.strip_prefix("content=") {
+                let value = value.trim();
+                if value.eq_ignore_ascii_case("none") {
+                    has_content = false;
+                    internal_content = false;
+                } else {
+                    has_content = true;
+                    internal_content = false;
+                }
+            } else if let Some(value) = trimmed.strip_prefix("CONTENT=") {
+                let value = value.trim();
+                if value.eq_ignore_ascii_case("none") {
+                    has_content = false;
+                    internal_content = false;
+                } else {
+                    has_content = true;
+                    internal_content = false;
+                }
+            } else if trimmed.starts_with("prefix=") || trimmed.starts_with("PREFIX=") {
+                pending_prefix = true;
+            } else if trimmed.starts_with("tokenize=") || trimmed.starts_with("TOKENIZE=") {
+                continue;
+            } else if pending_prefix {
+                if trimmed.parse::<i32>().is_ok() {
+                    continue;
+                }
+                pending_prefix = false;
+                if !trimmed.contains('=') {
+                    columns.push(trimmed.to_string());
+                }
+            } else if !trimmed.contains('=') {
+                columns.push(trimmed.to_string());
+            }
+        }
+
+        (columns, has_content, internal_content)
     }
 
     fn compile_create_index(&mut self, create: &CreateIndexStmt) -> Result<Vec<VdbeOp>> {

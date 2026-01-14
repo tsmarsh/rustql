@@ -1353,6 +1353,8 @@ impl Vdbe {
                     .cursor(op.p1)
                     .and_then(|cursor| cursor.vtab_name.clone());
 
+                let btree = self.btree.clone();
+                let schema = self.schema.clone();
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if cursor.is_virtual {
                         #[allow(unused_variables)]
@@ -1360,7 +1362,14 @@ impl Vdbe {
                             #[cfg(feature = "fts3")]
                             {
                                 if let Some(table) = crate::fts3::get_table(vtab_name) {
-                                    if let Ok(table) = table.lock() {
+                                    if let Ok(mut table) = table.lock() {
+                                        if let (Some(ref btree), Some(ref schema)) =
+                                            (btree.as_ref(), schema.as_ref())
+                                        {
+                                            if let Ok(schema_guard) = schema.read() {
+                                                table.ensure_loaded(btree, &schema_guard)?;
+                                            }
+                                        }
                                         if let Ok(rowids) = table.query_rowids(&query) {
                                             cursor.vtab_rowids = rowids;
                                             cursor.vtab_row_index = 0;
@@ -1396,6 +1405,8 @@ impl Vdbe {
             Opcode::Rewind => {
                 // Move cursor to first row, jump to P2 if empty
                 let mut is_empty = true;
+                let btree = self.btree.clone();
+                let schema = self.schema.clone();
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if cursor.is_sqlite_master {
                         // Virtual cursor for sqlite_master
@@ -1414,7 +1425,14 @@ impl Vdbe {
                                 #[cfg(feature = "fts3")]
                                 {
                                     if let Some(table) = crate::fts3::get_table(vtab_name) {
-                                        if let Ok(table) = table.lock() {
+                                        if let Ok(mut table) = table.lock() {
+                                            if let (Some(ref btree), Some(ref schema)) =
+                                                (btree.as_ref(), schema.as_ref())
+                                            {
+                                                if let Ok(schema_guard) = schema.read() {
+                                                    table.ensure_loaded(btree, &schema_guard)?;
+                                                }
+                                            }
                                             cursor.vtab_rowids = table.all_rowids();
                                         }
                                     }
@@ -1636,8 +1654,17 @@ impl Vdbe {
                         {
                             #[cfg(feature = "fts3")]
                             {
+                                let btree = self.btree.clone();
+                                let schema = self.schema.clone();
                                 if let Some(table) = crate::fts3::get_table(vtab_name) {
-                                    if let Ok(table) = table.lock() {
+                                    if let Ok(mut table) = table.lock() {
+                                        if let (Some(ref btree), Some(ref schema)) =
+                                            (btree.as_ref(), schema.as_ref())
+                                        {
+                                            if let Ok(schema_guard) = schema.read() {
+                                                table.ensure_loaded(btree, &schema_guard)?;
+                                            }
+                                        }
                                         if let Some(values) = table.row_values(rowid) {
                                             if let Some(value) = values.get(col_idx) {
                                                 result = Mem::from_str(value);
@@ -1992,6 +2019,8 @@ impl Vdbe {
                 // Get btree Arc before cursor borrow
                 let btree_arc = self.btree.clone();
 
+                let btree = self.btree.clone();
+                let schema = self.schema.clone();
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     cursor.rowid = Some(rowid);
 
@@ -2011,7 +2040,23 @@ impl Vdbe {
                                             mems.iter().map(|mem| mem.to_str()).collect();
                                         let refs: Vec<&str> =
                                             values.iter().map(|value| value.as_str()).collect();
-                                        let _ = table.insert(rowid, &refs);
+                                        let result = if let (Some(ref btree), Some(ref schema)) =
+                                            (btree.as_ref(), schema.as_ref())
+                                        {
+                                            if let Ok(schema_guard) = schema.read() {
+                                                table.insert_with_storage(
+                                                    rowid,
+                                                    &refs,
+                                                    btree,
+                                                    &schema_guard,
+                                                )
+                                            } else {
+                                                table.insert(rowid, &refs)
+                                            }
+                                        } else {
+                                            table.insert(rowid, &refs)
+                                        };
+                                        let _ = result;
                                     }
                                 }
                             }
@@ -2148,6 +2193,8 @@ impl Vdbe {
                 // P5 = flags (OPFLAG_* constants)
                 let btree_arc = self.btree.clone();
 
+                let btree = self.btree.clone();
+                let schema = self.schema.clone();
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if cursor.is_virtual {
                         if let Some(rowid) = cursor.rowid {
@@ -2156,6 +2203,13 @@ impl Vdbe {
                                 {
                                     if let Some(table) = crate::fts3::get_table(vtab_name) {
                                         if let Ok(mut table) = table.lock() {
+                                            if let (Some(ref btree), Some(ref schema)) =
+                                                (btree.as_ref(), schema.as_ref())
+                                            {
+                                                if let Ok(schema_guard) = schema.read() {
+                                                    table.ensure_loaded(btree, &schema_guard)?;
+                                                }
+                                            }
                                             // Clone values to avoid borrow conflict with delete
                                             let values: Option<Vec<String>> =
                                                 table.row_values(rowid).map(|v| v.to_vec());
@@ -2164,7 +2218,24 @@ impl Vdbe {
                                                     .iter()
                                                     .map(|value| value.as_str())
                                                     .collect();
-                                                let _ = table.delete(rowid, &refs);
+                                                let result =
+                                                    if let (Some(ref btree), Some(ref schema)) =
+                                                        (btree.as_ref(), schema.as_ref())
+                                                    {
+                                                        if let Ok(schema_guard) = schema.read() {
+                                                            table.delete_with_storage(
+                                                                rowid,
+                                                                &refs,
+                                                                btree,
+                                                                &schema_guard,
+                                                            )
+                                                        } else {
+                                                            table.delete(rowid, &refs)
+                                                        }
+                                                    } else {
+                                                        table.delete(rowid, &refs)
+                                                    };
+                                                let _ = result;
                                             }
                                         }
                                     }

@@ -2085,6 +2085,30 @@ impl<'s> SelectCompiler<'s> {
                     ) {
                         let reg = agg_regs[agg_idx];
 
+                        // Validate argument count for aggregate functions
+                        let arg_count = match &func_call.args {
+                            crate::parser::ast::FunctionArgs::Exprs(exprs) => exprs.len(),
+                            crate::parser::ast::FunctionArgs::Star => 0, // COUNT(*)
+                        };
+
+                        // Check argument count limits
+                        let (min_args, max_args) = match name_upper.as_str() {
+                            "COUNT" => (0, 1),
+                            "SUM" | "AVG" | "MIN" | "MAX" | "TOTAL" => (1, 1),
+                            "GROUP_CONCAT" => (1, 2),
+                            _ => (0, 255),
+                        };
+
+                        if arg_count < min_args || arg_count > max_args {
+                            return Err(crate::error::Error::with_message(
+                                crate::error::ErrorCode::Error,
+                                format!(
+                                    "wrong number of arguments to function {}()",
+                                    name_upper.to_lowercase()
+                                ),
+                            ));
+                        }
+
                         // Compile argument
                         let arg_reg = self.alloc_reg();
                         let mut has_arg = false;

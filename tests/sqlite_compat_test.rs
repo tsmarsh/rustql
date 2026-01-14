@@ -325,6 +325,68 @@ fn test_where_clause_filtering() {
 }
 
 #[test]
+fn test_count_aggregate() {
+    let db = match RustqlTestDb::new("/tmp/rustql_count_test.db") {
+        Ok(db) => db,
+        Err(e) => {
+            println!("Failed to create database: {}", e);
+            return;
+        }
+    };
+    let mut db = db;
+
+    // Setup - create table with 2 rows
+    let _ = db.exec_sql("CREATE TABLE test1(f1 INT, f2 INT)");
+    let _ = db.exec_sql("INSERT INTO test1 VALUES(11, 22)");
+    let _ = db.exec_sql("INSERT INTO test1 VALUES(33, 44)");
+
+    // Check row count
+    match db.exec_sql("SELECT * FROM test1") {
+        Ok(result) => println!("All rows: {:?}", result),
+        Err(e) => println!("ERROR: {}", e),
+    }
+
+    // Test COUNT(*)
+    match db.exec_sql("SELECT COUNT(*) FROM test1") {
+        Ok(result) => {
+            println!("COUNT(*) result: {:?}", result);
+            if result == vec!["2"] {
+                println!("PASS: COUNT(*) returns 2");
+            } else {
+                println!("FAIL: Expected [2], got {:?}", result);
+            }
+        }
+        Err(e) => println!("ERROR: {}", e),
+    }
+
+    // Test COUNT(f1)
+    match db.exec_sql("SELECT COUNT(f1) FROM test1") {
+        Ok(result) => {
+            println!("COUNT(f1) result: {:?}", result);
+            if result == vec!["2"] {
+                println!("PASS: COUNT(f1) returns 2");
+            } else {
+                println!("FAIL: Expected [2], got {:?}", result);
+            }
+        }
+        Err(e) => println!("ERROR: {}", e),
+    }
+
+    // Test MAX
+    match db.exec_sql("SELECT MAX(f1) FROM test1") {
+        Ok(result) => {
+            println!("MAX(f1) result: {:?}", result);
+            if result == vec!["33"] {
+                println!("PASS: MAX(f1) returns 33");
+            } else {
+                println!("FAIL: Expected [33], got {:?}", result);
+            }
+        }
+        Err(e) => println!("ERROR: {}", e),
+    }
+}
+
+#[test]
 fn test_distinct() {
     let db = match RustqlTestDb::new("/tmp/rustql_distinct_test.db") {
         Ok(db) => db,

@@ -534,9 +534,7 @@ fn shift_snippet(total_tokens: usize, n_snippet: i64, pos: &mut i64, highlight: 
         left += 1;
     }
     let mut right = 0u64;
-    while right < n_snippet
-        && (*highlight & (1u64 << (n_snippet - 1 - right))) == 0
-    {
+    while right < n_snippet && (*highlight & (1u64 << (n_snippet - 1 - right))) == 0 {
         right += 1;
     }
     if left >= n_snippet || right >= n_snippet {

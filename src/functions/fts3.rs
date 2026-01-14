@@ -621,16 +621,105 @@ fn snippet_text(
     }
 }
 
+fn matchinfo_format_valid(format: &str) -> bool {
+    format
+        .chars()
+        .all(|ch| matches!(ch, 'p' | 'c' | 'n' | 'a' | 'l' | 's' | 'x' | 'y' | 'b'))
+}
+
+fn current_row_lengths(
+    table: &fts3::Fts3Table,
+    rowid: i64,
+    n_col: usize,
+) -> Result<Vec<u32>> {
+    let mut lengths = vec![0u32; n_col];
+    if let Some(values) = table.row_values(rowid) {
+        for (idx, value) in values.iter().enumerate().take(n_col) {
+            let tokens = table.tokenize(value)?;
+            lengths[idx] = tokens.len().min(u32::MAX as usize) as u32;
+        }
+    }
+    Ok(lengths)
+}
+
+fn average_lengths(
+    table: &fts3::Fts3Table,
+    n_col: usize,
+    n_doc: u32,
+) -> Result<Vec<u32>> {
+    let mut totals = vec![0u64; n_col];
+    if n_doc == 0 {
+        return Ok(vec![0u32; n_col]);
+    }
+    for rowid in table.all_rowids() {
+        if let Some(values) = table.row_values(rowid) {
+            for (idx, value) in values.iter().enumerate().take(n_col) {
+                let tokens = table.tokenize(value)?;
+                totals[idx] += tokens.len() as u64;
+            }
+        }
+    }
+    let mut averages = vec![0u32; n_col];
+    for (idx, total) in totals.iter().enumerate() {
+        let avg = (*total + (n_doc as u64 / 2)) / n_doc as u64;
+        averages[idx] = avg.min(u32::MAX as u64) as u32;
+    }
+    Ok(averages)
+}
+
+fn lcs_for_column(
+    phrases: &[PhraseSpec],
+    doclists: &[fts3::Fts3Doclist],
+    rowid: i64,
+    column: i32,
+) -> u32 {
+    let mut sequences: Vec<(i64, u32)> = Vec::new();
+    for (idx, phrase) in phrases.iter().enumerate() {
+        let positions = phrase_positions(&doclists[idx], rowid, column);
+        let shift = phrase.terms.len().saturating_sub(1) as i64;
+        let mut next = Vec::new();
+        for pos in positions {
+            let start_pos = pos - shift;
+            if start_pos < 0 {
+                continue;
+            }
+            let mut best = 1u32;
+            for (prev_pos, prev_len) in &sequences {
+                if *prev_pos < start_pos {
+                    best = best.max(prev_len + 1);
+                }
+            }
+            next.push((start_pos, best));
+        }
+        sequences.extend(next);
+    }
+    sequences
+        .iter()
+        .map(|(_, len)| *len)
+        .max()
+        .unwrap_or(0)
+}
+
 /// matchinfo(text, query)
 pub fn func_matchinfo(args: &[Value]) -> Result<Value> {
-    if args.len() != 2 {
+    if args.len() < 2 || args.len() > 3 {
         return Err(Error::with_message(
             ErrorCode::Error,
-            "matchinfo() expects 2 arguments",
+            "matchinfo() expects 2 to 3 arguments",
         ));
     }
 
     let query = value_to_string(&args[1]);
+    let format = args
+        .get(2)
+        .map(value_to_string)
+        .unwrap_or_else(|| "pcx".to_string());
+    if !matchinfo_format_valid(&format) {
+        return Err(Error::with_message(
+            ErrorCode::Error,
+            "matchinfo() unrecognized request",
+        ));
+    }
     let Some(ctx) = get_fts3_context() else {
         return Err(Error::with_message(
             ErrorCode::Error,
@@ -645,7 +734,111 @@ pub fn func_matchinfo(args: &[Value]) -> Result<Value> {
     };
 
     let table = table.lock().expect("fts3 table lock");
-    let buf = table.matchinfo(&query, ctx.rowid)?;
+    let parsed = table.parse_query(&query)?;
+    let mut raw_phrases = Vec::new();
+    collect_matchable_phrases(&parsed, false, &mut raw_phrases);
+
+    let n_phrase = raw_phrases.len() as u32;
+    let n_col = table.columns.len() as u32;
+    let n_doc = table.all_rowids().len() as u32;
+
+    let mut phrases = Vec::new();
+    let mut doclists = Vec::new();
+    for (expr, terms) in raw_phrases {
+        let doclist = table.evaluate_expr(&expr)?;
+        doclists.push(doclist);
+        phrases.push(PhraseSpec {
+            expr,
+            terms,
+            term_start: 0,
+        });
+    }
+
+    let lengths = current_row_lengths(&table, ctx.rowid, n_col as usize)?;
+    let avg_lengths = average_lengths(&table, n_col as usize, n_doc)?;
+
+    let mut hits_this_row = vec![vec![0u32; n_col as usize]; n_phrase as usize];
+    let mut hits_all = vec![vec![0u32; n_col as usize]; n_phrase as usize];
+    let mut docs_with_hits = vec![vec![0u32; n_col as usize]; n_phrase as usize];
+
+    for (phrase_idx, doclist) in doclists.iter().enumerate() {
+        for entry in doclist.iter() {
+            let mut per_col = vec![0u32; n_col as usize];
+            for pos in entry.positions {
+                if pos.column >= 0 && (pos.column as usize) < per_col.len() {
+                    per_col[pos.column as usize] += 1;
+                }
+            }
+            for col in 0..per_col.len() {
+                let count = per_col[col];
+                if count > 0 {
+                    hits_all[phrase_idx][col] += count;
+                    docs_with_hits[phrase_idx][col] += 1;
+                }
+                if entry.rowid == ctx.rowid {
+                    hits_this_row[phrase_idx][col] = count;
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for flag in format.chars() {
+        match flag {
+            'p' => out.push(n_phrase),
+            'c' => out.push(n_col),
+            'n' => out.push(n_doc),
+            'a' => out.extend(avg_lengths.iter().copied()),
+            'l' => out.extend(lengths.iter().copied()),
+            's' => {
+                for col in 0..n_col as usize {
+                    let lcs = lcs_for_column(&phrases, &doclists, ctx.rowid, col as i32);
+                    out.push(lcs);
+                }
+            }
+            'x' => {
+                for phrase_idx in 0..phrases.len() {
+                    for col in 0..n_col as usize {
+                        out.push(hits_this_row[phrase_idx][col]);
+                        out.push(hits_all[phrase_idx][col]);
+                        out.push(docs_with_hits[phrase_idx][col]);
+                    }
+                }
+            }
+            'y' => {
+                for phrase_idx in 0..phrases.len() {
+                    for col in 0..n_col as usize {
+                        out.push(hits_this_row[phrase_idx][col]);
+                    }
+                }
+            }
+            'b' => {
+                let groups = (n_col as usize + 31) / 32;
+                for phrase_idx in 0..phrases.len() {
+                    for group in 0..groups {
+                        let mut mask = 0u32;
+                        for bit in 0..32 {
+                            let col = group * 32 + bit;
+                            if col >= n_col as usize {
+                                break;
+                            }
+                            if hits_this_row[phrase_idx][col] > 0 {
+                                mask |= 1u32 << bit;
+                            }
+                        }
+                        out.push(mask);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut buf = Vec::with_capacity(out.len() * 4);
+    for value in out {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
     Ok(Value::Blob(buf))
 }
 

@@ -3818,7 +3818,7 @@ impl BtCursor {
         if self.cur_int_key {
             // Integer key table - seek using saved n_key
             self.table_moveto(self.n_key, false)?;
-        } else if let Some(ref key) = self.key {
+        } else if self.key.is_some() {
             // Index - seek using saved key blob
             // Create an unpacked record for comparison
             // For now, just invalidate - full implementation would re-seek

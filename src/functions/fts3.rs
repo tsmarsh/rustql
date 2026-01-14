@@ -33,16 +33,21 @@ fn value_to_i64(value: &Value) -> i64 {
 struct Fts3Context {
     table: String,
     rowid: i64,
+    query: Option<String>,
 }
 
 lazy_static! {
     static ref FTS3_CONTEXT: Mutex<Option<Fts3Context>> = Mutex::new(None);
 }
 
-pub fn set_fts3_context(table: Option<String>, rowid: Option<i64>) {
+pub fn set_fts3_context(table: Option<String>, rowid: Option<i64>, query: Option<String>) {
     let mut guard = FTS3_CONTEXT.lock().expect("fts3 context lock");
     if let (Some(table), Some(rowid)) = (table, rowid) {
-        *guard = Some(Fts3Context { table, rowid });
+        *guard = Some(Fts3Context {
+            table,
+            rowid,
+            query,
+        });
     } else {
         *guard = None;
     }
@@ -118,14 +123,25 @@ fn token_at(tokens: &[fts3::Fts3Token], pos: i64) -> Option<&fts3::Fts3Token> {
 
 /// snippet(text, query [, start, end, ellipsis])
 pub fn func_snippet(args: &[Value]) -> Result<Value> {
-    if args.len() < 2 || args.len() > 6 {
+    if args.is_empty() || args.len() > 6 {
         return Err(Error::with_message(
             ErrorCode::Error,
-            "snippet() expects 2 to 6 arguments",
+            "snippet() expects 1 to 6 arguments",
         ));
     }
 
-    let query = value_to_string(&args[1]);
+    let Some(ctx) = get_fts3_context() else {
+        return Err(Error::with_message(
+            ErrorCode::Error,
+            "snippet() requires FTS3 context",
+        ));
+    };
+
+    let query = if args.len() >= 2 {
+        value_to_string(&args[1])
+    } else {
+        ctx.query.clone().unwrap_or_default()
+    };
     let start = args
         .get(2)
         .map(value_to_string)
@@ -140,12 +156,6 @@ pub fn func_snippet(args: &[Value]) -> Result<Value> {
         .unwrap_or_else(|| "<b>...</b>".to_string());
     let n_token = args.get(5).map(value_to_i64).unwrap_or(15);
 
-    let Some(ctx) = get_fts3_context() else {
-        return Err(Error::with_message(
-            ErrorCode::Error,
-            "snippet() requires FTS3 context",
-        ));
-    };
     let Some(table) = fts3::get_table(&ctx.table) else {
         return Err(Error::with_message(
             ErrorCode::Error,
@@ -258,20 +268,24 @@ pub fn func_snippet(args: &[Value]) -> Result<Value> {
 
 /// offsets(text, query)
 pub fn func_offsets(args: &[Value]) -> Result<Value> {
-    if args.len() != 2 {
+    if args.is_empty() || args.len() > 2 {
         return Err(Error::with_message(
             ErrorCode::Error,
-            "offsets() expects 2 arguments",
+            "offsets() expects 1 or 2 arguments",
         ));
     }
-
-    let query = value_to_string(&args[1]);
 
     let Some(ctx) = get_fts3_context() else {
         return Err(Error::with_message(
             ErrorCode::Error,
             "offsets() requires FTS3 context",
         ));
+    };
+
+    let query = if args.len() >= 2 {
+        value_to_string(&args[1])
+    } else {
+        ctx.query.clone().unwrap_or_default()
     };
     let Some(table) = fts3::get_table(&ctx.table) else {
         return Err(Error::with_message(
@@ -842,7 +856,7 @@ mod tests {
         );
         table.insert(1, &["hello world"]).expect("insert");
         fts3::register_table(table);
-        set_fts3_context(Some("docs_snippet".to_string()), Some(1));
+        set_fts3_context(Some("docs_snippet".to_string()), Some(1), None);
 
         let args = [
             Value::Text("ignored".to_string()),
@@ -865,7 +879,7 @@ mod tests {
         );
         table.insert(1, &["alpha beta alpha"]).expect("insert");
         fts3::register_table(table);
-        set_fts3_context(Some("docs_offsets".to_string()), Some(1));
+        set_fts3_context(Some("docs_offsets".to_string()), Some(1), None);
 
         let args = [
             Value::Text("ignored".to_string()),
@@ -888,7 +902,7 @@ mod tests {
         );
         table.insert(1, &["alpha beta alpha"]).expect("insert");
         fts3::register_table(table);
-        set_fts3_context(Some("docs".to_string()), Some(1));
+        set_fts3_context(Some("docs".to_string()), Some(1), None);
 
         let args = [
             Value::Text("alpha beta alpha".to_string()),

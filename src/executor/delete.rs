@@ -9,6 +9,12 @@ use crate::error::Result;
 use crate::parser::ast::{DeleteStmt, Expr, ResultColumn};
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
+fn is_rowid_alias(name: &str) -> bool {
+    name.eq_ignore_ascii_case("rowid")
+        || name.eq_ignore_ascii_case("_rowid_")
+        || name.eq_ignore_ascii_case("oid")
+}
+
 // ============================================================================
 // DeleteCompiler
 // ============================================================================
@@ -391,6 +397,10 @@ impl DeleteCompiler {
                 }
             },
             Expr::Column(col_ref) => {
+                if is_rowid_alias(&col_ref.column) {
+                    self.emit(Opcode::Rowid, self.table_cursor, dest_reg, 0, P4::Unused);
+                    return Ok(());
+                }
                 let col_idx = col_ref.column_index.unwrap_or_else(|| {
                     if let Some(&idx) = self.column_map.get(&col_ref.column) {
                         idx as i32

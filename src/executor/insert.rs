@@ -11,6 +11,18 @@ use crate::parser::ast::{
 };
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
+fn is_rowid_alias(name: &str) -> bool {
+    name.eq_ignore_ascii_case("rowid")
+        || name.eq_ignore_ascii_case("_rowid_")
+        || name.eq_ignore_ascii_case("oid")
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InsertColumnTarget {
+    Rowid,
+    Column(usize),
+}
+
 // ============================================================================
 // InsertCompiler
 // ============================================================================
@@ -115,7 +127,7 @@ impl InsertCompiler {
         conflict_action: ConflictAction,
     ) -> Result<()> {
         // Build column index map if columns specified
-        let col_indices = self.build_column_map(&insert.columns)?;
+        let col_targets = self.build_column_map(&insert.columns)?;
 
         for row in rows {
             // Allocate rowid register
@@ -135,16 +147,27 @@ impl InsertCompiler {
             let _data_regs = self.alloc_regs(self.num_columns);
 
             // Evaluate each value and store in appropriate register
-            for (i, col_idx) in col_indices.iter().enumerate() {
+            let mut present = vec![false; self.num_columns];
+            for (i, target) in col_targets.iter().enumerate() {
                 if i < row.len() {
-                    let dest_reg = data_base + *col_idx as i32;
-                    self.compile_expr(&row[i], dest_reg)?;
+                    match *target {
+                        InsertColumnTarget::Rowid => {
+                            self.compile_expr(&row[i], rowid_reg)?;
+                        }
+                        InsertColumnTarget::Column(col_idx) => {
+                            let dest_reg = data_base + col_idx as i32;
+                            self.compile_expr(&row[i], dest_reg)?;
+                            if col_idx < present.len() {
+                                present[col_idx] = true;
+                            }
+                        }
+                    }
                 }
             }
 
             // Fill in NULL for unspecified columns
-            for i in 0..self.num_columns {
-                if !col_indices.contains(&i) {
+            for (i, seen) in present.iter().enumerate() {
+                if !*seen {
                     let reg = data_base + i as i32;
                     self.emit(Opcode::Null, 0, reg, 0, P4::Unused);
                 }
@@ -180,7 +203,7 @@ impl InsertCompiler {
     fn infer_num_columns(&self, insert: &InsertStmt) -> usize {
         if let Some(cols) = &insert.columns {
             if !cols.is_empty() {
-                return cols.len();
+                return cols.iter().filter(|col| !is_rowid_alias(col)).count();
             }
         }
         match &insert.source {
@@ -198,7 +221,7 @@ impl InsertCompiler {
         conflict_action: ConflictAction,
     ) -> Result<()> {
         // Build column index map
-        let col_indices = self.build_column_map(&insert.columns)?;
+        let col_targets = self.build_column_map(&insert.columns)?;
 
         // Compile the SELECT statement
         // For a real implementation, we'd integrate with SelectCompiler
@@ -238,20 +261,37 @@ impl InsertCompiler {
         let data_base = self.next_reg;
         let _data_regs = self.alloc_regs(self.num_columns);
 
-        for (i, col_idx) in col_indices.iter().enumerate() {
-            let dest_reg = data_base + *col_idx as i32;
-            self.emit(
-                Opcode::Column,
-                select_cursor,
-                i as i32,
-                dest_reg,
-                P4::Unused,
-            );
+        let mut present = vec![false; self.num_columns];
+        for (i, target) in col_targets.iter().enumerate() {
+            match *target {
+                InsertColumnTarget::Rowid => {
+                    self.emit(
+                        Opcode::Column,
+                        select_cursor,
+                        i as i32,
+                        rowid_reg,
+                        P4::Unused,
+                    );
+                }
+                InsertColumnTarget::Column(col_idx) => {
+                    let dest_reg = data_base + col_idx as i32;
+                    self.emit(
+                        Opcode::Column,
+                        select_cursor,
+                        i as i32,
+                        dest_reg,
+                        P4::Unused,
+                    );
+                    if col_idx < present.len() {
+                        present[col_idx] = true;
+                    }
+                }
+            }
         }
 
         // Fill NULLs for unspecified columns
-        for i in 0..self.num_columns {
-            if !col_indices.contains(&i) {
+        for (i, seen) in present.iter().enumerate() {
+            if !*seen {
                 let reg = data_base + i as i32;
                 self.emit(Opcode::Null, 0, reg, 0, P4::Unused);
             }
@@ -373,20 +413,27 @@ impl InsertCompiler {
     }
 
     /// Build column index map from column list
-    fn build_column_map(&self, columns: &Option<Vec<String>>) -> Result<Vec<usize>> {
+    fn build_column_map(&self, columns: &Option<Vec<String>>) -> Result<Vec<InsertColumnTarget>> {
         match columns {
             Some(cols) => {
                 // Map specified columns to indices
-                let mut indices = Vec::with_capacity(cols.len());
-                for (i, _col) in cols.iter().enumerate() {
-                    // In real implementation, would look up column index by name
-                    indices.push(i);
+                let mut targets = Vec::with_capacity(cols.len());
+                let mut next_idx = 0usize;
+                for col in cols {
+                    if is_rowid_alias(col) {
+                        targets.push(InsertColumnTarget::Rowid);
+                    } else {
+                        targets.push(InsertColumnTarget::Column(next_idx));
+                        next_idx += 1;
+                    }
                 }
-                Ok(indices)
+                Ok(targets)
             }
             None => {
                 // All columns in order
-                Ok((0..self.num_columns).collect())
+                Ok((0..self.num_columns)
+                    .map(InsertColumnTarget::Column)
+                    .collect())
             }
         }
     }

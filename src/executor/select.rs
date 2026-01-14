@@ -93,6 +93,12 @@ fn filter_literal_text(expr: &Expr) -> Option<String> {
     }
 }
 
+fn is_rowid_alias(name: &str) -> bool {
+    name.eq_ignore_ascii_case("rowid")
+        || name.eq_ignore_ascii_case("_rowid_")
+        || name.eq_ignore_ascii_case("oid")
+}
+
 // ============================================================================
 // Select Compiler State
 // ============================================================================
@@ -1445,6 +1451,27 @@ impl<'s> SelectCompiler<'s> {
                 }
             }
             Expr::Column(col_ref) => {
+                if is_rowid_alias(&col_ref.column) {
+                    let cursor = if let Some(table) = &col_ref.table {
+                        self.tables
+                            .iter()
+                            .find(|t| {
+                                t.name.eq_ignore_ascii_case(table)
+                                    || t.table_name.eq_ignore_ascii_case(table)
+                            })
+                            .map(|t| t.cursor)
+                    } else if self.tables.len() == 1 {
+                        self.tables.first().map(|t| t.cursor)
+                    } else {
+                        None
+                    };
+
+                    if let Some(cursor) = cursor {
+                        self.emit(Opcode::Rowid, cursor, dest_reg, 0, P4::Unused);
+                        return Ok(());
+                    }
+                }
+
                 // Find the table and column index
                 let (cursor, col_idx) = if let Some(table) = &col_ref.table {
                     if let Some(tinfo) = self.tables.iter().find(|t| t.name == *table) {

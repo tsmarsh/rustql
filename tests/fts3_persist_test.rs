@@ -81,9 +81,9 @@ fn test_fts3_persists_internal_content() {
     let mut conn = sqlite3_open(path).expect("open db");
     exec_sql(
         &mut conn,
-        "CREATE VIRTUAL TABLE docs USING fts3(title, body);
-         INSERT INTO docs(rowid, title, body) VALUES(1, 'hello', 'world');
-         INSERT INTO docs(rowid, title, body) VALUES(2, 'goodbye', 'moon');",
+        "CREATE VIRTUAL TABLE docs_internal USING fts3(title, body);
+         INSERT INTO docs_internal(rowid, title, body) VALUES(1, 'hello', 'world');
+         INSERT INTO docs_internal(rowid, title, body) VALUES(2, 'goodbye', 'moon');",
     )
     .expect("setup");
     sqlite3_close(conn).expect("close");
@@ -91,14 +91,14 @@ fn test_fts3_persists_internal_content() {
     let mut conn = sqlite3_open(path).expect("reopen");
     let rows = exec_sql(
         &mut conn,
-        "SELECT rowid FROM docs WHERE docs MATCH 'hello';",
+        "SELECT rowid FROM docs_internal WHERE docs_internal MATCH 'hello';",
     )
     .expect("query");
     assert_eq!(rows, vec![vec!["1".to_string()]]);
 
     let rows = exec_sql(
         &mut conn,
-        "SELECT snippet(docs) FROM docs WHERE docs MATCH 'hello';",
+        "SELECT snippet(docs_internal) FROM docs_internal WHERE docs_internal MATCH 'hello';",
     )
     .expect("snippet");
     assert!(!rows.is_empty(), "snippet returns rows");
@@ -118,19 +118,19 @@ fn test_fts3_persists_external_content() {
     let mut conn = sqlite3_open(path).expect("open db");
     exec_sql(
         &mut conn,
-        "CREATE TABLE content(docid INTEGER PRIMARY KEY, title, body);
-         CREATE VIRTUAL TABLE docs USING fts3(title, body, content=content);
-         INSERT INTO docs(rowid, title, body) VALUES(1, 'alpha', 'beta');",
+        "CREATE TABLE content_external(docid INTEGER PRIMARY KEY, title, body);
+         CREATE VIRTUAL TABLE docs_external USING fts3(title, body, content=content_external);
+         INSERT INTO docs_external(rowid, title, body) VALUES(1, 'alpha', 'beta');",
     )
     .expect("setup");
-    let rows = exec_sql(&mut conn, "SELECT count(*) FROM content;").expect("content read");
+    let rows = exec_sql(&mut conn, "SELECT count(*) FROM content_external;").expect("content read");
     assert_eq!(rows, vec![vec!["1".to_string()]]);
     sqlite3_close(conn).expect("close");
 
     let mut conn = sqlite3_open(path).expect("reopen");
     let rows = exec_sql(
         &mut conn,
-        "SELECT rowid FROM docs WHERE docs MATCH 'alpha';",
+        "SELECT rowid FROM docs_external WHERE docs_external MATCH 'alpha';",
     )
     .expect("query");
     assert_eq!(rows, vec![vec!["1".to_string()]]);

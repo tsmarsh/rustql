@@ -573,6 +573,31 @@ impl Fts3Table {
         self.content.get(&rowid).map(|values| values.as_slice())
     }
 
+    pub fn load_row_values(
+        &mut self,
+        btree: &Arc<Btree>,
+        schema: &Schema,
+        rowid: i64,
+    ) -> Result<Option<Vec<String>>> {
+        if !self.has_content {
+            return Ok(None);
+        }
+        if let Some(values) = self.content.get(&rowid) {
+            return Ok(Some(values.clone()));
+        }
+        let Some(ref content_table) = self.content_table else {
+            return Ok(None);
+        };
+        let Some(root) = find_table_root(schema, content_table) else {
+            return Ok(None);
+        };
+        if let Some(values) = load_content_row(btree, root, rowid, self.columns.len())? {
+            self.content.insert(rowid, values.clone());
+            return Ok(Some(values));
+        }
+        Ok(None)
+    }
+
     pub fn all_rowids(&self) -> Vec<i64> {
         if !self.has_content {
             return Vec::new();
@@ -1067,6 +1092,27 @@ fn scan_table(
     }
 
     Ok(rows)
+}
+
+fn load_content_row(
+    btree: &Arc<Btree>,
+    root_page: u32,
+    rowid: i64,
+    column_count: usize,
+) -> Result<Option<Vec<String>>> {
+    let mut cursor = btree.cursor(root_page, BtreeCursorFlags::empty(), None)?;
+    if cursor.table_moveto(rowid, false)? != 0 {
+        return Ok(None);
+    }
+
+    let payload = cursor.info.payload.clone().unwrap_or_default();
+    let values = decode_record_values(&payload, column_count + 1)?;
+    let mut cols = Vec::with_capacity(column_count);
+    for idx in 0..column_count {
+        let value = values.get(idx + 1).map_or(String::new(), Mem::to_str);
+        cols.push(value);
+    }
+    Ok(Some(cols))
 }
 
 fn decode_record_values(payload: &[u8], expected_cols: usize) -> Result<Vec<Mem>> {

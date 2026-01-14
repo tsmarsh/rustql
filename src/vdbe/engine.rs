@@ -1405,6 +1405,7 @@ impl Vdbe {
             Opcode::Rewind => {
                 // Move cursor to first row, jump to P2 if empty
                 let mut is_empty = true;
+                let mut vtab_context: Option<(Option<String>, Option<i64>)> = None;
                 let btree = self.btree.clone();
                 let schema = self.schema.clone();
                 if let Some(cursor) = self.cursor_mut(op.p1) {
@@ -1444,9 +1445,11 @@ impl Vdbe {
                         if !is_empty {
                             cursor.state = CursorState::Valid;
                             cursor.rowid = Some(cursor.vtab_rowids[0]);
+                            vtab_context = Some((cursor.vtab_name.clone(), cursor.rowid));
                         } else {
                             cursor.state = CursorState::AtEnd;
                             cursor.rowid = None;
+                            vtab_context = Some((None, None));
                         }
                     } else if let Some(ref mut bt_cursor) = cursor.btree_cursor {
                         match bt_cursor.first() {
@@ -1475,11 +1478,24 @@ impl Vdbe {
                 if is_empty {
                     self.pc = op.p2;
                 }
+                if let Some((name, rowid)) = vtab_context {
+                    self.vtab_context_name = name.clone();
+                    self.vtab_context_rowid = rowid;
+                    #[cfg(feature = "fts3")]
+                    {
+                        crate::functions::fts3::set_fts3_context(
+                            name,
+                            rowid,
+                            self.vtab_query.clone(),
+                        );
+                    }
+                }
             }
 
             Opcode::Next => {
                 // Move cursor to next row, jump to P2 if has more rows
                 let mut has_more = false;
+                let mut vtab_context: Option<(Option<String>, Option<i64>)> = None;
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if cursor.is_sqlite_master {
                         // Virtual cursor for sqlite_master
@@ -1502,8 +1518,10 @@ impl Vdbe {
                         };
                         if has_more {
                             cursor.rowid = Some(cursor.vtab_rowids[cursor.vtab_row_index]);
+                            vtab_context = Some((cursor.vtab_name.clone(), cursor.rowid));
                         } else {
                             cursor.rowid = None;
+                            vtab_context = Some((None, None));
                         }
                     } else if let Some(ref mut bt_cursor) = cursor.btree_cursor {
                         match bt_cursor.next(0) {
@@ -1536,6 +1554,18 @@ impl Vdbe {
                 // Jump to P2 if there are more rows
                 if has_more {
                     self.pc = op.p2;
+                }
+                if let Some((name, rowid)) = vtab_context {
+                    self.vtab_context_name = name.clone();
+                    self.vtab_context_rowid = rowid;
+                    #[cfg(feature = "fts3")]
+                    {
+                        crate::functions::fts3::set_fts3_context(
+                            name,
+                            rowid,
+                            self.vtab_query.clone(),
+                        );
+                    }
                 }
             }
 
@@ -1678,7 +1708,21 @@ impl Vdbe {
                                                 table.ensure_loaded(btree, &schema_guard)?;
                                             }
                                         }
-                                        if let Some(values) = table.row_values(rowid) {
+                                        let values = if let (Some(ref btree), Some(ref schema)) =
+                                            (btree.as_ref(), schema.as_ref())
+                                        {
+                                            if let Ok(schema_guard) = schema.read() {
+                                                table
+                                                    .load_row_values(btree, &schema_guard, rowid)
+                                                    .ok()
+                                                    .flatten()
+                                            } else {
+                                                table.row_values(rowid).map(|vals| vals.to_vec())
+                                            }
+                                        } else {
+                                            table.row_values(rowid).map(|vals| vals.to_vec())
+                                        };
+                                        if let Some(values) = values {
                                             if let Some(value) = values.get(col_idx) {
                                                 result = Mem::from_str(value);
                                             }
@@ -1707,7 +1751,11 @@ impl Vdbe {
                     self.vtab_context_rowid = vtab_rowid;
                     #[cfg(feature = "fts3")]
                     {
-                        crate::functions::fts3::set_fts3_context(vtab_name, vtab_rowid);
+                        crate::functions::fts3::set_fts3_context(
+                            vtab_name,
+                            vtab_rowid,
+                            self.vtab_query.clone(),
+                        );
                     }
                     *self.mem_mut(op.p3) = value;
                 } else if let Some(cursor) = self.cursor(op.p1) {
@@ -1949,6 +1997,8 @@ impl Vdbe {
                         let argc = op.p1.max(0) as usize;
                         let arg_base = op.p2;
                         let mut args = Vec::with_capacity(argc);
+                        let btree = self.btree.clone();
+                        let schema = self.schema.clone();
                         for i in 0..argc {
                             let mem = self.mem(arg_base + i as i32);
                             args.push(mem.to_value());
@@ -1964,8 +2014,39 @@ impl Vdbe {
                                 #[cfg(feature = "fts3")]
                                 {
                                     if let Some(table) = crate::fts3::get_table(vtab_name) {
-                                        if let Ok(table) = table.lock() {
-                                            if let Some(values) = table.row_values(rowid) {
+                                        if let Ok(mut table) = table.lock() {
+                                            if let (Some(ref btree), Some(ref schema)) =
+                                                (btree.as_ref(), schema.as_ref())
+                                            {
+                                                if let Ok(schema_guard) = schema.read() {
+                                                    let _ =
+                                                        table.ensure_loaded(btree, &schema_guard);
+                                                }
+                                            }
+                                            let values =
+                                                if let (Some(ref btree), Some(ref schema)) =
+                                                    (btree.as_ref(), schema.as_ref())
+                                                {
+                                                    if let Ok(schema_guard) = schema.read() {
+                                                        table
+                                                            .load_row_values(
+                                                                btree,
+                                                                &schema_guard,
+                                                                rowid,
+                                                            )
+                                                            .ok()
+                                                            .flatten()
+                                                    } else {
+                                                        table
+                                                            .row_values(rowid)
+                                                            .map(|vals| vals.to_vec())
+                                                    }
+                                                } else {
+                                                    table
+                                                        .row_values(rowid)
+                                                        .map(|vals| vals.to_vec())
+                                                };
+                                            if let Some(values) = values {
                                                 text = Some(Value::Text(values.join(" ")));
                                             }
                                         }

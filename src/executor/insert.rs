@@ -178,13 +178,15 @@ impl InsertCompiler {
     }
 
     fn infer_num_columns(&self, insert: &InsertStmt) -> usize {
-        if !insert.columns.is_empty() {
-            return insert.columns.len();
+        if let Some(cols) = &insert.columns {
+            if !cols.is_empty() {
+                return cols.len();
+            }
         }
         match &insert.source {
             InsertSource::Values(rows) => rows.first().map(|row| row.len()).unwrap_or(0),
             InsertSource::Select(_) => 0,
-            InsertSource::DefaultValues => 0,
+            InsertSource::DefaultValues => 1,
         }
     }
 

@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use crate::api::SqliteConnection;
 use crate::error::{Error, ErrorCode, Result};
 
 use super::fts3_write::{LeafNode, PendingTerms};
@@ -291,7 +290,6 @@ pub struct Fts3Segdir {
 }
 
 pub struct Fts3Table {
-    pub db: *mut SqliteConnection,
     pub name: String,
     pub schema: String,
     pub columns: Vec<String>,
@@ -322,7 +320,6 @@ impl Fts3Table {
         let name = name.into();
         let schema = schema.into();
         Self {
-            db: std::ptr::null_mut(),
             name: name.clone(),
             schema,
             columns,
@@ -656,7 +653,9 @@ impl Fts3Table {
         let mut doclists = Vec::new();
         for segment in &self.segments {
             for leaf in &segment.leaves {
-                let terms = leaf_terms(leaf)?;
+                let terms = leaf_terms(leaf).ok_or_else(|| {
+                    Error::with_message(ErrorCode::Error, "invalid leaf node")
+                })?;
                 for (term, doclist) in terms {
                     if term.starts_with(prefix.as_bytes()) {
                         doclists.push(doclist);
@@ -712,7 +711,10 @@ impl Fts3Table {
         let mut term_doclists: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
         for segment in &segments {
             for leaf in &segment.leaves {
-                for (term, doclist) in leaf_terms(leaf)? {
+                let terms = leaf_terms(leaf).ok_or_else(|| {
+                    Error::with_message(ErrorCode::Error, "invalid leaf node")
+                })?;
+                for (term, doclist) in terms {
                     term_doclists
                         .entry(term)
                         .or_default()

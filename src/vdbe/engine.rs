@@ -1279,22 +1279,26 @@ impl Vdbe {
 
             Opcode::VFilter => {
                 // Apply filter to virtual table cursor P1 (P4 = query string)
+                let mut query = match &op.p4 {
+                    P4::Text(text) => text.clone(),
+                    P4::Vtab(text) => text.clone(),
+                    _ => String::new(),
+                };
+                if query.is_empty() && op.p2 > 0 {
+                    query = self.mem(op.p2).to_str();
+                }
+
+                let vtab_name = self
+                    .cursor(op.p1)
+                    .and_then(|cursor| cursor.vtab_name.clone());
+
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if cursor.is_virtual {
-                        let mut query = match &op.p4 {
-                            P4::Text(text) => text.clone(),
-                            P4::Vtab(text) => text.clone(),
-                            _ => String::new(),
-                        };
-                        if query.is_empty() && op.p2 > 0 {
-                            query = self.mem(op.p2).to_str();
-                        }
-
-                        if let Some(vtab_name) = cursor.vtab_name.as_ref() {
+                        if let Some(vtab_name) = vtab_name.as_ref() {
                             #[cfg(feature = "fts3")]
                             {
                                 if let Some(table) = crate::fts3::get_table(vtab_name) {
-                                    if let Ok(mut table) = table.lock() {
+                                    if let Ok(table) = table.lock() {
                                         if let Ok(rowids) = table.query_rowids(&query) {
                                             cursor.vtab_rowids = rowids;
                                             cursor.vtab_row_index = 0;
@@ -1592,16 +1596,16 @@ impl Vdbe {
                 if let Some(value) = sqlite_master_value {
                     *self.mem_mut(op.p3) = value;
                 } else if let Some(value) = vtab_value {
-                    if let Some(cursor) = self.cursor(op.p1) {
-                        self.vtab_context_name = cursor.vtab_name.clone();
-                        self.vtab_context_rowid = cursor.rowid;
-                        #[cfg(feature = "fts3")]
-                        {
-                            crate::functions::fts3::set_fts3_context(
-                                self.vtab_context_name.clone(),
-                                self.vtab_context_rowid,
-                            );
-                        }
+                    let (vtab_name, vtab_rowid) = if let Some(cursor) = self.cursor(op.p1) {
+                        (cursor.vtab_name.clone(), cursor.rowid)
+                    } else {
+                        (None, None)
+                    };
+                    self.vtab_context_name = vtab_name.clone();
+                    self.vtab_context_rowid = vtab_rowid;
+                    #[cfg(feature = "fts3")]
+                    {
+                        crate::functions::fts3::set_fts3_context(vtab_name, vtab_rowid);
                     }
                     *self.mem_mut(op.p3) = value;
                 } else if let Some(cursor) = self.cursor(op.p1) {
@@ -1619,16 +1623,20 @@ impl Vdbe {
                                         for i in 0..col_idx {
                                             data_offset += types[i].size();
                                         }
-                                        // Deserialize the value
-                                        let col_data = &payload[data_offset..];
-                                        match crate::vdbe::auxdata::deserialize_value(
-                                            col_data,
-                                            &types[col_idx],
-                                        ) {
-                                            Ok(mem) => {
-                                                *self.mem_mut(op.p3) = mem;
+                                        if data_offset >= payload.len() {
+                                            self.mem_mut(op.p3).set_null();
+                                        } else {
+                                            // Deserialize the value
+                                            let col_data = &payload[data_offset..];
+                                            match crate::vdbe::auxdata::deserialize_value(
+                                                col_data,
+                                                &types[col_idx],
+                                            ) {
+                                                Ok(mem) => {
+                                                    *self.mem_mut(op.p3) = mem;
+                                                }
+                                                Err(_) => self.mem_mut(op.p3).set_null(),
                                             }
-                                            Err(_) => self.mem_mut(op.p3).set_null(),
                                         }
                                     } else {
                                         self.mem_mut(op.p3).set_null();
@@ -1648,15 +1656,19 @@ impl Vdbe {
                                     for i in 0..col_idx {
                                         data_offset += types[i].size();
                                     }
-                                    let col_data = &row_data[data_offset..];
-                                    match crate::vdbe::auxdata::deserialize_value(
-                                        col_data,
-                                        &types[col_idx],
-                                    ) {
-                                        Ok(mem) => {
-                                            *self.mem_mut(op.p3) = mem;
+                                    if data_offset >= row_data.len() {
+                                        self.mem_mut(op.p3).set_null();
+                                    } else {
+                                        let col_data = &row_data[data_offset..];
+                                        match crate::vdbe::auxdata::deserialize_value(
+                                            col_data,
+                                            &types[col_idx],
+                                        ) {
+                                            Ok(mem) => {
+                                                *self.mem_mut(op.p3) = mem;
+                                            }
+                                            Err(_) => self.mem_mut(op.p3).set_null(),
                                         }
-                                        Err(_) => self.mem_mut(op.p3).set_null(),
                                     }
                                 } else {
                                     self.mem_mut(op.p3).set_null();
@@ -1993,13 +2005,13 @@ impl Vdbe {
                                 {
                                     if let Some(table) = crate::fts3::get_table(vtab_name) {
                                         if let Ok(mut table) = table.lock() {
-                                            if let Some(values) = table.row_values(rowid) {
-                                                let refs: Vec<&str> = values
-                                                    .iter()
-                                                    .map(|value| value.as_str())
-                                                    .collect();
-                                                let _ = table.delete(rowid, &refs);
-                                            }
+                                            let values = table
+                                                .row_values(rowid)
+                                                .map(|vals| vals.to_vec())
+                                                .unwrap_or_default();
+                                            let refs: Vec<&str> =
+                                                values.iter().map(|value| value.as_str()).collect();
+                                            let _ = table.delete(rowid, &refs);
                                         }
                                     }
                                 }

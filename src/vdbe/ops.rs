@@ -597,6 +597,7 @@ impl Opcode {
             Opcode::SeekLT => "SeekLT",
             Opcode::SeekNull => "SeekNull",
             Opcode::NotExists => "NotExists",
+            Opcode::VFilter => "VFilter",
             Opcode::Delete => "Delete",
             Opcode::ResetSorter => "ResetSorter",
             Opcode::Column => "Column",

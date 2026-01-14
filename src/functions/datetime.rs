@@ -331,7 +331,7 @@ impl DateTime {
             self.valid_ymd = true;
             return;
         }
-        let z = ((self.i_jd + 43_200_000) / MS_PER_DAY);
+        let z = (self.i_jd + 43_200_000) / MS_PER_DAY;
         let alpha = ((z as f64 + 32044.75) / 36524.25) as i64 - 52;
         let a = z + 1 + alpha - ((alpha + 100) / 4) + 25;
         let b = a + 1524;
@@ -358,7 +358,7 @@ impl DateTime {
             return;
         }
         self.compute_jd();
-        let day_ms = ((self.i_jd + 43_200_000) % MS_PER_DAY);
+        let day_ms = (self.i_jd + 43_200_000) % MS_PER_DAY;
         let day_min = day_ms / 60_000;
         self.second = (day_ms % 60_000) as f64 / 1000.0;
         self.minute = (day_min % 60) as i32;

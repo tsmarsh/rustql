@@ -76,7 +76,6 @@ fn main() {
                         println!("Query complete, {} rows returned", row_count);
                         break;
                     }
-                    Ok(_) => break,
                     Err(e) => {
                         println!("STEP error: {:?}", e);
                         break;
@@ -109,7 +108,6 @@ fn main() {
                         println!("Query complete, {} rows returned", row_count);
                         break;
                     }
-                    Ok(_) => break,
                     Err(e) => {
                         println!("STEP error: {:?}", e);
                         break;

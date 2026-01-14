@@ -6,6 +6,7 @@ use super::tcl_parser::{extract_sql_from_script, ParsedTestFile, SetupCommand, T
 use std::collections::HashMap;
 
 /// Result of running a single test
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct TestResult {
     pub name: String,
@@ -381,6 +382,7 @@ impl<D: TestDatabase> TestRunner<D> {
 mod tests {
     use super::*;
 
+    #[allow(dead_code)]
     struct MockDb {
         results: Vec<Vec<String>>,
         call_count: usize,

@@ -20,7 +20,6 @@ fn exec_sql(db: &mut rustql::api::SqliteConnection, sql: &str) -> Vec<String> {
                         }
                     }
                     Ok(StepResult::Done) => break,
-                    Ok(_) => break,
                     Err(e) => {
                         println!("  Error: {:?}", e);
                         break;

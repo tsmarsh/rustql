@@ -827,7 +827,7 @@ mod tests {
 
     #[test]
     fn test_mem_arithmetic() {
-        let mut a = Mem::from_int(10);
+        let a = Mem::from_int(10);
         let b = Mem::from_int(3);
 
         let mut result = a.clone();
@@ -871,7 +871,7 @@ mod tests {
 
     #[test]
     fn test_mem_bitwise() {
-        let mut a = Mem::from_int(0b1100);
+        let a = Mem::from_int(0b1100);
         let b = Mem::from_int(0b1010);
 
         let mut result = a.clone();
@@ -889,7 +889,7 @@ mod tests {
 
     #[test]
     fn test_mem_shift() {
-        let mut a = Mem::from_int(8);
+        let a = Mem::from_int(8);
         let b = Mem::from_int(2);
 
         let mut result = a.clone();

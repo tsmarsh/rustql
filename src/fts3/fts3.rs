@@ -1099,7 +1099,7 @@ fn positions_by_column(positions: &[Fts3Position]) -> HashMap<i32, Vec<i32>> {
 
 fn map_to_doclist(mut map: BTreeMap<i64, Vec<Fts3Position>>) -> Fts3Doclist {
     let mut entries = Vec::new();
-    for (rowid, mut positions) in map.iter_mut() {
+    for (rowid, positions) in map.iter_mut() {
         positions.sort_by(|a, b| a.column.cmp(&b.column).then(a.offset.cmp(&b.offset)));
         entries.push(Fts3DoclistEntry {
             rowid: *rowid,

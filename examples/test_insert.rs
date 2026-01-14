@@ -71,10 +71,6 @@ fn main() {
                         println!("   Done, {} rows total", row_count);
                         break;
                     }
-                    Ok(other) => {
-                        println!("   Other result: {:?}", other);
-                        break;
-                    }
                     Err(e) => {
                         println!("   Step error: {:?}", e);
                         break;

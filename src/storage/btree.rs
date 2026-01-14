@@ -1751,7 +1751,7 @@ impl MemPage {
 
     pub fn cell_offset_for_index(&self, index: u16, limits: PageLimits) -> Result<usize> {
         let ptr = self.cell_ptr(index, limits)? as usize;
-        Ok((ptr & self.mask_page as usize))
+        Ok(ptr & self.mask_page as usize)
     }
 
     pub fn cell_slice(&self, index: u16, limits: PageLimits) -> Result<&[u8]> {

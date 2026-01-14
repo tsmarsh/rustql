@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 /// A single test case from a TCL test file.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct TestCase {
     /// Test name (e.g., "select1-1.1")
@@ -29,6 +30,7 @@ pub struct SetupCommand {
 }
 
 /// Parsed content from a TCL test file.
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct ParsedTestFile {
     /// File path
@@ -44,6 +46,7 @@ pub struct ParsedTestFile {
 }
 
 /// Parser state
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ParserState {
     Normal,
@@ -202,7 +205,7 @@ fn extract_braced_block(lines: &[&str], start: usize) -> (Option<String>, usize)
     let mut content = String::new();
     let mut depth = 0;
     let mut started = false;
-    let mut char_pos = 0; // Track position within line for same-line blocks
+    let char_pos = 0; // Track position within line for same-line blocks
 
     while i < lines.len() {
         let line = lines[i];

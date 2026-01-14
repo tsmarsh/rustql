@@ -2036,7 +2036,7 @@ mod tests {
         let mut col = Column::new("id");
         col.is_primary_key = true;
         table.columns.push(col);
-        let mut col2 = Column::new("name");
+        let col2 = Column::new("name");
         table.columns.push(col2);
         table
     }

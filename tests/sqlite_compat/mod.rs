@@ -11,7 +11,6 @@ pub mod tcl_parser;
 use std::fs;
 use std::path::Path;
 
-pub use runner::{SuiteStats, TestDatabase, TestFileStats, TestResult, TestRunner};
 pub use tcl_parser::{parse_tcl_test_file, ParsedTestFile};
 
 /// Default path to SQLite test files
@@ -92,6 +91,7 @@ pub fn analyze_test_file(path: &Path) -> Result<TestFileAnalysis, String> {
 }
 
 /// Analysis of a test file (without running)
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct TestFileAnalysis {
     pub file: String,

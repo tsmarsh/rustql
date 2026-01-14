@@ -1335,7 +1335,7 @@ mod tests {
 
     #[test]
     fn test_wal_open() {
-        let mut wal = Wal::open(&get_test_db_path(), 4096).unwrap();
+        let wal = Wal::open(&get_test_db_path(), 4096).unwrap();
         assert_eq!(wal.page_size, 4096);
         assert_eq!(wal.max_frame, 0);
         assert_eq!(wal.read_lock, WAL_READ_LOCK_NONE);
@@ -1346,7 +1346,7 @@ mod tests {
     #[test]
     fn test_wal_path() {
         let db_path = get_test_db_path();
-        let mut wal = Wal::open(&db_path, 4096).unwrap();
+        let wal = Wal::open(&db_path, 4096).unwrap();
         assert!(wal.wal_path().ends_with("-wal"));
     }
 
@@ -1359,7 +1359,7 @@ mod tests {
 
     #[test]
     fn test_wal_is_empty() {
-        let mut wal = Wal::open(&get_test_db_path(), 4096).unwrap();
+        let wal = Wal::open(&get_test_db_path(), 4096).unwrap();
         assert!(wal.is_empty());
 
         // Simulate non-empty WAL by setting max_frame
@@ -1370,7 +1370,7 @@ mod tests {
 
     #[test]
     fn test_wal_db_size() {
-        let mut wal = Wal::open(&get_test_db_path(), 4096).unwrap();
+        let wal = Wal::open(&get_test_db_path(), 4096).unwrap();
         // Default db_size should be 0 for new WAL
         assert_eq!(wal.db_size(), 0);
     }
@@ -1555,7 +1555,7 @@ mod tests {
 
     #[test]
     fn test_wal_frame_operations() {
-        let mut wal = Wal::open(&get_test_db_path(), 4096).unwrap();
+        let _wal = Wal::open(&get_test_db_path(), 4096).unwrap();
 
         // Test frame header creation
         let frame_hdr = WalFrameHdr::new(42, 100, [0xdeadbeef, 0xcafebabe]);
@@ -1573,7 +1573,7 @@ mod tests {
 
     #[test]
     fn test_wal_index_header_operations() {
-        let mut wal = Wal::open(&get_test_db_path(), 4096).unwrap();
+        let wal = Wal::open(&get_test_db_path(), 4096).unwrap();
 
         // Test index header initialization
         assert_eq!(wal.header.version, WAL_VERSION);
@@ -1662,7 +1662,7 @@ mod tests {
         // shm.regions always exists
 
         // Test shared memory initialization
-        let header_region = wal.shm.get_header_region();
+        let _header_region = wal.shm.get_header_region();
         assert_eq!(WALINDEX_HDR_SIZE, WALINDEX_HDR_SIZE);
     }
 
@@ -1746,10 +1746,10 @@ mod tests {
 
     #[test]
     fn test_wal_index_header_edge_cases() {
-        let mut header = WalIndexHdr::new(4096);
+        let header = WalIndexHdr::new(4096);
 
         // Test with zero page size (should be handled)
-        let mut bad_header = WalIndexHdr {
+        let bad_header = WalIndexHdr {
             page_size: 0,
             ..header
         };
@@ -1758,7 +1758,7 @@ mod tests {
         assert_eq!(parsed.page_size, 0);
 
         // Test with maximum values
-        let mut max_header = WalIndexHdr {
+        let max_header = WalIndexHdr {
             change: u32::MAX,
             max_frame: u32::MAX,
             n_page: u32::MAX,
@@ -1774,7 +1774,7 @@ mod tests {
     #[test]
     fn test_wal_frame_header_edge_cases() {
         // Test frame header with page number 0 (invalid)
-        let mut frame = WalFrameHdr::new(0, 0, [0, 0]);
+        let frame = WalFrameHdr::new(0, 0, [0, 0]);
         assert_eq!(frame.pgno, 0); // Should be stored but may be invalid
 
         // Test frame header with maximum page number
@@ -1913,7 +1913,7 @@ mod tests {
 
     #[test]
     fn test_wal_write_ahead_logging_properties() {
-        let mut wal = Wal::open(&get_test_db_path(), 4096).unwrap();
+        let wal = Wal::open(&get_test_db_path(), 4096).unwrap();
 
         // Test WAL properties
         assert!(wal.page_size > 0);
@@ -2169,7 +2169,7 @@ mod tests {
 
     #[test]
     fn test_wal_memory_management_comprehensive() {
-        let mut wal = Wal::open(&get_test_db_path(), 4096).unwrap();
+        let wal = Wal::open(&get_test_db_path(), 4096).unwrap();
 
         // Test memory management aspects
 
@@ -2279,15 +2279,15 @@ mod tests {
 
     #[test]
     fn test_wal_shared_memory_validation() {
-        let mut wal = Wal::open(&get_test_db_path(), 4096).unwrap();
+        let wal = Wal::open(&get_test_db_path(), 4096).unwrap();
 
         // Test shared memory properties
         assert!(wal.shm.read_marks.len() == WAL_NREADER);
         // shm.regions always exists
 
         // Test that read marks are initialized
-        for mark in wal.shm.read_marks {
-            assert_eq!(mark, 0);
+        for mark in &wal.shm.read_marks {
+            assert_eq!(*mark, 0);
         }
     }
 
@@ -2405,7 +2405,7 @@ mod tests {
 
     #[test]
     fn test_wal_write_ahead_logging_properties_comprehensive() {
-        let mut wal = Wal::open(&get_test_db_path(), 4096).unwrap();
+        let wal = Wal::open(&get_test_db_path(), 4096).unwrap();
 
         // Test WAL properties comprehensively
 
@@ -2696,7 +2696,7 @@ mod tests {
 
     #[test]
     fn test_wal_memory_management_comprehensive_final() {
-        let mut wal = Wal::open(&get_test_db_path(), 4096).unwrap();
+        let wal = Wal::open(&get_test_db_path(), 4096).unwrap();
 
         // Final comprehensive memory management test
 
@@ -2819,15 +2819,15 @@ mod tests {
     fn test_wal_shared_memory_validation_comprehensive() {
         // Test shared memory validation
 
-        let mut wal = Wal::open(&get_test_db_path(), 4096).unwrap();
+        let wal = Wal::open(&get_test_db_path(), 4096).unwrap();
 
         // Test shared memory properties
         assert!(wal.shm.read_marks.len() == WAL_NREADER);
         // shm.regions always exists
 
         // Test read marks initialization
-        for mark in wal.shm.read_marks {
-            assert_eq!(mark, 0);
+        for mark in &wal.shm.read_marks {
+            assert_eq!(*mark, 0);
         }
     }
 
@@ -2948,7 +2948,7 @@ mod tests {
 
     #[test]
     fn test_wal_write_ahead_logging_properties_comprehensive_final() {
-        let mut wal = Wal::open(&get_test_db_path(), 4096).unwrap();
+        let wal = Wal::open(&get_test_db_path(), 4096).unwrap();
 
         // Final comprehensive WAL properties test
 
@@ -3211,7 +3211,7 @@ mod tests {
 
     #[test]
     fn test_wal_memory_management_comprehensive_final_final() {
-        let mut wal = Wal::open(&get_test_db_path(), 4096).unwrap();
+        let wal = Wal::open(&get_test_db_path(), 4096).unwrap();
 
         // Final final comprehensive memory management test
 
@@ -3255,7 +3255,7 @@ mod tests {
         ];
 
         for data in edge_cases {
-            let (c1, c2) = wal_checksum(false, &data, 0, 0);
+            let _ = wal_checksum(false, &data, 0, 0);
             // Should not panic
         }
     }
@@ -3307,7 +3307,7 @@ mod tests {
     fn test_wal_shared_memory_validation_comprehensive_final() {
         // Final comprehensive shared memory validation test
 
-        let mut wal = Wal::open(&get_test_db_path(), 4096).unwrap();
+        let wal = Wal::open(&get_test_db_path(), 4096).unwrap();
 
         // Test shared memory properties
         assert!(wal.shm.read_marks.len() == WAL_NREADER);
@@ -3375,7 +3375,7 @@ mod tests {
 
     #[test]
     fn test_wal_memory_safety_comprehensive_final_final() {
-        let mut wal = Wal::open(&get_test_db_path(), 4096).unwrap();
+        let wal = Wal::open(&get_test_db_path(), 4096).unwrap();
 
         // Final final comprehensive memory safety test
 
@@ -3400,7 +3400,7 @@ mod tests {
 
     #[test]
     fn test_wal_write_ahead_logging_properties_comprehensive_final_final() {
-        let mut wal = Wal::open(&get_test_db_path(), 4096).unwrap();
+        let wal = Wal::open(&get_test_db_path(), 4096).unwrap();
 
         // Final final comprehensive WAL properties test
 
@@ -3563,7 +3563,7 @@ mod tests {
 
     #[test]
     fn test_wal_memory_management_comprehensive_final_final_final() {
-        let mut wal = Wal::open(&get_test_db_path(), 4096).unwrap();
+        let wal = Wal::open(&get_test_db_path(), 4096).unwrap();
 
         // Final final final comprehensive memory management test
 
@@ -3589,7 +3589,7 @@ mod tests {
 
         // Test checksum edge cases
         let data = [0x01, 0x02];
-        let (c1, c2) = wal_checksum(false, &data, 0, 0);
+        let _ = wal_checksum(false, &data, 0, 0);
         // Should not panic
     }
 
@@ -3625,7 +3625,7 @@ mod tests {
         // Final final comprehensive shared memory validation test
 
         // Test shared memory validation
-        let mut wal = Wal::open(&get_test_db_path(), 4096).unwrap();
+        let wal = Wal::open(&get_test_db_path(), 4096).unwrap();
         assert!(wal.shm.read_marks.len() == WAL_NREADER);
     }
 
@@ -3675,7 +3675,7 @@ mod tests {
 
     #[test]
     fn test_wal_memory_safety_comprehensive_final_final_final() {
-        let mut wal = Wal::open(&get_test_db_path(), 4096).unwrap();
+        let wal = Wal::open(&get_test_db_path(), 4096).unwrap();
 
         // Final final final comprehensive memory safety test
 
@@ -3686,7 +3686,7 @@ mod tests {
 
     #[test]
     fn test_wal_concurrency_control_comprehensive_final_final_final() {
-        let mut wal = Wal::open(&get_test_db_path(), 4096).unwrap();
+        let wal = Wal::open(&get_test_db_path(), 4096).unwrap();
 
         // Final final final comprehensive concurrency control test
 
@@ -3696,7 +3696,7 @@ mod tests {
 
     #[test]
     fn test_wal_write_ahead_logging_properties_comprehensive_final_final_final() {
-        let mut wal = Wal::open(&get_test_db_path(), 4096).unwrap();
+        let wal = Wal::open(&get_test_db_path(), 4096).unwrap();
 
         // Final final final comprehensive WAL properties test
 
@@ -3754,7 +3754,7 @@ mod tests {
 
         // Test checksum algorithm
         let data = [0x01];
-        let (c1, c2) = wal_checksum(false, &data, 0, 0);
+        let _ = wal_checksum(false, &data, 0, 0);
         // Should not panic
     }
 

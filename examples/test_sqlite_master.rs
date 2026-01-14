@@ -54,10 +54,6 @@ fn main() {
                         println!("  Done, {} rows", count);
                         break;
                     }
-                    Ok(other) => {
-                        println!("  Other result: {:?}", other);
-                        break;
-                    }
                     Err(e) => {
                         println!("  Error: {:?}", e);
                         break;
@@ -93,10 +89,6 @@ fn main() {
                     }
                     Ok(StepResult::Done) => {
                         println!("  Done, {} rows", count);
-                        break;
-                    }
-                    Ok(other) => {
-                        println!("  Other result: {:?}", other);
                         break;
                     }
                     Err(e) => {

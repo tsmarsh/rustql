@@ -527,7 +527,7 @@ impl Fts3Table {
         max_idx + 1
     }
 
-    fn parse_query(&self, expr: &str) -> Result<Fts3Expr> {
+    pub fn parse_query(&self, expr: &str) -> Result<Fts3Expr> {
         let expr = expr.trim();
         if expr.is_empty() {
             return Err(Error::with_message(ErrorCode::Error, "empty query"));
@@ -573,7 +573,7 @@ impl Fts3Table {
         Ok(Fts3Expr::Term(expr.to_string()))
     }
 
-    fn evaluate_expr(&self, expr: &Fts3Expr) -> Result<Fts3Doclist> {
+    pub fn evaluate_expr(&self, expr: &Fts3Expr) -> Result<Fts3Doclist> {
         match expr {
             Fts3Expr::Term(term) => self.lookup_term(term),
             Fts3Expr::Prefix(prefix) => self.lookup_prefix(prefix),

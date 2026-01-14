@@ -678,7 +678,6 @@ impl Opcode {
             Opcode::Param => "Param",
             Opcode::TriggerTest => "TriggerTest",
             Opcode::TriggerProlog => "TriggerProlog",
-            Opcode::VFilter => "VFilter",
             Opcode::MaxOpcode => "MaxOpcode",
         }
     }

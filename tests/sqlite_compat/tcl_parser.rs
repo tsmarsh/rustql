@@ -379,6 +379,22 @@ pub fn extract_sql_from_script(script: &str) -> Vec<SqlCommand> {
                 });
                 i = new_i;
             }
+        } else if remaining.starts_with("db eval") {
+            // Handle "db eval {SQL}" pattern used in many tests
+            i += 7;
+            // Skip whitespace
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+            // Extract braced content
+            if i < chars.len() && chars[i] == '{' {
+                let (sql, new_i) = extract_braced_content(&chars, i);
+                commands.push(SqlCommand {
+                    sql,
+                    expects_error: false,
+                });
+                i = new_i;
+            }
         } else {
             i += 1;
         }

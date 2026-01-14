@@ -172,6 +172,23 @@ fn test_basic_sql_execution() {
         ("CREATE TABLE", "CREATE TABLE t1(a, b)", vec![]),
         ("INSERT", "INSERT INTO t1 VALUES(1, 2)", vec![]),
         ("SELECT", "SELECT * FROM t1", vec!["1", "2"]),
+        // Test COALESCE function
+        (
+            "CREATE t2",
+            "CREATE TABLE t2(a INTEGER PRIMARY KEY, b, c, d)",
+            vec![],
+        ),
+        (
+            "INSERT t2-1",
+            "INSERT INTO t2 VALUES(1, null, null, null)",
+            vec![],
+        ),
+        ("INSERT t2-2", "INSERT INTO t2 VALUES(2, 2, 99, 99)", vec![]),
+        (
+            "COALESCE",
+            "SELECT coalesce(b,c,d) FROM t2 ORDER BY a",
+            vec!["{}", "2"],
+        ),
     ];
 
     for (name, sql, expected) in &tests {
@@ -188,6 +205,65 @@ fn test_basic_sql_execution() {
                 println!("ERROR: {} - {}", name, e);
             }
         }
+    }
+}
+
+/// Test coalesce function with full data from coalesce.test
+#[test]
+fn test_coalesce_full() {
+    let db = match RustqlTestDb::new("/tmp/rustql_coalesce_test.db") {
+        Ok(db) => db,
+        Err(e) => {
+            println!("Failed to create database: {}", e);
+            return;
+        }
+    };
+    let mut db = db;
+
+    // Setup from coalesce.test
+    let setup = r#"
+        CREATE TABLE t1(a INTEGER PRIMARY KEY, b, c, d);
+        INSERT INTO t1 VALUES(1, null, null, null);
+        INSERT INTO t1 VALUES(2, 2, 99, 99);
+        INSERT INTO t1 VALUES(3, null, 3, 99);
+        INSERT INTO t1 VALUES(4, null, null, 4);
+        INSERT INTO t1 VALUES(5, null, null, null);
+        INSERT INTO t1 VALUES(6, 22, 99, 99);
+        INSERT INTO t1 VALUES(7, null, 33, 99);
+        INSERT INTO t1 VALUES(8, null, null, 44);
+    "#;
+
+    match db.exec_sql(setup) {
+        Ok(_) => println!("Setup OK"),
+        Err(e) => {
+            println!("Setup ERROR: {}", e);
+            return;
+        }
+    }
+
+    // Test coalesce-1.0: SELECT coalesce(b,c,d) FROM t1 ORDER BY a
+    match db.exec_sql("SELECT coalesce(b,c,d) FROM t1 ORDER BY a") {
+        Ok(result) => {
+            let expected = vec!["{}", "2", "3", "4", "{}", "22", "33", "44"];
+            println!("coalesce-1.0:");
+            println!("  Expected: {:?}", expected);
+            println!("  Got:      {:?}", result);
+            if result == expected {
+                println!("  PASS");
+            } else {
+                println!("  FAIL");
+            }
+        }
+        Err(e) => println!("Query ERROR: {}", e),
+    }
+
+    // Also check raw data
+    match db.exec_sql("SELECT a, b, c, d FROM t1 ORDER BY a") {
+        Ok(result) => {
+            println!("\nRaw data (a, b, c, d):");
+            println!("  {:?}", result);
+        }
+        Err(e) => println!("Raw query ERROR: {}", e),
     }
 }
 

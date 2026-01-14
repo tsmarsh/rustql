@@ -3,10 +3,11 @@
 //! This adapter connects the test runner to rustql's API.
 
 use super::runner::{CatchResult, TestDatabase};
-use rustql::types::StepResult;
+use rustql::types::{ColumnType, StepResult};
 use rustql::{
-    sqlite3_close, sqlite3_column_count, sqlite3_column_text, sqlite3_finalize, sqlite3_initialize,
-    sqlite3_open, sqlite3_prepare_v2, sqlite3_step, PreparedStmt, SqliteConnection,
+    sqlite3_close, sqlite3_column_count, sqlite3_column_text, sqlite3_column_type,
+    sqlite3_finalize, sqlite3_initialize, sqlite3_open, sqlite3_prepare_v2, sqlite3_step,
+    PreparedStmt, SqliteConnection,
 };
 use std::fs;
 
@@ -104,7 +105,13 @@ impl RustqlTestDb {
                 Ok(StepResult::Row) => {
                     let mut row = Vec::new();
                     for i in 0..col_count {
-                        let text = sqlite3_column_text(stmt, i);
+                        // Check if column is NULL and format for TCL compatibility
+                        let col_type = sqlite3_column_type(stmt, i);
+                        let text = if col_type == ColumnType::Null {
+                            "{}".to_string() // TCL representation of NULL
+                        } else {
+                            sqlite3_column_text(stmt, i)
+                        };
                         row.push(text);
                     }
                     rows.push(row);

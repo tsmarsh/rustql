@@ -133,6 +133,8 @@ pub struct SelectCompiler<'s> {
     offset_counter_reg: Option<i32>,
     /// Label to jump to when LIMIT is exhausted
     limit_done_label: Option<i32>,
+    /// ORDER BY terms (when outputting to sorter)
+    order_by_terms: Option<Vec<OrderingTerm>>,
 }
 
 impl<'s> SelectCompiler<'s> {
@@ -156,6 +158,7 @@ impl<'s> SelectCompiler<'s> {
             limit_counter_reg: None,
             offset_counter_reg: None,
             limit_done_label: None,
+            order_by_terms: None,
         }
     }
 
@@ -179,6 +182,7 @@ impl<'s> SelectCompiler<'s> {
             limit_counter_reg: None,
             offset_counter_reg: None,
             limit_done_label: None,
+            order_by_terms: None,
         }
     }
 
@@ -206,6 +210,8 @@ impl<'s> SelectCompiler<'s> {
                 0,
                 P4::Unused,
             );
+            // Store ORDER BY terms so output_row_inner can include them in records
+            self.order_by_terms = Some(order_by.clone());
             (
                 SelectDest::Sorter {
                     cursor: sorter_cursor,
@@ -1775,7 +1781,7 @@ impl<'s> SelectCompiler<'s> {
     /// Compile ORDER BY output - sort the sorter and output rows
     fn compile_order_by_output(
         &mut self,
-        _order_by: &[OrderingTerm],
+        order_by: &[OrderingTerm],
         sorter_cursor: i32,
         dest: &SelectDest,
     ) -> Result<()> {
@@ -1797,28 +1803,44 @@ impl<'s> SelectCompiler<'s> {
         let record_reg = self.alloc_reg();
         self.emit(Opcode::SorterData, sorter_cursor, record_reg, 0, P4::Unused);
 
-        // Decode the record and output columns
-        // We need to know how many columns - use the number of result columns
-        let num_cols = self.result_column_names.len();
-        let base_reg = self.alloc_regs(num_cols);
+        // Decode the record: [ORDER BY keys..., result columns...]
+        // We need to skip the ORDER BY keys and only output result columns
+        let num_order_by_cols = order_by.len();
+        let num_result_cols = self.result_column_names.len();
+        let total_cols = num_order_by_cols + num_result_cols;
 
-        // Use DecodeRecord to extract columns from the serialized record
-        // DecodeRecord P1 P2 P3: Decode record in P1, store starting at P2, num cols in P3
+        // Decode all columns into registers
+        let all_base_reg = self.alloc_regs(total_cols);
         self.emit(
             Opcode::DecodeRecord,
             record_reg,
-            base_reg,
-            num_cols as i32,
+            all_base_reg,
+            total_cols as i32,
             P4::Unused,
         );
 
-        // Output the decoded row
+        // Result columns start after ORDER BY keys
+        let result_base_reg = all_base_reg + num_order_by_cols as i32;
+
+        // Output the result columns (skip ORDER BY keys)
         match dest {
             SelectDest::Output => {
-                self.emit(Opcode::ResultRow, base_reg, num_cols as i32, 0, P4::Unused);
+                self.emit(
+                    Opcode::ResultRow,
+                    result_base_reg,
+                    num_result_cols as i32,
+                    0,
+                    P4::Unused,
+                );
             }
             _ => {
-                self.emit(Opcode::ResultRow, base_reg, num_cols as i32, 0, P4::Unused);
+                self.emit(
+                    Opcode::ResultRow,
+                    result_base_reg,
+                    num_result_cols as i32,
+                    0,
+                    P4::Unused,
+                );
             }
         }
 
@@ -1946,15 +1968,54 @@ impl<'s> SelectCompiler<'s> {
                 self.emit(Opcode::Copy, base_reg, *reg, 0, P4::Unused);
             }
             SelectDest::Sorter { cursor } => {
-                let record_reg = self.alloc_reg();
-                self.emit(
-                    Opcode::MakeRecord,
-                    base_reg,
-                    count as i32,
-                    record_reg,
-                    P4::Unused,
-                );
-                self.emit(Opcode::SorterInsert, *cursor, record_reg, 0, P4::Unused);
+                // For ORDER BY, record format is: [ORDER BY keys..., result columns...]
+                // This ensures proper sorting by key columns first
+                let order_by_count = self.order_by_terms.as_ref().map(|v| v.len()).unwrap_or(0);
+
+                if order_by_count > 0 {
+                    // Compile ORDER BY expressions and store in registers
+                    let key_base_reg = self.alloc_regs(order_by_count);
+                    if let Some(order_by) = &self.order_by_terms.clone() {
+                        for (i, term) in order_by.iter().enumerate() {
+                            self.compile_expr(&term.expr, key_base_reg + i as i32)?;
+                        }
+                    }
+
+                    // Copy result columns after ORDER BY keys
+                    let full_base_reg = key_base_reg;
+                    for i in 0..count {
+                        self.emit(
+                            Opcode::Copy,
+                            base_reg + i as i32,
+                            key_base_reg + order_by_count as i32 + i as i32,
+                            0,
+                            P4::Unused,
+                        );
+                    }
+
+                    // Make record: ORDER BY keys + result columns
+                    let record_reg = self.alloc_reg();
+                    let total_cols = order_by_count + count;
+                    self.emit(
+                        Opcode::MakeRecord,
+                        full_base_reg,
+                        total_cols as i32,
+                        record_reg,
+                        P4::Unused,
+                    );
+                    self.emit(Opcode::SorterInsert, *cursor, record_reg, 0, P4::Unused);
+                } else {
+                    // No ORDER BY, just store result columns
+                    let record_reg = self.alloc_reg();
+                    self.emit(
+                        Opcode::MakeRecord,
+                        base_reg,
+                        count as i32,
+                        record_reg,
+                        P4::Unused,
+                    );
+                    self.emit(Opcode::SorterInsert, *cursor, record_reg, 0, P4::Unused);
+                }
             }
             SelectDest::Discard => {
                 // Do nothing

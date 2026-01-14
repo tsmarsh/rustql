@@ -2208,12 +2208,16 @@ impl Vdbe {
 
             Opcode::SorterSort => {
                 // SorterSort P1 P2: Sort the sorter P1. Jump to P2 if empty.
+                // n_field contains the number of ORDER BY key columns
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if cursor.sorter_data.is_empty() {
                         self.pc = op.p2;
                     } else {
-                        // Sort the data
-                        cursor.sorter_data.sort();
+                        // Sort the data using custom comparison that decodes records
+                        let num_key_cols = cursor.n_field.max(1) as usize;
+                        cursor
+                            .sorter_data
+                            .sort_by(|a, b| compare_records(a, b, num_key_cols));
                         cursor.sorter_sorted = true;
                         cursor.sorter_index = 0;
                         cursor.state = CursorState::Valid;
@@ -2951,6 +2955,70 @@ impl Vdbe {
         }
         mems
     }
+}
+
+// ============================================================================
+// Sorter comparison helper
+// ============================================================================
+
+/// Compare two SQLite records by their first N columns (ORDER BY keys).
+/// Returns Ordering for use with sort_by.
+fn compare_records(a: &[u8], b: &[u8], num_key_cols: usize) -> Ordering {
+    use crate::vdbe::auxdata::{decode_record_header, deserialize_value};
+
+    // Decode headers to get column types
+    let (a_types, a_header_size) = match decode_record_header(a) {
+        Ok(v) => v,
+        Err(_) => return Ordering::Equal,
+    };
+    let (b_types, b_header_size) = match decode_record_header(b) {
+        Ok(v) => v,
+        Err(_) => return Ordering::Equal,
+    };
+
+    // Compare key columns
+    let mut a_offset = a_header_size;
+    let mut b_offset = b_header_size;
+
+    for i in 0..num_key_cols {
+        // Get types and values for this column
+        let a_type = a_types.get(i);
+        let b_type = b_types.get(i);
+
+        let a_mem = if let Some(t) = a_type {
+            deserialize_value(&a[a_offset..], t).ok()
+        } else {
+            None
+        };
+
+        let b_mem = if let Some(t) = b_type {
+            deserialize_value(&b[b_offset..], t).ok()
+        } else {
+            None
+        };
+
+        // Advance offsets
+        if let Some(t) = a_type {
+            a_offset += t.size();
+        }
+        if let Some(t) = b_type {
+            b_offset += t.size();
+        }
+
+        // Compare values
+        let cmp = match (a_mem, b_mem) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Less, // NULL sorts first
+            (Some(_), None) => Ordering::Greater,
+            (Some(a_val), Some(b_val)) => a_val.compare(&b_val),
+        };
+
+        if cmp != Ordering::Equal {
+            return cmp;
+        }
+    }
+
+    Ordering::Equal
 }
 
 // ============================================================================

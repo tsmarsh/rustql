@@ -285,6 +285,9 @@ pub struct Vdbe {
     /// Foreign key enforcement enabled
     fk_enabled: bool,
 
+    /// Active virtual table query string (for FTS helpers)
+    vtab_query: Option<String>,
+
     // ========================================================================
     // Trigger Context
     // ========================================================================
@@ -340,6 +343,7 @@ impl Vdbe {
             schema: None,
             deferred_fk_counter: 0,
             fk_enabled: true,
+            vtab_query: None,
             trigger_old_row: None,
             trigger_new_row: None,
             trigger_depth: 0,
@@ -1299,6 +1303,7 @@ impl Vdbe {
                                     }
                                 }
                             }
+                            self.vtab_query = if query.is_empty() { None } else { Some(query) };
                         }
                     }
                 }
@@ -1759,6 +1764,14 @@ impl Vdbe {
                         for i in 0..argc {
                             let mem = self.mem(arg_base + i as i32);
                             args.push(mem.to_value());
+                        }
+                        if (name.eq_ignore_ascii_case("snippet")
+                            || name.eq_ignore_ascii_case("offsets"))
+                            && args.len() == 1
+                        {
+                            if let Some(query) = self.vtab_query.clone() {
+                                args.push(Value::Text(query));
+                            }
                         }
                         match func(&args) {
                             Ok(value) => {

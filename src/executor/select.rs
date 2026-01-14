@@ -86,6 +86,13 @@ struct Fts3MatchFilter {
     pattern: Expr,
 }
 
+fn filter_literal_text(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Literal(Literal::String(text)) => Some(text.clone()),
+        _ => None,
+    }
+}
+
 // ============================================================================
 // Select Compiler State
 // ============================================================================
@@ -1221,11 +1228,57 @@ impl<'s> SelectCompiler<'s> {
             right,
         } = expr
         {
+            if let (Some(left_filter), Some(right_filter)) = (
+                self.extract_fts3_match_filter(left),
+                self.extract_fts3_match_filter(right),
+            ) {
+                if let (Some(left_text), Some(right_text)) = (
+                    filter_literal_text(&left_filter.pattern),
+                    filter_literal_text(&right_filter.pattern),
+                ) {
+                    return (
+                        Some(Fts3MatchFilter {
+                            cursor: left_filter.cursor,
+                            pattern: Expr::Literal(Literal::String(format!(
+                                "{} AND {}",
+                                left_text, right_text
+                            ))),
+                        }),
+                        None,
+                    );
+                }
+            }
             if let Some(filter) = self.extract_fts3_match_filter(left) {
                 return (Some(filter), Some(*right.clone()));
             }
             if let Some(filter) = self.extract_fts3_match_filter(right) {
                 return (Some(filter), Some(*left.clone()));
+            }
+        } else if let Expr::Binary {
+            op: BinaryOp::Or,
+            left,
+            right,
+        } = expr
+        {
+            if let (Some(left_filter), Some(right_filter)) = (
+                self.extract_fts3_match_filter(left),
+                self.extract_fts3_match_filter(right),
+            ) {
+                if let (Some(left_text), Some(right_text)) = (
+                    filter_literal_text(&left_filter.pattern),
+                    filter_literal_text(&right_filter.pattern),
+                ) {
+                    return (
+                        Some(Fts3MatchFilter {
+                            cursor: left_filter.cursor,
+                            pattern: Expr::Literal(Literal::String(format!(
+                                "{} OR {}",
+                                left_text, right_text
+                            ))),
+                        }),
+                        None,
+                    );
+                }
             }
         }
         (None, Some(expr.clone()))
@@ -1274,6 +1327,10 @@ impl<'s> SelectCompiler<'s> {
             }
         }
         None
+    }
+
+    fn is_fts3_match(&self, expr: &Expr) -> bool {
+        self.extract_fts3_match_filter(expr).is_some()
     }
 
     /// Compile an expression into a register

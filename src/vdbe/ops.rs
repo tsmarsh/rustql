@@ -351,6 +351,9 @@ pub enum Opcode {
     /// Compare sorter keys
     SorterCompare,
 
+    /// Configure sorter sort order - P1=cursor, P4=blob of sort directions (0=ASC, 1=DESC)
+    SorterConfig,
+
     // ========================================================================
     // Schema Operations
     // ========================================================================
@@ -652,6 +655,7 @@ impl Opcode {
             Opcode::SorterNext => "SorterNext",
             Opcode::SorterData => "SorterData",
             Opcode::SorterCompare => "SorterCompare",
+            Opcode::SorterConfig => "SorterConfig",
             Opcode::CreateBtree => "CreateBtree",
             Opcode::ParseSchema => "ParseSchema",
             Opcode::DropSchema => "DropSchema",

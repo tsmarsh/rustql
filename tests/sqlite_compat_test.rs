@@ -487,3 +487,39 @@ fn test_scalar_min_max() {
         Err(e) => println!("  ERROR: {}", e),
     }
 }
+
+#[test]
+fn test_value_one_bug() {
+    let db = match RustqlTestDb::new("/tmp/rustql_value_one_test.db") {
+        Ok(db) => db,
+        Err(e) => {
+            println!("Failed to create database: {}", e);
+            return;
+        }
+    };
+    let mut db = db;
+
+    // Test various small integer values
+    let _ = db.exec_sql("CREATE TABLE t(a INT)");
+
+    let test_values = vec!["0", "1", "2", "-1", "10"];
+    for val in test_values {
+        let _ = db.exec_sql(&format!("DELETE FROM t"));
+        let _ = db.exec_sql(&format!("INSERT INTO t VALUES({})", val));
+
+        println!("\nTesting value {}:", val);
+        match db.exec_sql("SELECT a, typeof(a) FROM t") {
+            Ok(result) => {
+                println!("  Result: {:?}", result);
+                let expected_val = val;
+                let expected_type = "integer";
+                if result.len() >= 2 && result[0] == expected_val && result[1] == expected_type {
+                    println!("  PASS!");
+                } else {
+                    println!("  FAIL: Expected [{}, integer], got {:?}", val, result);
+                }
+            }
+            Err(e) => println!("  ERROR: {}", e),
+        }
+    }
+}

@@ -1794,9 +1794,11 @@ impl<'a> Parser<'a> {
         let (schema, name) = self.parse_maybe_qualified_name()?;
 
         let value = if self.match_token(TokenKind::Eq) {
-            Some(PragmaValue::Set(self.parse_expr()?))
+            // PRAGMA values can be identifiers, keywords, numbers, or strings
+            // Try to parse simple values first before falling back to expressions
+            Some(PragmaValue::Set(self.parse_pragma_value()?))
         } else if self.match_token(TokenKind::LParen) {
-            let expr = self.parse_expr()?;
+            let expr = self.parse_pragma_value()?;
             self.expect(TokenKind::RParen)?;
             Some(PragmaValue::Call(expr))
         } else {
@@ -1808,6 +1810,56 @@ impl<'a> Parser<'a> {
             name,
             value,
         })
+    }
+
+    /// Parse a PRAGMA value - can be an identifier, keyword, number, or string
+    fn parse_pragma_value(&mut self) -> Result<Expr> {
+        // Handle ON/OFF/YES/NO and other keyword values
+        let token = self.current().clone();
+        match token.kind {
+            TokenKind::On => {
+                self.advance();
+                Ok(Expr::Literal(Literal::String("on".to_string())))
+            }
+            TokenKind::Integer => {
+                let text = token.text(self.source);
+                let val = text
+                    .parse::<i64>()
+                    .map_err(|_| self.error("invalid integer"))?;
+                self.advance();
+                Ok(Expr::Literal(Literal::Integer(val)))
+            }
+            TokenKind::Float => {
+                let text = token.text(self.source);
+                let val = text
+                    .parse::<f64>()
+                    .map_err(|_| self.error("invalid float"))?;
+                self.advance();
+                Ok(Expr::Literal(Literal::Float(val)))
+            }
+            TokenKind::String => {
+                let text = token.text(self.source);
+                let inner = &text[1..text.len() - 1];
+                let val = inner.replace("''", "'");
+                self.advance();
+                Ok(Expr::Literal(Literal::String(val)))
+            }
+            TokenKind::Identifier => {
+                let val = token.text(self.source).to_string();
+                self.advance();
+                Ok(Expr::Literal(Literal::String(val)))
+            }
+            // Handle other common PRAGMA keywords
+            TokenKind::Full | TokenKind::Default | TokenKind::Delete | TokenKind::No => {
+                let val = token.text(self.source).to_lowercase();
+                self.advance();
+                Ok(Expr::Literal(Literal::String(val)))
+            }
+            _ => {
+                // Fall back to regular expression parsing
+                self.parse_expr()
+            }
+        }
     }
 
     fn parse_vacuum(&mut self) -> Result<VacuumStmt> {

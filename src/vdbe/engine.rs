@@ -127,6 +127,8 @@ pub struct VdbeCursor {
     pub sorter_index: usize,
     /// Has the sorter been sorted?
     pub sorter_sorted: bool,
+    /// Sort directions for each ORDER BY column (true = DESC, false = ASC)
+    pub sort_desc: Vec<bool>,
     /// Ephemeral index data - used for DISTINCT and index operations
     pub ephemeral_set: std::collections::HashSet<Vec<u8>>,
 }
@@ -172,6 +174,7 @@ impl VdbeCursor {
             sorter_data: Vec::new(),
             sorter_index: 0,
             sorter_sorted: false,
+            sort_desc: Vec::new(),
             ephemeral_set: std::collections::HashSet::new(),
         }
     }
@@ -1774,13 +1777,19 @@ impl Vdbe {
                                             data_offset += types[i].size();
                                         }
                                         // Deserialize the value (with bounds check)
-                                        if data_offset >= payload.len() {
+                                        // Note: Zero and One serial types have size 0 and need no data
+                                        let col_type = &types[col_idx];
+                                        let needs_data = col_type.size() > 0;
+                                        if needs_data && data_offset >= payload.len() {
                                             self.mem_mut(op.p3).set_null();
                                         } else {
-                                            let col_data = &payload[data_offset..];
+                                            let col_data = if data_offset < payload.len() {
+                                                &payload[data_offset..]
+                                            } else {
+                                                &[][..]
+                                            };
                                             match crate::vdbe::auxdata::deserialize_value(
-                                                col_data,
-                                                &types[col_idx],
+                                                col_data, col_type,
                                             ) {
                                                 Ok(mem) => {
                                                     *self.mem_mut(op.p3) = mem;
@@ -1806,13 +1815,19 @@ impl Vdbe {
                                     for i in 0..col_idx {
                                         data_offset += types[i].size();
                                     }
-                                    if data_offset >= row_data.len() {
+                                    // Note: Zero and One serial types have size 0 and need no data
+                                    let col_type = &types[col_idx];
+                                    let needs_data = col_type.size() > 0;
+                                    if needs_data && data_offset >= row_data.len() {
                                         self.mem_mut(op.p3).set_null();
                                     } else {
-                                        let col_data = &row_data[data_offset..];
+                                        let col_data = if data_offset < row_data.len() {
+                                            &row_data[data_offset..]
+                                        } else {
+                                            &[][..]
+                                        };
                                         match crate::vdbe::auxdata::deserialize_value(
-                                            col_data,
-                                            &types[col_idx],
+                                            col_data, col_type,
                                         ) {
                                             Ok(mem) => {
                                                 *self.mem_mut(op.p3) = mem;
@@ -2408,9 +2423,10 @@ impl Vdbe {
                     } else {
                         // Sort the data using custom comparison that decodes records
                         let num_key_cols = cursor.n_field.max(1) as usize;
+                        let sort_desc = cursor.sort_desc.clone();
                         cursor
                             .sorter_data
-                            .sort_by(|a, b| compare_records(a, b, num_key_cols));
+                            .sort_by(|a, b| compare_records(a, b, num_key_cols, &sort_desc));
                         cursor.sorter_sorted = true;
                         cursor.sorter_index = 0;
                         cursor.state = CursorState::Valid;
@@ -2444,6 +2460,16 @@ impl Vdbe {
 
             Opcode::SorterCompare => {
                 // Placeholder: Sorter comparison
+            }
+
+            Opcode::SorterConfig => {
+                // SorterConfig P1: Set sort directions for cursor P1
+                // P4 contains a blob where each byte is 0 (ASC) or 1 (DESC)
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    if let P4::Blob(dirs) = &op.p4 {
+                        cursor.sort_desc = dirs.iter().map(|&b| b != 0).collect();
+                    }
+                }
             }
 
             Opcode::ReadCookie | Opcode::SetCookie | Opcode::VerifyCookie => {
@@ -3025,7 +3051,8 @@ impl Vdbe {
 
 /// Compare two SQLite records by their first N columns (ORDER BY keys).
 /// Returns Ordering for use with sort_by.
-fn compare_records(a: &[u8], b: &[u8], num_key_cols: usize) -> Ordering {
+/// sort_desc: slice of booleans indicating DESC (true) or ASC (false) for each key column
+fn compare_records(a: &[u8], b: &[u8], num_key_cols: usize, sort_desc: &[bool]) -> Ordering {
     use crate::vdbe::auxdata::{decode_record_header, deserialize_value};
 
     // Decode headers to get column types
@@ -3076,7 +3103,9 @@ fn compare_records(a: &[u8], b: &[u8], num_key_cols: usize) -> Ordering {
         };
 
         if cmp != Ordering::Equal {
-            return cmp;
+            // Reverse comparison for DESC columns
+            let is_desc = sort_desc.get(i).copied().unwrap_or(false);
+            return if is_desc { cmp.reverse() } else { cmp };
         }
     }
 

@@ -940,4 +940,14 @@ mod tests {
         assert_eq!(format_p4(&P4::Text("hi".to_string())), "'hi'");
         assert_eq!(format_p4(&P4::FuncDef("abs".to_string())), "func(abs)");
     }
+
+    #[test]
+    fn test_negative_int8_roundtrip() {
+        // Verify negative Int8 serialization works correctly
+        let mems = vec![Mem::from_int(-1)];
+        let record = make_record(&mems, 0, 1);
+        let (types, header_size) = decode_record_header(&record).unwrap();
+        let result = deserialize_value(&record[header_size..], &types[0]).unwrap();
+        assert_eq!(result.to_int(), -1);
+    }
 }

@@ -545,9 +545,10 @@ impl InsertCompiler {
                 self.compile_expr(inner, dest_reg)?;
                 match op {
                     crate::parser::ast::UnaryOp::Neg => {
+                        // Subtract computes P2 - P1, so we need 0 - value
                         let zero_reg = self.alloc_reg();
                         self.emit(Opcode::Integer, 0, zero_reg, 0, P4::Unused);
-                        self.emit(Opcode::Subtract, zero_reg, dest_reg, dest_reg, P4::Unused);
+                        self.emit(Opcode::Subtract, dest_reg, zero_reg, dest_reg, P4::Unused);
                     }
                     crate::parser::ast::UnaryOp::Not => {
                         self.emit(Opcode::Not, dest_reg, dest_reg, 0, P4::Unused);

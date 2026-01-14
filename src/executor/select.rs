@@ -9,7 +9,8 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::executor::window::{select_has_window_functions, WindowCompiler};
 use crate::parser::ast::{
     BinaryOp, CompoundOp, Distinct, Expr, FromClause, JoinType, LikeOp, LimitClause, Literal,
-    OrderingTerm, ResultColumn, SelectBody, SelectCore, SelectStmt, TableRef, WithClause,
+    OrderingTerm, ResultColumn, SelectBody, SelectCore, SelectStmt, SortOrder, TableRef,
+    WithClause,
 };
 use crate::schema::{Affinity, Table};
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
@@ -215,6 +216,18 @@ impl<'s> SelectCompiler<'s> {
                 num_cols as i32,
                 0,
                 P4::Unused,
+            );
+            // Configure sort directions (0=ASC, 1=DESC)
+            let sort_dirs: Vec<u8> = order_by
+                .iter()
+                .map(|t| if t.order == SortOrder::Desc { 1 } else { 0 })
+                .collect();
+            self.emit(
+                Opcode::SorterConfig,
+                sorter_cursor,
+                0,
+                0,
+                P4::Blob(sort_dirs),
             );
             // Store ORDER BY terms so output_row_inner can include them in records
             self.order_by_terms = Some(order_by.clone());
@@ -1644,12 +1657,30 @@ impl<'s> SelectCompiler<'s> {
                 expr: inner,
                 negated,
             } => {
+                // IsNull/NotNull are jump opcodes, so we need a jump pattern to produce boolean
+                let true_label = self.alloc_label();
+                let end_label = self.alloc_label();
+
                 self.compile_expr(inner, dest_reg)?;
+
+                // Jump to true_label if the condition matches
                 if *negated {
-                    self.emit(Opcode::NotNull, dest_reg, dest_reg, 0, P4::Unused);
+                    // IS NOT NULL: jump if not null
+                    self.emit(Opcode::NotNull, dest_reg, true_label, 0, P4::Unused);
                 } else {
-                    self.emit(Opcode::IsNull, dest_reg, dest_reg, 0, P4::Unused);
+                    // IS NULL: jump if null
+                    self.emit(Opcode::IsNull, dest_reg, true_label, 0, P4::Unused);
                 }
+
+                // Condition not matched - set to 0 and jump to end
+                self.emit(Opcode::Integer, 0, dest_reg, 0, P4::Unused);
+                self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+
+                // Condition matched - set to 1
+                self.resolve_label(true_label, self.current_addr());
+                self.emit(Opcode::Integer, 1, dest_reg, 0, P4::Unused);
+
+                self.resolve_label(end_label, self.current_addr());
             }
             Expr::Case {
                 operand,
@@ -1833,6 +1864,10 @@ impl<'s> SelectCompiler<'s> {
                 );
 
                 self.resolve_label(end_label, self.current_addr());
+            }
+            Expr::Parens(inner) => {
+                // Parenthesized expression - just compile the inner expression
+                self.compile_expr(inner, dest_reg)?;
             }
             _ => {
                 // For other expression types, emit NULL as placeholder

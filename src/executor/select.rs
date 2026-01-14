@@ -1165,8 +1165,9 @@ impl<'s> SelectCompiler<'s> {
 
     /// Compile result columns
     fn compile_result_columns(&mut self, columns: &[ResultColumn]) -> Result<(i32, usize)> {
-        let base_reg = self.next_reg;
-        let mut count = 0;
+        // Track result registers explicitly since they may not be contiguous
+        // (function arguments allocate intermediate registers)
+        let mut result_regs: Vec<i32> = Vec::new();
 
         for col in columns {
             match col {
@@ -1185,7 +1186,7 @@ impl<'s> SelectCompiler<'s> {
                                     P4::Unused,
                                 );
                                 self.result_column_names.push(col_def.name.clone());
-                                count += 1;
+                                result_regs.push(reg);
                             }
                         }
                     }
@@ -1208,7 +1209,7 @@ impl<'s> SelectCompiler<'s> {
                                         P4::Unused,
                                     );
                                     self.result_column_names.push(col_def.name.clone());
-                                    count += 1;
+                                    result_regs.push(reg);
                                 }
                             }
                             break;
@@ -1218,11 +1219,11 @@ impl<'s> SelectCompiler<'s> {
                 ResultColumn::Expr { expr, alias } => {
                     let reg = self.alloc_reg();
                     self.compile_expr(expr, reg)?;
-                    count += 1;
+                    result_regs.push(reg);
 
                     let name = alias
                         .clone()
-                        .unwrap_or_else(|| self.expr_to_name(expr, count));
+                        .unwrap_or_else(|| self.expr_to_name(expr, result_regs.len()));
                     self.result_column_names.push(name.clone());
                     self.columns.push(ColumnInfo {
                         name,
@@ -1234,7 +1235,36 @@ impl<'s> SelectCompiler<'s> {
             }
         }
 
-        Ok((base_reg, count))
+        // Check if result registers are contiguous
+        let count = result_regs.len();
+        if count == 0 {
+            return Ok((self.next_reg, 0));
+        }
+
+        let base_reg = result_regs[0];
+        let mut contiguous = true;
+        for (i, &reg) in result_regs.iter().enumerate() {
+            if reg != base_reg + i as i32 {
+                contiguous = false;
+                break;
+            }
+        }
+
+        if contiguous {
+            // Registers are already contiguous
+            Ok((base_reg, count))
+        } else {
+            // Copy result values to contiguous registers
+            let new_base = self.next_reg;
+            for &src_reg in result_regs.iter() {
+                let dest_reg = self.alloc_reg();
+                // Only copy if not already in the right place
+                if src_reg != dest_reg {
+                    self.emit(Opcode::Copy, src_reg, dest_reg, 0, P4::Unused);
+                }
+            }
+            Ok((new_base, count))
+        }
     }
 
     /// Convert an expression to a column name
@@ -2047,6 +2077,14 @@ impl<'s> SelectCompiler<'s> {
         match expr {
             Expr::Function(func_call) => {
                 let name_upper = func_call.name.to_uppercase();
+                let arg_count = match &func_call.args {
+                    crate::parser::ast::FunctionArgs::Exprs(exprs) => exprs.len(),
+                    crate::parser::ast::FunctionArgs::Star => 0,
+                };
+                // MIN/MAX with multiple args are scalar functions, not aggregates
+                if matches!(name_upper.as_str(), "MIN" | "MAX") && arg_count > 1 {
+                    return false;
+                }
                 matches!(
                     name_upper.as_str(),
                     "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
@@ -2092,14 +2130,30 @@ impl<'s> SelectCompiler<'s> {
                         };
 
                         // Check argument count limits
-                        let (min_args, max_args) = match name_upper.as_str() {
-                            "COUNT" => (0, 1),
-                            "SUM" | "AVG" | "MIN" | "MAX" | "TOTAL" => (1, 1),
-                            "GROUP_CONCAT" => (1, 2),
-                            _ => (0, 255),
+                        // MIN/MAX with multiple args are scalar functions, not aggregates - skip them
+                        let (min_args, max_args, skip_if_exceeded) = match name_upper.as_str() {
+                            "COUNT" => (0, 1, false),
+                            "SUM" | "AVG" | "TOTAL" => (1, 1, false),
+                            "MIN" | "MAX" => (1, 1, true), // Multi-arg MIN/MAX are scalar functions
+                            "GROUP_CONCAT" => (1, 2, false),
+                            _ => (0, 255, false),
                         };
 
-                        if arg_count < min_args || arg_count > max_args {
+                        if arg_count < min_args {
+                            return Err(crate::error::Error::with_message(
+                                crate::error::ErrorCode::Error,
+                                format!(
+                                    "wrong number of arguments to function {}()",
+                                    name_upper.to_lowercase()
+                                ),
+                            ));
+                        }
+
+                        if arg_count > max_args {
+                            if skip_if_exceeded {
+                                // This is a scalar function (e.g., MIN(a, b, c)), not aggregate
+                                continue;
+                            }
                             return Err(crate::error::Error::with_message(
                                 crate::error::ErrorCode::Error,
                                 format!(
@@ -2147,10 +2201,19 @@ impl<'s> SelectCompiler<'s> {
             if let ResultColumn::Expr { expr, .. } = col {
                 if let Expr::Function(func_call) = expr {
                     let name_upper = func_call.name.to_uppercase();
-                    if matches!(
-                        name_upper.as_str(),
-                        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
-                    ) {
+                    let arg_count = match &func_call.args {
+                        crate::parser::ast::FunctionArgs::Exprs(exprs) => exprs.len(),
+                        crate::parser::ast::FunctionArgs::Star => 0,
+                    };
+                    // MIN/MAX with multiple args are scalar functions
+                    let is_multi_arg_min_max =
+                        matches!(name_upper.as_str(), "MIN" | "MAX") && arg_count > 1;
+                    if !is_multi_arg_min_max
+                        && matches!(
+                            name_upper.as_str(),
+                            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
+                        )
+                    {
                         let agg_reg = agg_regs[agg_idx];
                         self.emit(Opcode::AggFinal, agg_reg, dest_reg, 0, P4::Text(name_upper));
                         agg_idx += 1;
@@ -2206,10 +2269,19 @@ impl<'s> SelectCompiler<'s> {
             if let ResultColumn::Expr { expr, .. } = col {
                 if let Expr::Function(func_call) = expr {
                     let name_upper = func_call.name.to_uppercase();
-                    if matches!(
-                        name_upper.as_str(),
-                        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
-                    ) {
+                    let arg_count = match &func_call.args {
+                        crate::parser::ast::FunctionArgs::Exprs(exprs) => exprs.len(),
+                        crate::parser::ast::FunctionArgs::Star => 0,
+                    };
+                    // MIN/MAX with multiple args are scalar functions
+                    let is_multi_arg_min_max =
+                        matches!(name_upper.as_str(), "MIN" | "MAX") && arg_count > 1;
+                    if !is_multi_arg_min_max
+                        && matches!(
+                            name_upper.as_str(),
+                            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
+                        )
+                    {
                         let arg_reg = self.alloc_reg();
                         self.emit(Opcode::Column, cursor, col_idx as i32, arg_reg, P4::Unused);
                         self.emit(

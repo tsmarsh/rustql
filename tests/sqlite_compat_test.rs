@@ -429,3 +429,61 @@ fn test_distinct() {
         Err(e) => println!("  ERROR: {}", e),
     }
 }
+
+#[test]
+fn test_scalar_min_max() {
+    let db = match RustqlTestDb::new("/tmp/rustql_scalar_minmax_test.db") {
+        Ok(db) => db,
+        Err(e) => {
+            println!("Failed to create database: {}", e);
+            return;
+        }
+    };
+    let mut db = db;
+
+    // Setup
+    let _ = db.exec_sql("CREATE TABLE test1(f1 INT, f2 INT)");
+    let _ = db.exec_sql("INSERT INTO test1 VALUES(11, 22)");
+
+    // Test scalar min
+    println!("Testing scalar min(f1, f2):");
+    match db.exec_sql("SELECT min(f1, f2) FROM test1") {
+        Ok(result) => {
+            println!("  Result: {:?}", result);
+            if result == vec!["11"] {
+                println!("  PASS: min(11, 22) = 11");
+            } else {
+                println!("  FAIL: Expected [11], got {:?}", result);
+            }
+        }
+        Err(e) => println!("  ERROR: {}", e),
+    }
+
+    // Test scalar max
+    println!("\nTesting scalar max(f1, f2):");
+    match db.exec_sql("SELECT max(f1, f2) FROM test1") {
+        Ok(result) => {
+            println!("  Result: {:?}", result);
+            if result == vec!["22"] {
+                println!("  PASS: max(11, 22) = 22");
+            } else {
+                println!("  FAIL: Expected [22], got {:?}", result);
+            }
+        }
+        Err(e) => println!("  ERROR: {}", e),
+    }
+
+    // Test both together
+    println!("\nTesting combined: SELECT *, min(f1,f2), max(f1,f2) FROM test1");
+    match db.exec_sql("SELECT *, min(f1,f2), max(f1,f2) FROM test1") {
+        Ok(result) => {
+            println!("  Result: {:?}", result);
+            if result == vec!["11", "22", "11", "22"] {
+                println!("  PASS: Combined scalar min/max works!");
+            } else {
+                println!("  FAIL: Expected [11, 22, 11, 22], got {:?}", result);
+            }
+        }
+        Err(e) => println!("  ERROR: {}", e),
+    }
+}

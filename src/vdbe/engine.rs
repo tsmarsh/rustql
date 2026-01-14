@@ -1591,12 +1591,21 @@ impl Vdbe {
                     self.pc = op.p2;
                 }
                 if let Some((name, rowid)) = vtab_context {
-                    self.vtab_context_name = name.clone();
+                    let context_name = name.clone();
+                    self.vtab_context_name = context_name.clone();
                     self.vtab_context_rowid = rowid;
                     #[cfg(feature = "fts3")]
                     {
                         crate::functions::fts3::set_fts3_context(
-                            name,
+                            context_name.clone(),
+                            rowid,
+                            self.vtab_query.clone(),
+                        );
+                    }
+                    #[cfg(feature = "fts5")]
+                    {
+                        crate::functions::fts5::set_fts5_context(
+                            context_name,
                             rowid,
                             self.vtab_query.clone(),
                         );
@@ -1668,12 +1677,21 @@ impl Vdbe {
                     self.pc = op.p2;
                 }
                 if let Some((name, rowid)) = vtab_context {
-                    self.vtab_context_name = name.clone();
+                    let context_name = name.clone();
+                    self.vtab_context_name = context_name.clone();
                     self.vtab_context_rowid = rowid;
                     #[cfg(feature = "fts3")]
                     {
                         crate::functions::fts3::set_fts3_context(
-                            name,
+                            context_name.clone(),
+                            rowid,
+                            self.vtab_query.clone(),
+                        );
+                    }
+                    #[cfg(feature = "fts5")]
+                    {
+                        crate::functions::fts5::set_fts5_context(
+                            context_name,
                             rowid,
                             self.vtab_query.clone(),
                         );
@@ -1920,12 +1938,21 @@ impl Vdbe {
                     } else {
                         (None, None)
                     };
-                    self.vtab_context_name = vtab_name.clone();
+                    let context_name = vtab_name.clone();
+                    self.vtab_context_name = context_name.clone();
                     self.vtab_context_rowid = vtab_rowid;
                     #[cfg(feature = "fts3")]
                     {
                         crate::functions::fts3::set_fts3_context(
-                            vtab_name,
+                            context_name.clone(),
+                            vtab_rowid,
+                            self.vtab_query.clone(),
+                        );
+                    }
+                    #[cfg(feature = "fts5")]
+                    {
+                        crate::functions::fts5::set_fts5_context(
+                            context_name,
                             vtab_rowid,
                             self.vtab_query.clone(),
                         );

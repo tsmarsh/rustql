@@ -138,21 +138,6 @@ impl Fts5Table {
                     deleted: false,
                 };
                 self.index.insert_term(token.text.as_bytes(), entry)?;
-                for prefix in &self.prefixes {
-                    let prefix_len = *prefix as usize;
-                    if token.text.len() >= prefix_len {
-                        let prefix_term = format!("{}*", &token.text[..prefix_len]);
-                        let entry = Fts5DoclistEntry {
-                            rowid,
-                            positions: vec![Fts5Position {
-                                column: col_idx as i32,
-                                offset: token.position,
-                            }],
-                            deleted: false,
-                        };
-                        self.index.insert_term(prefix_term.as_bytes(), entry)?;
-                    }
-                }
             }
         }
         if self.has_content {
@@ -173,18 +158,6 @@ impl Fts5Table {
                     deleted: true,
                 };
                 self.index.insert_term(token.text.as_bytes(), entry)?;
-                for prefix in &self.prefixes {
-                    let prefix_len = *prefix as usize;
-                    if token.text.len() >= prefix_len {
-                        let prefix_term = format!("{}*", &token.text[..prefix_len]);
-                        let entry = Fts5DoclistEntry {
-                            rowid,
-                            positions: Vec::new(),
-                            deleted: true,
-                        };
-                        self.index.insert_term(prefix_term.as_bytes(), entry)?;
-                    }
-                }
             }
         }
         if self.has_content {
@@ -216,6 +189,7 @@ impl Fts5Table {
                 entries_to_rowids(&self.index.lookup_prefix(prefix.as_bytes())?)
             }
             Fts5Expr::Phrase(terms) => self.phrase_rowids(terms)?,
+            Fts5Expr::Column(name, inner) => self.column_rowids(name, inner)?,
             Fts5Expr::And(left, right) => {
                 intersect_rowids(&self.expr_rowids(left)?, &self.expr_rowids(right)?)
             }
@@ -225,7 +199,7 @@ impl Fts5Table {
             Fts5Expr::Not(left, right) => {
                 subtract_rowids(&self.expr_rowids(left)?, &self.expr_rowids(right)?)
             }
-            Fts5Expr::Near(left, right, distance) => self.near_rowids(left, right, *distance)?,
+            Fts5Expr::Near(exprs, distance) => self.near_group_rowids(exprs, *distance)?,
         };
         rowids.sort_unstable();
         rowids.dedup();
@@ -259,27 +233,47 @@ impl Fts5Table {
         Ok(rowids)
     }
 
-    fn near_rowids(&self, left: &Fts5Expr, right: &Fts5Expr, distance: i32) -> Result<Vec<i64>> {
-        let left_rowids = self.expr_rowids(left)?;
-        let right_rowids = self.expr_rowids(right)?;
-        let mut rowids = intersect_rowids(&left_rowids, &right_rowids);
+    fn near_group_rowids(&self, exprs: &[Fts5Expr], distance: i32) -> Result<Vec<i64>> {
+        if exprs.len() < 2 {
+            if let Some(expr) = exprs.first() {
+                return self.expr_rowids(expr);
+            }
+            return Ok(Vec::new());
+        }
+        let mut rowids = self.expr_rowids(&exprs[0])?;
+        for expr in &exprs[1..] {
+            rowids = intersect_rowids(&rowids, &self.expr_rowids(expr)?);
+        }
         if rowids.is_empty() {
             return Ok(rowids);
         }
 
         let mut filtered = Vec::new();
         for rowid in rowids.drain(..) {
-            let left_pos = self.expr_positions(left, rowid)?;
-            let right_pos = self.expr_positions(right, rowid)?;
-            if left_pos.is_none() || right_pos.is_none() {
+            let mut positions = Vec::new();
+            let mut unsupported = false;
+            for expr in exprs {
+                match self.expr_positions(expr, rowid)? {
+                    Some(pos) => positions.push(pos),
+                    None => {
+                        unsupported = true;
+                        break;
+                    }
+                }
+            }
+            if unsupported {
                 filtered.push(rowid);
                 continue;
             }
-            if positions_within_distance(
-                left_pos.as_ref().unwrap(),
-                right_pos.as_ref().unwrap(),
-                distance,
-            ) {
+
+            let mut ok = true;
+            for pair in positions.windows(2) {
+                if !positions_within_distance(&pair[0], &pair[1], distance) {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
                 filtered.push(rowid);
             }
         }
@@ -292,7 +286,10 @@ impl Fts5Table {
                 &self.index.lookup_term(term.as_bytes())?,
                 rowid,
             )),
-            Fts5Expr::Prefix(_) => Ok(None),
+            Fts5Expr::Prefix(prefix) => Ok(term_positions(
+                &self.index.lookup_prefix(prefix.as_bytes())?,
+                rowid,
+            )),
             Fts5Expr::Phrase(terms) => {
                 let mut term_maps = Vec::new();
                 for term in terms {
@@ -311,8 +308,45 @@ impl Fts5Table {
                     Ok(Some(phrase_pos))
                 }
             }
+            Fts5Expr::Column(name, inner) => {
+                let Some(column) = self.column_index(name) else {
+                    return Ok(None);
+                };
+                if let Some(mut positions) = self.expr_positions(inner, rowid)? {
+                    positions.retain(|pos| pos.column == column);
+                    if positions.is_empty() {
+                        Ok(None)
+                    } else {
+                        Ok(Some(positions))
+                    }
+                } else {
+                    Ok(None)
+                }
+            }
             _ => Ok(None),
         }
+    }
+
+    fn column_rowids(&self, name: &str, inner: &Fts5Expr) -> Result<Vec<i64>> {
+        let Some(column) = self.column_index(name) else {
+            return Ok(Vec::new());
+        };
+        let mut rowids = self.expr_rowids(inner)?;
+        rowids.retain(|rowid| {
+            self.expr_positions(inner, *rowid)
+                .ok()
+                .flatten()
+                .map(|positions| positions.iter().any(|pos| pos.column == column))
+                .unwrap_or(false)
+        });
+        Ok(rowids)
+    }
+
+    fn column_index(&self, name: &str) -> Option<i32> {
+        self.columns
+            .iter()
+            .position(|col| col.eq_ignore_ascii_case(name))
+            .map(|idx| idx as i32)
     }
 }
 

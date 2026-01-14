@@ -7,10 +7,11 @@ pub enum Fts5Expr {
     Term(String),
     Prefix(String),
     Phrase(Vec<String>),
+    Column(String, Box<Fts5Expr>),
     And(Box<Fts5Expr>, Box<Fts5Expr>),
     Or(Box<Fts5Expr>, Box<Fts5Expr>),
     Not(Box<Fts5Expr>, Box<Fts5Expr>),
-    Near(Box<Fts5Expr>, Box<Fts5Expr>, i32),
+    Near(Vec<Fts5Expr>, i32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +20,7 @@ enum Fts5QueryToken {
     Phrase(String),
     LParen,
     RParen,
+    Comma,
     And,
     Or,
     Not,
@@ -94,12 +96,21 @@ impl<'a> Fts5QueryParser<'a> {
             };
             self.advance();
             let right = self.parse_primary()?;
-            expr = Fts5Expr::Near(Box::new(expr), Box::new(right), distance);
+            expr = Fts5Expr::Near(vec![expr, right], distance);
         }
         Ok(expr)
     }
 
     fn parse_primary(&mut self) -> Result<Fts5Expr> {
+        if let Some((col, rest)) = self.peek_column_token() {
+            self.advance();
+            let expr = if rest.is_empty() {
+                self.parse_primary()?
+            } else {
+                self.parse_word(Fts5QueryToken::Word(rest))?
+            };
+            return Ok(Fts5Expr::Column(col, Box::new(expr)));
+        }
         match self.peek() {
             Some(Fts5QueryToken::Word(_)) => {
                 let token = self.advance().cloned().unwrap();
@@ -109,6 +120,7 @@ impl<'a> Fts5QueryParser<'a> {
                 let token = self.advance().cloned().unwrap();
                 self.parse_phrase(token)
             }
+            Some(Fts5QueryToken::Near(_)) => self.parse_near_group(),
             Some(Fts5QueryToken::LParen) => {
                 self.advance();
                 let expr = self.parse_or()?;
@@ -183,6 +195,53 @@ impl<'a> Fts5QueryParser<'a> {
         ))
     }
 
+    fn parse_near_group(&mut self) -> Result<Fts5Expr> {
+        let Some(Fts5QueryToken::Near(distance)) = self.advance().cloned() else {
+            return Err(Error::with_message(ErrorCode::Error, "expected NEAR"));
+        };
+        if !self.consume_if(&Fts5QueryToken::LParen) {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                "expected '(' after NEAR",
+            ));
+        }
+
+        let mut exprs = Vec::new();
+        let mut near_distance = distance;
+        loop {
+            match self.peek() {
+                Some(Fts5QueryToken::RParen) => {
+                    self.advance();
+                    break;
+                }
+                Some(Fts5QueryToken::Comma) => {
+                    self.advance();
+                    let token = self.advance().cloned();
+                    let Some(Fts5QueryToken::Word(value)) = token else {
+                        return Err(Error::with_message(
+                            ErrorCode::Error,
+                            "expected distance value after comma",
+                        ));
+                    };
+                    if let Ok(parsed) = value.parse::<i32>() {
+                        near_distance = parsed;
+                    }
+                }
+                _ => {
+                    exprs.push(self.parse_primary()?);
+                }
+            }
+        }
+
+        if exprs.len() < 2 {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                "NEAR requires at least two terms",
+            ));
+        }
+        Ok(Fts5Expr::Near(exprs, near_distance))
+    }
+
     fn peek(&self) -> Option<&Fts5QueryToken> {
         self.tokens.get(self.pos)
     }
@@ -210,8 +269,26 @@ impl<'a> Fts5QueryParser<'a> {
             self.peek(),
             Some(Fts5QueryToken::Word(_))
                 | Some(Fts5QueryToken::Phrase(_))
+                | Some(Fts5QueryToken::Near(_))
                 | Some(Fts5QueryToken::LParen)
         )
+    }
+
+    fn peek_column_token(&self) -> Option<(String, String)> {
+        let Some(Fts5QueryToken::Word(word)) = self.peek() else {
+            return None;
+        };
+        if let Some((col, rest)) = word.split_once(':') {
+            if !col.is_empty() {
+                return Some((col.to_string(), rest.to_string()));
+            }
+        } else if word.ends_with(':') {
+            let col = word.trim_end_matches(':');
+            if !col.is_empty() {
+                return Some((col.to_string(), String::new()));
+            }
+        }
+        None
     }
 }
 
@@ -230,6 +307,10 @@ fn tokenize_query(expr: &str) -> Result<Vec<Fts5QueryToken>> {
         }
         if ch == ')' {
             tokens.push(Fts5QueryToken::RParen);
+            continue;
+        }
+        if ch == ',' {
+            tokens.push(Fts5QueryToken::Comma);
             continue;
         }
         if ch == '"' {
@@ -265,6 +346,7 @@ fn tokenize_query(expr: &str) -> Result<Vec<Fts5QueryToken>> {
             if next_ch.is_ascii_whitespace()
                 || *next_ch == '('
                 || *next_ch == ')'
+                || *next_ch == ','
                 || *next_ch == '"'
             {
                 break;

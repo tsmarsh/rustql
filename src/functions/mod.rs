@@ -4,6 +4,8 @@ pub mod aggregate;
 pub mod datetime;
 #[cfg(feature = "fts3")]
 pub mod fts3;
+#[cfg(feature = "fts5")]
+pub mod fts5;
 pub mod json;
 pub mod printf;
 pub mod scalar;

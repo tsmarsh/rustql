@@ -12,6 +12,8 @@ use super::datetime::{
 };
 #[cfg(feature = "fts3")]
 use super::fts3::{func_matchinfo, func_offsets, func_snippet};
+#[cfg(feature = "fts5")]
+use super::fts5::{func_bm25, func_highlight, func_snippet as func_snippet_fts5};
 use super::printf::printf_format;
 
 // ============================================================================
@@ -76,15 +78,35 @@ pub fn get_scalar_function(name: &str) -> Option<ScalarFunc> {
         "CURRENT_TIME" => Some(func_current_time),
         "CURRENT_TIMESTAMP" => Some(func_current_timestamp),
 
-        #[cfg(feature = "fts3")]
-        "SNIPPET" => Some(func_snippet),
+        #[cfg(any(feature = "fts3", feature = "fts5"))]
+        "SNIPPET" => Some(func_snippet_unified),
         #[cfg(feature = "fts3")]
         "OFFSETS" => Some(func_offsets),
         #[cfg(feature = "fts3")]
         "MATCHINFO" => Some(func_matchinfo),
+        #[cfg(feature = "fts5")]
+        "BM25" => Some(func_bm25),
+        #[cfg(feature = "fts5")]
+        "HIGHLIGHT" => Some(func_highlight),
 
         _ => None,
     }
+}
+
+#[cfg(any(feature = "fts3", feature = "fts5"))]
+fn func_snippet_unified(args: &[Value]) -> Result<Value> {
+    #[cfg(feature = "fts5")]
+    {
+        if let Ok(value) = func_snippet_fts5(args) {
+            return Ok(value);
+        }
+    }
+    #[cfg(feature = "fts3")]
+    {
+        return func_snippet(args);
+    }
+    #[allow(unreachable_code)]
+    Ok(Value::Null)
 }
 
 // ============================================================================

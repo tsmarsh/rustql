@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use crate::error::Result;
 use crate::parser::ast::{
-    ConflictAction, Expr, InsertSource, InsertStmt, ResultColumn, SelectStmt,
+    ConflictAction, Expr, InsertSource, InsertStmt, ResultColumn, SelectBody, SelectStmt, TableRef,
 };
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
@@ -129,6 +129,31 @@ impl InsertCompiler {
         // Build column index map if columns specified
         let col_targets = self.build_column_map(&insert.columns)?;
 
+        // Validate column count for each row
+        let expected_cols = col_targets.len();
+        for row in rows {
+            if row.len() != expected_cols {
+                if insert.columns.is_some() {
+                    // Column list specified: "N values for M columns"
+                    return Err(crate::error::Error::with_message(
+                        crate::error::ErrorCode::Error,
+                        format!("{} values for {} columns", row.len(), expected_cols),
+                    ));
+                } else {
+                    // No column list: "table X has N columns but M values were supplied"
+                    return Err(crate::error::Error::with_message(
+                        crate::error::ErrorCode::Error,
+                        format!(
+                            "table {} has {} columns but {} values were supplied",
+                            insert.table.name,
+                            self.num_columns,
+                            row.len()
+                        ),
+                    ));
+                }
+            }
+        }
+
         for row in rows {
             // Allocate rowid register
             let rowid_reg = self.alloc_reg();
@@ -208,46 +233,72 @@ impl InsertCompiler {
         }
         match &insert.source {
             InsertSource::Values(rows) => rows.first().map(|row| row.len()).unwrap_or(0),
-            InsertSource::Select(_) => 0,
+            InsertSource::Select(select) => self.count_select_columns(select),
             InsertSource::DefaultValues => 1,
         }
     }
 
+    /// Count columns in SELECT result
+    fn count_select_columns(&self, select: &SelectStmt) -> usize {
+        if let SelectBody::Select(core) = &select.body {
+            let mut count = 0;
+            for col in &core.columns {
+                match col {
+                    ResultColumn::Star => {
+                        // For *, we don't know the count without schema
+                        // Use a reasonable default
+                        return 10;
+                    }
+                    ResultColumn::TableStar(_) => return 10,
+                    ResultColumn::Expr { .. } => count += 1,
+                }
+            }
+            return count.max(1);
+        }
+        10 // Default fallback
+    }
+
     /// Compile INSERT...SELECT
+    ///
+    /// For simple cases, we directly emit the SELECT logic:
+    /// 1. Open source table for reading
+    /// 2. Loop through rows
+    /// 3. For each row, insert into target table
     fn compile_select(
         &mut self,
         insert: &InsertStmt,
-        _select: &SelectStmt,
+        select: &SelectStmt,
         conflict_action: ConflictAction,
     ) -> Result<()> {
         // Build column index map
         let col_targets = self.build_column_map(&insert.columns)?;
 
-        // Compile the SELECT statement
-        // For a real implementation, we'd integrate with SelectCompiler
-        // Here we emit a placeholder loop structure
+        // Extract source table from SELECT
+        // For now, we support simple "SELECT * FROM table" or "SELECT cols FROM table"
+        let source_table = self.get_source_table(select)?;
 
-        // Open ephemeral table for SELECT results
-        let select_cursor = self.alloc_cursor();
+        // Open source table for reading
+        let source_cursor = self.alloc_cursor();
         self.emit(
-            Opcode::OpenEphemeral,
-            select_cursor,
+            Opcode::OpenRead,
+            source_cursor,
+            0, // Root page 0 = look up by name
             self.num_columns as i32,
-            0,
-            P4::Unused,
+            P4::Text(source_table.clone()),
         );
 
-        // TODO: Actually compile the SELECT and populate ephemeral table
-        // For now, emit placeholder
+        // Get number of columns to read from SELECT
+        let select_col_count = self.get_select_column_count(select);
 
-        // Loop over SELECT results
+        // Loop labels
         let loop_start_label = self.alloc_label();
         let loop_end_label = self.alloc_label();
 
-        self.emit(Opcode::Rewind, select_cursor, loop_end_label, 0, P4::Unused);
+        // Rewind to start of source table
+        self.emit(Opcode::Rewind, source_cursor, loop_end_label, 0, P4::Unused);
         self.resolve_label(loop_start_label, self.current_addr() as i32);
 
-        // Allocate rowid register
+        // Allocate rowid register for target table
         let rowid_reg = self.alloc_reg();
         self.emit(
             Opcode::NewRowid,
@@ -257,17 +308,20 @@ impl InsertCompiler {
             P4::Unused,
         );
 
-        // Get data from SELECT row
+        // Read columns from source row
         let data_base = self.next_reg;
         let _data_regs = self.alloc_regs(self.num_columns);
 
         let mut present = vec![false; self.num_columns];
         for (i, target) in col_targets.iter().enumerate() {
+            if i >= select_col_count {
+                break;
+            }
             match *target {
                 InsertColumnTarget::Rowid => {
                     self.emit(
                         Opcode::Column,
-                        select_cursor,
+                        source_cursor,
                         i as i32,
                         rowid_reg,
                         P4::Unused,
@@ -277,7 +331,7 @@ impl InsertCompiler {
                     let dest_reg = data_base + col_idx as i32;
                     self.emit(
                         Opcode::Column,
-                        select_cursor,
+                        source_cursor,
                         i as i32,
                         dest_reg,
                         P4::Unused,
@@ -319,14 +373,50 @@ impl InsertCompiler {
             P4::Int64(flags),
         );
 
-        // Next row
-        self.emit(Opcode::Next, select_cursor, loop_start_label, 0, P4::Unused);
+        // Next row in source table
+        self.emit(Opcode::Next, source_cursor, loop_start_label, 0, P4::Unused);
         self.resolve_label(loop_end_label, self.current_addr() as i32);
 
-        // Close SELECT cursor
-        self.emit(Opcode::Close, select_cursor, 0, 0, P4::Unused);
+        // Close source cursor
+        self.emit(Opcode::Close, source_cursor, 0, 0, P4::Unused);
 
         Ok(())
+    }
+
+    /// Extract source table name from SELECT for simple cases
+    fn get_source_table(&self, select: &SelectStmt) -> Result<String> {
+        // Handle SELECT...FROM table
+        if let SelectBody::Select(core) = &select.body {
+            if let Some(from) = &core.from {
+                if let Some(table_ref) = from.tables.first() {
+                    if let TableRef::Table { name, .. } = table_ref {
+                        return Ok(name.name.clone());
+                    }
+                }
+            }
+        }
+        Err(crate::error::Error::with_message(
+            crate::error::ErrorCode::Error,
+            "INSERT...SELECT requires a simple SELECT from a table".to_string(),
+        ))
+    }
+
+    /// Get number of columns in SELECT result
+    fn get_select_column_count(&self, select: &SelectStmt) -> usize {
+        if let SelectBody::Select(core) = &select.body {
+            // For SELECT *, return all columns from target (num_columns)
+            // For explicit columns, count them
+            let mut count = 0;
+            for col in &core.columns {
+                match col {
+                    ResultColumn::Star => return self.num_columns,
+                    ResultColumn::TableStar(_) => return self.num_columns,
+                    ResultColumn::Expr { .. } => count += 1,
+                }
+            }
+            return count.max(1);
+        }
+        self.num_columns
     }
 
     /// Compile INSERT...DEFAULT VALUES

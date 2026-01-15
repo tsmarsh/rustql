@@ -511,12 +511,13 @@ impl Opcode {
         )
     }
 
-    /// Check if this opcode reads from cursor
+    /// Check if this opcode uses a cursor reference in P1
     pub fn uses_cursor(&self) -> bool {
         matches!(
             self,
             Opcode::OpenRead
                 | Opcode::OpenWrite
+                | Opcode::OpenEphemeral
                 | Opcode::VFilter
                 | Opcode::Close
                 | Opcode::Rewind
@@ -545,6 +546,12 @@ impl Opcode {
                 | Opcode::IdxInsert
                 | Opcode::IdxDelete
                 | Opcode::FkCheck
+                | Opcode::SorterSort
+                | Opcode::SorterNext
+                | Opcode::SorterData
+                | Opcode::SorterInsert
+                | Opcode::SorterConfig
+                | Opcode::NullRow
         )
     }
 

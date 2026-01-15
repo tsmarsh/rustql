@@ -297,6 +297,9 @@ impl<'s> SelectCompiler<'s> {
         self.has_aggregates = self.check_for_aggregates(core);
         self.has_window_functions = select_has_window_functions(core);
 
+        // Validate no nested aggregates (e.g., SUM(min(f1)))
+        self.validate_no_nested_aggregates(&core.columns)?;
+
         // Process FROM clause - open cursors
         if let Some(from) = &core.from {
             self.compile_from_clause(from)?;
@@ -2326,6 +2329,22 @@ impl<'s> SelectCompiler<'s> {
                     let key_base_reg = self.alloc_regs(order_by_count);
                     if let Some(order_by) = &self.order_by_terms.clone() {
                         for (i, term) in order_by.iter().enumerate() {
+                            // Handle ORDER BY column index (e.g., ORDER BY 1, ORDER BY 2)
+                            // These should reference result columns, not be literal values
+                            if let Expr::Literal(Literal::Integer(col_idx)) = &term.expr {
+                                let col_idx = *col_idx as i32;
+                                if col_idx >= 1 && col_idx <= count as i32 {
+                                    // Copy from the result column (1-based index)
+                                    self.emit(
+                                        Opcode::SCopy,
+                                        base_reg + col_idx - 1,
+                                        key_base_reg + i as i32,
+                                        0,
+                                        P4::Unused,
+                                    );
+                                    continue;
+                                }
+                            }
                             self.compile_expr(&term.expr, key_base_reg + i as i32)?;
                         }
                     }
@@ -2410,6 +2429,109 @@ impl<'s> SelectCompiler<'s> {
                 self.expr_has_aggregate(left) || self.expr_has_aggregate(right)
             }
             _ => false,
+        }
+    }
+
+    /// Validate that no result columns contain nested aggregates
+    fn validate_no_nested_aggregates(&self, columns: &[ResultColumn]) -> Result<()> {
+        for col in columns {
+            if let ResultColumn::Expr { expr, .. } = col {
+                if let Some(agg_name) = self.check_nested_aggregate(expr) {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        format!("misuse of aggregate function {}()", agg_name),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Check if expression has a nested aggregate (aggregate inside aggregate)
+    /// Returns Some(function_name) if nested aggregate found
+    fn check_nested_aggregate(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Function(func_call) => {
+                let name_upper = func_call.name.to_uppercase();
+                let arg_count = match &func_call.args {
+                    crate::parser::ast::FunctionArgs::Exprs(exprs) => exprs.len(),
+                    crate::parser::ast::FunctionArgs::Star => 0,
+                };
+                // Check if this is an aggregate function
+                let is_aggregate = if matches!(name_upper.as_str(), "MIN" | "MAX") && arg_count > 1
+                {
+                    false
+                } else {
+                    matches!(
+                        name_upper.as_str(),
+                        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
+                    )
+                };
+
+                if is_aggregate {
+                    // Check if any argument contains an aggregate
+                    if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
+                        for arg in exprs {
+                            if let Some(nested_name) = self.find_aggregate_in_expr(arg) {
+                                return Some(nested_name);
+                            }
+                        }
+                    }
+                }
+                // Not an aggregate, or no nested aggregate - check children
+                if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
+                    for arg in exprs {
+                        if let Some(nested) = self.check_nested_aggregate(arg) {
+                            return Some(nested);
+                        }
+                    }
+                }
+                None
+            }
+            Expr::Binary { left, right, .. } => self
+                .check_nested_aggregate(left)
+                .or_else(|| self.check_nested_aggregate(right)),
+            Expr::Unary { expr: inner, .. } => self.check_nested_aggregate(inner),
+            _ => None,
+        }
+    }
+
+    /// Find if expression contains an aggregate function, returning its name
+    fn find_aggregate_in_expr(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Function(func_call) => {
+                let name_upper = func_call.name.to_uppercase();
+                let arg_count = match &func_call.args {
+                    crate::parser::ast::FunctionArgs::Exprs(exprs) => exprs.len(),
+                    crate::parser::ast::FunctionArgs::Star => 0,
+                };
+                let is_aggregate = if matches!(name_upper.as_str(), "MIN" | "MAX") && arg_count > 1
+                {
+                    false
+                } else {
+                    matches!(
+                        name_upper.as_str(),
+                        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
+                    )
+                };
+                if is_aggregate {
+                    return Some(func_call.name.to_lowercase());
+                }
+                // Check arguments
+                if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
+                    for arg in exprs {
+                        if let Some(found) = self.find_aggregate_in_expr(arg) {
+                            return Some(found);
+                        }
+                    }
+                }
+                None
+            }
+            Expr::Binary { left, right, .. } => self
+                .find_aggregate_in_expr(left)
+                .or_else(|| self.find_aggregate_in_expr(right)),
+            Expr::Unary { expr: inner, .. } => self.find_aggregate_in_expr(inner),
+            _ => None,
         }
     }
 

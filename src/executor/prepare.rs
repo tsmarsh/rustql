@@ -15,7 +15,7 @@ use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 use super::delete::compile_delete;
 use super::insert::compile_insert;
 use super::select::{SelectCompiler, SelectDest};
-use super::update::compile_update;
+use super::update::{compile_update, compile_update_with_schema};
 
 // ============================================================================
 // Compiled Statement Info
@@ -185,7 +185,11 @@ impl<'s> StatementCompiler<'s> {
             }
 
             Stmt::Update(update) => {
-                let ops = compile_update(update)?;
+                let ops = if let Some(schema) = self.schema {
+                    compile_update_with_schema(update, schema)?
+                } else {
+                    compile_update(update)?
+                };
                 Ok((ops, StmtType::Update, Vec::new(), Vec::new()))
             }
 

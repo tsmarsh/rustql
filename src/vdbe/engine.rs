@@ -137,6 +137,10 @@ pub struct VdbeCursor {
     pub sort_desc: Vec<bool>,
     /// Ephemeral index data - used for DISTINCT and index operations
     pub ephemeral_set: std::collections::HashSet<Vec<u8>>,
+    /// Ephemeral table rows for iteration - stores (rowid, record) pairs
+    pub ephemeral_rows: Vec<(i64, Vec<u8>)>,
+    /// Current index into ephemeral_rows during iteration
+    pub ephemeral_index: usize,
 }
 
 impl std::fmt::Debug for VdbeCursor {
@@ -186,6 +190,8 @@ impl VdbeCursor {
             sorter_sorted: false,
             sort_desc: Vec::new(),
             ephemeral_set: std::collections::HashSet::new(),
+            ephemeral_rows: Vec::new(),
+            ephemeral_index: 0,
         }
     }
 
@@ -1504,6 +1510,17 @@ impl Vdbe {
                                 cursor.state = CursorState::AtEnd;
                             }
                         }
+                    } else if cursor.is_ephemeral {
+                        // Ephemeral table cursor - start at first row
+                        cursor.ephemeral_index = 0;
+                        is_empty = cursor.ephemeral_rows.is_empty();
+                        if !is_empty {
+                            cursor.state = CursorState::Valid;
+                            cursor.rowid = Some(cursor.ephemeral_rows[0].0);
+                            cursor.row_data = Some(cursor.ephemeral_rows[0].1.clone());
+                        } else {
+                            cursor.state = CursorState::AtEnd;
+                        }
                     } else if cursor.is_virtual {
                         let vtab_module = cursor.vtab_name.as_ref().and_then(|name| {
                             schema.as_ref().and_then(|schema| {
@@ -1628,6 +1645,23 @@ impl Vdbe {
                             } else {
                                 CursorState::AtEnd
                             };
+                        }
+                    } else if cursor.is_ephemeral {
+                        // Ephemeral table cursor - move to next row
+                        cursor.ephemeral_index += 1;
+                        has_more = cursor.ephemeral_index < cursor.ephemeral_rows.len();
+                        cursor.state = if has_more {
+                            CursorState::Valid
+                        } else {
+                            CursorState::AtEnd
+                        };
+                        if has_more {
+                            cursor.rowid = Some(cursor.ephemeral_rows[cursor.ephemeral_index].0);
+                            cursor.row_data =
+                                Some(cursor.ephemeral_rows[cursor.ephemeral_index].1.clone());
+                        } else {
+                            cursor.rowid = None;
+                            cursor.row_data = None;
                         }
                     } else if cursor.is_virtual {
                         cursor.vtab_row_index += 1;
@@ -2303,15 +2337,40 @@ impl Vdbe {
             Opcode::NewRowid => {
                 // NewRowid P1 P2 P3
                 // Generate a new unique rowid for cursor P1, store in register P2
-                // P3 is the previous rowid if updating
+                // P3 is the previous rowid if updating (for AUTOINCREMENT)
+                //
+                // Following SQLite's algorithm:
+                // 1. Move cursor to the last row
+                // 2. If table is empty, use rowid 1
+                // 3. Otherwise, get the last rowid and add 1
+                let mut new_rowid: i64 = 1;
+
                 if let Some(cursor) = self.cursor_mut(op.p1) {
-                    // Simple rowid generation - increment from last known rowid
-                    let new_rowid = cursor.rowid.map_or(1, |r| r + 1);
+                    if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                        // Move to the last entry in the btree
+                        match bt_cursor.last() {
+                            Ok(is_empty) => {
+                                if is_empty {
+                                    // Table is empty, start at 1
+                                    new_rowid = 1;
+                                } else {
+                                    // Get the last rowid and increment
+                                    let last_rowid = bt_cursor.integer_key();
+                                    new_rowid = last_rowid.saturating_add(1);
+                                }
+                            }
+                            Err(_) => {
+                                // Error moving cursor, fall back to cursor's last known rowid
+                                new_rowid = cursor.rowid.map_or(1, |r| r.saturating_add(1));
+                            }
+                        }
+                    } else {
+                        // No btree cursor (ephemeral table, etc), use cursor's last known rowid
+                        new_rowid = cursor.rowid.map_or(1, |r| r.saturating_add(1));
+                    }
                     cursor.rowid = Some(new_rowid);
-                    self.mem_mut(op.p2).set_int(new_rowid);
-                } else {
-                    self.mem_mut(op.p2).set_int(1);
                 }
+                self.mem_mut(op.p2).set_int(new_rowid);
             }
 
             Opcode::Insert | Opcode::InsertInt => {
@@ -2331,7 +2390,10 @@ impl Vdbe {
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     cursor.rowid = Some(rowid);
 
-                    if cursor.is_virtual {
+                    if cursor.is_ephemeral {
+                        // Store into ephemeral table for iteration
+                        cursor.ephemeral_rows.push((rowid, record_data.clone()));
+                    } else if cursor.is_virtual {
                         if let Some(ref vtab_name) = cursor.vtab_name {
                             #[cfg(feature = "fts3")]
                             {
@@ -3030,7 +3092,7 @@ impl Vdbe {
                                         // Return error: table already exists
                                         return Err(crate::error::Error::with_message(
                                             crate::error::ErrorCode::Error,
-                                            format!("table {} already exists", table.name),
+                                            format!("table \"{}\" already exists", table.name),
                                         ));
                                     }
                                     // IF NOT EXISTS was specified, silently succeed

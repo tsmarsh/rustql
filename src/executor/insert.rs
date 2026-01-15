@@ -9,6 +9,7 @@ use crate::error::Result;
 use crate::parser::ast::{
     ConflictAction, Expr, InsertSource, InsertStmt, ResultColumn, SelectBody, SelectStmt, TableRef,
 };
+use crate::schema::Schema;
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
 fn is_rowid_alias(name: &str) -> bool {
@@ -28,7 +29,7 @@ enum InsertColumnTarget {
 // ============================================================================
 
 /// Compiles INSERT statements to VDBE opcodes
-pub struct InsertCompiler {
+pub struct InsertCompiler<'a> {
     /// Generated VDBE operations
     ops: Vec<VdbeOp>,
 
@@ -52,9 +53,12 @@ pub struct InsertCompiler {
 
     /// Column name to index mapping
     column_map: HashMap<String, usize>,
+
+    /// Optional schema for validation
+    schema: Option<&'a Schema>,
 }
 
-impl InsertCompiler {
+impl<'a> InsertCompiler<'a> {
     /// Create a new INSERT compiler
     pub fn new() -> Self {
         InsertCompiler {
@@ -66,6 +70,22 @@ impl InsertCompiler {
             table_cursor: 0,
             num_columns: 0,
             column_map: HashMap::new(),
+            schema: None,
+        }
+    }
+
+    /// Create a new INSERT compiler with schema
+    pub fn with_schema(schema: &'a Schema) -> Self {
+        InsertCompiler {
+            ops: Vec::new(),
+            next_reg: 1,
+            next_cursor: 0,
+            next_label: -1,
+            labels: HashMap::new(),
+            table_cursor: 0,
+            num_columns: 0,
+            column_map: HashMap::new(),
+            schema: Some(schema),
         }
     }
 
@@ -226,11 +246,22 @@ impl InsertCompiler {
     }
 
     fn infer_num_columns(&self, insert: &InsertStmt) -> usize {
+        // If column list is specified, use that count
         if let Some(cols) = &insert.columns {
             if !cols.is_empty() {
                 return cols.iter().filter(|col| !is_rowid_alias(col)).count();
             }
         }
+
+        // If schema is available, use actual table column count
+        if let Some(schema) = self.schema {
+            let table_name_lower = insert.table.name.to_lowercase();
+            if let Some(table) = schema.tables.get(&table_name_lower) {
+                return table.columns.len();
+            }
+        }
+
+        // Fallback: infer from source (less accurate)
         match &insert.source {
             InsertSource::Values(rows) => rows.first().map(|row| row.len()).unwrap_or(0),
             InsertSource::Select(select) => self.count_select_columns(select),
@@ -729,7 +760,7 @@ impl InsertCompiler {
     }
 }
 
-impl Default for InsertCompiler {
+impl<'a> Default for InsertCompiler<'a> {
     fn default() -> Self {
         Self::new()
     }
@@ -742,6 +773,12 @@ impl Default for InsertCompiler {
 /// Compile an INSERT statement to VDBE opcodes
 pub fn compile_insert(insert: &InsertStmt) -> Result<Vec<VdbeOp>> {
     let mut compiler = InsertCompiler::new();
+    compiler.compile(insert)
+}
+
+/// Compile an INSERT statement with schema for proper column count validation
+pub fn compile_insert_with_schema(insert: &InsertStmt, schema: &Schema) -> Result<Vec<VdbeOp>> {
+    let mut compiler = InsertCompiler::with_schema(schema);
     compiler.compile(insert)
 }
 

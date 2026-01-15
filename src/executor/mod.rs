@@ -31,7 +31,7 @@ pub use fkey::{
     fk_check_delete, fk_check_insert, fk_check_update, foreign_key_check, DeferredFkState,
     FkContext, FkViolation,
 };
-pub use insert::{compile_insert, InsertCompiler};
+pub use insert::{compile_insert, compile_insert_with_schema, InsertCompiler};
 pub use prepare::{
     compile_sql, compile_sql_with_schema, parse_sql, CompiledStmt, StatementCompiler, StmtType,
 };

@@ -13,7 +13,7 @@ use crate::types::ColumnType;
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
 use super::delete::compile_delete;
-use super::insert::compile_insert;
+use super::insert::{compile_insert, compile_insert_with_schema};
 use super::select::{SelectCompiler, SelectDest};
 use super::update::{compile_update, compile_update_with_schema};
 
@@ -180,7 +180,11 @@ impl<'s> StatementCompiler<'s> {
             }
 
             Stmt::Insert(insert) => {
-                let ops = compile_insert(insert)?;
+                let ops = if let Some(schema) = self.schema {
+                    compile_insert_with_schema(insert, schema)?
+                } else {
+                    compile_insert(insert)?
+                };
                 Ok((ops, StmtType::Insert, Vec::new(), Vec::new()))
             }
 

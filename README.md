@@ -161,10 +161,24 @@ cargo build --release
 
 ## SQLite Test Suite
 
-RustQL includes a runner for SQLite’s Tcl tests. The canonical tests live in `sqlite3/test/`.
+RustQL includes a runner for SQLite’s Tcl tests. The canonical tests live in `sqlite3/test/` (ensure the `sqlite3/` tree is present in the repo).
 
 ```bash
-cargo test --features fts3
+# Run the compatibility suite (uses sqlite3/test)
+cargo test --test sqlite_compat_test
+```
+
+Run a specific compatibility test function (for a single file):
+
+```bash
+cargo test --test sqlite_compat_test test_table_basic
+```
+
+Run the Tcl extension smoke tests:
+
+```bash
+cargo build --features tcl
+tclsh tests/run_tcl_test.tcl tests/basic_tcl.test
 ```
 
 ## Contributing And Workflow

@@ -2967,7 +2967,7 @@ impl Vdbe {
                 }
             }
 
-            Opcode::SeekLT => {
+            | Opcode::SeekLT => {
                 let mut jump = true;
                 let index_key = self.mem(op.p3).to_blob();
                 let rowid_key = self.mem(op.p3).to_int();
@@ -3002,8 +3002,18 @@ impl Vdbe {
                 }
             }
 
-            Opcode::SeekNull => {
-                // Placeholder: These need btree integration for index operations
+            | Opcode::SeekNull => {
+                // SeekNull P1 P2 P3 P4: Jump to P2 if any key register is NULL.
+                let count = match op.p4 {
+                    P4::Int64(v) => v as i32,
+                    _ => 1,
+                };
+                for i in 0..count.max(1) {
+                    if self.mem(op.p3 + i).is_null() {
+                        self.pc = op.p2;
+                        break;
+                    }
+                }
             }
 
             Opcode::OpenAutoindex => {
@@ -4065,9 +4075,7 @@ mod tests {
         let btree = conn.main_db().btree.as_ref().unwrap().clone();
 
         btree.begin_trans(true).unwrap();
-        let root_page = btree
-            .create_table(crate::storage::btree::BTREE_INTKEY)
-            .unwrap();
+        let root_page = btree.create_table(crate::storage::btree::BTREE_INTKEY).unwrap();
         let mut cursor = btree
             .cursor(root_page, BtreeCursorFlags::WRCSR, None)
             .unwrap();
@@ -4108,9 +4116,7 @@ mod tests {
         let btree = conn.main_db().btree.as_ref().unwrap().clone();
 
         btree.begin_trans(true).unwrap();
-        let root_page = btree
-            .create_table(crate::storage::btree::BTREE_INTKEY)
-            .unwrap();
+        let root_page = btree.create_table(crate::storage::btree::BTREE_INTKEY).unwrap();
         let mut cursor = btree
             .cursor(root_page, BtreeCursorFlags::WRCSR, None)
             .unwrap();
@@ -4151,9 +4157,7 @@ mod tests {
         let btree = conn.main_db().btree.as_ref().unwrap().clone();
 
         btree.begin_trans(true).unwrap();
-        let root_page = btree
-            .create_table(crate::storage::btree::BTREE_INTKEY)
-            .unwrap();
+        let root_page = btree.create_table(crate::storage::btree::BTREE_INTKEY).unwrap();
         let mut cursor = btree
             .cursor(root_page, BtreeCursorFlags::WRCSR, None)
             .unwrap();
@@ -4194,9 +4198,7 @@ mod tests {
         let btree = conn.main_db().btree.as_ref().unwrap().clone();
 
         btree.begin_trans(true).unwrap();
-        let root_page = btree
-            .create_table(crate::storage::btree::BTREE_INTKEY)
-            .unwrap();
+        let root_page = btree.create_table(crate::storage::btree::BTREE_INTKEY).unwrap();
         let mut cursor = btree
             .cursor(root_page, BtreeCursorFlags::WRCSR, None)
             .unwrap();
@@ -4228,6 +4230,31 @@ mod tests {
         let result = vdbe.step().unwrap();
         assert_eq!(result, ExecResult::Row);
         assert_eq!(vdbe.column_int(0), 3);
+    }
+
+    #[test]
+    fn test_op_seeknull_jumps_on_null() {
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::Null, 0, 1, 0),
+            VdbeOp {
+                opcode: Opcode::SeekNull,
+                p1: 0,
+                p2: 4,
+                p3: 1,
+                p4: P4::Int64(1),
+                p5: 0,
+                comment: None,
+            },
+            VdbeOp::new(Opcode::Integer, 0, 2, 0),
+            VdbeOp::new(Opcode::Goto, 0, 5, 0),
+            VdbeOp::new(Opcode::Integer, 1, 2, 0),
+            VdbeOp::new(Opcode::ResultRow, 2, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), 1);
     }
 
     #[test]

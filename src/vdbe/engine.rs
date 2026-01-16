@@ -15,7 +15,7 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::functions::aggregate::AggregateState;
 use crate::schema::Schema;
 use crate::storage::btree::{BtCursor, Btree, BtreeCursorFlags, BtreeInsertFlags, BtreePayload};
-use crate::types::{ColumnType, Pgno, Value};
+use crate::types::{ColumnType, OpenFlags, Pgno, Value};
 use crate::vdbe::mem::Mem;
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
@@ -2162,8 +2162,64 @@ impl Vdbe {
             // Transaction (placeholder)
             // ================================================================
             Opcode::Transaction => {
-                // P1 = database, P2 = write flag
-                // Placeholder: Would start transaction
+                // P1 = database, P2 = transaction type (0 read, 1 write, 2 exclusive)
+                if op.p2 < 0 || op.p2 > 2 {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        "invalid transaction type",
+                    ));
+                }
+                if op.p1 != 0 {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        "unsupported database index",
+                    ));
+                }
+
+                let Some(conn_ptr) = self.conn_ptr else {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        "missing connection for transaction",
+                    ));
+                };
+                // SAFETY: conn_ptr is valid for the lifetime of the statement/VDBE.
+                let conn = unsafe { &mut *conn_ptr };
+
+                let write = op.p2 > 0;
+                if write && conn.flags.contains(OpenFlags::READONLY) {
+                    return Err(Error::with_message(
+                        ErrorCode::ReadOnly,
+                        "attempt to write a readonly database",
+                    ));
+                }
+
+                let Some(ref btree) = self.btree else {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        "missing btree for transaction",
+                    ));
+                };
+
+                let current = conn.transaction_state;
+                if write {
+                    if current != TransactionState::Write {
+                        btree.begin_trans(true)?;
+                        conn.transaction_state = TransactionState::Write;
+                    }
+                } else if current == TransactionState::None {
+                    btree.begin_trans(false)?;
+                    conn.transaction_state = TransactionState::Read;
+                }
+
+                if op.p5 != 0 {
+                    let cookie = btree.get_meta(crate::storage::btree::BTREE_SCHEMA_VERSION)?;
+                    if cookie != op.p3 as u32 {
+                        return Err(Error::with_message(
+                            ErrorCode::Schema,
+                            "database schema has changed",
+                        ));
+                    }
+                }
             }
 
             Opcode::AutoCommit => {
@@ -3518,6 +3574,7 @@ fn compare_records(a: &[u8], b: &[u8], num_key_cols: usize, sort_desc: &[bool]) 
 mod tests {
     use super::*;
     use crate::api::{sqlite3_initialize, sqlite3_open, SqliteConnection, TransactionState};
+    use crate::storage::btree::TransState;
     use std::sync::atomic::Ordering as AtomicOrdering;
     use std::sync::Once;
 
@@ -3640,6 +3697,34 @@ mod tests {
         vdbe.set_connection(conn_ptr);
         let err = vdbe.step().unwrap_err();
         assert_eq!(err.code, ErrorCode::Error);
+    }
+
+    #[test]
+    fn test_op_transaction_read_then_write() {
+        let mut conn = open_test_connection();
+        let conn_ptr = &mut *conn as *mut SqliteConnection;
+        let btree = conn.main_db().btree.as_ref().unwrap().clone();
+
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::Transaction, 0, 0, 0),
+            VdbeOp::new(Opcode::Integer, 1, 1, 0),
+            VdbeOp::new(Opcode::ResultRow, 1, 1, 0),
+            VdbeOp::new(Opcode::Transaction, 0, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+        vdbe.set_btree(btree.clone());
+        vdbe.set_connection(conn_ptr);
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(conn.transaction_state, TransactionState::Read);
+        assert_eq!(btree.txn_state(), TransState::Read);
+        assert!(conn.get_autocommit());
+
+        vdbe.step().unwrap();
+        assert_eq!(conn.transaction_state, TransactionState::Write);
+        assert_eq!(btree.txn_state(), TransState::Write);
+        assert!(conn.get_autocommit());
     }
 
     #[test]

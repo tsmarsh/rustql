@@ -1362,6 +1362,7 @@ impl<'s> StatementCompiler<'s> {
         };
 
         ops.push(Self::make_op(Opcode::Transaction, 0, p2, 0, P4::Unused));
+        ops.push(Self::make_op(Opcode::AutoCommit, 0, 0, 0, P4::Unused));
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
         Ok(ops)
     }

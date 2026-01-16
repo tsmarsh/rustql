@@ -4755,7 +4755,9 @@ mod tests {
         let btree = conn.main_db().btree.as_ref().unwrap().clone();
 
         btree.begin_trans(true).unwrap();
-        let root_page = btree.create_table(crate::storage::btree::BTREE_INTKEY).unwrap();
+        let root_page = btree
+            .create_table(crate::storage::btree::BTREE_INTKEY)
+            .unwrap();
         let mut insert_cursor = btree
             .cursor(root_page, BtreeCursorFlags::WRCSR, None)
             .unwrap();
@@ -4804,7 +4806,9 @@ mod tests {
         let btree = conn.main_db().btree.as_ref().unwrap().clone();
 
         btree.begin_trans(true).unwrap();
-        let root_page = btree.create_table(crate::storage::btree::BTREE_BLOBKEY).unwrap();
+        let root_page = btree
+            .create_table(crate::storage::btree::BTREE_BLOBKEY)
+            .unwrap();
         let mut index_cursor = btree
             .cursor(root_page, BtreeCursorFlags::WRCSR, None)
             .unwrap();
@@ -4876,7 +4880,9 @@ mod tests {
         let btree = conn.main_db().btree.as_ref().unwrap().clone();
 
         btree.begin_trans(true).unwrap();
-        let root_page = btree.create_table(crate::storage::btree::BTREE_BLOBKEY).unwrap();
+        let root_page = btree
+            .create_table(crate::storage::btree::BTREE_BLOBKEY)
+            .unwrap();
         let mut index_cursor = btree
             .cursor(root_page, BtreeCursorFlags::WRCSR, None)
             .unwrap();
@@ -4947,7 +4953,9 @@ mod tests {
         let btree = conn.main_db().btree.as_ref().unwrap().clone();
 
         btree.begin_trans(true).unwrap();
-        let root_page = btree.create_table(crate::storage::btree::BTREE_BLOBKEY).unwrap();
+        let root_page = btree
+            .create_table(crate::storage::btree::BTREE_BLOBKEY)
+            .unwrap();
         let mut index_cursor = btree
             .cursor(root_page, BtreeCursorFlags::WRCSR, None)
             .unwrap();

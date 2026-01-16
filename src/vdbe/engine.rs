@@ -3747,7 +3747,16 @@ impl Vdbe {
             }
 
             Opcode::Regexp => {
-                // Placeholder: Advanced pattern matching
+                // Regexp P1 P2 P3: Compare text in P1 against regexp pattern in P3
+                let text = self.mem(op.p1).to_value();
+                let pattern = self.mem(op.p3).to_value();
+
+                if matches!(text, Value::Null) || matches!(pattern, Value::Null) {
+                    self.mem_mut(op.p2).set_null();
+                } else {
+                    let matched = regexp_match(&pattern.to_text(), &text.to_text());
+                    self.mem_mut(op.p2).set_int(if matched { 1 } else { 0 });
+                }
             }
 
             Opcode::EndCoroutine => {
@@ -4542,6 +4551,58 @@ fn compare_records(a: &[u8], b: &[u8], num_key_cols: usize, sort_desc: &[bool]) 
     }
 
     Ordering::Equal
+}
+
+// ============================================================================
+// Regexp helper
+// ============================================================================
+
+/// Simple regexp matcher supporting ^, $, ., and *
+fn regexp_match(pattern: &str, text: &str) -> bool {
+    let p = pattern.as_bytes();
+    let t = text.as_bytes();
+    if p.first() == Some(&b'^') {
+        return regexp_match_here(&p[1..], t);
+    }
+    for i in 0..=t.len() {
+        if regexp_match_here(p, &t[i..]) {
+            return true;
+        }
+    }
+    false
+}
+
+fn regexp_match_here(pattern: &[u8], text: &[u8]) -> bool {
+    if pattern.is_empty() {
+        return true;
+    }
+    if pattern.len() >= 2 && pattern[1] == b'*' {
+        return regexp_match_star(pattern[0], &pattern[2..], text);
+    }
+    if pattern[0] == b'$' && pattern.len() == 1 {
+        return text.is_empty();
+    }
+    if !text.is_empty() && (pattern[0] == b'.' || pattern[0] == text[0]) {
+        return regexp_match_here(&pattern[1..], &text[1..]);
+    }
+    false
+}
+
+fn regexp_match_star(c: u8, pattern: &[u8], text: &[u8]) -> bool {
+    let mut i = 0;
+    loop {
+        if regexp_match_here(pattern, &text[i..]) {
+            return true;
+        }
+        if i >= text.len() {
+            break;
+        }
+        if c != b'.' && text[i] != c {
+            break;
+        }
+        i += 1;
+    }
+    false
 }
 
 // ============================================================================
@@ -5480,6 +5541,37 @@ mod tests {
         ]);
         vdbe.set_btree(btree);
         vdbe.set_connection(conn_ptr);
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), 1);
+    }
+
+    #[test]
+    fn test_op_regexp_matches() {
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp {
+                opcode: Opcode::String8,
+                p1: 0,
+                p2: 2,
+                p3: 0,
+                p4: P4::Text("^a.*b$".to_string()),
+                p5: 0,
+                comment: None,
+            },
+            VdbeOp {
+                opcode: Opcode::String8,
+                p1: 0,
+                p2: 1,
+                p3: 0,
+                p4: P4::Text("acb".to_string()),
+                p5: 0,
+                comment: None,
+            },
+            VdbeOp::new(Opcode::Regexp, 1, 3, 2),
+            VdbeOp::new(Opcode::ResultRow, 3, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
 
         let result = vdbe.step().unwrap();
         assert_eq!(result, ExecResult::Row);

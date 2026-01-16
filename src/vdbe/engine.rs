@@ -3821,8 +3821,31 @@ impl Vdbe {
 
             Opcode::IdxRowid => {
                 // IdxRowid P1 P2: Get rowid from index cursor
-                // Placeholder for ephemeral tables
-                self.mem_mut(op.p2).set_null();
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    if cursor.null_row {
+                        self.mem_mut(op.p2).set_null();
+                    } else if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                        let payload = if let Some(data) = bt_cursor.payload_fetch() {
+                            data.to_vec()
+                        } else {
+                            bt_cursor.payload(0, bt_cursor.payload_size())?
+                        };
+                        let mems = self.decode_record_mems(&payload);
+                        if let Some(last) = mems.last() {
+                            if last.is_null() {
+                                self.mem_mut(op.p2).set_null();
+                            } else {
+                                self.mem_mut(op.p2).set_int(last.to_int());
+                            }
+                        } else {
+                            self.mem_mut(op.p2).set_null();
+                        }
+                    } else {
+                        self.mem_mut(op.p2).set_null();
+                    }
+                } else {
+                    self.mem_mut(op.p2).set_null();
+                }
             }
 
             Opcode::And => {
@@ -5017,6 +5040,51 @@ mod tests {
         let result = vdbe.step().unwrap();
         assert_eq!(result, ExecResult::Row);
         assert_eq!(vdbe.column_int(0), 0);
+    }
+
+    #[test]
+    fn test_op_idxrowid_index_key() {
+        let mut conn = open_test_connection();
+        let conn_ptr = &mut *conn as *mut SqliteConnection;
+        let btree = conn.main_db().btree.as_ref().unwrap().clone();
+
+        btree.begin_trans(true).unwrap();
+        let root_page = btree.create_table(crate::storage::btree::BTREE_BLOBKEY).unwrap();
+        let mut index_cursor = btree
+            .cursor(root_page, BtreeCursorFlags::WRCSR, None)
+            .unwrap();
+
+        let mems = vec![Mem::from_int(10), Mem::from_int(99)];
+        let key = crate::vdbe::auxdata::make_record(&mems, 0, 2);
+        let payload = BtreePayload {
+            key: Some(key),
+            n_key: 0,
+            data: None,
+            mem: Vec::new(),
+            n_data: 0,
+            n_zero: 0,
+        };
+        btree
+            .insert(&mut index_cursor, &payload, BtreeInsertFlags::APPEND, 0)
+            .unwrap();
+        index_cursor.first().unwrap();
+
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::IdxRowid, 0, 1, 0),
+            VdbeOp::new(Opcode::ResultRow, 1, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+        vdbe.set_btree(btree.clone());
+        vdbe.set_connection(conn_ptr);
+        vdbe.open_cursor(0, root_page, false).unwrap();
+        if let Some(cursor) = vdbe.cursor_mut(0) {
+            cursor.is_index = true;
+            cursor.btree_cursor = Some(index_cursor);
+        }
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), 99);
     }
 
     #[test]

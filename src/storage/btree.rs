@@ -3106,7 +3106,7 @@ impl Btree {
     }
 
     /// sqlite3BtreeUpdateMeta
-    pub fn update_meta(&mut self, _idx: usize, _value: u32) -> Result<()> {
+    pub fn update_meta(&self, _idx: usize, _value: u32) -> Result<()> {
         let mut shared = self
             .shared
             .write()

@@ -3674,7 +3674,47 @@ impl Vdbe {
             }
 
             Opcode::IdxLT => {
-                // Placeholder: Index range scans
+                // IdxLT P1 P2 P3 P4: jump if index entry < key
+                let (key_cols, sort_desc) = match &op.p4 {
+                    P4::Int64(n) => (*n as usize, Vec::new()),
+                    P4::KeyInfo(info) => (info.n_key_field as usize, info.sort_orders.clone()),
+                    _ => (0, Vec::new()),
+                };
+
+                if key_cols != 0 {
+                    let mut should_jump = false;
+
+                    if let Some(cursor) = self.cursor_mut(op.p1) {
+                        if !cursor.is_ephemeral {
+                            if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                                let payload = if let Some(data) = bt_cursor.payload_fetch() {
+                                    data.to_vec()
+                                } else {
+                                    bt_cursor.payload(0, bt_cursor.payload_size())?
+                                };
+                                let index_mems = self.decode_record_mems(&payload);
+                                let null_mem = Mem::new();
+                                let mut cmp = std::cmp::Ordering::Equal;
+                                for i in 0..key_cols {
+                                    let idx_mem = index_mems.get(i).unwrap_or(&null_mem);
+                                    let key_mem = self.mem(op.p3 + i as i32);
+                                    let col_cmp = idx_mem.compare(key_mem);
+                                    let desc = sort_desc.get(i).copied().unwrap_or(false);
+                                    let col_cmp = if desc { col_cmp.reverse() } else { col_cmp };
+                                    if col_cmp != std::cmp::Ordering::Equal {
+                                        cmp = col_cmp;
+                                        break;
+                                    }
+                                }
+                                should_jump = cmp == std::cmp::Ordering::Less;
+                            }
+                        }
+                    }
+
+                    if should_jump {
+                        self.pc = op.p2;
+                    }
+                }
             }
 
             Opcode::IdxInsert => {
@@ -4818,6 +4858,77 @@ mod tests {
         let result = vdbe.step().unwrap();
         assert_eq!(result, ExecResult::Row);
         assert_eq!(vdbe.column_int(0), 1);
+    }
+
+    #[test]
+    fn test_op_idxlt_index_key_strict() {
+        let mut conn = open_test_connection();
+        let conn_ptr = &mut *conn as *mut SqliteConnection;
+        let btree = conn.main_db().btree.as_ref().unwrap().clone();
+
+        btree.begin_trans(true).unwrap();
+        let root_page = btree.create_table(crate::storage::btree::BTREE_BLOBKEY).unwrap();
+        let mut index_cursor = btree
+            .cursor(root_page, BtreeCursorFlags::WRCSR, None)
+            .unwrap();
+
+        let mems = vec![Mem::from_int(1)];
+        let key1 = crate::vdbe::auxdata::make_record(&mems, 0, 1);
+        let payload1 = BtreePayload {
+            key: Some(key1),
+            n_key: 0,
+            data: None,
+            mem: Vec::new(),
+            n_data: 0,
+            n_zero: 0,
+        };
+        btree
+            .insert(&mut index_cursor, &payload1, BtreeInsertFlags::APPEND, 0)
+            .unwrap();
+
+        let mems = vec![Mem::from_int(3)];
+        let key3 = crate::vdbe::auxdata::make_record(&mems, 0, 1);
+        let payload3 = BtreePayload {
+            key: Some(key3),
+            n_key: 0,
+            data: None,
+            mem: Vec::new(),
+            n_data: 0,
+            n_zero: 0,
+        };
+        btree
+            .insert(&mut index_cursor, &payload3, BtreeInsertFlags::APPEND, 0)
+            .unwrap();
+        index_cursor.first().unwrap();
+
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::Integer, 1, 1, 0),
+            VdbeOp {
+                opcode: Opcode::IdxLT,
+                p1: 0,
+                p2: 4,
+                p3: 1,
+                p4: P4::Int64(1),
+                p5: 0,
+                comment: None,
+            },
+            VdbeOp::new(Opcode::Integer, 0, 2, 0),
+            VdbeOp::new(Opcode::Goto, 0, 5, 0),
+            VdbeOp::new(Opcode::Integer, 1, 2, 0),
+            VdbeOp::new(Opcode::ResultRow, 2, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+        vdbe.set_btree(btree.clone());
+        vdbe.set_connection(conn_ptr);
+        vdbe.open_cursor(0, root_page, false).unwrap();
+        if let Some(cursor) = vdbe.cursor_mut(0) {
+            cursor.is_index = true;
+            cursor.btree_cursor = Some(index_cursor);
+        }
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), 0);
     }
 
     #[test]

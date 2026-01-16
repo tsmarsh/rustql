@@ -291,10 +291,18 @@ impl<'a> InsertCompiler<'a> {
 
     /// Compile INSERT...SELECT
     ///
-    /// For simple cases, we directly emit the SELECT logic:
+    /// To handle self-referential queries (INSERT INTO t SELECT ... FROM t),
+    /// we materialize the SELECT results into an ephemeral table first, then
+    /// insert from the ephemeral table. This prevents infinite loops where
+    /// newly inserted rows would be visible to the SELECT cursor.
+    ///
+    /// Steps:
     /// 1. Open source table for reading
-    /// 2. Loop through rows
-    /// 3. For each row, insert into target table
+    /// 2. Open ephemeral table to buffer rows
+    /// 3. First loop: Read from source, insert into ephemeral table
+    /// 4. Close source cursor
+    /// 5. Second loop: Read from ephemeral table, insert into target
+    /// 6. Close ephemeral cursor
     fn compile_select(
         &mut self,
         insert: &InsertStmt,
@@ -308,6 +316,9 @@ impl<'a> InsertCompiler<'a> {
         // For now, we support simple "SELECT * FROM table" or "SELECT cols FROM table"
         let source_table = self.get_source_table(select)?;
 
+        // Get number of columns to read from SELECT
+        let select_col_count = self.get_select_column_count(select);
+
         // Open source table for reading
         let source_cursor = self.alloc_cursor();
         self.emit(
@@ -318,16 +329,81 @@ impl<'a> InsertCompiler<'a> {
             P4::Text(source_table.clone()),
         );
 
-        // Get number of columns to read from SELECT
-        let select_col_count = self.get_select_column_count(select);
+        // Open ephemeral table to buffer the SELECT results
+        // This is critical for self-referential queries to avoid infinite loops
+        let eph_cursor = self.alloc_cursor();
+        self.emit(
+            Opcode::OpenEphemeral,
+            eph_cursor,
+            select_col_count as i32,
+            0,
+            P4::Unused,
+        );
 
-        // Loop labels
-        let loop_start_label = self.alloc_label();
-        let loop_end_label = self.alloc_label();
+        // ========================================================================
+        // Phase 1: Read all source rows into ephemeral table
+        // ========================================================================
+        let read_loop_start = self.alloc_label();
+        let read_loop_end = self.alloc_label();
 
         // Rewind to start of source table
-        self.emit(Opcode::Rewind, source_cursor, loop_end_label, 0, P4::Unused);
-        self.resolve_label(loop_start_label, self.current_addr() as i32);
+        self.emit(Opcode::Rewind, source_cursor, read_loop_end, 0, P4::Unused);
+        self.resolve_label(read_loop_start, self.current_addr() as i32);
+
+        // Read columns from source row into registers
+        let temp_base = self.next_reg;
+        let _temp_regs = self.alloc_regs(select_col_count);
+
+        for i in 0..select_col_count {
+            let dest_reg = temp_base + i as i32;
+            self.emit(
+                Opcode::Column,
+                source_cursor,
+                i as i32,
+                dest_reg,
+                P4::Unused,
+            );
+        }
+
+        // Allocate a rowid for the ephemeral table
+        let eph_rowid_reg = self.alloc_reg();
+        self.emit(Opcode::NewRowid, eph_cursor, eph_rowid_reg, 0, P4::Unused);
+
+        // Make record for ephemeral table
+        let eph_record_reg = self.alloc_reg();
+        self.emit(
+            Opcode::MakeRecord,
+            temp_base,
+            select_col_count as i32,
+            eph_record_reg,
+            P4::Unused,
+        );
+
+        // Insert into ephemeral table
+        self.emit(
+            Opcode::Insert,
+            eph_cursor,
+            eph_record_reg,
+            eph_rowid_reg,
+            P4::Int64(0), // No conflict handling for ephemeral
+        );
+
+        // Next row in source table
+        self.emit(Opcode::Next, source_cursor, read_loop_start, 0, P4::Unused);
+        self.resolve_label(read_loop_end, self.current_addr() as i32);
+
+        // Close source cursor - we're done reading
+        self.emit(Opcode::Close, source_cursor, 0, 0, P4::Unused);
+
+        // ========================================================================
+        // Phase 2: Insert from ephemeral table into target
+        // ========================================================================
+        let insert_loop_start = self.alloc_label();
+        let insert_loop_end = self.alloc_label();
+
+        // Rewind ephemeral table
+        self.emit(Opcode::Rewind, eph_cursor, insert_loop_end, 0, P4::Unused);
+        self.resolve_label(insert_loop_start, self.current_addr() as i32);
 
         // Allocate rowid register for target table
         let rowid_reg = self.alloc_reg();
@@ -339,7 +415,7 @@ impl<'a> InsertCompiler<'a> {
             P4::Unused,
         );
 
-        // Read columns from source row
+        // Read columns from ephemeral row and map to target columns
         let data_base = self.next_reg;
         let _data_regs = self.alloc_regs(self.num_columns);
 
@@ -350,23 +426,11 @@ impl<'a> InsertCompiler<'a> {
             }
             match *target {
                 InsertColumnTarget::Rowid => {
-                    self.emit(
-                        Opcode::Column,
-                        source_cursor,
-                        i as i32,
-                        rowid_reg,
-                        P4::Unused,
-                    );
+                    self.emit(Opcode::Column, eph_cursor, i as i32, rowid_reg, P4::Unused);
                 }
                 InsertColumnTarget::Column(col_idx) => {
                     let dest_reg = data_base + col_idx as i32;
-                    self.emit(
-                        Opcode::Column,
-                        source_cursor,
-                        i as i32,
-                        dest_reg,
-                        P4::Unused,
-                    );
+                    self.emit(Opcode::Column, eph_cursor, i as i32, dest_reg, P4::Unused);
                     if col_idx < present.len() {
                         present[col_idx] = true;
                     }
@@ -404,12 +468,12 @@ impl<'a> InsertCompiler<'a> {
             P4::Int64(flags),
         );
 
-        // Next row in source table
-        self.emit(Opcode::Next, source_cursor, loop_start_label, 0, P4::Unused);
-        self.resolve_label(loop_end_label, self.current_addr() as i32);
+        // Next row in ephemeral table
+        self.emit(Opcode::Next, eph_cursor, insert_loop_start, 0, P4::Unused);
+        self.resolve_label(insert_loop_end, self.current_addr() as i32);
 
-        // Close source cursor
-        self.emit(Opcode::Close, source_cursor, 0, 0, P4::Unused);
+        // Close ephemeral cursor
+        self.emit(Opcode::Close, eph_cursor, 0, 0, P4::Unused);
 
         Ok(())
     }

@@ -2967,7 +2967,7 @@ impl Vdbe {
                 }
             }
 
-            | Opcode::SeekLT => {
+            Opcode::SeekLT => {
                 let mut jump = true;
                 let index_key = self.mem(op.p3).to_blob();
                 let rowid_key = self.mem(op.p3).to_int();
@@ -3002,7 +3002,7 @@ impl Vdbe {
                 }
             }
 
-            | Opcode::SeekNull => {
+            Opcode::SeekNull => {
                 // Placeholder: These need btree integration for index operations
             }
 
@@ -4065,7 +4065,9 @@ mod tests {
         let btree = conn.main_db().btree.as_ref().unwrap().clone();
 
         btree.begin_trans(true).unwrap();
-        let root_page = btree.create_table(crate::storage::btree::BTREE_INTKEY).unwrap();
+        let root_page = btree
+            .create_table(crate::storage::btree::BTREE_INTKEY)
+            .unwrap();
         let mut cursor = btree
             .cursor(root_page, BtreeCursorFlags::WRCSR, None)
             .unwrap();
@@ -4106,7 +4108,9 @@ mod tests {
         let btree = conn.main_db().btree.as_ref().unwrap().clone();
 
         btree.begin_trans(true).unwrap();
-        let root_page = btree.create_table(crate::storage::btree::BTREE_INTKEY).unwrap();
+        let root_page = btree
+            .create_table(crate::storage::btree::BTREE_INTKEY)
+            .unwrap();
         let mut cursor = btree
             .cursor(root_page, BtreeCursorFlags::WRCSR, None)
             .unwrap();
@@ -4147,7 +4151,9 @@ mod tests {
         let btree = conn.main_db().btree.as_ref().unwrap().clone();
 
         btree.begin_trans(true).unwrap();
-        let root_page = btree.create_table(crate::storage::btree::BTREE_INTKEY).unwrap();
+        let root_page = btree
+            .create_table(crate::storage::btree::BTREE_INTKEY)
+            .unwrap();
         let mut cursor = btree
             .cursor(root_page, BtreeCursorFlags::WRCSR, None)
             .unwrap();
@@ -4188,7 +4194,9 @@ mod tests {
         let btree = conn.main_db().btree.as_ref().unwrap().clone();
 
         btree.begin_trans(true).unwrap();
-        let root_page = btree.create_table(crate::storage::btree::BTREE_INTKEY).unwrap();
+        let root_page = btree
+            .create_table(crate::storage::btree::BTREE_INTKEY)
+            .unwrap();
         let mut cursor = btree
             .cursor(root_page, BtreeCursorFlags::WRCSR, None)
             .unwrap();

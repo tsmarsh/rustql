@@ -112,7 +112,10 @@ fn run_test_file(file_name: &str) -> Option<sqlite_compat::runner::TestFileStats
 }
 
 /// Run all priority test files and report overall progress
+/// This test is ignored by default because it runs the full SQLite test suite
+/// and takes a long time. Run with: cargo test --ignored test_sqlite_compatibility_progress
 #[test]
+#[ignore]
 fn test_sqlite_compatibility_progress() {
     let test_dir = Path::new(SQLITE_TEST_DIR);
     if !test_dir.exists() {

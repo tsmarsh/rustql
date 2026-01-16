@@ -2575,12 +2575,15 @@ impl Btree {
         }
 
         // Calculate insert_index before checking if split is needed
-        let insert_index =
-            if _flags.contains(BtreeInsertFlags::APPEND) || _cursor.state != CursorState::Valid {
-                mem_page.n_cell
-            } else {
-                _cursor.ix.min(mem_page.n_cell)
-            };
+        // For intkey tables (rowid tables), always append since NewRowid generates sequential IDs
+        let insert_index = if mem_page.is_intkey
+            || _flags.contains(BtreeInsertFlags::APPEND)
+            || _cursor.state != CursorState::Valid
+        {
+            mem_page.n_cell
+        } else {
+            _cursor.ix.min(mem_page.n_cell)
+        };
 
         let header_start = limits.header_start();
         let header_size = mem_page.header_size();
@@ -2652,21 +2655,26 @@ impl Btree {
         let mut page = shared_guard.pager.get(root_pgno, PagerGetFlags::empty())?;
         shared_guard.pager.write(&mut page)?;
 
-        let data = &mut page.data;
-        data[new_cell_offset..new_cell_offset + cell_size].copy_from_slice(&cell);
+        {
+            let data = &mut page.data;
+            data[new_cell_offset..new_cell_offset + cell_size].copy_from_slice(&cell);
 
-        let ptr_array_start = header_start + header_size;
-        let ptr_array_end = ptr_array_start + (mem_page.n_cell as usize * 2);
-        let insert_ptr_offset = ptr_array_start + (insert_index as usize * 2);
-        if insert_ptr_offset < ptr_array_end {
-            data.copy_within(insert_ptr_offset..ptr_array_end, insert_ptr_offset + 2);
+            let ptr_array_start = header_start + header_size;
+            let ptr_array_end = ptr_array_start + (mem_page.n_cell as usize * 2);
+            let insert_ptr_offset = ptr_array_start + (insert_index as usize * 2);
+            if insert_ptr_offset < ptr_array_end {
+                data.copy_within(insert_ptr_offset..ptr_array_end, insert_ptr_offset + 2);
+            }
+            let ptr_write = header_start + header_size + (insert_index as usize * 2);
+            write_u16(data, ptr_write, new_cell_offset as u16)?;
+            write_u16(data, header_start + 3, mem_page.n_cell + 1)?;
+            write_u16(data, header_start + 5, new_cell_offset as u16)?;
         }
-        let ptr_write = header_start + header_size + (insert_index as usize * 2);
-        write_u16(data, ptr_write, new_cell_offset as u16)?;
-        write_u16(data, header_start + 3, mem_page.n_cell + 1)?;
-        write_u16(data, header_start + 5, new_cell_offset as u16)?;
 
-        mem_page.data = data.clone();
+        // Write modified page back to cache so subsequent reads see the changes
+        shared_guard.pager.write_page_to_cache(&page);
+
+        mem_page.data = page.data.clone();
         mem_page.n_cell += 1;
         mem_page.cell_offset = new_cell_offset as u16;
         _cursor.page = Some(mem_page);
@@ -2711,6 +2719,15 @@ impl Btree {
         let new_n_cell = mem_page.n_cell - 1;
         write_u16(data, header_start + 3, new_n_cell)?;
 
+        // Write modified page back to cache so subsequent reads see the changes
+        shared_guard.pager.write_page_to_cache(&page);
+
+        // Update cursor's stored page with new n_cell
+        if let Some(ref mut cursor_page) = _cursor.page {
+            cursor_page.n_cell = new_n_cell;
+            cursor_page.data = page.data.clone();
+        }
+
         if mem_page.is_underfull(limits).unwrap_or(false) {
             if let (Some(parent), Some(child_index)) =
                 (_cursor.page_stack.last(), _cursor.idx_stack.last())
@@ -2749,7 +2766,19 @@ impl Btree {
             }
         }
 
-        _cursor.state = CursorState::Invalid;
+        // Set skip_next so Next() doesn't advance past the shifted cells
+        // The cursor is still at the same ix, which now contains the "next" row
+        _cursor.skip_next = 1;
+        // Keep cursor valid if there are still cells to process
+        if let Some(ref cursor_page) = _cursor.page {
+            if _cursor.ix < cursor_page.n_cell {
+                _cursor.state = CursorState::Valid;
+            } else {
+                _cursor.state = CursorState::Invalid;
+            }
+        } else {
+            _cursor.state = CursorState::Invalid;
+        }
         let _ = collapse_root_if_empty(&mut shared_guard, root_pgno);
         Ok(())
     }
@@ -3380,6 +3409,21 @@ impl BtCursor {
 
     /// sqlite3BtreeNext
     pub fn next(&mut self, _flags: i32) -> Result<()> {
+        // Check skip_next flag (set after delete to avoid advancing past the shifted cells)
+        if self.skip_next != 0 {
+            self.skip_next = 0;
+            // After delete, cursor is already at the "next" row (cells shifted down)
+            // Just verify cursor is still valid
+            if let Some(ref page) = self.page {
+                if self.ix < page.n_cell {
+                    self.state = CursorState::Valid;
+                    return Ok(());
+                }
+            }
+            self.state = CursorState::Invalid;
+            return Ok(());
+        }
+
         let page = self.page.as_ref().ok_or(Error::new(ErrorCode::Corrupt))?;
         if !page.is_leaf {
             return Err(Error::new(ErrorCode::Internal));

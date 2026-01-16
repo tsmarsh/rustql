@@ -2817,11 +2817,19 @@ impl Vdbe {
                             if let Err(e) = btree.delete(bt_cursor, flags) {
                                 eprintln!("Delete failed: {:?}", e);
                             }
+                            // Sync cursor state from btree cursor
+                            // After delete, btree cursor may still be valid (pointing to next row)
+                            cursor.state = match bt_cursor.state {
+                                crate::storage::btree::CursorState::Valid => CursorState::Valid,
+                                _ => CursorState::Invalid,
+                            };
+                            if cursor.state == CursorState::Valid {
+                                cursor.rowid = Some(bt_cursor.integer_key());
+                            } else {
+                                cursor.rowid = None;
+                            }
                         }
                     }
-                    // Invalidate cursor after delete
-                    cursor.state = CursorState::Invalid;
-                    cursor.rowid = None;
                 }
             }
 

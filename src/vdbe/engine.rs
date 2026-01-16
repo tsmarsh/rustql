@@ -37,8 +37,8 @@ const DEFAULT_MEM_SIZE: usize = 128;
 
 /// Default number of cursor slots
 const DEFAULT_CURSOR_SLOTS: usize = 16;
-const OPFLAG_NCHANGE: i32 = 0x01;
-const OPFLAG_LASTROWID: i32 = 0x20;
+const OPFLAG_NCHANGE: u16 = 0x01;
+const OPFLAG_LASTROWID: u16 = 0x20;
 
 // ============================================================================
 // Execution Result
@@ -3433,7 +3433,29 @@ impl Vdbe {
                 }
             }
 
-            Opcode::Between | Opcode::Regexp => {
+            Opcode::Between => {
+                // Between P1 P2 P3 P4: r[P2] = (r[P1] BETWEEN r[P3] AND r[P4])
+                let high_reg = match op.p4 {
+                    P4::Int64(v) => v as i32,
+                    _ => {
+                        self.mem_mut(op.p2).set_null();
+                        return Ok(ExecResult::Continue);
+                    }
+                };
+                let val = self.mem(op.p1);
+                let low = self.mem(op.p3);
+                let high = self.mem(high_reg);
+
+                if val.is_null() || low.is_null() || high.is_null() {
+                    self.mem_mut(op.p2).set_null();
+                } else {
+                    let below = val.compare(low) == Ordering::Less;
+                    let above = val.compare(high) == Ordering::Greater;
+                    self.mem_mut(op.p2).set_int(if below || above { 0 } else { 1 });
+                }
+            }
+
+            Opcode::Regexp => {
                 // Placeholder: Advanced pattern matching
             }
 
@@ -4359,6 +4381,30 @@ mod tests {
             VdbeOp::new(Opcode::Goto, 0, 5, 0),
             VdbeOp::new(Opcode::Integer, 1, 2, 0),
             VdbeOp::new(Opcode::ResultRow, 2, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), 1);
+    }
+
+    #[test]
+    fn test_op_between_inclusive() {
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::Integer, 5, 1, 0),
+            VdbeOp::new(Opcode::Integer, 3, 2, 0),
+            VdbeOp::new(Opcode::Integer, 7, 3, 0),
+            VdbeOp {
+                opcode: Opcode::Between,
+                p1: 1,
+                p2: 4,
+                p3: 2,
+                p4: P4::Int64(3),
+                p5: 0,
+                comment: None,
+            },
+            VdbeOp::new(Opcode::ResultRow, 4, 1, 0),
             VdbeOp::new(Opcode::Halt, 0, 0, 0),
         ]);
 

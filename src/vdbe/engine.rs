@@ -3453,7 +3453,26 @@ impl Vdbe {
             }
 
             Opcode::VerifyCookie => {
-                // Placeholder: Schema cookie operations
+                // VerifyCookie P1 P2 P3: ensure meta cookie P2 equals P3
+                if op.p1 != 0 {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        "unsupported database index",
+                    ));
+                }
+                let Some(ref btree) = self.btree else {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        "missing btree for VerifyCookie",
+                    ));
+                };
+                let cookie = btree.get_meta(op.p2 as usize)? as i64;
+                if cookie != op.p3 as i64 {
+                    return Err(Error::with_message(
+                        ErrorCode::Schema,
+                        "database schema has changed",
+                    ));
+                }
             }
 
             Opcode::Savepoint => {
@@ -5424,6 +5443,43 @@ mod tests {
             VdbeOp::new(Opcode::ResultRow, 5, 1, 0),
             VdbeOp::new(Opcode::Halt, 0, 0, 0),
         ]);
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), 1);
+    }
+
+    #[test]
+    fn test_op_verifycookie_matches() {
+        let mut conn = open_test_connection();
+        let conn_ptr = &mut *conn as *mut SqliteConnection;
+        let btree = conn.main_db().btree.as_ref().unwrap().clone();
+
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp {
+                opcode: Opcode::SetCookie,
+                p1: 0,
+                p2: crate::storage::btree::BTREE_USER_VERSION as i32,
+                p3: 321,
+                p4: P4::Unused,
+                p5: 0,
+                comment: None,
+            },
+            VdbeOp {
+                opcode: Opcode::VerifyCookie,
+                p1: 0,
+                p2: crate::storage::btree::BTREE_USER_VERSION as i32,
+                p3: 321,
+                p4: P4::Unused,
+                p5: 0,
+                comment: None,
+            },
+            VdbeOp::new(Opcode::Integer, 1, 1, 0),
+            VdbeOp::new(Opcode::ResultRow, 1, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+        vdbe.set_btree(btree);
+        vdbe.set_connection(conn_ptr);
 
         let result = vdbe.step().unwrap();
         assert_eq!(result, ExecResult::Row);

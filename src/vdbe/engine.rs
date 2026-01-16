@@ -158,6 +158,8 @@ pub struct VdbeCursor {
     pub sorter_data: Vec<Vec<u8>>,
     /// Sorter index - current position in sorted data
     pub sorter_index: usize,
+    /// Sequence counter for OP_Sequence
+    pub seq_count: i64,
     /// Has the sorter been sorted?
     pub sorter_sorted: bool,
     /// Sort directions for each ORDER BY column (true = DESC, false = ASC)
@@ -216,6 +218,7 @@ impl VdbeCursor {
             vtab_input: None,
             sorter_data: Vec::new(),
             sorter_index: 0,
+            seq_count: 0,
             sorter_sorted: false,
             sort_desc: Vec::new(),
             ephemeral_set: std::collections::HashSet::new(),
@@ -4195,7 +4198,18 @@ impl Vdbe {
                 }
             }
 
-            Opcode::SortKey | Opcode::Sequence => {
+            Opcode::Sequence => {
+                // Sequence P1 P2: r[P2]=cursor[P1].seq_count++
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    let seq = cursor.seq_count;
+                    cursor.seq_count = cursor.seq_count.wrapping_add(1);
+                    self.mem_mut(op.p2).set_int(seq);
+                } else {
+                    self.mem_mut(op.p2).set_null();
+                }
+            }
+
+            Opcode::SortKey => {
                 // Placeholder: Misc operations
             }
 
@@ -5576,6 +5590,22 @@ mod tests {
         let result = vdbe.step().unwrap();
         assert_eq!(result, ExecResult::Row);
         assert_eq!(vdbe.column_int(0), 1);
+    }
+
+    #[test]
+    fn test_op_sequence_increments() {
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::OpenEphemeral, 0, 1, 0),
+            VdbeOp::new(Opcode::Sequence, 0, 1, 0),
+            VdbeOp::new(Opcode::Sequence, 0, 2, 0),
+            VdbeOp::new(Opcode::ResultRow, 1, 2, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), 0);
+        assert_eq!(vdbe.column_int(1), 1);
     }
 
     #[test]

@@ -4210,7 +4210,33 @@ impl Vdbe {
             }
 
             Opcode::SortKey => {
-                // Placeholder: Misc operations
+                // SortKey P1 P2: write sorter key into register P2
+                if let Some(cursor) = self.cursor(op.p1) {
+                    if cursor.sorter_index < cursor.sorter_data.len() {
+                        let record = &cursor.sorter_data[cursor.sorter_index];
+                        let key_cols = cursor.n_field.max(0) as usize;
+                        if key_cols == 0 {
+                            self.mem_mut(op.p2).set_null();
+                        } else {
+                            let mems = self.decode_record_mems(record);
+                            let mut key_mems = Vec::with_capacity(key_cols);
+                            for i in 0..key_cols {
+                                if let Some(mem) = mems.get(i) {
+                                    key_mems.push(mem.clone());
+                                } else {
+                                    key_mems.push(Mem::new());
+                                }
+                            }
+                            let key_record =
+                                crate::vdbe::auxdata::make_record(&key_mems, 0, key_cols as i32);
+                            self.mem_mut(op.p2).set_blob(&key_record);
+                        }
+                    } else {
+                        self.mem_mut(op.p2).set_null();
+                    }
+                } else {
+                    self.mem_mut(op.p2).set_null();
+                }
             }
 
             // ================================================================
@@ -5606,6 +5632,25 @@ mod tests {
         assert_eq!(result, ExecResult::Row);
         assert_eq!(vdbe.column_int(0), 0);
         assert_eq!(vdbe.column_int(1), 1);
+    }
+
+    #[test]
+    fn test_op_sortkey_returns_key_record() {
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::OpenEphemeral, 0, 1, 0),
+            VdbeOp::new(Opcode::Integer, 7, 1, 0),
+            VdbeOp::new(Opcode::MakeRecord, 1, 1, 2),
+            VdbeOp::new(Opcode::SorterInsert, 0, 2, 0),
+            VdbeOp::new(Opcode::SorterSort, 0, 8, 0),
+            VdbeOp::new(Opcode::SortKey, 0, 3, 0),
+            VdbeOp::new(Opcode::DecodeRecord, 3, 4, 1),
+            VdbeOp::new(Opcode::ResultRow, 4, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), 7);
     }
 
     #[test]

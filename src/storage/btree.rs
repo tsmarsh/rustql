@@ -2943,7 +2943,7 @@ impl Btree {
 
     /// sqlite3BtreeCheckpoint
     /// Trigger WAL checkpoint (only relevant in WAL mode)
-    pub fn checkpoint(&mut self, _mode: i32) -> Result<(i32, i32)> {
+    pub fn checkpoint(&self, _mode: i32) -> Result<(i32, i32)> {
         let shared = self
             .shared
             .read()

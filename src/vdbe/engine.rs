@@ -3303,7 +3303,28 @@ impl Vdbe {
             }
 
             Opcode::Checkpoint => {
-                // Placeholder: Savepoint operations
+                // Checkpoint P1 P2 P3: run WAL checkpoint, store results in P3..P3+2
+                let mut busy = 0;
+                let mut log = -1;
+                let mut ckpt = -1;
+                if let Some(ref btree) = self.btree {
+                    match btree.checkpoint(op.p2) {
+                        Ok((log_pages, ckpt_pages)) => {
+                            log = log_pages;
+                            ckpt = ckpt_pages;
+                        }
+                        Err(err) => {
+                            if err.code == ErrorCode::Busy {
+                                busy = 1;
+                            } else {
+                                return Err(err);
+                            }
+                        }
+                    }
+                }
+                self.mem_mut(op.p3).set_int(busy);
+                self.mem_mut(op.p3 + 1).set_int(log as i64);
+                self.mem_mut(op.p3 + 2).set_int(ckpt as i64);
             }
 
             Opcode::Cast => {
@@ -4411,6 +4432,27 @@ mod tests {
         let result = vdbe.step().unwrap();
         assert_eq!(result, ExecResult::Row);
         assert_eq!(vdbe.column_int(0), 1);
+    }
+
+    #[test]
+    fn test_op_checkpoint_default() {
+        let mut conn = open_test_connection();
+        let conn_ptr = &mut *conn as *mut SqliteConnection;
+        let btree = conn.main_db().btree.as_ref().unwrap().clone();
+
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::Checkpoint, 0, 0, 1),
+            VdbeOp::new(Opcode::ResultRow, 1, 3, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+        vdbe.set_btree(btree);
+        vdbe.set_connection(conn_ptr);
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), 0);
+        assert_eq!(vdbe.column_int(1), 0);
+        assert_eq!(vdbe.column_int(2), 0);
     }
 
     #[test]

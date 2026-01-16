@@ -55,4 +55,16 @@ fi
 echo -e "${GREEN}Tests OK${NC}"
 
 echo -e "\n${GREEN}All pre-commit checks passed!${NC}"
+
+# Run SQLite compatibility tests in background (non-blocking, for tracking progress)
+echo -e "\n${YELLOW}Starting SQLite compatibility tests in background...${NC}"
+COMPAT_LOG="$REPO_ROOT/.compat-test-results.log"
+(
+    echo "=== SQLite Compatibility Test Run: $(date) ===" > "$COMPAT_LOG"
+    cargo test --test sqlite_compat_test test_sqlite_compatibility_progress -- --ignored --nocapture >> "$COMPAT_LOG" 2>&1
+    echo "" >> "$COMPAT_LOG"
+    echo "=== Completed: $(date) ===" >> "$COMPAT_LOG"
+) &
+echo -e "Results will be written to: ${YELLOW}.compat-test-results.log${NC}"
+
 exit 0

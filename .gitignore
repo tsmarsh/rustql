@@ -35,3 +35,4 @@
 /.claude/
 .moth/.current
 .current
+.compat-test-results.log

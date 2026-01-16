@@ -3290,7 +3290,18 @@ impl Vdbe {
             }
 
             Opcode::ResetSorter => {
-                // Placeholder: Other sorter-related operations
+                // ResetSorter P1: Clear sorter or ephemeral table content
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    cursor.sorter_data.clear();
+                    cursor.sorter_index = 0;
+                    cursor.sorter_sorted = false;
+                    if cursor.is_ephemeral {
+                        cursor.ephemeral_set.clear();
+                        cursor.ephemeral_rows.clear();
+                        cursor.ephemeral_index = 0;
+                    }
+                    cursor.state = CursorState::Invalid;
+                }
             }
 
             Opcode::SorterInsert => {
@@ -5193,6 +5204,27 @@ mod tests {
         let result = vdbe.step().unwrap();
         assert_eq!(result, ExecResult::Row);
         assert_eq!(vdbe.column_int(0), expected);
+    }
+
+    #[test]
+    fn test_op_resetsorter_clears_sorter() {
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::OpenEphemeral, 0, 1, 0),
+            VdbeOp::new(Opcode::Integer, 7, 1, 0),
+            VdbeOp::new(Opcode::MakeRecord, 1, 1, 2),
+            VdbeOp::new(Opcode::SorterInsert, 0, 2, 0),
+            VdbeOp::new(Opcode::ResetSorter, 0, 0, 0),
+            VdbeOp::new(Opcode::SorterSort, 0, 8, 0),
+            VdbeOp::new(Opcode::Integer, 0, 3, 0),
+            VdbeOp::new(Opcode::Goto, 0, 9, 0),
+            VdbeOp::new(Opcode::Integer, 1, 3, 0),
+            VdbeOp::new(Opcode::ResultRow, 3, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), 1);
     }
 
     #[test]

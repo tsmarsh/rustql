@@ -3696,7 +3696,25 @@ impl Vdbe {
                 // Debug/explain operations
             }
 
-            Opcode::FinishSeek | Opcode::SortKey | Opcode::Sequence | Opcode::Count => {
+            Opcode::Count => {
+                // Count P1 P2 P3: count entries in cursor P1, store in P2
+                let mut total = 0i64;
+                let btree = self.btree.clone();
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    if cursor.is_ephemeral {
+                        total = cursor.ephemeral_rows.len() as i64;
+                    } else if cursor.is_virtual {
+                        total = cursor.vtab_rowids.len() as i64;
+                    } else if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                        if let Some(ref btree) = btree {
+                            total = btree.count(bt_cursor)?;
+                        }
+                    }
+                }
+                self.mem_mut(op.p2).set_int(total);
+            }
+
+            Opcode::FinishSeek | Opcode::SortKey | Opcode::Sequence => {
                 // Placeholder: Misc operations
             }
 
@@ -4453,6 +4471,45 @@ mod tests {
         assert_eq!(vdbe.column_int(0), 0);
         assert_eq!(vdbe.column_int(1), 0);
         assert_eq!(vdbe.column_int(2), 0);
+    }
+
+    #[test]
+    fn test_op_count_table() {
+        let mut conn = open_test_connection();
+        let conn_ptr = &mut *conn as *mut SqliteConnection;
+        let btree = conn.main_db().btree.as_ref().unwrap().clone();
+
+        btree.begin_trans(true).unwrap();
+        let root_page = btree.create_table(crate::storage::btree::BTREE_INTKEY).unwrap();
+        let mut cursor = btree
+            .cursor(root_page, BtreeCursorFlags::WRCSR, None)
+            .unwrap();
+        for rowid in [1, 3, 5] {
+            let payload = BtreePayload {
+                key: None,
+                n_key: rowid,
+                data: None,
+                mem: Vec::new(),
+                n_data: 0,
+                n_zero: 0,
+            };
+            btree
+                .insert(&mut cursor, &payload, BtreeInsertFlags::APPEND, 0)
+                .unwrap();
+        }
+
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::OpenRead, 0, root_page as i32, 1),
+            VdbeOp::new(Opcode::Count, 0, 1, 0),
+            VdbeOp::new(Opcode::ResultRow, 1, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+        vdbe.set_btree(btree);
+        vdbe.set_connection(conn_ptr);
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), 3);
     }
 
     #[test]

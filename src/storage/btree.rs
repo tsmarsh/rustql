@@ -3199,7 +3199,7 @@ impl Btree {
     }
 
     /// sqlite3BtreeCount
-    pub fn count(&mut self, _cursor: &mut BtCursor) -> Result<i64> {
+    pub fn count(&self, _cursor: &mut BtCursor) -> Result<i64> {
         _cursor.count()
     }
 

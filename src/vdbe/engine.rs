@@ -37,6 +37,8 @@ const DEFAULT_MEM_SIZE: usize = 128;
 
 /// Default number of cursor slots
 const DEFAULT_CURSOR_SLOTS: usize = 16;
+const OPFLAG_NCHANGE: i32 = 0x01;
+const OPFLAG_LASTROWID: i32 = 0x20;
 
 // ============================================================================
 // Execution Result
@@ -1062,11 +1064,11 @@ impl Vdbe {
 
                 // In standard SQL, comparing with NULL yields unknown (no jump)
                 // unless NULLEQ flag is set
-                if !nulleq && (left.is_null() || right.is_null()) {
-                    // For Ne with NULL, SQLite typically DOES jump (NULL != X is true)
-                    // Actually this is subtle - let's check if either is NULL
-                    if left.is_null() || right.is_null() {
-                        self.pc = op.p2;
+                if left.is_null() || right.is_null() {
+                    if nulleq {
+                        if left.is_null() ^ right.is_null() {
+                            self.pc = op.p2;
+                        }
                     }
                 } else {
                     let cmp = left.compare(right);
@@ -1978,6 +1980,21 @@ impl Vdbe {
                     None
                 };
 
+                let mut affinity = None;
+                if sqlite_master_value.is_none() && vtab_value.is_none() {
+                    if let Some(cursor) = self.cursor(op.p1) {
+                        if let Some(ref table_name) = cursor.table_name {
+                            if let Some(ref schema) = self.schema {
+                                if let Ok(schema_guard) = schema.read() {
+                                    if let Some(table) = schema_guard.tables.get(table_name) {
+                                        affinity = table.columns.get(col_idx).map(|c| c.affinity);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if let Some(value) = sqlite_master_value {
                     *self.mem_mut(op.p3) = value;
                 } else if let Some(value) = vtab_value {
@@ -2038,6 +2055,9 @@ impl Vdbe {
                                             ) {
                                                 Ok(mem) => {
                                                     *self.mem_mut(op.p3) = mem;
+                                                    if let Some(affinity) = affinity {
+                                                        self.mem_mut(op.p3).apply_affinity(affinity);
+                                                    }
                                                 }
                                                 Err(_) => self.mem_mut(op.p3).set_null(),
                                             }
@@ -2071,17 +2091,20 @@ impl Vdbe {
                                         } else {
                                             &[][..]
                                         };
-                                        match crate::vdbe::auxdata::deserialize_value(
-                                            col_data, col_type,
-                                        ) {
-                                            Ok(mem) => {
-                                                *self.mem_mut(op.p3) = mem;
+                                    match crate::vdbe::auxdata::deserialize_value(
+                                        col_data, col_type,
+                                    ) {
+                                        Ok(mem) => {
+                                            *self.mem_mut(op.p3) = mem;
+                                            if let Some(affinity) = affinity {
+                                                self.mem_mut(op.p3).apply_affinity(affinity);
                                             }
-                                            Err(_) => self.mem_mut(op.p3).set_null(),
                                         }
+                                        Err(_) => self.mem_mut(op.p3).set_null(),
                                     }
-                                } else {
-                                    self.mem_mut(op.p3).set_null();
+                                }
+                            } else {
+                                self.mem_mut(op.p3).set_null();
                                 }
                             }
                             Err(_) => self.mem_mut(op.p3).set_null(),
@@ -2510,6 +2533,12 @@ impl Vdbe {
                 // 2. If table is empty, use rowid 1
                 // 3. Otherwise, get the last rowid and add 1
                 let mut new_rowid: i64 = 1;
+                let mut use_random = false;
+                let autoinc_max = if op.p3 > 0 {
+                    self.mem(op.p3).to_int()
+                } else {
+                    0
+                };
 
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if let Some(ref mut bt_cursor) = cursor.btree_cursor {
@@ -2522,12 +2551,53 @@ impl Vdbe {
                                 } else {
                                     // Get the last rowid and increment
                                     let last_rowid = bt_cursor.integer_key();
-                                    new_rowid = last_rowid.saturating_add(1);
+                                    if last_rowid == i64::MAX {
+                                        use_random = true;
+                                    } else {
+                                        new_rowid = last_rowid.saturating_add(1);
+                                    }
                                 }
                             }
                             Err(_) => {
                                 // Error moving cursor, fall back to cursor's last known rowid
                                 new_rowid = cursor.rowid.map_or(1, |r| r.saturating_add(1));
+                            }
+                        }
+                        if autoinc_max == i64::MAX {
+                            use_random = true;
+                        }
+                        if !use_random && new_rowid <= autoinc_max {
+                            if autoinc_max == i64::MAX {
+                                use_random = true;
+                            } else {
+                                new_rowid = autoinc_max.saturating_add(1);
+                            }
+                        }
+                        if use_random {
+                            let mut found = None;
+                            for _ in 0..100 {
+                                let mut v = crate::random::sqlite3_random_int64();
+                                v &= i64::MAX >> 1;
+                                v = v.saturating_add(1);
+                                if v <= autoinc_max {
+                                    continue;
+                                }
+                                match bt_cursor.table_moveto(v, false) {
+                                    Ok(0) => continue,
+                                    Ok(_) => {
+                                        found = Some(v);
+                                        break;
+                                    }
+                                    Err(_) => continue,
+                                }
+                            }
+                            if let Some(v) = found {
+                                new_rowid = v;
+                            } else {
+                                return Err(Error::with_message(
+                                    ErrorCode::Full,
+                                    "unable to generate rowid",
+                                ));
                             }
                         }
                     } else {
@@ -2537,6 +2607,9 @@ impl Vdbe {
                     cursor.rowid = Some(new_rowid);
                 }
                 self.mem_mut(op.p2).set_int(new_rowid);
+                if op.p3 > 0 && new_rowid > autoinc_max {
+                    self.mem_mut(op.p3).set_int(new_rowid);
+                }
             }
 
             Opcode::Insert | Opcode::InsertInt => {
@@ -2553,12 +2626,14 @@ impl Vdbe {
                 let btree = self.btree.clone();
                 let schema = self.schema.clone();
                 let record_mems = self.decode_record_mems(&record_data);
+                let mut inserted = false;
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     cursor.rowid = Some(rowid);
 
                     if cursor.is_ephemeral {
                         // Store into ephemeral table for iteration
                         cursor.ephemeral_rows.push((rowid, record_data.clone()));
+                        inserted = true;
                     } else if cursor.is_virtual {
                         if let Some(ref vtab_name) = cursor.vtab_name {
                             #[cfg(feature = "fts3")]
@@ -2592,6 +2667,7 @@ impl Vdbe {
                                             table.insert(rowid, &refs)
                                         };
                                         let _ = result;
+                                        inserted = true;
                                     }
                                 }
                             }
@@ -2610,6 +2686,7 @@ impl Vdbe {
                                         let refs: Vec<&str> =
                                             values.iter().map(|value| value.as_str()).collect();
                                         let _ = table.insert(rowid, &refs);
+                                        inserted = true;
                                     }
                                 }
                             }
@@ -2635,8 +2712,22 @@ impl Vdbe {
                                 if let Err(e) = btree.insert(bt_cursor, &payload, flags, 0) {
                                     // Log error but continue for now
                                     eprintln!("Insert failed: {:?}", e);
+                                } else {
+                                    inserted = true;
                                 }
                             }
+                        }
+                    }
+                }
+                if inserted && (op.p5 & OPFLAG_NCHANGE) != 0 {
+                    self.n_change += 1;
+                    if let Some(conn_ptr) = self.conn_ptr {
+                        let conn = unsafe { &mut *conn_ptr };
+                        conn.changes.fetch_add(1, AtomicOrdering::SeqCst);
+                        conn.total_changes.fetch_add(1, AtomicOrdering::SeqCst);
+                        if (op.p5 & OPFLAG_LASTROWID) != 0 {
+                            conn.last_insert_rowid
+                                .store(rowid, AtomicOrdering::SeqCst);
                         }
                     }
                 }
@@ -2748,6 +2839,7 @@ impl Vdbe {
 
                 let btree = self.btree.clone();
                 let schema = self.schema.clone();
+                let mut deleted = false;
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if cursor.is_virtual {
                         if let Some(rowid) = cursor.rowid {
@@ -2789,6 +2881,7 @@ impl Vdbe {
                                                         table.delete(rowid, &refs)
                                                     };
                                                 let _ = result;
+                                                deleted = true;
                                             }
                                         }
                                     }
@@ -2805,6 +2898,7 @@ impl Vdbe {
                                                     .map(|value| value.as_str())
                                                     .collect();
                                                 let _ = table.delete(rowid, &refs);
+                                                deleted = true;
                                             }
                                         }
                                     }
@@ -2816,6 +2910,8 @@ impl Vdbe {
                             let flags = BtreeInsertFlags::from_bits_truncate(op.p5 as u8);
                             if let Err(e) = btree.delete(bt_cursor, flags) {
                                 eprintln!("Delete failed: {:?}", e);
+                            } else {
+                                deleted = true;
                             }
                             // Sync cursor state from btree cursor
                             // After delete, btree cursor may still be valid (pointing to next row)
@@ -2829,6 +2925,14 @@ impl Vdbe {
                                 cursor.rowid = None;
                             }
                         }
+                    }
+                }
+                if deleted && (op.p5 & OPFLAG_NCHANGE) != 0 {
+                    self.n_change += 1;
+                    if let Some(conn_ptr) = self.conn_ptr {
+                        let conn = unsafe { &mut *conn_ptr };
+                        conn.changes.fetch_add(1, AtomicOrdering::SeqCst);
+                        conn.total_changes.fetch_add(1, AtomicOrdering::SeqCst);
                     }
                 }
             }
@@ -3569,7 +3673,7 @@ impl Vdbe {
                 // Jump to P2 if deferred FK counter is zero
                 // P1 = database index (unused for now)
                 if self.deferred_fk_counter == 0 {
-                    self.pc = op.p2 - 1; // -1 because we increment after
+                    self.pc = op.p2;
                 }
             }
 
@@ -3734,10 +3838,16 @@ impl Vdbe {
     /// Decode a record's raw bytes into Value vector
     /// This is a simplified decoder for FK checking
     fn decode_record_values(&self, _data: &[u8], n_fields: usize) -> Vec<Value> {
-        // For now, return placeholder values
-        // TODO: Implement proper record format decoding when needed
-        // The actual format is: header_size (varint), type_codes[], data[]
-        vec![Value::Null; n_fields]
+        let mems = self.decode_record_mems(_data);
+        let mut values = Vec::with_capacity(n_fields);
+        for i in 0..n_fields {
+            if let Some(mem) = mems.get(i) {
+                values.push(mem.to_value());
+            } else {
+                values.push(Value::Null);
+            }
+        }
+        values
     }
 
     fn decode_record_mems(&self, data: &[u8]) -> Vec<Mem> {

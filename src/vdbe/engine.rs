@@ -3480,7 +3480,27 @@ impl Vdbe {
                 // Placeholder: Advanced pattern matching
             }
 
-            Opcode::IfNullRow | Opcode::EndCoroutine => {
+            Opcode::EndCoroutine => {
+                // EndCoroutine P1: Jump to Yield.P2 for coroutine in register P1
+                let caller_addr = self.mem(op.p1).to_int() as i32;
+                if caller_addr < 0 || caller_addr as usize >= self.ops.len() {
+                    return Err(Error::with_message(
+                        ErrorCode::Internal,
+                        "invalid coroutine address",
+                    ));
+                }
+                let caller = self.ops[caller_addr as usize].clone();
+                if caller.opcode != Opcode::Yield {
+                    return Err(Error::with_message(
+                        ErrorCode::Internal,
+                        "coroutine does not point to Yield",
+                    ));
+                }
+                self.mem_mut(op.p1).set_int((pc) as i64);
+                self.pc = caller.p2;
+            }
+
+            Opcode::IfNullRow => {
                 // Placeholder: Advanced control flow
             }
 
@@ -4510,6 +4530,24 @@ mod tests {
         let result = vdbe.step().unwrap();
         assert_eq!(result, ExecResult::Row);
         assert_eq!(vdbe.column_int(0), 3);
+    }
+
+    #[test]
+    fn test_op_endcoroutine_jumps_to_yield_target() {
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::Integer, 3, 1, 0),
+            VdbeOp::new(Opcode::EndCoroutine, 1, 0, 0),
+            VdbeOp::new(Opcode::Integer, 0, 2, 0),
+            VdbeOp::new(Opcode::Yield, 1, 5, 0),
+            VdbeOp::new(Opcode::Integer, 0, 2, 0),
+            VdbeOp::new(Opcode::Integer, 1, 2, 0),
+            VdbeOp::new(Opcode::ResultRow, 2, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), 1);
     }
 
     #[test]

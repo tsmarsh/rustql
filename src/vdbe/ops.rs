@@ -467,6 +467,16 @@ pub enum Opcode {
     /// Mark end of trigger prolog (where OLD/NEW setup ends)
     TriggerProlog,
 
+    // ========================================================================
+    // RowSet Operations (for IN clause optimization)
+    // ========================================================================
+    /// Add integer P2 to the RowSet in register P1
+    RowSetAdd,
+    /// Extract smallest value from RowSet P1 into P3, jump to P2 if empty
+    RowSetRead,
+    /// If P3 is in RowSet P1, jump to P2; if P4>=0, also insert P3
+    RowSetTest,
+
     /// Maximum opcode value
     MaxOpcode,
 }
@@ -689,6 +699,9 @@ impl Opcode {
             Opcode::Param => "Param",
             Opcode::TriggerTest => "TriggerTest",
             Opcode::TriggerProlog => "TriggerProlog",
+            Opcode::RowSetAdd => "RowSetAdd",
+            Opcode::RowSetRead => "RowSetRead",
+            Opcode::RowSetTest => "RowSetTest",
             Opcode::MaxOpcode => "MaxOpcode",
         }
     }

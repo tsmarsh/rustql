@@ -375,6 +375,9 @@ pub struct Vdbe {
 
     /// Tracking which Once opcodes have been executed
     once_flags: std::collections::HashSet<i32>,
+
+    /// RowSet objects for IN clause optimization, keyed by register number
+    rowsets: HashMap<i32, std::collections::BTreeSet<i64>>,
 }
 
 impl Default for Vdbe {
@@ -424,6 +427,7 @@ impl Vdbe {
             agg_contexts: HashMap::new(),
             last_compare: std::cmp::Ordering::Equal,
             once_flags: std::collections::HashSet::new(),
+            rowsets: HashMap::new(),
         }
     }
 
@@ -4291,6 +4295,72 @@ impl Vdbe {
                 // This is a no-op marker used for debugging/tracing
             }
 
+            // ================================================================
+            // RowSet Operations (for IN clause optimization)
+            // ================================================================
+            Opcode::RowSetAdd => {
+                // RowSetAdd P1 P2: Add integer in register P2 to RowSet in register P1
+                // SQLite vdbe.c lines 7302-7311
+                let val = self.mem(op.p2).to_int();
+                self.rowsets
+                    .entry(op.p1)
+                    .or_insert_with(std::collections::BTreeSet::new)
+                    .insert(val);
+            }
+
+            Opcode::RowSetRead => {
+                // RowSetRead P1 P2 P3: Extract smallest value from RowSet P1 into P3
+                // Jump to P2 if RowSet is empty
+                // SQLite vdbe.c lines 7322-7339
+                let is_empty = if let Some(rowset) = self.rowsets.get_mut(&op.p1) {
+                    if let Some(&val) = rowset.iter().next() {
+                        rowset.remove(&val);
+                        self.mem_mut(op.p3).set_int(val);
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                };
+
+                if is_empty {
+                    self.rowsets.remove(&op.p1);
+                    self.mem_mut(op.p1).set_null();
+                    self.pc = op.p2;
+                }
+            }
+
+            Opcode::RowSetTest => {
+                // RowSetTest P1 P2 P3 P4: Test if P3 is in RowSet P1
+                // If P4>=0, also insert P3; if found, jump to P2
+                // SQLite vdbe.c lines 7365-7391
+                let val = self.mem(op.p3).to_int();
+                let iset = match &op.p4 {
+                    P4::Int64(v) => *v as i32,
+                    _ => -1,
+                };
+
+                let rowset = self
+                    .rowsets
+                    .entry(op.p1)
+                    .or_insert_with(std::collections::BTreeSet::new);
+
+                let exists = if iset != 0 {
+                    rowset.contains(&val)
+                } else {
+                    false
+                };
+
+                if iset >= 0 {
+                    rowset.insert(val);
+                }
+
+                if exists {
+                    self.pc = op.p2;
+                }
+            }
+
             Opcode::MaxOpcode => {
                 // Should never be executed
                 return Err(Error::with_message(
@@ -5121,7 +5191,9 @@ mod tests {
         let btree = conn.main_db().btree.as_ref().unwrap().clone();
 
         btree.begin_trans(true).unwrap();
-        let root_page = btree.create_table(crate::storage::btree::BTREE_BLOBKEY).unwrap();
+        let root_page = btree
+            .create_table(crate::storage::btree::BTREE_BLOBKEY)
+            .unwrap();
         let mut index_cursor = btree
             .cursor(root_page, BtreeCursorFlags::WRCSR, None)
             .unwrap();

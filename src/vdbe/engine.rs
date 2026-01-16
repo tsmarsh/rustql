@@ -110,6 +110,10 @@ pub struct VdbeCursor {
     pub null_row: bool,
     /// Deferred seek key
     pub seek_key: Option<Vec<Mem>>,
+    /// Deferred table seek pending
+    pub deferred_moveto: bool,
+    /// Target rowid for deferred seek
+    pub moveto_target: Option<i64>,
     /// B-tree cursor for actual storage operations
     pub btree_cursor: Option<BtCursor>,
     /// Table name (for looking up column indices at runtime)
@@ -179,6 +183,8 @@ impl VdbeCursor {
             n_field: 0,
             null_row: false,
             seek_key: None,
+            deferred_moveto: false,
+            moveto_target: None,
             btree_cursor: None,
             table_name: None,
             is_sqlite_master: false,
@@ -3785,7 +3791,31 @@ impl Vdbe {
                 self.mem_mut(op.p2).set_int(total);
             }
 
-            Opcode::FinishSeek | Opcode::SortKey | Opcode::Sequence => {
+            Opcode::FinishSeek => {
+                // Complete a deferred table seek if one is pending.
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    if cursor.deferred_moveto {
+                        if let (Some(target), Some(ref mut bt_cursor)) =
+                            (cursor.moveto_target, cursor.btree_cursor.as_mut())
+                        {
+                            match bt_cursor.table_moveto(target, false) {
+                                Ok(0) => {
+                                    cursor.state = CursorState::Valid;
+                                    cursor.rowid = Some(target);
+                                }
+                                Ok(_) | Err(_) => {
+                                    cursor.state = CursorState::Invalid;
+                                    cursor.rowid = None;
+                                }
+                            }
+                        }
+                        cursor.deferred_moveto = false;
+                        cursor.moveto_target = None;
+                    }
+                }
+            }
+
+            Opcode::SortKey | Opcode::Sequence => {
                 // Placeholder: Misc operations
             }
 
@@ -4506,6 +4536,55 @@ mod tests {
         let result = vdbe.step().unwrap();
         assert_eq!(result, ExecResult::Row);
         assert_eq!(vdbe.column_int(0), 1);
+    }
+
+    #[test]
+    fn test_op_finishseek_deferred_rowid() {
+        let mut conn = open_test_connection();
+        let conn_ptr = &mut *conn as *mut SqliteConnection;
+        let btree = conn.main_db().btree.as_ref().unwrap().clone();
+
+        btree.begin_trans(true).unwrap();
+        let root_page = btree.create_table(crate::storage::btree::BTREE_INTKEY).unwrap();
+        let mut insert_cursor = btree
+            .cursor(root_page, BtreeCursorFlags::WRCSR, None)
+            .unwrap();
+        for rowid in [1, 3] {
+            let payload = BtreePayload {
+                key: None,
+                n_key: rowid,
+                data: None,
+                mem: Vec::new(),
+                n_data: 0,
+                n_zero: 0,
+            };
+            btree
+                .insert(&mut insert_cursor, &payload, BtreeInsertFlags::APPEND, 0)
+                .unwrap();
+        }
+
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::FinishSeek, 0, 0, 0),
+            VdbeOp::new(Opcode::Rowid, 0, 1, 0),
+            VdbeOp::new(Opcode::ResultRow, 1, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+        vdbe.set_btree(btree.clone());
+        vdbe.set_connection(conn_ptr);
+        vdbe.open_cursor(0, root_page, false).unwrap();
+        if let Some(cursor) = vdbe.cursor_mut(0) {
+            cursor.btree_cursor = Some(
+                btree
+                    .cursor(root_page, BtreeCursorFlags::WRCSR, None)
+                    .unwrap(),
+            );
+            cursor.deferred_moveto = true;
+            cursor.moveto_target = Some(3);
+        }
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), 3);
     }
 
     #[test]

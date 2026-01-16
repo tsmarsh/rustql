@@ -2854,7 +2854,7 @@ impl Btree {
     }
 
     /// sqlite3BtreeBeginStmt
-    pub fn begin_stmt(&mut self, stmt_id: i32) -> Result<()> {
+    pub fn begin_stmt(&self, stmt_id: i32) -> Result<()> {
         self.savepoint(SavepointOp::Begin, stmt_id)
     }
 
@@ -2904,7 +2904,7 @@ impl Btree {
     }
 
     /// sqlite3BtreeSavepoint
-    pub fn savepoint(&mut self, op: SavepointOp, index: i32) -> Result<()> {
+    pub fn savepoint(&self, op: SavepointOp, index: i32) -> Result<()> {
         let mut shared = self
             .shared
             .write()

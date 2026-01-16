@@ -676,6 +676,8 @@ pub struct SqliteConnection {
     pub transaction_state: TransactionState,
     /// Savepoint stack
     pub savepoints: Vec<String>,
+    /// True if the outermost savepoint started a transaction
+    pub is_transaction_savepoint: bool,
     /// Total changes since connection opened
     pub total_changes: AtomicI64,
     /// Changes from last statement
@@ -752,6 +754,7 @@ impl SqliteConnection {
             auto_vacuum: AutoVacuum::None,
             transaction_state: TransactionState::None,
             savepoints: Vec::new(),
+            is_transaction_savepoint: false,
             total_changes: AtomicI64::new(0),
             changes: AtomicI64::new(0),
             last_insert_rowid: AtomicI64::new(0),

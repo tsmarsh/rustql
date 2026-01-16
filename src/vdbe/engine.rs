@@ -14,7 +14,10 @@ use crate::api::{SqliteConnection, TransactionState};
 use crate::error::{Error, ErrorCode, Result};
 use crate::functions::aggregate::AggregateState;
 use crate::schema::Schema;
-use crate::storage::btree::{BtCursor, Btree, BtreeCursorFlags, BtreeInsertFlags, BtreePayload};
+use crate::storage::btree::{
+    BtCursor, Btree, BtreeCursorFlags, BtreeInsertFlags, BtreePayload,
+};
+use crate::storage::pager::SavepointOp;
 use crate::types::{ColumnType, OpenFlags, Pgno, Value};
 use crate::vdbe::mem::Mem;
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
@@ -2280,6 +2283,7 @@ impl Vdbe {
                     conn.transaction_state = TransactionState::None;
                     conn.autocommit.store(true, AtomicOrdering::SeqCst);
                     conn.savepoints.clear();
+                    conn.is_transaction_savepoint = false;
                     self.deferred_fk_counter = 0;
                     // Allow subsequent Halt opcode to finish the statement.
                 }
@@ -2302,6 +2306,7 @@ impl Vdbe {
                             conn.transaction_state = TransactionState::None;
                             conn.autocommit.store(true, AtomicOrdering::SeqCst);
                             conn.savepoints.clear();
+                            conn.is_transaction_savepoint = false;
                             self.deferred_fk_counter = 0;
                             return Err(Error::with_message(
                                 ErrorCode::Abort,
@@ -2315,6 +2320,7 @@ impl Vdbe {
                     conn.transaction_state = TransactionState::None;
                     conn.autocommit.store(true, AtomicOrdering::SeqCst);
                     conn.savepoints.clear();
+                    conn.is_transaction_savepoint = false;
                 } else {
                     conn.autocommit.store(false, AtomicOrdering::SeqCst);
                 }
@@ -2930,7 +2936,103 @@ impl Vdbe {
                 // Placeholder: Schema cookie operations
             }
 
-            Opcode::Savepoint | Opcode::Checkpoint => {
+            Opcode::Savepoint => {
+                let name = match &op.p4 {
+                    P4::Text(text) => text.as_str(),
+                    _ => {
+                        return Err(Error::with_message(
+                            ErrorCode::Error,
+                            "savepoint requires a name",
+                        ));
+                    }
+                };
+                let Some(conn_ptr) = self.conn_ptr else {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        "missing connection for savepoint",
+                    ));
+                };
+                let conn = unsafe { &mut *conn_ptr };
+                let Some(ref btree) = self.btree else {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        "missing btree for savepoint",
+                    ));
+                };
+
+                match op.p1 {
+                    0 => {
+                        if conn.autocommit.load(AtomicOrdering::SeqCst) {
+                            conn.autocommit.store(false, AtomicOrdering::SeqCst);
+                            conn.is_transaction_savepoint = true;
+                            if conn.transaction_state == TransactionState::None {
+                                btree.begin_trans(false)?;
+                                conn.transaction_state = TransactionState::Read;
+                            }
+                        }
+                        let idx = conn.savepoints.len() as i32;
+                        btree.savepoint(SavepointOp::Begin, idx)?;
+                        conn.savepoints.push(name.to_string());
+                    }
+                    1 | 2 => {
+                        let pos = conn
+                            .savepoints
+                            .iter()
+                            .rposition(|sp| sp.eq_ignore_ascii_case(name));
+                        let Some(pos) = pos else {
+                            return Err(Error::with_message(
+                                ErrorCode::Error,
+                                format!("no such savepoint: {}", name),
+                            ));
+                        };
+                        let idx = pos as i32;
+                        if op.p1 == 1 {
+                            btree.savepoint(SavepointOp::Release, idx)?;
+                            conn.savepoints.truncate(pos);
+                            if conn.savepoints.is_empty() && conn.is_transaction_savepoint {
+                                if self.deferred_fk_counter > 0 {
+                                    return Err(Error::with_message(
+                                        ErrorCode::Constraint,
+                                        "foreign key constraint failed",
+                                    ));
+                                }
+                                if let Some(hook) = conn.commit_hook.as_ref() {
+                                    if hook() {
+                                        let _ = btree.rollback(0, false);
+                                        if let Some(hook) = conn.rollback_hook.as_ref() {
+                                            hook();
+                                        }
+                                        conn.transaction_state = TransactionState::None;
+                                        conn.autocommit.store(true, AtomicOrdering::SeqCst);
+                                        conn.is_transaction_savepoint = false;
+                                        self.deferred_fk_counter = 0;
+                                        return Err(Error::with_message(
+                                            ErrorCode::Abort,
+                                            "commit hook aborted transaction",
+                                        ));
+                                    }
+                                }
+                                btree.commit()?;
+                                conn.transaction_state = TransactionState::None;
+                                conn.autocommit.store(true, AtomicOrdering::SeqCst);
+                                conn.is_transaction_savepoint = false;
+                            }
+                        } else {
+                            btree.savepoint(SavepointOp::Rollback, idx)?;
+                            conn.savepoints.truncate(pos + 1);
+                            self.deferred_fk_counter = 0;
+                        }
+                    }
+                    _ => {
+                        return Err(Error::with_message(
+                            ErrorCode::Error,
+                            "invalid savepoint operation",
+                        ));
+                    }
+                }
+            }
+
+            Opcode::Checkpoint => {
                 // Placeholder: Savepoint operations
             }
 
@@ -3725,6 +3827,52 @@ mod tests {
         assert_eq!(conn.transaction_state, TransactionState::Write);
         assert_eq!(btree.txn_state(), TransState::Write);
         assert!(conn.get_autocommit());
+    }
+
+    #[test]
+    fn test_op_savepoint_begin_release() {
+        let mut conn = open_test_connection();
+        let conn_ptr = &mut *conn as *mut SqliteConnection;
+        let btree = conn.main_db().btree.as_ref().unwrap().clone();
+
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp {
+                opcode: Opcode::Savepoint,
+                p1: 0,
+                p2: 0,
+                p3: 0,
+                p4: P4::Text("sp1".to_string()),
+                p5: 0,
+                comment: None,
+            },
+            VdbeOp::new(Opcode::Integer, 1, 1, 0),
+            VdbeOp::new(Opcode::ResultRow, 1, 1, 0),
+            VdbeOp {
+                opcode: Opcode::Savepoint,
+                p1: 1,
+                p2: 0,
+                p3: 0,
+                p4: P4::Text("sp1".to_string()),
+                p5: 0,
+                comment: None,
+            },
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+        vdbe.set_btree(btree.clone());
+        vdbe.set_connection(conn_ptr);
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert!(!conn.get_autocommit());
+        assert_eq!(conn.savepoints.len(), 1);
+        assert!(conn.is_transaction_savepoint);
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Done);
+        assert!(conn.get_autocommit());
+        assert_eq!(conn.savepoints.len(), 0);
+        assert!(!conn.is_transaction_savepoint);
+        assert_eq!(conn.transaction_state, TransactionState::None);
     }
 
     #[test]

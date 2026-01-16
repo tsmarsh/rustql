@@ -1079,34 +1079,84 @@ impl Vdbe {
             }
 
             Opcode::Lt => {
-                // Lt P1, P2, P3: jump to P2 if r[P1] < r[P3]
-                let cmp = self.mem(op.p1).compare(self.mem(op.p3));
-                if cmp == Ordering::Less {
-                    self.pc = op.p2;
+                // Lt P1 P2 P3 * P5: jump to P2 if r[P3] < r[P1]
+                // Note: SQLite semantics compare P3 vs P1 (not P1 vs P3)
+                use crate::vdbe::ops::cmp_flags;
+
+                let left = self.mem(op.p3);
+                let right = self.mem(op.p1);
+                let jumpifnull = (op.p5 & cmp_flags::JUMPIFNULL) != 0;
+
+                if left.is_null() || right.is_null() {
+                    if jumpifnull {
+                        self.pc = op.p2;
+                    }
+                    // Otherwise: standard SQL - result is unknown, no jump
+                } else {
+                    let cmp = left.compare(right);
+                    if cmp == Ordering::Less {
+                        self.pc = op.p2;
+                    }
                 }
             }
 
             Opcode::Le => {
-                // Le P1, P2, P3: jump to P2 if r[P1] <= r[P3]
-                let cmp = self.mem(op.p1).compare(self.mem(op.p3));
-                if cmp != Ordering::Greater {
-                    self.pc = op.p2;
+                // Le P1 P2 P3 * P5: jump to P2 if r[P3] <= r[P1]
+                use crate::vdbe::ops::cmp_flags;
+
+                let left = self.mem(op.p3);
+                let right = self.mem(op.p1);
+                let jumpifnull = (op.p5 & cmp_flags::JUMPIFNULL) != 0;
+
+                if left.is_null() || right.is_null() {
+                    if jumpifnull {
+                        self.pc = op.p2;
+                    }
+                } else {
+                    let cmp = left.compare(right);
+                    if cmp != Ordering::Greater {
+                        self.pc = op.p2;
+                    }
                 }
             }
 
             Opcode::Gt => {
-                // Gt P1, P2, P3: jump to P2 if r[P1] > r[P3]
-                let cmp = self.mem(op.p1).compare(self.mem(op.p3));
-                if cmp == Ordering::Greater {
-                    self.pc = op.p2;
+                // Gt P1 P2 P3 * P5: jump to P2 if r[P3] > r[P1]
+                use crate::vdbe::ops::cmp_flags;
+
+                let left = self.mem(op.p3);
+                let right = self.mem(op.p1);
+                let jumpifnull = (op.p5 & cmp_flags::JUMPIFNULL) != 0;
+
+                if left.is_null() || right.is_null() {
+                    if jumpifnull {
+                        self.pc = op.p2;
+                    }
+                } else {
+                    let cmp = left.compare(right);
+                    if cmp == Ordering::Greater {
+                        self.pc = op.p2;
+                    }
                 }
             }
 
             Opcode::Ge => {
-                // Ge P1, P2, P3: jump to P2 if r[P1] >= r[P3]
-                let cmp = self.mem(op.p1).compare(self.mem(op.p3));
-                if cmp != Ordering::Less {
-                    self.pc = op.p2;
+                // Ge P1 P2 P3 * P5: jump to P2 if r[P3] >= r[P1]
+                use crate::vdbe::ops::cmp_flags;
+
+                let left = self.mem(op.p3);
+                let right = self.mem(op.p1);
+                let jumpifnull = (op.p5 & cmp_flags::JUMPIFNULL) != 0;
+
+                if left.is_null() || right.is_null() {
+                    if jumpifnull {
+                        self.pc = op.p2;
+                    }
+                } else {
+                    let cmp = left.compare(right);
+                    if cmp != Ordering::Less {
+                        self.pc = op.p2;
+                    }
                 }
             }
 
@@ -2056,7 +2106,8 @@ impl Vdbe {
                                                 Ok(mem) => {
                                                     *self.mem_mut(op.p3) = mem;
                                                     if let Some(affinity) = affinity {
-                                                        self.mem_mut(op.p3).apply_affinity(affinity);
+                                                        self.mem_mut(op.p3)
+                                                            .apply_affinity(affinity);
                                                     }
                                                 }
                                                 Err(_) => self.mem_mut(op.p3).set_null(),
@@ -2091,20 +2142,20 @@ impl Vdbe {
                                         } else {
                                             &[][..]
                                         };
-                                    match crate::vdbe::auxdata::deserialize_value(
-                                        col_data, col_type,
-                                    ) {
-                                        Ok(mem) => {
-                                            *self.mem_mut(op.p3) = mem;
-                                            if let Some(affinity) = affinity {
-                                                self.mem_mut(op.p3).apply_affinity(affinity);
+                                        match crate::vdbe::auxdata::deserialize_value(
+                                            col_data, col_type,
+                                        ) {
+                                            Ok(mem) => {
+                                                *self.mem_mut(op.p3) = mem;
+                                                if let Some(affinity) = affinity {
+                                                    self.mem_mut(op.p3).apply_affinity(affinity);
+                                                }
                                             }
+                                            Err(_) => self.mem_mut(op.p3).set_null(),
                                         }
-                                        Err(_) => self.mem_mut(op.p3).set_null(),
                                     }
-                                }
-                            } else {
-                                self.mem_mut(op.p3).set_null();
+                                } else {
+                                    self.mem_mut(op.p3).set_null();
                                 }
                             }
                             Err(_) => self.mem_mut(op.p3).set_null(),
@@ -2726,8 +2777,7 @@ impl Vdbe {
                         conn.changes.fetch_add(1, AtomicOrdering::SeqCst);
                         conn.total_changes.fetch_add(1, AtomicOrdering::SeqCst);
                         if (op.p5 & OPFLAG_LASTROWID) != 0 {
-                            conn.last_insert_rowid
-                                .store(rowid, AtomicOrdering::SeqCst);
+                            conn.last_insert_rowid.store(rowid, AtomicOrdering::SeqCst);
                         }
                     }
                 }
@@ -3071,7 +3121,7 @@ impl Vdbe {
                 }
             }
 
-            | Opcode::SeekLT => {
+            Opcode::SeekLT => {
                 let mut jump = true;
                 let index_key = self.mem(op.p3).to_blob();
                 let rowid_key = self.mem(op.p3).to_int();
@@ -3106,7 +3156,7 @@ impl Vdbe {
                 }
             }
 
-            | Opcode::SeekNull => {
+            Opcode::SeekNull => {
                 // SeekNull P1 P2 P3 P4: Jump to P2 if any key register is NULL.
                 let count = match op.p4 {
                     P4::Int64(v) => v as i32,
@@ -3472,7 +3522,8 @@ impl Vdbe {
                 } else {
                     let below = val.compare(low) == Ordering::Less;
                     let above = val.compare(high) == Ordering::Greater;
-                    self.mem_mut(op.p2).set_int(if below || above { 0 } else { 1 });
+                    self.mem_mut(op.p2)
+                        .set_int(if below || above { 0 } else { 1 });
                 }
             }
 
@@ -3895,7 +3946,8 @@ impl Vdbe {
                 // P3 = jump destination if trigger should NOT fire
                 //
                 // For now, always skip (jump to P3) - triggers are disabled
-                self.pc = op.p3 - 1;
+                // Note: pc was already incremented at start of exec_op, so no -1 needed
+                self.pc = op.p3;
             }
 
             Opcode::TriggerProlog => {
@@ -4266,7 +4318,9 @@ mod tests {
         let btree = conn.main_db().btree.as_ref().unwrap().clone();
 
         btree.begin_trans(true).unwrap();
-        let root_page = btree.create_table(crate::storage::btree::BTREE_INTKEY).unwrap();
+        let root_page = btree
+            .create_table(crate::storage::btree::BTREE_INTKEY)
+            .unwrap();
         let mut cursor = btree
             .cursor(root_page, BtreeCursorFlags::WRCSR, None)
             .unwrap();
@@ -4307,7 +4361,9 @@ mod tests {
         let btree = conn.main_db().btree.as_ref().unwrap().clone();
 
         btree.begin_trans(true).unwrap();
-        let root_page = btree.create_table(crate::storage::btree::BTREE_INTKEY).unwrap();
+        let root_page = btree
+            .create_table(crate::storage::btree::BTREE_INTKEY)
+            .unwrap();
         let mut cursor = btree
             .cursor(root_page, BtreeCursorFlags::WRCSR, None)
             .unwrap();
@@ -4348,7 +4404,9 @@ mod tests {
         let btree = conn.main_db().btree.as_ref().unwrap().clone();
 
         btree.begin_trans(true).unwrap();
-        let root_page = btree.create_table(crate::storage::btree::BTREE_INTKEY).unwrap();
+        let root_page = btree
+            .create_table(crate::storage::btree::BTREE_INTKEY)
+            .unwrap();
         let mut cursor = btree
             .cursor(root_page, BtreeCursorFlags::WRCSR, None)
             .unwrap();
@@ -4389,7 +4447,9 @@ mod tests {
         let btree = conn.main_db().btree.as_ref().unwrap().clone();
 
         btree.begin_trans(true).unwrap();
-        let root_page = btree.create_table(crate::storage::btree::BTREE_INTKEY).unwrap();
+        let root_page = btree
+            .create_table(crate::storage::btree::BTREE_INTKEY)
+            .unwrap();
         let mut cursor = btree
             .cursor(root_page, BtreeCursorFlags::WRCSR, None)
             .unwrap();
@@ -4500,7 +4560,9 @@ mod tests {
         let btree = conn.main_db().btree.as_ref().unwrap().clone();
 
         btree.begin_trans(true).unwrap();
-        let root_page = btree.create_table(crate::storage::btree::BTREE_INTKEY).unwrap();
+        let root_page = btree
+            .create_table(crate::storage::btree::BTREE_INTKEY)
+            .unwrap();
         let mut cursor = btree
             .cursor(root_page, BtreeCursorFlags::WRCSR, None)
             .unwrap();
@@ -4616,12 +4678,13 @@ mod tests {
 
     #[test]
     fn test_vdbe_comparison() {
-        // Test Lt: if 5 < 10, jump
+        // Test Lt: SQLite semantics are Lt P1 P2 P3 = jump if r[P3] < r[P1]
+        // So: Lt 1, 5, 2 means jump if r[2] < r[1] = 5 < 10 = true
         let mut vdbe = Vdbe::from_ops(vec![
             VdbeOp::new(Opcode::Integer, 10, 1, 0), // r1 = 10
             VdbeOp::new(Opcode::Integer, 5, 2, 0),  // r2 = 5
-            VdbeOp::new(Opcode::Lt, 2, 5, 1),       // if r[2] < r[1] (5 < 10), goto 5
-            VdbeOp::new(Opcode::Integer, 0, 3, 0),  // r3 = 0 (not taken)
+            VdbeOp::new(Opcode::Lt, 1, 5, 2), // if r[P3] < r[P1] = r[2] < r[1] = 5 < 10, goto 5
+            VdbeOp::new(Opcode::Integer, 0, 3, 0), // r3 = 0 (not taken)
             VdbeOp::new(Opcode::Goto, 0, 6, 0),
             VdbeOp::new(Opcode::Integer, 1, 3, 0), // r3 = 1 (taken)
             VdbeOp::new(Opcode::ResultRow, 3, 1, 0),

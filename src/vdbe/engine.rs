@@ -3359,7 +3359,25 @@ impl Vdbe {
                 }
             }
 
-            Opcode::ReadCookie | Opcode::SetCookie | Opcode::VerifyCookie => {
+            Opcode::ReadCookie => {
+                // ReadCookie P1 P2 P3: read meta cookie P3 into register P2
+                if op.p1 != 0 {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        "unsupported database index",
+                    ));
+                }
+                let Some(ref btree) = self.btree else {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        "missing btree for ReadCookie",
+                    ));
+                };
+                let cookie = btree.get_meta(op.p3 as usize)? as i64;
+                self.mem_mut(op.p2).set_int(cookie);
+            }
+
+            Opcode::SetCookie | Opcode::VerifyCookie => {
                 // Placeholder: Schema cookie operations
             }
 
@@ -5148,6 +5166,33 @@ mod tests {
         assert_eq!(result, ExecResult::Row);
         assert_eq!(vdbe.column_int(0), 10);
         assert_eq!(vdbe.column_int(1), 20);
+    }
+
+    #[test]
+    fn test_op_readcookie_schema_version() {
+        let mut conn = open_test_connection();
+        let conn_ptr = &mut *conn as *mut SqliteConnection;
+        let btree = conn.main_db().btree.as_ref().unwrap().clone();
+        let expected = btree
+            .get_meta(crate::storage::btree::BTREE_SCHEMA_VERSION)
+            .unwrap() as i64;
+
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(
+                Opcode::ReadCookie,
+                0,
+                1,
+                crate::storage::btree::BTREE_SCHEMA_VERSION as i32,
+            ),
+            VdbeOp::new(Opcode::ResultRow, 1, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+        vdbe.set_btree(btree);
+        vdbe.set_connection(conn_ptr);
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), expected);
     }
 
     #[test]

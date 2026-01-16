@@ -2870,7 +2870,19 @@ impl Vdbe {
                 // Placeholder: These need btree integration for index operations
             }
 
-            Opcode::OpenPseudo | Opcode::OpenAutoindex | Opcode::ResetSorter => {
+            Opcode::OpenAutoindex => {
+                self.open_cursor(op.p1, 0, true)?;
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    cursor.is_ephemeral = true;
+                    cursor.is_index = true;
+                    cursor.n_field = op.p2;
+                    cursor.ephemeral_set.clear();
+                    cursor.ephemeral_rows.clear();
+                    cursor.ephemeral_index = 0;
+                }
+            }
+
+            Opcode::OpenPseudo | Opcode::ResetSorter => {
                 // Placeholder: Other sorter-related operations
             }
 
@@ -3881,6 +3893,33 @@ mod tests {
         assert_eq!(conn.savepoints.len(), 0);
         assert!(!conn.is_transaction_savepoint);
         assert_eq!(conn.transaction_state, TransactionState::None);
+    }
+
+    #[test]
+    fn test_op_openautoindex_found() {
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::OpenAutoindex, 0, 1, 0),
+            VdbeOp {
+                opcode: Opcode::Blob,
+                p1: 0,
+                p2: 1,
+                p3: 0,
+                p4: P4::Blob(vec![1, 2, 3]),
+                p5: 0,
+                comment: None,
+            },
+            VdbeOp::new(Opcode::IdxInsert, 0, 1, 0),
+            VdbeOp::new(Opcode::Found, 0, 6, 1),
+            VdbeOp::new(Opcode::Integer, 0, 2, 0),
+            VdbeOp::new(Opcode::Goto, 0, 7, 0),
+            VdbeOp::new(Opcode::Integer, 1, 2, 0),
+            VdbeOp::new(Opcode::ResultRow, 2, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), 1);
     }
 
     #[test]

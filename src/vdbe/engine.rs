@@ -3638,7 +3638,12 @@ impl Vdbe {
             }
 
             Opcode::IfNullRow => {
-                // Placeholder: Advanced control flow
+                // IfNullRow P1 P2: jump to P2 if cursor P1 is in NULL row state
+                if let Some(cursor) = self.cursor(op.p1) {
+                    if cursor.null_row {
+                        self.pc = op.p2;
+                    }
+                }
             }
 
             // ================================================================
@@ -5085,6 +5090,24 @@ mod tests {
         let result = vdbe.step().unwrap();
         assert_eq!(result, ExecResult::Row);
         assert_eq!(vdbe.column_int(0), 99);
+    }
+
+    #[test]
+    fn test_op_ifnullrow_jumps() {
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::NullRow, 0, 0, 0),
+            VdbeOp::new(Opcode::IfNullRow, 0, 4, 0),
+            VdbeOp::new(Opcode::Integer, 0, 1, 0),
+            VdbeOp::new(Opcode::Goto, 0, 5, 0),
+            VdbeOp::new(Opcode::Integer, 1, 1, 0),
+            VdbeOp::new(Opcode::ResultRow, 1, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+        vdbe.open_cursor(0, 0, false).unwrap();
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), 1);
     }
 
     #[test]

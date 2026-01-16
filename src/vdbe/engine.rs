@@ -37,8 +37,24 @@ const DEFAULT_MEM_SIZE: usize = 128;
 
 /// Default number of cursor slots
 const DEFAULT_CURSOR_SLOTS: usize = 16;
+
+// OPFLAG constants (from SQLite's vdbe.h)
 const OPFLAG_NCHANGE: u16 = 0x01;
 const OPFLAG_LASTROWID: u16 = 0x20;
+const OPFLAG_ISUPDATE: u16 = 0x04;
+const OPFLAG_APPEND: u16 = 0x08;
+
+// Conflict resolution modes (from SQLite's sqlite.h - OE_* constants)
+// These are encoded in bits 0-4 of P5 for Insert/Update/Delete
+const OE_NONE: u8 = 0;
+const OE_ROLLBACK: u8 = 1;
+const OE_ABORT: u8 = 2; // Default
+const OE_FAIL: u8 = 3;
+const OE_IGNORE: u8 = 4;
+const OE_REPLACE: u8 = 5;
+
+// Mask to extract conflict resolution from P5
+const OE_MASK: u8 = 0x1F;
 
 // ============================================================================
 // Execution Result
@@ -947,11 +963,12 @@ impl Vdbe {
             }
 
             Opcode::DecrJumpZero => {
-                // DecrJumpZero P1 P2: Decrement r[P1], jump to P2 if it becomes zero or less
+                // DecrJumpZero P1 P2: Decrement r[P1], jump to P2 if it becomes exactly zero
+                // SQLite vdbe.c: if( pIn1->u.i==0 ) goto jump_to_p2;
                 let val = self.mem(op.p1).to_int();
                 let new_val = val - 1;
                 self.mem_mut(op.p1).set_int(new_val);
-                if new_val <= 0 {
+                if new_val == 0 {
                     self.pc = op.p2;
                 }
             }
@@ -2752,25 +2769,88 @@ impl Vdbe {
                         // Actually insert into btree
                         if let Some(ref btree) = btree_arc {
                             if let Some(ref mut bt_cursor) = cursor.btree_cursor {
-                                // Create payload with record data
-                                let payload = BtreePayload {
-                                    key: None, // Table insert, not index
-                                    n_key: rowid,
-                                    data: Some(record_data.clone()),
-                                    mem: Vec::new(),
-                                    n_data: record_data.len() as i32,
-                                    n_zero: 0,
-                                };
+                                // Extract conflict resolution mode from P5 (lower 5 bits)
+                                let on_error = (op.p5 as u8) & OE_MASK;
 
-                                // Insert flags from P5 (lower 8 bits)
-                                let flags = BtreeInsertFlags::from_bits_truncate(op.p5 as u8);
+                                // Check if rowid already exists (for conflict detection)
+                                let mut row_exists = false;
+                                if on_error != OE_NONE {
+                                    if let Ok(res) = bt_cursor.table_moveto(rowid, false) {
+                                        row_exists = res == 0; // 0 = exact match found
+                                    }
+                                }
 
-                                // Perform the insert
-                                if let Err(e) = btree.insert(bt_cursor, &payload, flags, 0) {
-                                    // Log error but continue for now
-                                    eprintln!("Insert failed: {:?}", e);
-                                } else {
-                                    inserted = true;
+                                // Handle conflict based on resolution mode
+                                let mut skip_insert = false;
+                                if row_exists {
+                                    match on_error {
+                                        OE_IGNORE => {
+                                            // Skip the insert silently
+                                            skip_insert = true;
+                                        }
+                                        OE_REPLACE => {
+                                            // Delete existing row first
+                                            let del_flags = BtreeInsertFlags::empty();
+                                            let _ = btree.delete(bt_cursor, del_flags);
+                                        }
+                                        OE_ABORT | OE_FAIL => {
+                                            // Return constraint violation error
+                                            let table_name = match &op.p4 {
+                                                P4::Text(s) => s.as_str(),
+                                                _ => "table",
+                                            };
+                                            return Err(Error::with_message(
+                                                ErrorCode::Constraint,
+                                                format!(
+                                                    "UNIQUE constraint failed: {}.rowid",
+                                                    table_name
+                                                ),
+                                            ));
+                                        }
+                                        OE_ROLLBACK => {
+                                            // Rollback and return error
+                                            // TODO: Actually rollback the transaction
+                                            let table_name = match &op.p4 {
+                                                P4::Text(s) => s.as_str(),
+                                                _ => "table",
+                                            };
+                                            return Err(Error::with_message(
+                                                ErrorCode::Constraint,
+                                                format!(
+                                                    "UNIQUE constraint failed: {}.rowid",
+                                                    table_name
+                                                ),
+                                            ));
+                                        }
+                                        _ => {
+                                            // OE_NONE or unknown - proceed with insert (overwrite)
+                                        }
+                                    }
+                                }
+
+                                if !skip_insert {
+                                    // Create payload with record data
+                                    let payload = BtreePayload {
+                                        key: None, // Table insert, not index
+                                        n_key: rowid,
+                                        data: Some(record_data.clone()),
+                                        mem: Vec::new(),
+                                        n_data: record_data.len() as i32,
+                                        n_zero: 0,
+                                    };
+
+                                    // Insert flags from P5 (exclude conflict resolution bits)
+                                    let flags = BtreeInsertFlags::from_bits_truncate(
+                                        (op.p5 as u8) & !OE_MASK,
+                                    );
+
+                                    // Perform the insert
+                                    if let Err(e) = btree.insert(bt_cursor, &payload, flags, 0) {
+                                        // Log error but continue for now
+                                        eprintln!("Insert failed: {:?}", e);
+                                    } else {
+                                        inserted = true;
+                                    }
                                 }
                             }
                         }

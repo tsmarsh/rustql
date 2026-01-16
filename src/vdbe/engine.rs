@@ -3268,7 +3268,28 @@ impl Vdbe {
                 }
             }
 
-            Opcode::OpenPseudo | Opcode::ResetSorter => {
+            Opcode::OpenPseudo => {
+                // OpenPseudo P1 P2 P3: pseudo cursor for single row in register P2
+                self.open_cursor(op.p1, 0, false)?;
+                let row_data = if op.p2 > 0 {
+                    Some(self.mem(op.p2).to_blob())
+                } else {
+                    None
+                };
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    cursor.n_field = op.p3;
+                    if let Some(data) = row_data {
+                        cursor.row_data = Some(data);
+                        cursor.null_row = false;
+                    } else {
+                        cursor.row_data = None;
+                        cursor.null_row = true;
+                    }
+                    cursor.state = CursorState::Valid;
+                }
+            }
+
+            Opcode::ResetSorter => {
                 // Placeholder: Other sorter-related operations
             }
 
@@ -5108,6 +5129,25 @@ mod tests {
         let result = vdbe.step().unwrap();
         assert_eq!(result, ExecResult::Row);
         assert_eq!(vdbe.column_int(0), 1);
+    }
+
+    #[test]
+    fn test_op_openpseudo_reads_columns() {
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::Integer, 10, 1, 0),
+            VdbeOp::new(Opcode::Integer, 20, 2, 0),
+            VdbeOp::new(Opcode::MakeRecord, 1, 2, 3),
+            VdbeOp::new(Opcode::OpenPseudo, 0, 3, 2),
+            VdbeOp::new(Opcode::Column, 0, 0, 4),
+            VdbeOp::new(Opcode::Column, 0, 1, 5),
+            VdbeOp::new(Opcode::ResultRow, 4, 2, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), 10);
+        assert_eq!(vdbe.column_int(1), 20);
     }
 
     #[test]

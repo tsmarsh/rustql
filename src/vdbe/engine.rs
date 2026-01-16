@@ -3361,7 +3361,50 @@ impl Vdbe {
             }
 
             Opcode::SorterCompare => {
-                // Placeholder: Sorter comparison
+                // SorterCompare P1 P2 P3 P4: jump if sorter key != record key
+                let n_key_cols = match op.p4 {
+                    P4::Int64(v) => v as usize,
+                    _ => 0,
+                };
+                if n_key_cols != 0 {
+                    if let Some(cursor) = self.cursor(op.p1) {
+                        if cursor.sorter_index < cursor.sorter_data.len() {
+                            let sorter_record = &cursor.sorter_data[cursor.sorter_index];
+                            let record = self.mem(op.p3).to_blob();
+
+                            let sorter_mems = self.decode_record_mems(sorter_record);
+                            let record_mems = self.decode_record_mems(&record);
+                            let mut has_null = false;
+                            for i in 0..n_key_cols {
+                                if sorter_mems
+                                    .get(i)
+                                    .map_or(false, |mem| mem.is_null())
+                                    || record_mems.get(i).map_or(false, |mem| mem.is_null())
+                                {
+                                    has_null = true;
+                                    break;
+                                }
+                            }
+
+                            if !has_null {
+                                let null_mem = Mem::new();
+                                let mut cmp = std::cmp::Ordering::Equal;
+                                for i in 0..n_key_cols {
+                                    let left = sorter_mems.get(i).unwrap_or(&null_mem);
+                                    let right = record_mems.get(i).unwrap_or(&null_mem);
+                                    let col_cmp = left.compare(right);
+                                    if col_cmp != std::cmp::Ordering::Equal {
+                                        cmp = col_cmp;
+                                        break;
+                                    }
+                                }
+                                if cmp != std::cmp::Ordering::Equal {
+                                    self.pc = op.p2;
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             Opcode::SorterConfig => {
@@ -5341,6 +5384,44 @@ mod tests {
             VdbeOp::new(Opcode::Goto, 0, 9, 0),
             VdbeOp::new(Opcode::Integer, 1, 3, 0),
             VdbeOp::new(Opcode::ResultRow, 3, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), 1);
+    }
+
+    #[test]
+    fn test_op_sortercompare_jumps_on_mismatch() {
+        let record7 = crate::vdbe::auxdata::make_record(&[Mem::from_int(7)], 0, 1);
+        let record8 = crate::vdbe::auxdata::make_record(&[Mem::from_int(8)], 0, 1);
+        assert_ne!(
+            compare_records(&record7, &record8, 1, &[]),
+            std::cmp::Ordering::Equal
+        );
+
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::OpenEphemeral, 0, 1, 0),
+            VdbeOp::new(Opcode::Integer, 7, 1, 0),
+            VdbeOp::new(Opcode::MakeRecord, 1, 1, 2),
+            VdbeOp::new(Opcode::SorterInsert, 0, 2, 0),
+            VdbeOp::new(Opcode::SorterSort, 0, 11, 0),
+            VdbeOp::new(Opcode::Integer, 8, 3, 0),
+            VdbeOp::new(Opcode::MakeRecord, 3, 1, 4),
+            VdbeOp {
+                opcode: Opcode::SorterCompare,
+                p1: 0,
+                p2: 10,
+                p3: 4,
+                p4: P4::Int64(1),
+                p5: 0,
+                comment: None,
+            },
+            VdbeOp::new(Opcode::Integer, 0, 5, 0),
+            VdbeOp::new(Opcode::Goto, 0, 11, 0),
+            VdbeOp::new(Opcode::Integer, 1, 5, 0),
+            VdbeOp::new(Opcode::ResultRow, 5, 1, 0),
             VdbeOp::new(Opcode::Halt, 0, 0, 0),
         ]);
 

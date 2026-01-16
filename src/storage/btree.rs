@@ -1,7 +1,7 @@
 //! B-tree implementation
 
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 
 use bitflags::bitflags;
@@ -155,7 +155,7 @@ bitflags! {
 pub struct Btree {
     pub db: Option<Arc<dyn Connection>>,
     pub shared: Arc<RwLock<BtShared>>,
-    pub in_trans: TransState,
+    pub in_trans: AtomicU8,
     pub sharable: bool,
     pub locked: bool,
     pub has_incrblob_cur: bool,
@@ -2179,7 +2179,7 @@ impl Btree {
         Ok(Arc::new(Btree {
             db,
             shared: Arc::new(RwLock::new(shared)),
-            in_trans: TransState::None,
+            in_trans: AtomicU8::new(TransState::None as u8),
             sharable: false,
             locked: false,
             has_incrblob_cur: false,
@@ -2375,7 +2375,7 @@ impl Btree {
     }
 
     /// sqlite3BtreeBeginTrans
-    pub fn begin_trans(&mut self, write: bool) -> Result<()> {
+    pub fn begin_trans(&self, write: bool) -> Result<()> {
         let mut shared = self
             .shared
             .write()
@@ -2387,21 +2387,18 @@ impl Btree {
             shared.pager.shared_lock()?;
             shared.in_transaction = TransState::Read;
         }
-        self.in_trans = shared.in_transaction;
+        self.in_trans
+            .store(shared.in_transaction as u8, Ordering::SeqCst);
         Ok(())
     }
 
     /// sqlite3BtreeBeginTrans with schema flag
-    pub fn begin_trans_with_schema(
-        &mut self,
-        write: bool,
-        _schema_modified: &mut i32,
-    ) -> Result<()> {
+    pub fn begin_trans_with_schema(&self, write: bool, _schema_modified: &mut i32) -> Result<()> {
         self.begin_trans(write)
     }
 
     /// sqlite3BtreeCommitPhaseOne
-    pub fn commit_phase_one(&mut self, super_journal: Option<&str>) -> Result<()> {
+    pub fn commit_phase_one(&self, super_journal: Option<&str>) -> Result<()> {
         let mut shared = self
             .shared
             .write()
@@ -2411,19 +2408,20 @@ impl Btree {
     }
 
     /// sqlite3BtreeCommitPhaseTwo
-    pub fn commit_phase_two(&mut self, _cleanup: bool) -> Result<()> {
+    pub fn commit_phase_two(&self, _cleanup: bool) -> Result<()> {
         let mut shared = self
             .shared
             .write()
             .map_err(|_| Error::new(ErrorCode::Internal))?;
         shared.pager.commit_phase_two()?;
         shared.in_transaction = TransState::None;
-        self.in_trans = TransState::None;
+        self.in_trans
+            .store(TransState::None as u8, Ordering::SeqCst);
         Ok(())
     }
 
     /// sqlite3BtreeCommit
-    pub fn commit(&mut self) -> Result<()> {
+    pub fn commit(&self) -> Result<()> {
         self.commit_phase_one(None)?;
         self.commit_phase_two(false)
     }
@@ -2436,18 +2434,21 @@ impl Btree {
         shared.pager.commit_phase_one(None)?;
         shared.pager.commit_phase_two()?;
         shared.in_transaction = TransState::None;
+        self.in_trans
+            .store(TransState::None as u8, Ordering::SeqCst);
         Ok(())
     }
 
     /// sqlite3BtreeRollback
-    pub fn rollback(&mut self, _trip_code: i32, _write_only: bool) -> Result<()> {
+    pub fn rollback(&self, _trip_code: i32, _write_only: bool) -> Result<()> {
         let mut shared = self
             .shared
             .write()
             .map_err(|_| Error::new(ErrorCode::Internal))?;
         shared.pager.rollback()?;
         shared.in_transaction = TransState::None;
-        self.in_trans = TransState::None;
+        self.in_trans
+            .store(TransState::None as u8, Ordering::SeqCst);
         Ok(())
     }
 
@@ -2859,7 +2860,11 @@ impl Btree {
 
     /// sqlite3BtreeTxnState
     pub fn txn_state(&self) -> TransState {
-        self.in_trans
+        match self.in_trans.load(Ordering::SeqCst) {
+            1 => TransState::Read,
+            2 => TransState::Write,
+            _ => TransState::None,
+        }
     }
 
     /// sqlite3BtreeIsInBackup

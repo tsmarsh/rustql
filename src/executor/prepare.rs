@@ -1387,7 +1387,7 @@ impl<'s> StatementCompiler<'s> {
                 P4::Text(savepoint.clone()),
             ));
         } else {
-            ops.push(Self::make_op(Opcode::AutoCommit, 2, 0, 0, P4::Unused));
+            ops.push(Self::make_op(Opcode::AutoCommit, 1, 1, 0, P4::Unused));
         }
 
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));

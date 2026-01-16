@@ -6,9 +6,11 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use crate::api::{SqliteConnection, TransactionState};
 use crate::error::{Error, ErrorCode, Result};
 use crate::functions::aggregate::AggregateState;
 use crate::schema::Schema;
@@ -303,6 +305,9 @@ pub struct Vdbe {
     /// Schema for main database (for DDL operations)
     schema: Option<Arc<RwLock<Schema>>>,
 
+    /// Connection pointer for transaction/autocommit state
+    conn_ptr: Option<*mut SqliteConnection>,
+
     /// Deferred foreign key violation counter
     deferred_fk_counter: i64,
 
@@ -378,6 +383,7 @@ impl Vdbe {
             column_names: Vec::new(),
             btree: None,
             schema: None,
+            conn_ptr: None,
             deferred_fk_counter: 0,
             fk_enabled: true,
             vtab_query: None,
@@ -442,6 +448,11 @@ impl Vdbe {
     /// Set the schema for DDL operations
     pub fn set_schema(&mut self, schema: Arc<RwLock<Schema>>) {
         self.schema = Some(schema);
+    }
+
+    /// Set the connection pointer for transaction/autocommit updates
+    pub fn set_connection(&mut self, conn_ptr: *mut SqliteConnection) {
+        self.conn_ptr = Some(conn_ptr);
     }
 
     /// Create from a list of operations
@@ -2156,8 +2167,101 @@ impl Vdbe {
             }
 
             Opcode::AutoCommit => {
-                // P1 = 1 to commit, 0 to rollback
-                // Placeholder: Would handle autocommit
+                // AutoCommit P1 P2
+                // P1 = desired autocommit (1 commit/end txn, 0 begin txn)
+                // P2 = rollback flag (1 rollback, only valid with P1=1)
+                let mut desired = op.p1;
+                let mut rollback = op.p2 != 0;
+
+                // Back-compat with older compiler behavior (P1=2 for rollback)
+                if desired == 2 && !rollback {
+                    desired = 1;
+                    rollback = true;
+                }
+
+                if desired != 0 && desired != 1 {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        "invalid autocommit flag",
+                    ));
+                }
+                if desired == 0 && rollback {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        "invalid rollback flag for autocommit=0",
+                    ));
+                }
+
+                let Some(conn_ptr) = self.conn_ptr else {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        "missing connection for autocommit",
+                    ));
+                };
+                // SAFETY: conn_ptr is valid for the lifetime of the statement/VDBE.
+                let conn = unsafe { &mut *conn_ptr };
+                let current = conn.autocommit.load(AtomicOrdering::SeqCst);
+                let desired_autocommit = desired == 1;
+
+                if desired_autocommit == current {
+                    let msg = if !desired_autocommit {
+                        "cannot start a transaction within a transaction"
+                    } else if rollback {
+                        "cannot rollback - no transaction is active"
+                    } else {
+                        "cannot commit - no transaction is active"
+                    };
+                    return Err(Error::with_message(ErrorCode::Error, msg));
+                }
+
+                if rollback {
+                    if let Some(ref btree) = self.btree {
+                        let _ = btree.rollback(0, false);
+                    }
+                    if let Some(hook) = conn.rollback_hook.as_ref() {
+                        hook();
+                    }
+                    conn.transaction_state = TransactionState::None;
+                    conn.autocommit.store(true, AtomicOrdering::SeqCst);
+                    conn.savepoints.clear();
+                    self.deferred_fk_counter = 0;
+                    // Allow subsequent Halt opcode to finish the statement.
+                }
+
+                if desired_autocommit {
+                    if self.deferred_fk_counter > 0 {
+                        return Err(Error::with_message(
+                            ErrorCode::Constraint,
+                            "foreign key constraint failed",
+                        ));
+                    }
+                    if let Some(hook) = conn.commit_hook.as_ref() {
+                        if hook() {
+                            if let Some(ref btree) = self.btree {
+                                let _ = btree.rollback(0, false);
+                            }
+                            if let Some(hook) = conn.rollback_hook.as_ref() {
+                                hook();
+                            }
+                            conn.transaction_state = TransactionState::None;
+                            conn.autocommit.store(true, AtomicOrdering::SeqCst);
+                            conn.savepoints.clear();
+                            self.deferred_fk_counter = 0;
+                            return Err(Error::with_message(
+                                ErrorCode::Abort,
+                                "commit hook aborted transaction",
+                            ));
+                        }
+                    }
+                    if let Some(ref btree) = self.btree {
+                        btree.commit()?;
+                    }
+                    conn.transaction_state = TransactionState::None;
+                    conn.autocommit.store(true, AtomicOrdering::SeqCst);
+                    conn.savepoints.clear();
+                } else {
+                    conn.autocommit.store(false, AtomicOrdering::SeqCst);
+                }
             }
 
             // ================================================================
@@ -3413,6 +3517,17 @@ fn compare_records(a: &[u8], b: &[u8], num_key_cols: usize, sort_desc: &[bool]) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::{sqlite3_initialize, sqlite3_open, SqliteConnection, TransactionState};
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    use std::sync::Once;
+
+    fn open_test_connection() -> Box<SqliteConnection> {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            sqlite3_initialize().expect("sqlite3_initialize");
+        });
+        sqlite3_open(":memory:").expect("sqlite3_open")
+    }
 
     #[test]
     fn test_vdbe_new() {
@@ -3472,6 +3587,59 @@ mod tests {
         let result = vdbe.step().unwrap();
         assert_eq!(result, ExecResult::Row);
         assert_eq!(vdbe.column_int(0), 42);
+    }
+
+    #[test]
+    fn test_op_autocommit_commit_and_rollback() {
+        let mut conn = open_test_connection();
+        let conn_ptr = &mut *conn as *mut SqliteConnection;
+        let btree = conn.main_db().btree.as_ref().unwrap().clone();
+
+        btree.begin_trans(true).unwrap();
+        conn.transaction_state = TransactionState::Write;
+        conn.autocommit.store(false, AtomicOrdering::SeqCst);
+
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::AutoCommit, 1, 0, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+        vdbe.set_btree(btree.clone());
+        vdbe.set_connection(conn_ptr);
+        vdbe.step().unwrap();
+        vdbe.step().unwrap();
+        assert!(conn.get_autocommit());
+        assert_eq!(conn.transaction_state, TransactionState::None);
+
+        btree.begin_trans(true).unwrap();
+        conn.transaction_state = TransactionState::Write;
+        conn.autocommit.store(false, AtomicOrdering::SeqCst);
+
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::AutoCommit, 1, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+        vdbe.set_btree(btree);
+        vdbe.set_connection(conn_ptr);
+        vdbe.step().unwrap();
+        vdbe.step().unwrap();
+        assert!(conn.get_autocommit());
+        assert_eq!(conn.transaction_state, TransactionState::None);
+    }
+
+    #[test]
+    fn test_op_autocommit_errors_without_transaction() {
+        let mut conn = open_test_connection();
+        let conn_ptr = &mut *conn as *mut SqliteConnection;
+        let btree = conn.main_db().btree.as_ref().unwrap().clone();
+
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::AutoCommit, 1, 0, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+        vdbe.set_btree(btree);
+        vdbe.set_connection(conn_ptr);
+        let err = vdbe.step().unwrap_err();
+        assert_eq!(err.code, ErrorCode::Error);
     }
 
     #[test]

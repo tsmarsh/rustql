@@ -397,6 +397,7 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
                     vdbe.set_schema(schema.clone());
                 }
             }
+            vdbe.set_connection(conn_ptr);
         }
 
         // Set up parameters

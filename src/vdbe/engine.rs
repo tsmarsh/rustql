@@ -15,7 +15,7 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::functions::aggregate::AggregateState;
 use crate::schema::Schema;
 use crate::storage::btree::{
-    BtCursor, Btree, BtreeCursorFlags, BtreeInsertFlags, BtreePayload,
+    BtCursor, Btree, BtreeCursorFlags, BtreeInsertFlags, BtreePayload, UnpackedRecord,
 };
 use crate::storage::pager::SavepointOp;
 use crate::types::{ColumnType, OpenFlags, Pgno, Value};
@@ -2862,8 +2862,42 @@ impl Vdbe {
             // ================================================================
             // Other opcodes (placeholder implementations)
             // ================================================================
-            Opcode::SeekGE
-            | Opcode::SeekGT
+            Opcode::SeekGE => {
+                let mut jump = true;
+                let index_key = self.mem(op.p3).to_blob();
+                let rowid_key = self.mem(op.p3).to_int();
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                        let res = if cursor.is_index {
+                            bt_cursor.index_moveto(&UnpackedRecord {
+                                key: index_key.clone(),
+                            })?
+                        } else {
+                            bt_cursor.table_moveto(rowid_key, false)?
+                        };
+
+                        if res == 1 {
+                            let _ = bt_cursor.next(0);
+                        }
+
+                        jump = bt_cursor.state != crate::storage::btree::CursorState::Valid;
+                        if !jump {
+                            cursor.state = CursorState::Valid;
+                            if !cursor.is_index {
+                                cursor.rowid = Some(bt_cursor.integer_key());
+                            }
+                        } else {
+                            cursor.state = CursorState::Invalid;
+                            cursor.rowid = None;
+                        }
+                    }
+                }
+                if jump {
+                    self.pc = op.p2;
+                }
+            }
+
+            Opcode::SeekGT
             | Opcode::SeekLE
             | Opcode::SeekLT
             | Opcode::SeekNull => {
@@ -3920,6 +3954,47 @@ mod tests {
         let result = vdbe.step().unwrap();
         assert_eq!(result, ExecResult::Row);
         assert_eq!(vdbe.column_int(0), 1);
+    }
+
+    #[test]
+    fn test_op_seekge_table() {
+        let mut conn = open_test_connection();
+        let conn_ptr = &mut *conn as *mut SqliteConnection;
+        let btree = conn.main_db().btree.as_ref().unwrap().clone();
+
+        btree.begin_trans(true).unwrap();
+        let root_page = btree.create_table(crate::storage::btree::BTREE_INTKEY).unwrap();
+        let mut cursor = btree
+            .cursor(root_page, BtreeCursorFlags::WRCSR, None)
+            .unwrap();
+        for rowid in [1, 3, 5] {
+            let payload = BtreePayload {
+                key: None,
+                n_key: rowid,
+                data: None,
+                mem: Vec::new(),
+                n_data: 0,
+                n_zero: 0,
+            };
+            btree
+                .insert(&mut cursor, &payload, BtreeInsertFlags::APPEND, 0)
+                .unwrap();
+        }
+
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::OpenRead, 0, root_page as i32, 1),
+            VdbeOp::new(Opcode::Integer, 2, 1, 0),
+            VdbeOp::new(Opcode::SeekGE, 0, 6, 1),
+            VdbeOp::new(Opcode::Rowid, 0, 2, 0),
+            VdbeOp::new(Opcode::ResultRow, 2, 1, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+        vdbe.set_btree(btree.clone());
+        vdbe.set_connection(conn_ptr);
+
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), 3);
     }
 
     #[test]

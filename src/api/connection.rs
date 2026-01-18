@@ -726,6 +726,8 @@ pub struct DbConfigFlags {
     pub legacy_file_format: bool,
     /// No checkpoint on close
     pub no_ckpt_on_close: bool,
+    /// Count changes - return row count for INSERT/UPDATE/DELETE
+    pub count_changes: bool,
 }
 
 impl Default for SqliteConnection {
@@ -779,6 +781,7 @@ impl SqliteConnection {
                 legacy_alter_table: false,
                 legacy_file_format: false,
                 no_ckpt_on_close: false,
+                count_changes: false,
             },
             schema_generation: AtomicU64::new(0),
         };

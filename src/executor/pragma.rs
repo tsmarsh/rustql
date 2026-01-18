@@ -117,6 +117,7 @@ pub fn execute_pragma(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Resul
         "wal_checkpoint" => pragma_wal_checkpoint(),
         "auto_vacuum" => pragma_auto_vacuum(conn, pragma),
         "encoding" => pragma_encoding(conn, pragma),
+        "count_changes" => pragma_count_changes(conn, pragma),
         _ => Err(Error::with_message(
             ErrorCode::Error,
             format!("unknown pragma: {}", pragma.name),
@@ -479,6 +480,18 @@ fn pragma_recursive_triggers(
     Ok(empty_result())
 }
 
+fn pragma_count_changes(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Result<PragmaResult> {
+    if let Some(value) = pragma_value_i64(pragma) {
+        conn.db_config.count_changes = value != 0;
+    } else if let Some(value) = pragma_value_string(pragma) {
+        conn.db_config.count_changes = parse_bool_value(&value);
+    }
+    if pragma.value.is_none() {
+        return Ok(single_int_result(i64::from(conn.db_config.count_changes)));
+    }
+    Ok(empty_result())
+}
+
 fn pragma_journal_mode(
     conn: &mut SqliteConnection,
     schema_name: &str,
@@ -594,7 +607,12 @@ fn pragma_value_i64(pragma: &PragmaStmt) -> Option<i64> {
         Some(PragmaValue::Call(expr)) => expr,
         None => return None,
     };
-    expr_to_value(expr).map(|v| v.to_i64())
+    // Only return value for actual integer literals, not text/column values
+    match expr_to_value(expr) {
+        Some(Value::Integer(v)) => Some(v),
+        Some(Value::Real(v)) => Some(v as i64),
+        _ => None,
+    }
 }
 
 fn pragma_value_string(pragma: &PragmaStmt) -> Option<String> {
@@ -686,6 +704,13 @@ fn fk_action_name(action: crate::schema::FkAction) -> String {
         crate::schema::FkAction::NoAction => "NO ACTION",
     }
     .to_string()
+}
+
+fn parse_bool_value(value: &str) -> bool {
+    match value.to_lowercase().as_str() {
+        "on" | "yes" | "true" | "1" => true,
+        _ => false,
+    }
 }
 
 fn safety_level_from_str(value: &str, default: SafetyLevel) -> SafetyLevel {

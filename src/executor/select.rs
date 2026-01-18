@@ -146,6 +146,8 @@ pub struct SelectCompiler<'s> {
     agg_final_regs: Vec<i32>,
     /// Current index into agg_final_regs when compiling expressions
     agg_final_idx: usize,
+    /// Number of columns in compound select (for UNION, INTERSECT, EXCEPT output)
+    compound_column_count: usize,
 }
 
 impl<'s> SelectCompiler<'s> {
@@ -172,6 +174,7 @@ impl<'s> SelectCompiler<'s> {
             order_by_terms: None,
             agg_final_regs: Vec::new(),
             agg_final_idx: 0,
+            compound_column_count: 0,
         }
     }
 
@@ -198,6 +201,7 @@ impl<'s> SelectCompiler<'s> {
             order_by_terms: None,
             agg_final_regs: Vec::new(),
             agg_final_idx: 0,
+            compound_column_count: 0,
         }
     }
 
@@ -720,13 +724,17 @@ impl<'s> SelectCompiler<'s> {
     fn compile_grouped_aggregate(&mut self, core: &SelectCore, dest: &SelectDest) -> Result<()> {
         let group_by = core.group_by.as_ref().unwrap();
 
+        // Count total columns needed in sorter: group columns + aggregate arguments
+        let num_group_cols = group_by.len();
+        let num_agg_args = self.count_aggregate_args(&core.columns);
+        let total_sorter_cols = num_group_cols + num_agg_args;
+
         // Open sorter for grouping
         let sorter_cursor = self.alloc_cursor();
-        let num_group_cols = group_by.len();
         self.emit(
             Opcode::OpenEphemeral,
             sorter_cursor,
-            num_group_cols as i32,
+            total_sorter_cols as i32,
             0,
             P4::Unused,
         );
@@ -853,12 +861,14 @@ impl<'s> SelectCompiler<'s> {
             num_group_cols as i32,
             P4::Unused,
         );
-        self.emit(Opcode::Jump, same_group_label, 0, 0, P4::Unused);
+        // Jump to same_group_label when compare result = 0 (same group)
+        self.emit(Opcode::Jump, 0, same_group_label, 0, P4::Unused);
 
         // New group - output previous group if not first
+        // Skip output if prev_group is NULL (first group)
         let first_group_label = self.alloc_label();
         self.emit(
-            Opcode::If,
+            Opcode::IfNot,
             prev_group_regs,
             first_group_label,
             0,
@@ -866,7 +876,12 @@ impl<'s> SelectCompiler<'s> {
         );
 
         // Finalize and output previous group
-        let result_regs = self.finalize_aggregates(&core.columns, &agg_regs)?;
+        let result_regs = self.finalize_aggregates_with_group(
+            &core.columns,
+            &agg_regs,
+            Some(group_by),
+            prev_group_regs,
+        )?;
 
         // HAVING clause
         if let Some(having) = &core.having {
@@ -910,7 +925,12 @@ impl<'s> SelectCompiler<'s> {
         );
 
         // Output final group
-        let result_regs = self.finalize_aggregates(&core.columns, &agg_regs)?;
+        let result_regs = self.finalize_aggregates_with_group(
+            &core.columns,
+            &agg_regs,
+            Some(group_by),
+            prev_group_regs,
+        )?;
         if let Some(having) = &core.having {
             let skip_output_label = self.alloc_label();
             self.compile_where_condition(having, skip_output_label)?;
@@ -943,17 +963,29 @@ impl<'s> SelectCompiler<'s> {
         self.emit(Opcode::OpenEphemeral, result_cursor, 0, 0, P4::Unused);
 
         // Compile left side into ephemeral table
+        // Clear tables and result column names to avoid accumulating from parent context
+        self.tables.clear();
+        self.result_column_names.clear();
         let left_dest = SelectDest::EphemTable {
             cursor: result_cursor,
         };
         self.compile_body(left, &left_dest)?;
 
+        // Track column count from left side for output
+        self.compound_column_count = self.result_column_names.len();
+        // Save the left side's column names (right side will add more but we only want left's names)
+        let saved_column_names = self.result_column_names.clone();
+
         match op {
             CompoundOp::UnionAll => {
+                // Clear tables before compiling right side (but keep column names from left)
+                self.tables.clear();
                 // Just add right side to same table
                 self.compile_body(right, &left_dest)?;
             }
             CompoundOp::Union => {
+                // Clear tables before compiling right side
+                self.tables.clear();
                 // Right side goes to separate table, then merge with distinct
                 let right_cursor = self.alloc_cursor();
                 self.emit(Opcode::OpenEphemeral, right_cursor, 0, 0, P4::Unused);
@@ -967,6 +999,8 @@ impl<'s> SelectCompiler<'s> {
                 self.emit(Opcode::Close, right_cursor, 0, 0, P4::Unused);
             }
             CompoundOp::Intersect => {
+                // Clear tables before compiling right side
+                self.tables.clear();
                 // Keep only rows that appear in both
                 let right_cursor = self.alloc_cursor();
                 self.emit(Opcode::OpenEphemeral, right_cursor, 0, 0, P4::Unused);
@@ -979,6 +1013,8 @@ impl<'s> SelectCompiler<'s> {
                 self.emit(Opcode::Close, right_cursor, 0, 0, P4::Unused);
             }
             CompoundOp::Except => {
+                // Clear tables before compiling right side
+                self.tables.clear();
                 // Remove rows that appear in right
                 let right_cursor = self.alloc_cursor();
                 self.emit(Opcode::OpenEphemeral, right_cursor, 0, 0, P4::Unused);
@@ -991,6 +1027,9 @@ impl<'s> SelectCompiler<'s> {
                 self.emit(Opcode::Close, right_cursor, 0, 0, P4::Unused);
             }
         }
+
+        // Restore left side's column names (right side added its own but we want only left's names)
+        self.result_column_names = saved_column_names;
 
         // Output results from ephemeral table
         self.output_ephemeral_table(result_cursor, dest)?;
@@ -2070,8 +2109,72 @@ impl<'s> SelectCompiler<'s> {
                             self.resolve_label(end_label, self.current_addr());
                         }
                     }
-                    _ => {
-                        // Subquery or table - not yet implemented, return NULL
+                    crate::parser::ast::InList::Subquery(subquery) => {
+                        // Compile IN subquery using a fresh compilation context
+                        // to avoid cursor conflicts with outer query
+                        let subq_cursor = self.alloc_cursor();
+                        self.emit(Opcode::OpenEphemeral, subq_cursor, 1, 0, P4::Unused);
+
+                        // Save outer query state
+                        let saved_tables = std::mem::take(&mut self.tables);
+                        let saved_has_agg = self.has_aggregates;
+                        let saved_has_window = self.has_window_functions;
+
+                        // Compile subquery to fill ephemeral table
+                        let subq_dest = SelectDest::EphemTable {
+                            cursor: subq_cursor,
+                        };
+                        self.compile_body(&subquery.body, &subq_dest)?;
+
+                        // Restore outer query state
+                        self.tables = saved_tables;
+                        self.has_aggregates = saved_has_agg;
+                        self.has_window_functions = saved_has_window;
+
+                        // Check if value exists in ephemeral table
+                        // Make a record from the value
+                        let record_reg = self.alloc_reg();
+                        self.emit(Opcode::MakeRecord, val_reg, 1, record_reg, P4::Unused);
+
+                        let found_label = self.alloc_label();
+                        let end_label = self.alloc_label();
+
+                        // Found jumps if record exists in cursor
+                        self.emit(
+                            Opcode::Found,
+                            subq_cursor,
+                            found_label,
+                            record_reg,
+                            P4::Unused,
+                        );
+
+                        // Not found
+                        self.emit(
+                            Opcode::Integer,
+                            if *negated { 1 } else { 0 },
+                            dest_reg,
+                            0,
+                            P4::Unused,
+                        );
+                        self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+
+                        // Found
+                        self.resolve_label(found_label, self.current_addr());
+                        self.emit(
+                            Opcode::Integer,
+                            if *negated { 0 } else { 1 },
+                            dest_reg,
+                            0,
+                            P4::Unused,
+                        );
+
+                        self.resolve_label(end_label, self.current_addr());
+
+                        // Close ephemeral table
+                        self.emit(Opcode::Close, subq_cursor, 0, 0, P4::Unused);
+                    }
+                    crate::parser::ast::InList::Table(_) => {
+                        // IN table - not yet implemented, return NULL
                         self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
                     }
                 }
@@ -2666,6 +2769,16 @@ impl<'s> SelectCompiler<'s> {
         columns: &[ResultColumn],
         agg_regs: &[i32],
     ) -> Result<(i32, usize)> {
+        self.finalize_aggregates_with_group(columns, agg_regs, None, 0)
+    }
+
+    fn finalize_aggregates_with_group(
+        &mut self,
+        columns: &[ResultColumn],
+        agg_regs: &[i32],
+        group_by: Option<&[Expr]>,
+        group_regs: i32,
+    ) -> Result<(i32, usize)> {
         let base_reg = self.next_reg;
         let mut count = 0;
         let mut agg_idx = 0;
@@ -2673,6 +2786,22 @@ impl<'s> SelectCompiler<'s> {
         for col in columns {
             let dest_reg = self.alloc_reg();
             if let ResultColumn::Expr { expr, .. } = col {
+                // Check if this column matches a GROUP BY expression
+                if let Some(group_exprs) = group_by {
+                    if let Some(idx) = self.find_matching_group_expr(expr, group_exprs) {
+                        // Copy from the group register
+                        self.emit(
+                            Opcode::Copy,
+                            group_regs + idx as i32,
+                            dest_reg,
+                            0,
+                            P4::Unused,
+                        );
+                        count += 1;
+                        continue;
+                    }
+                }
+
                 if let Expr::Function(func_call) = expr {
                     let name_upper = func_call.name.to_uppercase();
                     let arg_count = match &func_call.args {
@@ -2728,6 +2857,30 @@ impl<'s> SelectCompiler<'s> {
         }
 
         Ok((base_reg, count))
+    }
+
+    /// Find if an expression matches one of the GROUP BY expressions
+    fn find_matching_group_expr(&self, expr: &Expr, group_by: &[Expr]) -> Option<usize> {
+        for (i, group_expr) in group_by.iter().enumerate() {
+            if self.exprs_equal(expr, group_expr) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Check if two expressions are structurally equal
+    fn exprs_equal(&self, a: &Expr, b: &Expr) -> bool {
+        match (a, b) {
+            (Expr::Column(c1), Expr::Column(c2)) => {
+                c1.table == c2.table && c1.column.to_uppercase() == c2.column.to_uppercase()
+            }
+            (Expr::Literal(l1), Expr::Literal(l2)) => l1 == l2,
+            (Expr::Parens(e1), Expr::Parens(e2)) => self.exprs_equal(e1, e2),
+            (Expr::Parens(e1), e2) => self.exprs_equal(e1, e2),
+            (e1, Expr::Parens(e2)) => self.exprs_equal(e1, e2),
+            _ => false,
+        }
     }
 
     /// Count aggregates in an expression
@@ -2810,6 +2963,21 @@ impl<'s> SelectCompiler<'s> {
             self.emit(Opcode::Null, 0, reg, 0, P4::Unused);
         }
         Ok(())
+    }
+
+    /// Count the number of aggregate arguments in result columns without compiling
+    fn count_aggregate_args(&self, columns: &[ResultColumn]) -> usize {
+        let mut count = 0;
+        for col in columns {
+            if let ResultColumn::Expr { expr, .. } = col {
+                if let Expr::Function(func_call) = expr {
+                    if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
+                        count += exprs.len();
+                    }
+                }
+            }
+        }
+        count
     }
 
     fn compile_aggregate_args(&mut self, columns: &[ResultColumn]) -> Result<(i32, usize)> {
@@ -2911,12 +3079,21 @@ impl<'s> SelectCompiler<'s> {
         let loop_start_label = self.alloc_label();
         self.resolve_label(loop_start_label, self.current_addr());
 
-        // Get row from ephemeral table
-        let data_reg = self.alloc_reg();
-        self.emit(Opcode::Column, cursor, 0, data_reg, P4::Unused);
+        // Get all columns from the ephemeral table row
+        let col_count = if self.compound_column_count > 0 {
+            self.compound_column_count
+        } else {
+            1 // Default to 1 if not set
+        };
+
+        let base_reg = self.next_reg;
+        for i in 0..col_count {
+            let reg = self.alloc_reg();
+            self.emit(Opcode::Column, cursor, i as i32, reg, P4::Unused);
+        }
 
         // Output based on destination
-        self.output_row(dest, data_reg, 1)?;
+        self.output_row(dest, base_reg, col_count)?;
 
         self.emit(Opcode::Next, cursor, loop_start_label, 0, P4::Unused);
         self.resolve_label(done_label, self.current_addr());

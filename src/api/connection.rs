@@ -71,6 +71,7 @@ impl VfsFile for StubVfsFile {
 }
 
 /// Stub VFS for btree/pager (temporary until full VFS integration)
+#[derive(Clone, Copy)]
 pub struct StubVfs;
 
 impl Vfs for StubVfs {
@@ -280,6 +281,7 @@ impl VfsFile for FileVfsFile {
 }
 
 /// File-based VFS that performs real disk I/O
+#[derive(Clone, Copy)]
 pub struct FileVfs;
 
 impl Vfs for FileVfs {

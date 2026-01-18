@@ -3469,7 +3469,7 @@ fn pager_open_flags_from_btree(flags: BtreeOpenFlags) -> PagerOpenFlags {
 
 impl Btree {
     /// sqlite3BtreeOpen
-    pub fn open<V: Vfs + 'static>(
+    pub fn open<V: Vfs + Clone + 'static>(
         vfs: &V,
         filename: &str,
         db: Option<Arc<dyn Connection>>,

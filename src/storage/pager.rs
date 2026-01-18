@@ -469,6 +469,10 @@ pub struct Pager {
     /// Pages written to sub-journal
     pub sub_journal_pages: Vec<Pgno>,
 
+    // In-memory journal for memory databases
+    /// Journal records stored in memory (page number, original data)
+    pub mem_journal: Vec<(Pgno, Vec<u8>)>,
+
     // WAL mode
     /// Write-ahead log (when in WAL mode)
     pub wal: Option<Wal>,
@@ -484,7 +488,7 @@ impl Pager {
     // ========================================================================
 
     /// Open a pager on a database file (sqlite3PagerOpen)
-    pub fn open<V: Vfs + 'static>(
+    pub fn open<V: Vfs + Clone + 'static>(
         vfs: &V,
         path: &str,
         flags: PagerOpenFlags,
@@ -531,13 +535,40 @@ impl Pager {
         // Determine read-only status
         let read_only = vfs_flags.contains(OpenFlags::READONLY);
 
+        // Create VFS callbacks for journal operations (unless memory-only mode)
+        let (vfs_open, vfs_delete, vfs_access): (
+            Option<VfsOpenFn>,
+            Option<VfsDeleteFn>,
+            Option<VfsAccessFn>,
+        ) = if !mem_db {
+            let vfs_for_open = vfs.clone();
+            let vfs_for_delete = vfs.clone();
+            let vfs_for_access = vfs.clone();
+
+            let open_fn: VfsOpenFn = Box::new(move |path: &str, flags: OpenFlags| {
+                let file = vfs_for_open.open(path, flags)?;
+                Ok(Box::new(file) as Box<dyn VfsFile>)
+            });
+
+            let delete_fn: VfsDeleteFn =
+                Box::new(move |path: &str| vfs_for_delete.delete(path, false));
+
+            let access_fn: VfsAccessFn = Box::new(move |path: &str| {
+                vfs_for_access.access(path, crate::types::AccessFlags::EXISTS)
+            });
+
+            (Some(open_fn), Some(delete_fn), Some(access_fn))
+        } else {
+            (None, None, None)
+        };
+
         Ok(Pager {
             fd,
             jfd: None,
             sjfd: None,
-            vfs_open: None,
-            vfs_delete: None,
-            vfs_access: None,
+            vfs_open,
+            vfs_delete,
+            vfs_access,
             db_path: path.to_string(),
             journal_path,
             state: PagerState::Open,
@@ -575,6 +606,7 @@ impl Pager {
             no_sync: false,
             savepoints: Vec::new(),
             sub_journal_pages: Vec::new(),
+            mem_journal: Vec::new(),
             wal: None,
             tmp_space: vec![0u8; DEFAULT_PAGE_SIZE as usize],
         })
@@ -992,7 +1024,8 @@ impl Pager {
         }
 
         // Playback journal to restore database
-        if self.jfd.is_some() {
+        // For file-based databases, use file journal; for memory databases, use in-memory journal
+        if self.jfd.is_some() || (self.mem_db && !self.mem_journal.is_empty()) {
             self.playback_journal()?;
         }
 
@@ -1173,6 +1206,7 @@ impl Pager {
         let checksum = Self::checksum_data(&page.data);
 
         if let Some(ref mut jfd) = self.jfd {
+            // Write to file-based journal
             // Write page number (4 bytes)
             jfd.write(&page.pgno.to_be_bytes(), self.journal_offset)?;
             self.journal_offset += 4;
@@ -1185,6 +1219,10 @@ impl Pager {
             jfd.write(&checksum.to_be_bytes(), self.journal_offset)?;
             self.journal_offset += 4;
 
+            self.n_rec += 1;
+        } else if self.mem_db {
+            // For memory databases, store journal records in memory
+            self.mem_journal.push((page.pgno, page.data.clone()));
             self.n_rec += 1;
         }
 
@@ -1229,12 +1267,49 @@ impl Pager {
         self.journal_header = 0;
         self.n_rec = 0;
         self.sub_journal_pages.clear();
+        self.mem_journal.clear();
 
         Ok(())
     }
 
     /// Playback journal for recovery/rollback
     fn playback_journal(&mut self) -> Result<()> {
+        // For memory databases, use the in-memory journal
+        if self.mem_db && !self.mem_journal.is_empty() {
+            let page_size = self.page_size as usize;
+
+            // Process journal records in reverse order (LIFO) to restore original state
+            // We iterate in reverse because a page might be journaled multiple times
+            // and we want to restore the earliest (original) version
+            let journal_records: Vec<_> = std::mem::take(&mut self.mem_journal);
+
+            // Track which pages we've already restored to avoid double-restoring
+            let mut restored_pages = std::collections::HashSet::new();
+
+            for (pgno, original_data) in journal_records.into_iter().rev() {
+                if restored_pages.contains(&pgno) {
+                    continue; // Already restored this page
+                }
+                restored_pages.insert(pgno);
+
+                // Restore the page in the cache
+                if let Some(mut cache_page) = self.pcache.fetch(pgno, false) {
+                    unsafe {
+                        let data_len = original_data.len().min(page_size);
+                        cache_page.as_mut().data[..data_len]
+                            .copy_from_slice(&original_data[..data_len]);
+                        cache_page.as_mut().flags.remove(PgFlags::DIRTY);
+                        cache_page.as_mut().flags.remove(PgFlags::WRITEABLE);
+                    }
+                }
+            }
+
+            // Restore original database size
+            self.db_size = self.db_orig_size;
+            return Ok(());
+        }
+
+        // For file-based databases, use the file journal
         // Check if journal exists and has valid content
         let jfd = match self.jfd.as_mut() {
             Some(jfd) => jfd,

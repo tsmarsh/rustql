@@ -490,6 +490,7 @@ impl Opcode {
         matches!(
             self,
             Opcode::Goto
+                | Opcode::Jump
                 | Opcode::If
                 | Opcode::IfNot
                 | Opcode::Ne
@@ -518,6 +519,7 @@ impl Opcode {
                 | Opcode::IdxLE
                 | Opcode::IdxLT
                 | Opcode::SorterNext
+                | Opcode::SorterSort
                 | Opcode::FkIfZero
                 | Opcode::Program
                 | Opcode::TriggerTest

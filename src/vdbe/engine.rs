@@ -2759,6 +2759,8 @@ impl Vdbe {
                     if cursor.is_ephemeral {
                         // Store into ephemeral table for iteration
                         cursor.ephemeral_rows.push((rowid, record_data.clone()));
+                        // Also add to ephemeral_set for Found opcode lookups
+                        cursor.ephemeral_set.insert(record_data.clone());
                         inserted = true;
                     } else if cursor.is_virtual {
                         if let Some(ref vtab_name) = cursor.vtab_name {
@@ -3392,10 +3394,21 @@ impl Vdbe {
 
             Opcode::SorterData => {
                 // SorterData P1 P2: Copy current sorter row data to register P2
-                if let Some(cursor) = self.cursor(op.p1) {
+                // Also set cursor.row_data so Column can read from it
+                let data_opt = if let Some(cursor) = self.cursor(op.p1) {
                     if cursor.sorter_index < cursor.sorter_data.len() {
-                        let data = cursor.sorter_data[cursor.sorter_index].clone();
-                        self.mem_mut(op.p2).set_blob(&data);
+                        Some(cursor.sorter_data[cursor.sorter_index].clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(data) = data_opt {
+                    self.mem_mut(op.p2).set_blob(&data);
+                    // Also store in cursor.row_data for Column to use
+                    if let Some(cursor) = self.cursor_mut(op.p1) {
+                        cursor.row_data = Some(data);
                     }
                 }
             }
@@ -3847,7 +3860,8 @@ impl Vdbe {
                 if matches!(text, Value::Null) || matches!(pattern, Value::Null) {
                     self.mem_mut(op.p2).set_null();
                 } else {
-                    let args = vec![text, pattern];
+                    // func_like expects [pattern, text] order
+                    let args = vec![pattern, text];
                     match crate::functions::scalar::func_like(&args) {
                         Ok(Value::Integer(result)) => {
                             self.mem_mut(op.p2).set_int(result);
@@ -3869,7 +3883,8 @@ impl Vdbe {
                 if matches!(text, Value::Null) || matches!(pattern, Value::Null) {
                     self.mem_mut(op.p2).set_null();
                 } else {
-                    let args = vec![text, pattern];
+                    // func_glob expects [pattern, text] order
+                    let args = vec![pattern, text];
                     match crate::functions::scalar::func_glob(&args) {
                         Ok(Value::Integer(result)) => {
                             self.mem_mut(op.p2).set_int(result);

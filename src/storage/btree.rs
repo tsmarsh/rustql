@@ -315,12 +315,388 @@ pub struct CellInfo {
     pub overflow_pgno: Option<Pgno>,
 }
 
-pub struct KeyInfo {
-    pub encoding: u8,
+/// Sort order flags for KeyInfo columns
+pub const KEYINFO_ORDER_DESC: u8 = 0x01;
+pub const KEYINFO_ORDER_NULLS_FIRST: u8 = 0x02;
+
+/// Collation sequence type for string comparison
+#[derive(Clone)]
+pub enum CollSeq {
+    /// Binary comparison (memcmp, default)
+    Binary,
+    /// Case-insensitive comparison for ASCII
+    NoCase,
+    /// Ignore trailing spaces
+    RTrim,
+    /// Custom collation with name and comparison function
+    Custom {
+        name: String,
+        cmp: Arc<dyn Fn(&str, &str) -> std::cmp::Ordering + Send + Sync>,
+    },
 }
 
+impl CollSeq {
+    /// Compare two strings using this collation
+    pub fn compare(&self, a: &str, b: &str) -> std::cmp::Ordering {
+        match self {
+            CollSeq::Binary => a.cmp(b),
+            CollSeq::NoCase => a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()),
+            CollSeq::RTrim => a.trim_end().cmp(b.trim_end()),
+            CollSeq::Custom { cmp, .. } => cmp(a, b),
+        }
+    }
+
+    /// Get the name of this collation
+    pub fn name(&self) -> &str {
+        match self {
+            CollSeq::Binary => "BINARY",
+            CollSeq::NoCase => "NOCASE",
+            CollSeq::RTrim => "RTRIM",
+            CollSeq::Custom { name, .. } => name,
+        }
+    }
+}
+
+impl std::fmt::Debug for CollSeq {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CollSeq({})", self.name())
+    }
+}
+
+impl Default for CollSeq {
+    fn default() -> Self {
+        CollSeq::Binary
+    }
+}
+
+/// Key comparison information for indexes.
+/// Based on SQLite's KeyInfo structure (sqliteInt.h ~2400)
+#[derive(Clone)]
+pub struct KeyInfo {
+    /// Text encoding (1=UTF8, 2=UTF16LE, 3=UTF16BE)
+    pub encoding: u8,
+    /// Number of key columns in the index
+    pub n_key_field: u16,
+    /// Total columns including rowid
+    pub n_all_field: u16,
+    /// Sort order flags for each column (KEYINFO_ORDER_DESC, KEYINFO_ORDER_NULLS_FIRST)
+    pub sort_flags: Vec<u8>,
+    /// Collation sequence for each column
+    pub collations: Vec<CollSeq>,
+}
+
+impl Default for KeyInfo {
+    fn default() -> Self {
+        Self {
+            encoding: 1, // UTF8
+            n_key_field: 0,
+            n_all_field: 0,
+            sort_flags: Vec::new(),
+            collations: Vec::new(),
+        }
+    }
+}
+
+impl KeyInfo {
+    /// Create a new KeyInfo with the specified number of key fields
+    pub fn new(n_key_field: u16) -> Self {
+        Self {
+            encoding: 1,
+            n_key_field,
+            n_all_field: n_key_field,
+            sort_flags: vec![0; n_key_field as usize],
+            collations: vec![CollSeq::Binary; n_key_field as usize],
+        }
+    }
+
+    /// Create a KeyInfo with specific collations
+    pub fn with_collations(n_key_field: u16, collations: Vec<CollSeq>) -> Self {
+        let n = n_key_field as usize;
+        let mut colls = collations;
+        colls.resize(n, CollSeq::Binary);
+        Self {
+            encoding: 1,
+            n_key_field,
+            n_all_field: n_key_field,
+            sort_flags: vec![0; n],
+            collations: colls,
+        }
+    }
+
+    /// Compare two SQLite records using this KeyInfo
+    /// Returns Ordering based on collations and sort flags
+    pub fn compare_records(&self, rec_a: &[u8], rec_b: &[u8]) -> std::cmp::Ordering {
+        let fields_a = parse_record_fields(rec_a);
+        let fields_b = parse_record_fields(rec_b);
+
+        let n_fields = (self.n_key_field as usize)
+            .min(fields_a.len())
+            .min(fields_b.len());
+
+        for i in 0..n_fields {
+            let desc = self
+                .sort_flags
+                .get(i)
+                .map_or(false, |f| f & KEYINFO_ORDER_DESC != 0);
+            let collation = self.collations.get(i).cloned().unwrap_or(CollSeq::Binary);
+
+            let cmp = compare_record_fields(&fields_a[i], &fields_b[i], &collation);
+
+            if cmp != std::cmp::Ordering::Equal {
+                return if desc { cmp.reverse() } else { cmp };
+            }
+        }
+
+        // If all compared fields are equal, compare by number of fields
+        fields_a.len().cmp(&fields_b.len())
+    }
+}
+
+/// Represents a parsed field value from a SQLite record
+#[derive(Clone, Debug)]
+pub enum RecordField {
+    Null,
+    Int(i64),
+    Float(f64),
+    Blob(Vec<u8>),
+    Text(String),
+}
+
+/// Unpacked record for index operations
 pub struct UnpackedRecord {
+    /// Raw serialized key bytes
     pub key: Vec<u8>,
+    /// Parsed field values (lazy-parsed on demand)
+    pub fields: Option<Vec<RecordField>>,
+    /// Key info for comparison (optional)
+    pub key_info: Option<Arc<KeyInfo>>,
+}
+
+impl UnpackedRecord {
+    /// Create a new UnpackedRecord from raw key bytes
+    pub fn new(key: Vec<u8>) -> Self {
+        Self {
+            key,
+            fields: None,
+            key_info: None,
+        }
+    }
+
+    /// Create with KeyInfo for comparison
+    pub fn with_key_info(key: Vec<u8>, key_info: Arc<KeyInfo>) -> Self {
+        Self {
+            key,
+            fields: None,
+            key_info: Some(key_info),
+        }
+    }
+}
+
+/// Parse a SQLite record into field values
+fn parse_record_fields(data: &[u8]) -> Vec<RecordField> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+
+    // Decode header size (varint)
+    let (header_size, header_size_len) = read_varint_at(data, 0);
+    let header_size = header_size as usize;
+
+    if header_size > data.len() || header_size < header_size_len {
+        return Vec::new();
+    }
+
+    // Parse serial types from header
+    let mut serial_types = Vec::new();
+    let mut offset = header_size_len;
+    while offset < header_size {
+        let (type_code, consumed) = read_varint_at(data, offset);
+        serial_types.push(type_code as u32);
+        offset += consumed;
+    }
+
+    // Parse field values
+    let mut fields = Vec::new();
+    let mut data_offset = header_size;
+
+    for serial_type in serial_types {
+        let (field, size) = deserialize_field(&data[data_offset..], serial_type);
+        fields.push(field);
+        data_offset += size;
+    }
+
+    fields
+}
+
+/// Read a varint at the given offset, returns (value, bytes_consumed)
+fn read_varint_at(data: &[u8], start: usize) -> (u64, usize) {
+    if start >= data.len() {
+        return (0, 0);
+    }
+
+    let mut value: u64 = 0;
+    let mut bytes = 0;
+
+    for i in 0..9 {
+        if start + i >= data.len() {
+            break;
+        }
+        let b = data[start + i];
+        if i < 8 {
+            value = (value << 7) | (b & 0x7f) as u64;
+            bytes += 1;
+            if b & 0x80 == 0 {
+                break;
+            }
+        } else {
+            // 9th byte uses all 8 bits
+            value = (value << 8) | b as u64;
+            bytes += 1;
+        }
+    }
+
+    (value, bytes)
+}
+
+/// Deserialize a field value from data given the serial type
+fn deserialize_field(data: &[u8], serial_type: u32) -> (RecordField, usize) {
+    match serial_type {
+        0 => (RecordField::Null, 0),
+        1 => {
+            // Int8
+            if data.is_empty() {
+                return (RecordField::Int(0), 0);
+            }
+            (RecordField::Int(data[0] as i8 as i64), 1)
+        }
+        2 => {
+            // Int16
+            if data.len() < 2 {
+                return (RecordField::Int(0), 0);
+            }
+            let val = i16::from_be_bytes([data[0], data[1]]) as i64;
+            (RecordField::Int(val), 2)
+        }
+        3 => {
+            // Int24
+            if data.len() < 3 {
+                return (RecordField::Int(0), 0);
+            }
+            let sign = if data[0] & 0x80 != 0 { 0xFF } else { 0x00 };
+            let val = i32::from_be_bytes([sign, data[0], data[1], data[2]]) as i64;
+            (RecordField::Int(val), 3)
+        }
+        4 => {
+            // Int32
+            if data.len() < 4 {
+                return (RecordField::Int(0), 0);
+            }
+            let val = i32::from_be_bytes([data[0], data[1], data[2], data[3]]) as i64;
+            (RecordField::Int(val), 4)
+        }
+        5 => {
+            // Int48
+            if data.len() < 6 {
+                return (RecordField::Int(0), 0);
+            }
+            let sign = if data[0] & 0x80 != 0 { 0xFFFF } else { 0x0000 };
+            let val = i64::from_be_bytes([
+                (sign >> 8) as u8,
+                (sign & 0xFF) as u8,
+                data[0],
+                data[1],
+                data[2],
+                data[3],
+                data[4],
+                data[5],
+            ]);
+            (RecordField::Int(val), 6)
+        }
+        6 => {
+            // Int64
+            if data.len() < 8 {
+                return (RecordField::Int(0), 0);
+            }
+            let val = i64::from_be_bytes([
+                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+            ]);
+            (RecordField::Int(val), 8)
+        }
+        7 => {
+            // Float64
+            if data.len() < 8 {
+                return (RecordField::Float(0.0), 0);
+            }
+            let bits = u64::from_be_bytes([
+                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+            ]);
+            (RecordField::Float(f64::from_bits(bits)), 8)
+        }
+        8 => (RecordField::Int(0), 0),     // Integer 0
+        9 => (RecordField::Int(1), 0),     // Integer 1
+        10 | 11 => (RecordField::Null, 0), // Reserved
+        n if n >= 12 && n % 2 == 0 => {
+            // Blob: (N-12)/2 bytes
+            let len = ((n - 12) / 2) as usize;
+            if data.len() < len {
+                return (RecordField::Blob(Vec::new()), 0);
+            }
+            (RecordField::Blob(data[..len].to_vec()), len)
+        }
+        n if n >= 13 && n % 2 == 1 => {
+            // Text: (N-13)/2 bytes
+            let len = ((n - 13) / 2) as usize;
+            if data.len() < len {
+                return (RecordField::Text(String::new()), 0);
+            }
+            let s = String::from_utf8_lossy(&data[..len]).into_owned();
+            (RecordField::Text(s), len)
+        }
+        _ => (RecordField::Null, 0),
+    }
+}
+
+/// Compare two record fields using the given collation
+fn compare_record_fields(
+    a: &RecordField,
+    b: &RecordField,
+    collation: &CollSeq,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    // SQLite type affinity order: NULL < INT/REAL < TEXT < BLOB
+    match (a, b) {
+        (RecordField::Null, RecordField::Null) => Ordering::Equal,
+        (RecordField::Null, _) => Ordering::Less,
+        (_, RecordField::Null) => Ordering::Greater,
+
+        (RecordField::Int(x), RecordField::Int(y)) => x.cmp(y),
+        (RecordField::Float(x), RecordField::Float(y)) => {
+            x.partial_cmp(y).unwrap_or(Ordering::Equal)
+        }
+        (RecordField::Int(x), RecordField::Float(y)) => {
+            (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal)
+        }
+        (RecordField::Float(x), RecordField::Int(y)) => {
+            x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal)
+        }
+
+        (RecordField::Text(x), RecordField::Text(y)) => collation.compare(x, y),
+
+        (RecordField::Blob(x), RecordField::Blob(y)) => x.cmp(y),
+
+        // Cross-type comparisons based on SQLite affinity
+        (
+            RecordField::Int(_) | RecordField::Float(_),
+            RecordField::Text(_) | RecordField::Blob(_),
+        ) => Ordering::Less,
+        (
+            RecordField::Text(_) | RecordField::Blob(_),
+            RecordField::Int(_) | RecordField::Float(_),
+        ) => Ordering::Greater,
+        (RecordField::Text(_), RecordField::Blob(_)) => Ordering::Less,
+        (RecordField::Blob(_), RecordField::Text(_)) => Ordering::Greater,
+    }
 }
 
 pub struct IntegrityCheckResult {
@@ -2969,7 +3345,7 @@ impl Btree {
             if mem_page.is_intkey {
                 let _ = _cursor.table_moveto(_payload.n_key, false)?;
             } else if let Some(key) = _payload.key.clone() {
-                let _ = _cursor.index_moveto(&UnpackedRecord { key })?;
+                let _ = _cursor.index_moveto(&UnpackedRecord::new(key))?;
             }
             if let Some(ref page) = _cursor.page {
                 mem_page = page.clone();
@@ -4227,7 +4603,9 @@ impl BtCursor {
     }
 
     /// sqlite3BtreeIndexMoveto
-    pub fn index_moveto(&mut self, _key: &UnpackedRecord) -> Result<i32> {
+    /// Moves cursor to the entry matching the unpacked record key.
+    /// Uses KeyInfo collations if available for proper comparison.
+    pub fn index_moveto(&mut self, search_key: &UnpackedRecord) -> Result<i32> {
         let shared = self
             .bt_shared
             .upgrade()
@@ -4238,6 +4616,9 @@ impl BtCursor {
         let mut pgno = self.root_page;
         self.page_stack.clear();
         self.idx_stack.clear();
+
+        // Get KeyInfo for comparison - prefer from UnpackedRecord, fall back to cursor's key_info
+        let key_info = search_key.key_info.as_ref().or(self.key_info.as_ref());
 
         loop {
             let (mem_page, limits) = self.load_page(&mut shared_guard, pgno)?;
@@ -4250,7 +4631,15 @@ impl BtCursor {
                     let cell_offset = mem_page.cell_ptr(i, limits)?;
                     let info = mem_page.parse_cell(cell_offset, limits)?;
                     let payload = info.payload.as_deref().unwrap_or(&[]);
-                    match payload.cmp(_key.key.as_slice()) {
+
+                    // Use KeyInfo comparison if available, otherwise fall back to byte comparison
+                    let cmp = if let Some(ki) = key_info {
+                        ki.compare_records(payload, &search_key.key)
+                    } else {
+                        payload.cmp(search_key.key.as_slice())
+                    };
+
+                    match cmp {
                         std::cmp::Ordering::Equal => {
                             self.info = info;
                             self.n_key = self.info.n_key;
@@ -4289,7 +4678,15 @@ impl BtCursor {
                 let cell_offset = mem_page.cell_ptr(i, limits)?;
                 let info = mem_page.parse_cell(cell_offset, limits)?;
                 let payload = info.payload.as_deref().unwrap_or(&[]);
-                if payload > _key.key.as_slice() {
+
+                // Use KeyInfo comparison if available
+                let is_greater = if let Some(ki) = key_info {
+                    ki.compare_records(payload, &search_key.key) == std::cmp::Ordering::Greater
+                } else {
+                    payload > search_key.key.as_slice()
+                };
+
+                if is_greater {
                     child = mem_page.child_pgno(cell_offset)?;
                     child_index = i;
                     break;
@@ -5171,5 +5568,293 @@ mod tests {
             page_count_before > 0,
             "Should have pages allocated after insert"
         );
+    }
+
+    // =========================================================================
+    // KeyInfo and Collation Tests
+    // =========================================================================
+
+    /// Helper to create a SQLite record with a single integer value
+    fn make_int_record(value: i64) -> Vec<u8> {
+        let mut record = Vec::new();
+        let (serial_type, bytes) = if value == 0 {
+            (8u64, vec![])
+        } else if value == 1 {
+            (9u64, vec![])
+        } else if value >= -128 && value <= 127 {
+            (1u64, vec![value as i8 as u8])
+        } else if value >= -32768 && value <= 32767 {
+            (2u64, (value as i16).to_be_bytes().to_vec())
+        } else if value >= -2147483648 && value <= 2147483647 {
+            (4u64, (value as i32).to_be_bytes().to_vec())
+        } else {
+            (6u64, value.to_be_bytes().to_vec())
+        };
+
+        // Header: header_size + serial_type
+        let header_size = 1 + 1; // 1 byte for header size varint + 1 byte for serial type
+        record.push(header_size as u8);
+        record.push(serial_type as u8);
+        record.extend(bytes);
+        record
+    }
+
+    /// Helper to create a SQLite record with a single text value
+    fn make_text_record(value: &str) -> Vec<u8> {
+        let mut record = Vec::new();
+        let bytes = value.as_bytes();
+        let serial_type = (bytes.len() * 2 + 13) as u64; // Text serial type: N*2+13
+
+        // Header: header_size + serial_type (may be varint)
+        let mut header = Vec::new();
+        write_varint(serial_type, &mut header);
+        let header_size = 1 + header.len();
+
+        record.push(header_size as u8);
+        record.extend(header);
+        record.extend(bytes);
+        record
+    }
+
+    /// Helper to create a SQLite record with multiple fields
+    fn make_multi_record(fields: &[(&str, &str)]) -> Vec<u8> {
+        let mut header = Vec::new();
+        let mut data = Vec::new();
+
+        for (ftype, value) in fields {
+            match *ftype {
+                "int" => {
+                    let v: i64 = value.parse().unwrap_or(0);
+                    let (serial_type, bytes) = if v == 0 {
+                        (8u64, vec![])
+                    } else if v == 1 {
+                        (9u64, vec![])
+                    } else if v >= -128 && v <= 127 {
+                        (1u64, vec![v as i8 as u8])
+                    } else {
+                        (4u64, (v as i32).to_be_bytes().to_vec())
+                    };
+                    write_varint(serial_type, &mut header);
+                    data.extend(bytes);
+                }
+                "text" => {
+                    let bytes = value.as_bytes();
+                    let serial_type = (bytes.len() * 2 + 13) as u64;
+                    write_varint(serial_type, &mut header);
+                    data.extend(bytes);
+                }
+                "null" => {
+                    write_varint(0, &mut header);
+                }
+                _ => {}
+            }
+        }
+
+        let mut record = Vec::new();
+        let header_size = 1 + header.len();
+        record.push(header_size as u8);
+        record.extend(header);
+        record.extend(data);
+        record
+    }
+
+    #[test]
+    fn test_collseq_binary() {
+        let coll = CollSeq::Binary;
+        assert_eq!(coll.compare("abc", "abd"), std::cmp::Ordering::Less);
+        assert_eq!(coll.compare("ABC", "abc"), std::cmp::Ordering::Less); // A < a in ASCII
+        assert_eq!(coll.compare("abc", "abc"), std::cmp::Ordering::Equal);
+        assert_eq!(coll.compare("xyz", "abc"), std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn test_collseq_nocase() {
+        let coll = CollSeq::NoCase;
+        assert_eq!(coll.compare("ABC", "abc"), std::cmp::Ordering::Equal);
+        assert_eq!(coll.compare("Hello", "HELLO"), std::cmp::Ordering::Equal);
+        assert_eq!(coll.compare("abc", "abd"), std::cmp::Ordering::Less);
+        assert_eq!(coll.compare("ABC", "ABD"), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn test_collseq_rtrim() {
+        let coll = CollSeq::RTrim;
+        assert_eq!(coll.compare("abc   ", "abc"), std::cmp::Ordering::Equal);
+        assert_eq!(coll.compare("abc", "abc   "), std::cmp::Ordering::Equal);
+        assert_eq!(coll.compare("abc  ", "abd"), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn test_keyinfo_default() {
+        let ki = KeyInfo::default();
+        assert_eq!(ki.encoding, 1);
+        assert_eq!(ki.n_key_field, 0);
+        assert_eq!(ki.n_all_field, 0);
+        assert!(ki.collations.is_empty());
+    }
+
+    #[test]
+    fn test_keyinfo_new() {
+        let ki = KeyInfo::new(3);
+        assert_eq!(ki.n_key_field, 3);
+        assert_eq!(ki.n_all_field, 3);
+        assert_eq!(ki.collations.len(), 3);
+        assert_eq!(ki.sort_flags.len(), 3);
+    }
+
+    #[test]
+    fn test_keyinfo_with_collations() {
+        let ki = KeyInfo::with_collations(2, vec![CollSeq::NoCase, CollSeq::Binary]);
+        assert_eq!(ki.n_key_field, 2);
+        assert_eq!(ki.collations.len(), 2);
+        assert_eq!(ki.collations[0].name(), "NOCASE");
+        assert_eq!(ki.collations[1].name(), "BINARY");
+    }
+
+    #[test]
+    fn test_parse_record_int() {
+        let record = make_int_record(42);
+        let fields = parse_record_fields(&record);
+        assert_eq!(fields.len(), 1);
+        match &fields[0] {
+            RecordField::Int(v) => assert_eq!(*v, 42),
+            _ => panic!("Expected Int field"),
+        }
+    }
+
+    #[test]
+    fn test_parse_record_text() {
+        let record = make_text_record("hello");
+        let fields = parse_record_fields(&record);
+        assert_eq!(fields.len(), 1);
+        match &fields[0] {
+            RecordField::Text(s) => assert_eq!(s, "hello"),
+            _ => panic!("Expected Text field"),
+        }
+    }
+
+    #[test]
+    fn test_keyinfo_compare_int_records() {
+        let ki = KeyInfo::new(1);
+
+        let rec1 = make_int_record(10);
+        let rec2 = make_int_record(20);
+        let rec3 = make_int_record(10);
+
+        assert_eq!(ki.compare_records(&rec1, &rec2), std::cmp::Ordering::Less);
+        assert_eq!(
+            ki.compare_records(&rec2, &rec1),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(ki.compare_records(&rec1, &rec3), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn test_keyinfo_compare_text_binary() {
+        let ki = KeyInfo::with_collations(1, vec![CollSeq::Binary]);
+
+        let rec1 = make_text_record("abc");
+        let rec2 = make_text_record("abd");
+        let rec_upper = make_text_record("ABC");
+
+        assert_eq!(ki.compare_records(&rec1, &rec2), std::cmp::Ordering::Less);
+        // Binary: "ABC" < "abc" because 'A' (65) < 'a' (97)
+        assert_eq!(
+            ki.compare_records(&rec_upper, &rec1),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn test_keyinfo_compare_text_nocase() {
+        let ki = KeyInfo::with_collations(1, vec![CollSeq::NoCase]);
+
+        let rec_lower = make_text_record("abc");
+        let rec_upper = make_text_record("ABC");
+        let rec_mixed = make_text_record("AbC");
+
+        // All should be equal with NOCASE
+        assert_eq!(
+            ki.compare_records(&rec_lower, &rec_upper),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            ki.compare_records(&rec_upper, &rec_mixed),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            ki.compare_records(&rec_lower, &rec_mixed),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn test_keyinfo_compare_desc_order() {
+        let mut ki = KeyInfo::new(1);
+        ki.sort_flags = vec![KEYINFO_ORDER_DESC];
+
+        let rec1 = make_int_record(10);
+        let rec2 = make_int_record(20);
+
+        // With DESC, larger values should come first (Less ordering)
+        assert_eq!(
+            ki.compare_records(&rec1, &rec2),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(ki.compare_records(&rec2, &rec1), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn test_keyinfo_compare_null() {
+        let ki = KeyInfo::new(1);
+
+        let rec_null = vec![2u8, 0]; // Header size 2, serial type 0 (NULL)
+        let rec_int = make_int_record(1);
+
+        // NULL compares less than any value
+        assert_eq!(
+            ki.compare_records(&rec_null, &rec_int),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            ki.compare_records(&rec_int, &rec_null),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn test_keyinfo_multi_column() {
+        // Compare (name COLLATE NOCASE, age BINARY)
+        let ki = KeyInfo::with_collations(2, vec![CollSeq::NoCase, CollSeq::Binary]);
+
+        // ("John", 25) vs ("JOHN", 30) - names equal (nocase), 25 < 30
+        let rec1 = make_multi_record(&[("text", "John"), ("int", "25")]);
+        let rec2 = make_multi_record(&[("text", "JOHN"), ("int", "30")]);
+
+        assert_eq!(ki.compare_records(&rec1, &rec2), std::cmp::Ordering::Less);
+
+        // ("Alice", 20) vs ("Bob", 20) - different names
+        let rec3 = make_multi_record(&[("text", "Alice"), ("int", "20")]);
+        let rec4 = make_multi_record(&[("text", "Bob"), ("int", "20")]);
+
+        assert_eq!(ki.compare_records(&rec3, &rec4), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn test_unpacked_record_new() {
+        let key = vec![1, 2, 3];
+        let rec = UnpackedRecord::new(key.clone());
+        assert_eq!(rec.key, key);
+        assert!(rec.fields.is_none());
+        assert!(rec.key_info.is_none());
+    }
+
+    #[test]
+    fn test_unpacked_record_with_key_info() {
+        let key = vec![1, 2, 3];
+        let ki = Arc::new(KeyInfo::new(1));
+        let rec = UnpackedRecord::with_key_info(key.clone(), ki.clone());
+        assert_eq!(rec.key, key);
+        assert!(rec.key_info.is_some());
     }
 }

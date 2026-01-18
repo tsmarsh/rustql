@@ -3116,9 +3116,7 @@ impl Vdbe {
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if let Some(ref mut bt_cursor) = cursor.btree_cursor {
                         let res = if cursor.is_index {
-                            bt_cursor.index_moveto(&UnpackedRecord {
-                                key: index_key.clone(),
-                            })?
+                            bt_cursor.index_moveto(&UnpackedRecord::new(index_key.clone()))?
                         } else {
                             bt_cursor.table_moveto(rowid_key, false)?
                         };
@@ -3151,9 +3149,7 @@ impl Vdbe {
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if let Some(ref mut bt_cursor) = cursor.btree_cursor {
                         let res = if cursor.is_index {
-                            bt_cursor.index_moveto(&UnpackedRecord {
-                                key: index_key.clone(),
-                            })?
+                            bt_cursor.index_moveto(&UnpackedRecord::new(index_key.clone()))?
                         } else {
                             bt_cursor.table_moveto(rowid_key, false)?
                         };
@@ -3186,9 +3182,7 @@ impl Vdbe {
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if let Some(ref mut bt_cursor) = cursor.btree_cursor {
                         let res = if cursor.is_index {
-                            bt_cursor.index_moveto(&UnpackedRecord {
-                                key: index_key.clone(),
-                            })?
+                            bt_cursor.index_moveto(&UnpackedRecord::new(index_key.clone()))?
                         } else {
                             bt_cursor.table_moveto(rowid_key, false)?
                         };
@@ -3221,9 +3215,7 @@ impl Vdbe {
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if let Some(ref mut bt_cursor) = cursor.btree_cursor {
                         let res = if cursor.is_index {
-                            bt_cursor.index_moveto(&UnpackedRecord {
-                                key: index_key.clone(),
-                            })?
+                            bt_cursor.index_moveto(&UnpackedRecord::new(index_key.clone()))?
                         } else {
                             bt_cursor.table_moveto(rowid_key, false)?
                         };

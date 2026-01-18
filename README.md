@@ -209,21 +209,6 @@ cargo build --features tcl
 tclsh tests/run_tcl_test.tcl tests/basic_tcl.test
 ```
 
-### Rust-Based Test Runner (Pattern Matching)
-
-RustQL also includes a Rust-based compatibility runner that parses TCL test files and extracts SQL. This doesn't execute actual TCL but provides quick feedback:
-
-```bash
-# Run the compatibility suite
-cargo test --test sqlite_compat_test
-
-# Run a specific test file
-cargo test --test sqlite_compat_test test_select1_basic -- --nocapture
-cargo test --test sqlite_compat_test test_table_basic -- --nocapture
-```
-
-Note: The Rust runner uses pattern matching to extract tests from TCL files. It misses TCL control flow, procs, and variable substitution. For accurate compatibility testing, use the TCL extension with real `tclsh`.
-
 ## Contributing And Workflow
 
 This project uses [moth](https://github.com/tsmarsh/moth) to coordinate work.

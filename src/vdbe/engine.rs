@@ -3379,9 +3379,7 @@ impl Vdbe {
                             let record_mems = self.decode_record_mems(&record);
                             let mut has_null = false;
                             for i in 0..n_key_cols {
-                                if sorter_mems
-                                    .get(i)
-                                    .map_or(false, |mem| mem.is_null())
+                                if sorter_mems.get(i).map_or(false, |mem| mem.is_null())
                                     || record_mems.get(i).map_or(false, |mem| mem.is_null())
                                 {
                                     has_null = true;

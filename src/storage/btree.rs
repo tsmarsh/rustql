@@ -3710,9 +3710,14 @@ impl Btree {
 
         let header_start = limits.header_start();
         let header_size = mem_page.header_size();
-        let ptr_array_end = header_start + header_size + (mem_page.n_cell as usize * 2);
-        let cell_offset = mem_page.cell_content_offset(limits)?;
-        if cell_offset < ptr_array_end + cell_size {
+
+        // Check if we have enough total free space (including free blocks)
+        // Need space for cell + 2 bytes for the cell pointer
+        let space_needed = cell_size + 2;
+        let total_free = mem_page.n_free as usize;
+
+        if total_free < space_needed {
+            // Not enough total space - need to split
             if mem_page.is_leaf {
                 if let (Some(parent), Some(child_index)) =
                     (_cursor.page_stack.last(), _cursor.idx_stack.last())
@@ -3774,9 +3779,26 @@ impl Btree {
             }
             return Err(Error::new(ErrorCode::Full));
         }
-        let new_cell_offset = cell_offset - cell_size;
+
+        // Try to allocate space using free block chain first, then gap
+        let new_cell_offset = match mem_page.allocate_space(cell_size, limits) {
+            Some(offset) => offset as usize,
+            None => {
+                // Allocation failed but we have enough total free space - defragment and retry
+                mem_page.defragment(limits)?;
+                match mem_page.allocate_space(cell_size, limits) {
+                    Some(offset) => offset as usize,
+                    None => return Err(Error::new(ErrorCode::Full)),
+                }
+            }
+        };
+
+        // Get page from pager and sync mem_page changes
         let mut page = shared_guard.pager.get(root_pgno, PagerGetFlags::empty())?;
         shared_guard.pager.write(&mut page)?;
+
+        // Copy mem_page.data (which has updated free block chain) to page.data
+        page.data.copy_from_slice(&mem_page.data);
 
         {
             let data = &mut page.data;
@@ -3791,7 +3813,9 @@ impl Btree {
             let ptr_write = header_start + header_size + (insert_index as usize * 2);
             write_u16(data, ptr_write, new_cell_offset as u16)?;
             write_u16(data, header_start + 3, mem_page.n_cell + 1)?;
-            write_u16(data, header_start + 5, new_cell_offset as u16)?;
+            // Note: cell_offset in header is only updated if we used the gap, not free blocks
+            // allocate_space already updated mem_page.cell_offset if gap was used
+            write_u16(data, header_start + 5, mem_page.cell_offset)?;
         }
 
         // Write modified page back to cache so subsequent reads see the changes
@@ -3799,7 +3823,8 @@ impl Btree {
 
         mem_page.data = page.data.clone();
         mem_page.n_cell += 1;
-        mem_page.cell_offset = new_cell_offset as u16;
+        // n_free is already updated by allocate_space, but we used 2 more bytes for the pointer
+        mem_page.n_free -= 2;
         _cursor.page = Some(mem_page);
         Ok(())
     }
@@ -3812,7 +3837,7 @@ impl Btree {
             .map_err(|_| Error::new(ErrorCode::Internal))?;
         let mut shared_guard = shared;
         let root_pgno = _cursor.root_page;
-        let (mem_page, limits) = _cursor.load_page(&mut shared_guard, root_pgno)?;
+        let (mut mem_page, limits) = _cursor.load_page(&mut shared_guard, root_pgno)?;
         if !mem_page.is_leaf {
             return Err(Error::new(ErrorCode::Internal));
         }
@@ -3823,32 +3848,40 @@ impl Btree {
         let header_start = limits.header_start();
         let header_size = mem_page.header_size();
         let ptr_array_start = header_start + header_size;
-        let mut page = shared_guard.pager.get(root_pgno, PagerGetFlags::empty())?;
-        shared_guard.pager.write(&mut page)?;
-        let data = &mut page.data;
 
         let cell_offset = mem_page.cell_ptr(_cursor.ix, limits)?;
         let info = mem_page.parse_cell(cell_offset, limits)?;
         if let Some(overflow_pgno) = info.overflow_pgno {
             free_overflow_chain(&mut shared_guard, overflow_pgno)?;
         }
-        let _cell_size = info.n_size as i32;
+        let cell_size = info.n_size;
 
+        // Free the cell space to the free block chain
+        mem_page.free_space(cell_offset, cell_size, limits);
+
+        // Remove the cell pointer by shifting remaining pointers
         let from = ptr_array_start + ((_cursor.ix as usize + 1) * 2);
         let to = ptr_array_start + (_cursor.ix as usize * 2);
         let ptr_end = ptr_array_start + (mem_page.n_cell as usize * 2);
-        data.copy_within(from..ptr_end, to);
+        mem_page.data.copy_within(from..ptr_end, to);
 
         let new_n_cell = mem_page.n_cell - 1;
-        write_u16(data, header_start + 3, new_n_cell)?;
+        write_u16(&mut mem_page.data, header_start + 3, new_n_cell)?;
+        mem_page.n_cell = new_n_cell;
+        // Account for the 2 bytes freed from the cell pointer array
+        mem_page.n_free += 2;
+
+        // Write mem_page changes to pager
+        let mut page = shared_guard.pager.get(root_pgno, PagerGetFlags::empty())?;
+        shared_guard.pager.write(&mut page)?;
+        page.data.copy_from_slice(&mem_page.data);
 
         // Write modified page back to cache so subsequent reads see the changes
         shared_guard.pager.write_page_to_cache(&page);
 
-        // Update cursor's stored page with new n_cell
+        // Update cursor's stored page
         if let Some(ref mut cursor_page) = _cursor.page {
-            cursor_page.n_cell = new_n_cell;
-            cursor_page.data = page.data.clone();
+            *cursor_page = mem_page.clone();
         }
 
         if mem_page.is_underfull(limits).unwrap_or(false) {

@@ -2899,12 +2899,8 @@ impl Vdbe {
                                     );
 
                                     // Perform the insert
-                                    if let Err(e) = btree.insert(bt_cursor, &payload, flags, 0) {
-                                        // Log error but continue for now
-                                        eprintln!("Insert failed: {:?}", e);
-                                    } else {
-                                        inserted = true;
-                                    }
+                                    btree.insert(bt_cursor, &payload, flags, 0)?;
+                                    inserted = true;
                                 }
                             }
                         }
@@ -3098,11 +3094,8 @@ impl Vdbe {
                     } else if let Some(ref btree) = btree_arc {
                         if let Some(ref mut bt_cursor) = cursor.btree_cursor {
                             let flags = BtreeInsertFlags::from_bits_truncate(op.p5 as u8);
-                            if let Err(e) = btree.delete(bt_cursor, flags) {
-                                eprintln!("Delete failed: {:?}", e);
-                            } else {
-                                deleted = true;
-                            }
+                            btree.delete(bt_cursor, flags)?;
+                            deleted = true;
                             // Sync cursor state from btree cursor
                             // After delete, btree cursor may still be valid (pointing to next row)
                             cursor.state = match bt_cursor.state {

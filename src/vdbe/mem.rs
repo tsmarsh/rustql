@@ -754,11 +754,28 @@ impl Mem {
             return Ok(());
         }
         let shift = other.to_int();
-        if shift < 0 {
-            self.set_int(self.to_int() >> (-shift as u32));
+        let val = self.to_int();
+        let result = if shift < 0 {
+            // Negative shift = right shift
+            let s = (-shift) as u64;
+            if s >= 64 {
+                if val < 0 {
+                    -1
+                } else {
+                    0
+                }
+            } else {
+                val >> s
+            }
         } else {
-            self.set_int(self.to_int() << (shift as u32));
-        }
+            let s = shift as u64;
+            if s >= 64 {
+                0
+            } else {
+                val << s
+            }
+        };
+        self.set_int(result);
         Ok(())
     }
 
@@ -769,11 +786,28 @@ impl Mem {
             return Ok(());
         }
         let shift = other.to_int();
-        if shift < 0 {
-            self.set_int(self.to_int() << (-shift as u32));
+        let val = self.to_int();
+        let result = if shift < 0 {
+            // Negative shift = left shift
+            let s = (-shift) as u64;
+            if s >= 64 {
+                0
+            } else {
+                val << s
+            }
         } else {
-            self.set_int(self.to_int() >> (shift as u32));
-        }
+            let s = shift as u64;
+            if s >= 64 {
+                if val < 0 {
+                    -1
+                } else {
+                    0
+                }
+            } else {
+                val >> s
+            }
+        };
+        self.set_int(result);
         Ok(())
     }
 }

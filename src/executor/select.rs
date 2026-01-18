@@ -1810,8 +1810,9 @@ impl<'s> SelectCompiler<'s> {
                     let end_label = self.alloc_label();
 
                     // Compare: if condition is true, jump to true_label
-                    // Comparison opcode format: P1=left operand, P2=jump target, P3=right operand
-                    self.emit(cmp_opcode, left_reg, true_label, right_reg, P4::Unused);
+                    // Comparison opcode format: P1=right operand, P2=jump target, P3=left operand
+                    // Lt P1 P2 P3 means "jump to P2 if r[P3] < r[P1]"
+                    self.emit(cmp_opcode, right_reg, true_label, left_reg, P4::Unused);
 
                     // Fall through means false - goto end
                     self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
@@ -1840,7 +1841,9 @@ impl<'s> SelectCompiler<'s> {
                         _ => Opcode::Noop,
                     };
 
-                    self.emit(opcode, left_reg, right_reg, dest_reg, P4::Unused);
+                    // Arithmetic opcodes: P1=right operand, P2=left operand, P3=dest
+                    // Add/Sub/Mul/Div compute r[P2] op r[P1] and store in r[P3]
+                    self.emit(opcode, right_reg, left_reg, dest_reg, P4::Unused);
                 }
             }
             Expr::Unary { op, expr: inner } => {
@@ -2092,9 +2095,11 @@ impl<'s> SelectCompiler<'s> {
                 let end_label = self.alloc_label();
 
                 // Check val >= low (fail if val < low)
-                self.emit(Opcode::Lt, val_reg, fail_label, low_reg, P4::Unused);
+                // Lt P1 P2 P3 jumps if r[P3] < r[P1], so P1=low, P3=val
+                self.emit(Opcode::Lt, low_reg, fail_label, val_reg, P4::Unused);
                 // Check val <= high (fail if val > high)
-                self.emit(Opcode::Gt, val_reg, fail_label, high_reg, P4::Unused);
+                // Gt P1 P2 P3 jumps if r[P3] > r[P1], so P1=high, P3=val
+                self.emit(Opcode::Gt, high_reg, fail_label, val_reg, P4::Unused);
 
                 // Success - in range
                 self.emit(

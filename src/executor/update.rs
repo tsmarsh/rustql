@@ -725,7 +725,8 @@ impl<'s> UpdateCompiler<'s> {
                     // Default to false
                     self.emit(Opcode::Integer, 0, dest_reg, 0, P4::Unused);
 
-                    // The comparison opcode: P1=left, P2=jump_target, P3=right
+                    // Comparison opcodes: P1=right operand, P2=jump target, P3=left operand
+                    // Lt P1 P2 P3 means "jump to P2 if r[P3] < r[P1]"
                     let cmp_opcode = match op {
                         crate::parser::ast::BinaryOp::Eq => Opcode::Eq,
                         crate::parser::ast::BinaryOp::Ne => Opcode::Ne,
@@ -735,7 +736,7 @@ impl<'s> UpdateCompiler<'s> {
                         crate::parser::ast::BinaryOp::Ge => Opcode::Ge,
                         _ => unreachable!(),
                     };
-                    self.emit(cmp_opcode, left_reg, set_true_label, right_reg, P4::Unused);
+                    self.emit(cmp_opcode, right_reg, set_true_label, left_reg, P4::Unused);
 
                     // Jump past set_true
                     self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
@@ -763,7 +764,9 @@ impl<'s> UpdateCompiler<'s> {
                         crate::parser::ast::BinaryOp::ShiftRight => Opcode::ShiftRight,
                         _ => Opcode::Add, // Default fallback
                     };
-                    self.emit(opcode, left_reg, right_reg, dest_reg, P4::Unused);
+                    // Arithmetic opcodes: P1=right operand, P2=left operand, P3=dest
+                    // Add/Sub/Mul/Div compute r[P2] op r[P1] and store in r[P3]
+                    self.emit(opcode, right_reg, left_reg, dest_reg, P4::Unused);
                 }
             }
             Expr::Unary { op, expr: inner } => {

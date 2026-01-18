@@ -448,7 +448,10 @@ impl DeleteCompiler {
                     _ => Opcode::Add, // Default fallback
                 };
 
-                self.emit(opcode, left_reg, right_reg, dest_reg, P4::Unused);
+                // Binary opcodes: P1=right operand, P2=left operand, P3=dest
+                // Arithmetic: r[P2] op r[P1] stored in r[P3]
+                // Comparison: jump to P2 if r[P3] op r[P1]
+                self.emit(opcode, right_reg, left_reg, dest_reg, P4::Unused);
             }
             Expr::Unary { op, expr: inner } => {
                 self.compile_expr(inner, dest_reg)?;

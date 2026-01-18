@@ -672,19 +672,28 @@ impl Mem {
     }
 
     /// Divide self by other
+    /// SQLite uses integer division when both operands are integers
     pub fn divide(&mut self, other: &Mem) -> Result<()> {
         if self.is_null() || other.is_null() {
             self.set_null();
             return Ok(());
         }
 
-        let divisor = other.to_real();
-        if divisor == 0.0 {
-            self.set_null();
-            return Ok(());
+        // Integer division when both operands are integers
+        if self.is_int() && other.is_int() {
+            if other.i == 0 {
+                self.set_null();
+            } else {
+                self.set_int(self.i / other.i);
+            }
+        } else {
+            let divisor = other.to_real();
+            if divisor == 0.0 {
+                self.set_null();
+            } else {
+                self.set_real(self.to_real() / divisor);
+            }
         }
-
-        self.set_real(self.to_real() / divisor);
         Ok(())
     }
 
@@ -878,12 +887,20 @@ mod tests {
 
     #[test]
     fn test_mem_division() {
+        // Integer division: 10/4 = 2 (truncates like SQLite)
         let mut a = Mem::from_int(10);
+        let b = Mem::from_int(4);
+        a.divide(&b).unwrap();
+        assert_eq!(a.to_int(), 2);
+        assert!(a.is_int());
+
+        // Float division: 10.0/4 = 2.5
+        let mut a = Mem::from_real(10.0);
         let b = Mem::from_int(4);
         a.divide(&b).unwrap();
         assert_eq!(a.to_real(), 2.5);
 
-        // Division by zero
+        // Division by zero returns NULL
         let mut a = Mem::from_int(10);
         let b = Mem::from_int(0);
         a.divide(&b).unwrap();

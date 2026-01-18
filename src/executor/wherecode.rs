@@ -413,7 +413,9 @@ impl WhereCodeGen {
             self.code_expression(left, left_reg)?;
             self.code_expression(right, right_reg)?;
 
-            self.emit(skip_op, left_reg, skip_label, right_reg, P4::Unused);
+            // Comparison opcodes: P1=right operand, P2=jump target, P3=left operand
+            // Lt P1 P2 P3 means "jump to P2 if r[P3] < r[P1]"
+            self.emit(skip_op, right_reg, skip_label, left_reg, P4::Unused);
         }
         Ok(())
     }
@@ -587,7 +589,10 @@ impl WhereCodeGen {
                     }
                 };
 
-                self.emit(opcode, left_reg, right_reg, dest_reg, P4::Unused);
+                // Binary opcodes: P1=right operand, P2=left operand, P3=dest
+                // Arithmetic: r[P2] op r[P1] stored in r[P3]
+                // Comparison: jump to P2 if r[P3] op r[P1]
+                self.emit(opcode, right_reg, left_reg, dest_reg, P4::Unused);
             }
             Expr::Unary { op, expr: inner } => {
                 self.code_expression(inner, dest_reg)?;

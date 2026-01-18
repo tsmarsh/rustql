@@ -3,7 +3,7 @@
 //! This module implements the sqlite3 connection type and related functions.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::error::{Error, ErrorCode, Result};
@@ -692,6 +692,9 @@ pub struct SqliteConnection {
     pub encoding: Encoding,
     /// Per-connection configuration flags
     pub db_config: DbConfigFlags,
+    /// Schema generation counter - incremented on schema changes
+    /// Used to invalidate prepared statements
+    pub schema_generation: AtomicU64,
 }
 
 /// Per-connection configuration flags
@@ -775,6 +778,7 @@ impl SqliteConnection {
                 legacy_file_format: false,
                 no_ckpt_on_close: false,
             },
+            schema_generation: AtomicU64::new(0),
         };
 
         // Add main and temp databases
@@ -831,6 +835,17 @@ impl SqliteConnection {
     /// Set the collation-needed callback
     pub fn set_collation_needed(&mut self, callback: Option<CollationNeeded>) {
         self.collation_needed = callback;
+    }
+
+    /// Get the current schema generation
+    pub fn get_schema_generation(&self) -> u64 {
+        self.schema_generation.load(Ordering::SeqCst)
+    }
+
+    /// Increment the schema generation counter
+    /// Called when the schema changes (e.g., SetCookie on schema version)
+    pub fn increment_schema_generation(&self) -> u64 {
+        self.schema_generation.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     /// Register a scalar function

@@ -3564,8 +3564,13 @@ impl Vdbe {
                     }
                 }
 
-                // Note: Statement invalidation for temp DB schema changes
-                // would be handled here if we had a statement cache
+                // Schema version change invalidates all prepared statements
+                if cookie_index == BTREE_SCHEMA_VERSION {
+                    if let Some(conn_ptr) = self.conn_ptr {
+                        let conn = unsafe { &*conn_ptr };
+                        conn.increment_schema_generation();
+                    }
+                }
             }
 
             Opcode::VerifyCookie => {

@@ -63,6 +63,10 @@ pub struct PreparedStmt {
     detach_name: Option<String>,
     /// Connection pointer for PRAGMA/ANALYZE execution
     conn_ptr: Option<*mut SqliteConnection>,
+    /// Statement has been expired due to schema change
+    expired: bool,
+    /// Schema generation when statement was prepared
+    schema_generation: u64,
 }
 
 impl PreparedStmt {
@@ -91,6 +95,8 @@ impl PreparedStmt {
             attach_stmt: None,
             detach_name: None,
             conn_ptr: None,
+            expired: false,
+            schema_generation: 0,
         }
     }
 
@@ -123,7 +129,41 @@ impl PreparedStmt {
             attach_stmt: None,
             detach_name: None,
             conn_ptr: None,
+            expired: false,
+            schema_generation: 0,
         }
+    }
+
+    /// Create from compiled statement with schema generation
+    pub fn from_compiled_with_generation(
+        sql: &str,
+        compiled: CompiledStmt,
+        tail: &str,
+        schema_generation: u64,
+    ) -> Self {
+        let mut stmt = Self::from_compiled(sql, compiled, tail);
+        stmt.schema_generation = schema_generation;
+        stmt
+    }
+
+    /// Mark this statement as expired
+    pub fn expire(&mut self) {
+        self.expired = true;
+    }
+
+    /// Check if statement is expired
+    pub fn is_expired(&self) -> bool {
+        self.expired
+    }
+
+    /// Get schema generation this statement was prepared with
+    pub fn schema_generation(&self) -> u64 {
+        self.schema_generation
+    }
+
+    /// Set schema generation
+    pub fn set_schema_generation(&mut self, gen: u64) {
+        self.schema_generation = gen;
     }
 
     /// Get the compiled bytecode
@@ -292,6 +332,8 @@ pub fn sqlite3_prepare_v2<'a>(
             let mut stmt = PreparedStmt::from_compiled(sql, compiled, tail);
             // Always set connection pointer so VDBE has access to btree and schema
             stmt.conn_ptr = Some(conn as *mut SqliteConnection);
+            // Capture schema generation for statement invalidation
+            stmt.set_schema_generation(conn.get_schema_generation());
             if let Some(pragma) = parsed_pragma {
                 if let Some((names, types)) = pragma_columns(&pragma) {
                     stmt.set_columns(names, types);
@@ -359,6 +401,28 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
 
     if stmt.done {
         return Ok(StepResult::Done);
+    }
+
+    // Check if statement is expired due to schema change
+    if stmt.is_expired() {
+        return Err(Error::with_message(
+            ErrorCode::Schema,
+            "statement expired: schema has changed",
+        ));
+    }
+
+    // Check if schema generation has changed since statement was prepared
+    if let Some(conn_ptr) = stmt.conn_ptr {
+        let conn = unsafe { &*conn_ptr };
+        let current_gen = conn.get_schema_generation();
+        if stmt.schema_generation != current_gen {
+            // Mark as expired and return schema error
+            stmt.expire();
+            return Err(Error::with_message(
+                ErrorCode::Schema,
+                "statement expired: schema has changed",
+            ));
+        }
     }
 
     if stmt.stmt_type == Some(StmtType::Pragma) && stmt.pragma.is_some() {
@@ -1362,5 +1426,65 @@ mod tests {
             value_to_sql_literal(&Value::Blob(vec![1, 2, 3])),
             "X'010203'"
         );
+    }
+
+    #[test]
+    fn test_statement_expiration_manual() {
+        let mut stmt = PreparedStmt::new("SELECT 1");
+        assert!(!stmt.is_expired());
+
+        stmt.expire();
+        assert!(stmt.is_expired());
+    }
+
+    #[test]
+    fn test_schema_generation_captured_on_prepare() {
+        let mut conn = SqliteConnection::new();
+        assert_eq!(conn.get_schema_generation(), 0);
+
+        let (stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT 1").unwrap();
+        assert_eq!(stmt.schema_generation(), 0);
+
+        // Increment generation
+        conn.increment_schema_generation();
+        assert_eq!(conn.get_schema_generation(), 1);
+
+        // New statement should have new generation
+        let (stmt2, _) = sqlite3_prepare_v2(&mut conn, "SELECT 2").unwrap();
+        assert_eq!(stmt2.schema_generation(), 1);
+    }
+
+    #[test]
+    fn test_expired_statement_returns_schema_error() {
+        let mut conn = SqliteConnection::new();
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT 1").unwrap();
+
+        // Manually expire
+        stmt.expire();
+
+        let result = sqlite3_step(&mut stmt);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Schema);
+    }
+
+    #[test]
+    fn test_schema_generation_mismatch_expires_statement() {
+        let mut conn = SqliteConnection::new();
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT 1").unwrap();
+        assert_eq!(stmt.schema_generation(), 0);
+        assert!(!stmt.is_expired());
+
+        // Simulate schema change by incrementing generation
+        conn.increment_schema_generation();
+
+        // Statement should now fail with schema error
+        let result = sqlite3_step(&mut stmt);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Schema);
+
+        // Statement should now be marked as expired
+        assert!(stmt.is_expired());
     }
 }

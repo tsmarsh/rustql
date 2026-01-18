@@ -2876,8 +2876,8 @@ impl Vdbe {
                                             ));
                                         }
                                         OE_ROLLBACK => {
-                                            // Rollback and return error
-                                            // TODO: Actually rollback the transaction
+                                            // Rollback transaction and return error
+                                            let _ = btree.rollback(0, false);
                                             let table_name = match &op.p4 {
                                                 P4::Text(s) => s.as_str(),
                                                 _ => "table",

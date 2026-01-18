@@ -411,7 +411,10 @@ pub enum Opcode {
     /// Check for interrupt
     Checkpoint,
 
-    /// Finish expression evaluation
+    /// Set up deferred table seek from index cursor
+    DeferredSeek,
+
+    /// Complete deferred table seek
     FinishSeek,
 
     /// Sort key comparison
@@ -688,6 +691,7 @@ impl Opcode {
             Opcode::Explain => "Explain",
             Opcode::SqlExec => "SqlExec",
             Opcode::Checkpoint => "Checkpoint",
+            Opcode::DeferredSeek => "DeferredSeek",
             Opcode::FinishSeek => "FinishSeek",
             Opcode::SortKey => "SortKey",
             Opcode::Sequence => "Sequence",

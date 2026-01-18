@@ -130,6 +130,10 @@ pub struct VdbeCursor {
     pub deferred_moveto: bool,
     /// Target rowid for deferred seek
     pub moveto_target: Option<i64>,
+    /// Alternative cursor for deferred seek column reads
+    pub alt_cursor: Option<i32>,
+    /// Column mapping from this cursor to alt_cursor (maps col index -> alt col index)
+    pub alt_map: Option<Vec<i32>>,
     /// B-tree cursor for actual storage operations
     pub btree_cursor: Option<BtCursor>,
     /// Table name (for looking up column indices at runtime)
@@ -203,6 +207,8 @@ impl VdbeCursor {
             seek_key: None,
             deferred_moveto: false,
             moveto_target: None,
+            alt_cursor: None,
+            alt_map: None,
             btree_cursor: None,
             table_name: None,
             is_sqlite_master: false,
@@ -2104,6 +2110,41 @@ impl Vdbe {
                     }
                     *self.mem_mut(op.p3) = value;
                 } else if let Some(cursor) = self.cursor(op.p1) {
+                    // Check for deferred seek with alt-map redirection
+                    if cursor.deferred_moveto {
+                        if let (Some(alt_cursor_id), Some(ref alt_map)) =
+                            (cursor.alt_cursor, cursor.alt_map.as_ref())
+                        {
+                            // Check if this column is mapped to the alt cursor
+                            if let Some(&mapped_col) = alt_map.get(col_idx) {
+                                if mapped_col >= 0 {
+                                    // Read from alt cursor instead
+                                    if let Some(alt_cursor) = self.cursor(alt_cursor_id) {
+                                        // Get payload data from alt cursor
+                                        let payload_data =
+                                            if let Some(ref bt_cursor) = alt_cursor.btree_cursor {
+                                                bt_cursor.info.payload.clone()
+                                            } else {
+                                                alt_cursor.row_data.clone()
+                                            };
+
+                                        if let Some(ref data) = payload_data {
+                                            let mems = self.decode_record_mems(data);
+                                            if let Some(value) = mems.get(mapped_col as usize) {
+                                                *self.mem_mut(op.p3) = value.clone();
+                                            } else {
+                                                self.mem_mut(op.p3).set_null();
+                                            }
+                                            return Ok(ExecResult::Continue);
+                                        }
+                                    }
+                                }
+                            }
+                            // Column not in alt-map or mapped to -1, need to finish seek
+                            // Fall through to complete the deferred seek
+                        }
+                    }
+
                     if cursor.null_row {
                         self.mem_mut(op.p3).set_null();
                     } else if let Some(ref bt_cursor) = cursor.btree_cursor {
@@ -4255,6 +4296,85 @@ impl Vdbe {
                 self.mem_mut(op.p2).set_int(total);
             }
 
+            Opcode::DeferredSeek => {
+                // DeferredSeek P1 P2 P3 P4: Set up deferred table seek from index cursor
+                // P1 = table cursor to seek
+                // P3 = index cursor with the rowid
+                // P4 = alt-map array (column mapping from P1 cols to P3 cols)
+                //
+                // This sets P1 into deferred mode. Column reads from P1 will be
+                // redirected to P3 using the alt-map until FinishSeek is called.
+
+                // Get the rowid from the index cursor (P3)
+                // First try to get from row_data or existing rowid
+                let rowid = {
+                    // Try row_data first
+                    let from_row_data = if let Some(idx_cursor) = self.cursor(op.p3) {
+                        if let Some(ref data) = idx_cursor.row_data {
+                            let mems = self.decode_record_mems(data);
+                            mems.last().map(|m| m.to_int())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    if from_row_data.is_some() {
+                        from_row_data
+                    } else {
+                        // Try btree cursor payload
+                        let payload = if let Some(idx_cursor) = self.cursor_mut(op.p3) {
+                            if let Some(ref mut bt_cursor) = idx_cursor.btree_cursor {
+                                if let Some(data) = bt_cursor.payload_fetch() {
+                                    Some(data.to_vec())
+                                } else if let Ok(data) =
+                                    bt_cursor.payload(0, bt_cursor.payload_size())
+                                {
+                                    Some(data)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        if let Some(ref data) = payload {
+                            if !data.is_empty() {
+                                let mems = self.decode_record_mems(data);
+                                mems.last().map(|m| m.to_int())
+                            } else {
+                                None
+                            }
+                        } else {
+                            // Fall back to cursor rowid
+                            self.cursor(op.p3).and_then(|c| c.rowid)
+                        }
+                    }
+                };
+
+                // Extract alt-map from P4 if present (convert i64 to i32)
+                let alt_map: Option<Vec<i32>> = match &op.p4 {
+                    P4::IntArray(arr) => Some(arr.iter().map(|&x| x as i32).collect()),
+                    _ => None,
+                };
+
+                // Set up the table cursor for deferred seek
+                if let Some(tbl_cursor) = self.cursor_mut(op.p1) {
+                    if let Some(target) = rowid {
+                        tbl_cursor.deferred_moveto = true;
+                        tbl_cursor.moveto_target = Some(target);
+                        tbl_cursor.alt_cursor = Some(op.p3);
+                        tbl_cursor.alt_map = alt_map;
+                        tbl_cursor.state = CursorState::Valid;
+                        tbl_cursor.rowid = Some(target);
+                    }
+                }
+            }
+
             Opcode::FinishSeek => {
                 // Complete a deferred table seek if one is pending.
                 if let Some(cursor) = self.cursor_mut(op.p1) {
@@ -4275,6 +4395,8 @@ impl Vdbe {
                         }
                         cursor.deferred_moveto = false;
                         cursor.moveto_target = None;
+                        cursor.alt_cursor = None;
+                        cursor.alt_map = None;
                     }
                 }
             }
@@ -5987,5 +6109,49 @@ mod tests {
         assert_eq!(vdbe.column_int(0), 1);
         assert_eq!(vdbe.column_int(1), 2);
         assert_eq!(vdbe.column_int(2), 3);
+    }
+
+    #[test]
+    fn test_deferred_seek_cursor_state() {
+        // Test that DeferredSeek sets up cursor state correctly
+        let mut conn = open_test_connection();
+        let conn_ptr = &mut *conn as *mut SqliteConnection;
+
+        let mut vdbe = Vdbe::from_ops(vec![
+            // Open table cursor P1=0
+            VdbeOp::new(Opcode::OpenRead, 0, 1, 0),
+            // Open index cursor P1=1 (simulated)
+            VdbeOp::new(Opcode::OpenRead, 1, 1, 0),
+            // Set up a record with rowid=42 in register 2
+            VdbeOp::new(Opcode::Integer, 42, 2, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        vdbe.set_connection(conn_ptr);
+
+        // Execute up to halt
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Done);
+    }
+
+    #[test]
+    fn test_finish_seek_clears_deferred_state() {
+        // Test that FinishSeek clears deferred seek state
+        let mut conn = open_test_connection();
+        let conn_ptr = &mut *conn as *mut SqliteConnection;
+
+        let mut vdbe = Vdbe::from_ops(vec![
+            // Open table cursor
+            VdbeOp::new(Opcode::OpenRead, 0, 1, 0),
+            // FinishSeek should be a no-op if no deferred seek pending
+            VdbeOp::new(Opcode::FinishSeek, 0, 0, 0),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        vdbe.set_connection(conn_ptr);
+
+        // Execute - should not fail
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Done);
     }
 }

@@ -2861,6 +2861,255 @@ impl MemPage {
         let free = self.compute_free_space(limits)?;
         Ok(free > (limits.usable_size as i32 / 2))
     }
+
+    /// Allocate n_byte bytes of space within the page.
+    /// First searches the free block chain for a suitable block, then falls back to
+    /// allocating from the cell content area (the gap between cell pointers and cell data).
+    ///
+    /// Returns Some(offset) if successful, None if not enough room.
+    ///
+    /// Reference: sqlite3/src/btree.c allocateSpace() ~1470
+    pub fn allocate_space(&mut self, n_byte: usize, limits: PageLimits) -> Option<u16> {
+        if n_byte < 4 {
+            // Minimum allocation is 4 bytes (size of free block header)
+            return self.allocate_space(4, limits);
+        }
+
+        let header_start = limits.header_start();
+        let usable_end = limits.usable_end();
+
+        // Search free block chain for a block large enough
+        let mut prev_ptr_offset = header_start + 1; // Points to first_freeblock field
+        let mut pc = self.first_freeblock as usize;
+
+        while pc != 0 {
+            if pc >= usable_end || pc + 4 > self.data.len() {
+                // Corrupt free block pointer
+                return None;
+            }
+
+            let next = read_u16(&self.data, pc).unwrap_or(0) as usize;
+            let size = read_u16(&self.data, pc + 2).unwrap_or(0) as usize;
+
+            if size >= n_byte {
+                // Found a block big enough
+                if size < n_byte + 4 {
+                    // Block is too small to split (remaining < 4 bytes)
+                    // Use whole block - unlink it from the chain
+                    write_u16(&mut self.data, prev_ptr_offset, next as u16).ok()?;
+                    if prev_ptr_offset == header_start + 1 {
+                        self.first_freeblock = next as u16;
+                    }
+                    // Add leftover to fragmented bytes if any
+                    let leftover = size - n_byte;
+                    if leftover > 0 && leftover < 4 {
+                        let new_frag = self.free_bytes.saturating_add(leftover as u16);
+                        self.free_bytes = new_frag;
+                        self.data[header_start + 7] = new_frag.min(255) as u8;
+                    }
+                    self.n_free = self.n_free.saturating_sub(size as i32);
+                    return Some(pc as u16);
+                } else {
+                    // Split the block - allocate from the end of the free block
+                    let new_size = size - n_byte;
+                    write_u16(&mut self.data, pc + 2, new_size as u16).ok()?;
+                    let allocated_offset = pc + new_size;
+                    self.n_free = self.n_free.saturating_sub(n_byte as i32);
+                    return Some(allocated_offset as u16);
+                }
+            }
+
+            prev_ptr_offset = pc;
+            pc = next;
+        }
+
+        // No suitable free block found - allocate from cell content area
+        let cell_content_start = self.cell_content_offset(limits).ok()? as usize;
+        let header_size = self.header_size();
+        let ptr_array_end = header_start + header_size + (self.n_cell as usize * 2);
+
+        // Gap is the space between end of cell pointers and start of cell content
+        let gap = cell_content_start.saturating_sub(ptr_array_end);
+
+        if gap >= n_byte {
+            let new_cell_offset = cell_content_start - n_byte;
+            // Update cell_offset in page header (bytes 5-6)
+            write_u16(&mut self.data, header_start + 5, new_cell_offset as u16).ok()?;
+            self.cell_offset = new_cell_offset as u16;
+            self.n_free = self.n_free.saturating_sub(n_byte as i32);
+            return Some(new_cell_offset as u16);
+        }
+
+        // Not enough space
+        None
+    }
+
+    /// Free space at given offset, adding it to the free block chain.
+    /// Coalesces with adjacent free blocks when possible.
+    ///
+    /// Reference: sqlite3/src/btree.c freeSpace() ~1570
+    pub fn free_space(&mut self, offset: u16, size: u16, limits: PageLimits) {
+        if size == 0 {
+            return;
+        }
+
+        let header_start = limits.header_start();
+        let start = offset as usize;
+        let mut size = size as usize;
+
+        // If size is less than 4, add to fragmented bytes
+        if size < 4 {
+            let new_frag = self.free_bytes.saturating_add(size as u16);
+            self.free_bytes = new_frag;
+            // Update fragmented bytes in header (byte 7), capped at 255
+            self.data[header_start + 7] = new_frag.min(255) as u8;
+            self.n_free = self.n_free.saturating_add(size as i32);
+            return;
+        }
+
+        // Find insertion point in the sorted free block chain
+        let mut prev_ptr_offset = header_start + 1;
+        let mut pc = self.first_freeblock as usize;
+
+        // Find where to insert (chain is sorted by offset)
+        while pc != 0 && pc < start {
+            prev_ptr_offset = pc;
+            pc = read_u16(&self.data, pc).unwrap_or(0) as usize;
+        }
+
+        // Try to coalesce with previous block
+        if prev_ptr_offset != header_start + 1 {
+            // prev_ptr_offset points to a free block, not the header
+            let prev_size = read_u16(&self.data, prev_ptr_offset + 2).unwrap_or(0) as usize;
+            if prev_ptr_offset + prev_size == start {
+                // Coalesce with previous block
+                size += prev_size;
+                // Update prev's next pointer to be the new block's next (pc)
+                // The new block extends the previous block
+                let new_start = prev_ptr_offset;
+
+                // Try to also coalesce with next block
+                if pc != 0 && new_start + size == pc {
+                    let next_size = read_u16(&self.data, pc + 2).unwrap_or(0) as usize;
+                    let next_next = read_u16(&self.data, pc).unwrap_or(0);
+                    size += next_size;
+                    write_u16(&mut self.data, new_start, next_next).ok();
+                    write_u16(&mut self.data, new_start + 2, size as u16).ok();
+                } else {
+                    // Just coalesce with previous
+                    write_u16(&mut self.data, new_start + 2, size as u16).ok();
+                }
+                self.n_free = self.n_free.saturating_add(
+                    (offset as usize + (size - prev_size)) as i32 - (offset as i32),
+                );
+                self.n_free = self.n_free.saturating_add(size as i32 - prev_size as i32);
+                return;
+            }
+        }
+
+        // Try to coalesce with next block
+        if pc != 0 && start + size == pc {
+            let next_size = read_u16(&self.data, pc + 2).unwrap_or(0) as usize;
+            let next_next = read_u16(&self.data, pc).unwrap_or(0);
+            size += next_size;
+            // Write new combined block at start
+            write_u16(&mut self.data, start, next_next).ok();
+            write_u16(&mut self.data, start + 2, size as u16).ok();
+            // Update previous pointer to point to new block
+            write_u16(&mut self.data, prev_ptr_offset, start as u16).ok();
+            if prev_ptr_offset == header_start + 1 {
+                self.first_freeblock = start as u16;
+            }
+            self.n_free = self.n_free.saturating_add(offset as i32);
+            // Subtract the old free block size that was already counted
+            self.n_free = self.n_free.saturating_sub(next_size as i32);
+            self.n_free = self.n_free.saturating_add(size as i32);
+            return;
+        }
+
+        // No coalescing possible - insert new free block into chain
+        write_u16(&mut self.data, start, pc as u16).ok();
+        write_u16(&mut self.data, start + 2, size as u16).ok();
+        write_u16(&mut self.data, prev_ptr_offset, start as u16).ok();
+        if prev_ptr_offset == header_start + 1 {
+            self.first_freeblock = start as u16;
+        }
+        self.n_free = self.n_free.saturating_add(size as i32);
+    }
+
+    /// Defragment the page by moving all cells to the end of the page,
+    /// consolidating all free space into a single contiguous area.
+    ///
+    /// Reference: sqlite3/src/btree.c defragmentPage() ~1680
+    pub fn defragment(&mut self, limits: PageLimits) -> Result<()> {
+        let header_start = limits.header_start();
+        let header_size = self.header_size();
+        let usable_end = limits.usable_end();
+
+        // Collect all cell data and their original pointers
+        let mut cells: Vec<(u16, Vec<u8>)> = Vec::with_capacity(self.n_cell as usize);
+
+        for i in 0..self.n_cell {
+            let cell_offset = self.cell_ptr(i, limits)?;
+            let info = self.parse_cell(cell_offset, limits)?;
+            let cell_size = info.n_size as usize;
+            let cell_data =
+                self.data[cell_offset as usize..cell_offset as usize + cell_size].to_vec();
+            cells.push((i, cell_data));
+        }
+
+        // Write cells at end of usable space
+        let mut write_offset = usable_end;
+        let ptr_array_start = header_start + header_size;
+
+        for (index, cell_data) in cells.iter() {
+            let cell_size = cell_data.len();
+            write_offset -= cell_size;
+            // Write cell data
+            self.data[write_offset..write_offset + cell_size].copy_from_slice(cell_data);
+            // Update cell pointer
+            let ptr_offset = ptr_array_start + (*index as usize * 2);
+            write_u16(&mut self.data, ptr_offset, write_offset as u16)?;
+        }
+
+        // Clear free block chain
+        self.first_freeblock = 0;
+        write_u16(&mut self.data, header_start + 1, 0)?;
+
+        // Update cell content offset
+        self.cell_offset = write_offset as u16;
+        write_u16(&mut self.data, header_start + 5, write_offset as u16)?;
+
+        // Clear fragmented bytes
+        self.free_bytes = 0;
+        self.data[header_start + 7] = 0;
+
+        // Recalculate free space
+        let ptr_array_end = ptr_array_start + (self.n_cell as usize * 2);
+        self.n_free = (write_offset - ptr_array_end) as i32;
+
+        Ok(())
+    }
+
+    /// Get the free block chain as a list of (offset, size) pairs for debugging/testing.
+    pub fn get_free_block_chain(&self, limits: PageLimits) -> Vec<(u16, u16)> {
+        let mut chain = Vec::new();
+        let usable_end = limits.usable_end();
+        let mut pc = self.first_freeblock as usize;
+        let mut steps = 0;
+
+        while pc != 0 && steps < 1000 {
+            if pc >= usable_end || pc + 4 > self.data.len() {
+                break;
+            }
+            let size = read_u16(&self.data, pc + 2).unwrap_or(0);
+            chain.push((pc as u16, size));
+            pc = read_u16(&self.data, pc).unwrap_or(0) as usize;
+            steps += 1;
+        }
+
+        chain
+    }
 }
 
 fn pager_open_flags_from_btree(flags: BtreeOpenFlags) -> PagerOpenFlags {
@@ -6257,5 +6506,213 @@ mod tests {
             seek_res,
         );
         assert!(result.is_ok());
+    }
+
+    // ============================================================
+    // Free block chain management tests
+    // ============================================================
+
+    fn create_test_page(page_size: u32) -> (MemPage, PageLimits) {
+        let limits = PageLimits::new(page_size, page_size);
+        let usable_end = limits.usable_end();
+        let header_start = limits.header_start();
+
+        let mut data = vec![0u8; page_size as usize];
+
+        // Initialize page header for a leaf table page
+        data[header_start] = BTREE_PAGEFLAG_LEAF | BTREE_PAGEFLAG_INTKEY | BTREE_PAGEFLAG_LEAFDATA;
+        // first_freeblock = 0 (no free blocks)
+        write_u16(&mut data, header_start + 1, 0).unwrap();
+        // n_cell = 0
+        write_u16(&mut data, header_start + 3, 0).unwrap();
+        // cell_offset = usable_end (start of cell content area)
+        write_u16(&mut data, header_start + 5, usable_end as u16).unwrap();
+        // fragmented bytes = 0
+        data[header_start + 7] = 0;
+
+        let page = MemPage {
+            pgno: 2,
+            data,
+            is_init: true,
+            is_leaf: true,
+            is_intkey: true,
+            is_leafdata: true,
+            is_zerodata: false,
+            hdr_offset: header_start as u8,
+            child_ptr_size: 0,
+            max_local: 0,
+            min_local: 0,
+            n_cell: 0,
+            cell_offset: usable_end as u16,
+            free_bytes: 0,
+            rightmost_ptr: None,
+            n_overflow: 0,
+            first_freeblock: 0,
+            mask_page: (page_size - 1) as u16,
+            n_free: (usable_end - header_start - 8) as i32,
+            parent: None,
+            usable_space: page_size as u16,
+        };
+
+        (page, limits)
+    }
+
+    #[test]
+    fn test_allocate_space_from_gap() {
+        let (mut page, limits) = create_test_page(4096);
+
+        // Allocate from the gap between cell pointers and cell content
+        let offset = page.allocate_space(100, limits);
+        assert!(offset.is_some());
+        let off = offset.unwrap();
+
+        // Should be at end of usable space minus 100
+        assert_eq!(off, (limits.usable_end() - 100) as u16);
+        assert_eq!(page.cell_offset, off);
+    }
+
+    #[test]
+    fn test_free_space_creates_free_block() {
+        let (mut page, limits) = create_test_page(4096);
+        let header_start = limits.header_start();
+
+        // Allocate and free space
+        let offset = page.allocate_space(100, limits).unwrap();
+        let initial_free = page.n_free;
+
+        page.free_space(offset, 100, limits);
+
+        // Free block should be in the chain
+        assert_eq!(page.first_freeblock, offset);
+        // n_free should increase
+        assert_eq!(page.n_free, initial_free + 100);
+
+        // Verify free block structure
+        let chain = page.get_free_block_chain(limits);
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0], (offset, 100));
+    }
+
+    #[test]
+    fn test_free_space_small_becomes_fragment() {
+        let (mut page, limits) = create_test_page(4096);
+        let header_start = limits.header_start();
+
+        let initial_frag = page.free_bytes;
+
+        // Free a small amount (< 4 bytes)
+        page.free_space(1000, 3, limits);
+
+        // Should be counted as fragments, not a free block
+        assert_eq!(page.first_freeblock, 0);
+        assert_eq!(page.free_bytes, initial_frag + 3);
+        assert_eq!(page.data[header_start + 7], 3);
+    }
+
+    #[test]
+    fn test_allocate_space_from_free_block() {
+        let (mut page, limits) = create_test_page(4096);
+
+        // Allocate and free to create a free block
+        let offset1 = page.allocate_space(100, limits).unwrap();
+        page.free_space(offset1, 100, limits);
+
+        // Now allocate 50 bytes - should reuse from free block
+        let offset2 = page.allocate_space(50, limits);
+        assert!(offset2.is_some());
+
+        // Should be from the same free block (split)
+        // Split allocates from end of free block
+        let off2 = offset2.unwrap();
+        assert!(off2 >= offset1);
+        assert!(off2 < offset1 + 100);
+    }
+
+    #[test]
+    fn test_free_block_coalesce_next() {
+        let (mut page, limits) = create_test_page(4096);
+
+        // Allocate two adjacent blocks
+        let offset2 = page.allocate_space(100, limits).unwrap();
+        let offset1 = page.allocate_space(100, limits).unwrap();
+
+        // offset1 is lower (allocated later from shrinking gap)
+        // Free them in reverse order - offset2 first (higher), then offset1
+        page.free_space(offset2, 100, limits);
+        page.free_space(offset1, 100, limits);
+
+        // Should coalesce into single 200-byte block
+        let chain = page.get_free_block_chain(limits);
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].1, 200);
+    }
+
+    #[test]
+    fn test_free_block_chain_sorted() {
+        let (mut page, limits) = create_test_page(4096);
+
+        // Allocate multiple blocks
+        let offset1 = page.allocate_space(50, limits).unwrap();
+        let offset2 = page.allocate_space(50, limits).unwrap();
+        let offset3 = page.allocate_space(50, limits).unwrap();
+
+        // Free in random order
+        page.free_space(offset2, 50, limits);
+        page.free_space(offset1, 50, limits);
+        page.free_space(offset3, 50, limits);
+
+        // Chain should be sorted by offset
+        let chain = page.get_free_block_chain(limits);
+        for i in 1..chain.len() {
+            assert!(
+                chain[i - 1].0 < chain[i].0,
+                "Free block chain should be sorted by offset"
+            );
+        }
+    }
+
+    #[test]
+    fn test_defragment_empty_page() {
+        let (mut page, limits) = create_test_page(4096);
+
+        // Defragment an empty page should work
+        let result = page.defragment(limits);
+        assert!(result.is_ok());
+        assert_eq!(page.first_freeblock, 0);
+        assert_eq!(page.free_bytes, 0);
+    }
+
+    #[test]
+    fn test_allocate_uses_exact_fit_block() {
+        let (mut page, limits) = create_test_page(4096);
+
+        // Create a free block of exactly 100 bytes
+        let offset = page.allocate_space(100, limits).unwrap();
+        page.free_space(offset, 100, limits);
+
+        // Allocate exactly 100 bytes - should use the whole block
+        let offset2 = page.allocate_space(100, limits);
+        assert!(offset2.is_some());
+        assert_eq!(offset2.unwrap(), offset);
+
+        // Free block chain should be empty
+        assert_eq!(page.first_freeblock, 0);
+    }
+
+    #[test]
+    fn test_get_free_block_chain_empty() {
+        let (page, limits) = create_test_page(4096);
+        let chain = page.get_free_block_chain(limits);
+        assert!(chain.is_empty());
+    }
+
+    #[test]
+    fn test_allocate_space_not_enough_room() {
+        let (mut page, limits) = create_test_page(4096);
+        let usable_end = limits.usable_end();
+
+        // Try to allocate more than available
+        let result = page.allocate_space(usable_end, limits);
+        assert!(result.is_none());
     }
 }

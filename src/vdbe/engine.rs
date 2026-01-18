@@ -1362,6 +1362,13 @@ impl Vdbe {
                                     }
                                 }
                             }
+                            // Table not found - return proper error
+                            if root_page == 0 {
+                                return Err(Error::with_message(
+                                    ErrorCode::Error,
+                                    format!("no such table: {}", tname),
+                                ));
+                            }
                         }
                     }
 
@@ -1417,6 +1424,13 @@ impl Vdbe {
                                     root_page = table.root_page;
                                 }
                             }
+                        }
+                        // Table not found - return proper error
+                        if root_page == 0 {
+                            return Err(Error::with_message(
+                                ErrorCode::Error,
+                                format!("no such table: {}", table_name),
+                            ));
                         }
                     }
                 }

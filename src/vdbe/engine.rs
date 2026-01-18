@@ -714,6 +714,9 @@ impl Vdbe {
 
         // Clear frames
         self.frames.clear();
+
+        // Clear OP_Once flags so they trigger again on re-execution
+        self.once_flags.clear();
     }
 
     /// Interrupt execution
@@ -6079,6 +6082,46 @@ mod tests {
         let result = vdbe.step().unwrap();
         assert_eq!(result, ExecResult::Row);
         assert_eq!(vdbe.column_int(0), 42);
+    }
+
+    #[test]
+    fn test_op_once_clears_on_reset() {
+        // Test that OP_Once flags are cleared on reset, allowing the Once opcode
+        // to trigger again when the VM is re-executed.
+        //
+        // Program structure:
+        // 0: Once 1 3      - If once_id 1 already seen, jump to addr 3 (skip Integer 100)
+        // 1: Integer 100 1 - Only executed first time through this run
+        // 2: Goto 0 4      - Jump to ResultRow
+        // 3: Integer 200 1 - Executed if Once was already triggered this run
+        // 4: ResultRow 1 1 - Return value in register 1
+        // 5: Halt
+        let mut vdbe = Vdbe::from_ops(vec![
+            VdbeOp::new(Opcode::Once, 1, 3, 0), // addr 0: jump to 3 if already triggered
+            VdbeOp::new(Opcode::Integer, 100, 1, 0), // addr 1: first time = 100
+            VdbeOp::new(Opcode::Goto, 0, 4, 0), // addr 2: skip the 200 path
+            VdbeOp::new(Opcode::Integer, 200, 1, 0), // addr 3: not first time = 200
+            VdbeOp::new(Opcode::ResultRow, 1, 1, 0), // addr 4: return result
+            VdbeOp::new(Opcode::Halt, 0, 0, 0), // addr 5
+        ]);
+
+        // First run: Once falls through, we get 100
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(vdbe.column_int(0), 100);
+        vdbe.step().unwrap(); // Halt
+
+        // Reset the VM
+        vdbe.reset();
+
+        // Second run: Once should fall through again (flags cleared), we get 100 again
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Row);
+        assert_eq!(
+            vdbe.column_int(0),
+            100,
+            "OP_Once should trigger again after reset"
+        );
     }
 
     #[test]

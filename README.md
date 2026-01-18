@@ -161,25 +161,68 @@ cargo build --release
 
 ## SQLite Test Suite
 
-RustQL includes a runner for SQLite’s Tcl tests. The canonical tests live in `sqlite3/test/` (ensure the `sqlite3/` tree is present in the repo).
+RustQL can run SQLite's TCL test suite using the TCL extension. The canonical tests live in `sqlite3/test/`.
+
+### Building the TCL Extension
 
 ```bash
-# Run the compatibility suite (uses sqlite3/test)
-cargo test --test sqlite_compat_test
+cargo build --release --features tcl
 ```
 
-Run a specific compatibility test function (for a single file):
+This produces `target/release/librustql.so` (Linux) or `librustql.dylib` (macOS).
+
+### Running SQLite TCL Tests
+
+Load the extension into `tclsh` and run tests against RustQL instead of SQLite:
 
 ```bash
-cargo test --test sqlite_compat_test test_table_basic
+cd sqlite3/test
+tclsh
 ```
 
-Run the Tcl extension smoke tests:
+```tcl
+# Load RustQL as the sqlite3 implementation
+load ../../target/release/librustql.so
+
+# Source the test infrastructure
+source tester.tcl
+
+# Run a specific test file
+source select1.test
+```
+
+Or run individual tests interactively:
+
+```tcl
+load ../../target/release/librustql.so
+sqlite3 db :memory:
+db eval {CREATE TABLE t(x); INSERT INTO t VALUES(1),(2),(3)}
+db eval {SELECT * FROM t}  ;# Returns: 1 2 3
+db close
+```
+
+### Quick Smoke Tests
 
 ```bash
+# Run basic TCL extension tests
 cargo build --features tcl
 tclsh tests/run_tcl_test.tcl tests/basic_tcl.test
 ```
+
+### Rust-Based Test Runner (Pattern Matching)
+
+RustQL also includes a Rust-based compatibility runner that parses TCL test files and extracts SQL. This doesn't execute actual TCL but provides quick feedback:
+
+```bash
+# Run the compatibility suite
+cargo test --test sqlite_compat_test
+
+# Run a specific test file
+cargo test --test sqlite_compat_test test_select1_basic -- --nocapture
+cargo test --test sqlite_compat_test test_table_basic -- --nocapture
+```
+
+Note: The Rust runner uses pattern matching to extract tests from TCL files. It misses TCL control flow, procs, and variable substitution. For accurate compatibility testing, use the TCL extension with real `tclsh`.
 
 ## Contributing And Workflow
 

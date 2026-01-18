@@ -254,10 +254,12 @@ impl<'s> SelectCompiler<'s> {
             (dest.clone(), None, None)
         };
 
-        // Handle LIMIT/OFFSET - must set up counter BEFORE body compilation
-        // so output_row_with_limit can use it
-        if let Some(limit) = &select.limit {
-            self.compile_limit(limit)?;
+        // Handle LIMIT/OFFSET - only compile for body if there's no ORDER BY.
+        // When ORDER BY is present, LIMIT must be applied AFTER sorting.
+        if sorter_cursor.is_none() {
+            if let Some(limit) = &select.limit {
+                self.compile_limit(limit)?;
+            }
         }
 
         // Compile the body with appropriate destination
@@ -265,6 +267,10 @@ impl<'s> SelectCompiler<'s> {
 
         // Handle ORDER BY output (after body has populated sorter)
         if let (Some(sorter_cursor), Some(order_by)) = (sorter_cursor, order_by_cols) {
+            // When ORDER BY is present, compile LIMIT for the output phase
+            if let Some(limit) = &select.limit {
+                self.compile_limit(limit)?;
+            }
             self.compile_order_by_output(&order_by, sorter_cursor, dest)?;
         }
 
@@ -2259,6 +2265,31 @@ impl<'s> SelectCompiler<'s> {
         let sorter_loop_start_label = self.alloc_label();
         self.resolve_label(sorter_loop_start_label, self.current_addr());
 
+        // Handle OFFSET: skip rows until offset counter reaches 0
+        if let Some(offset_reg) = self.offset_counter_reg {
+            let after_offset = self.alloc_label();
+            // If offset <= 0, skip the offset decrement
+            self.emit(Opcode::IfNot, offset_reg, after_offset, 0, P4::Unused);
+            // Decrement offset and skip this row
+            self.emit(Opcode::AddImm, offset_reg, -1, 0, P4::Unused);
+            self.emit(
+                Opcode::SorterNext,
+                sorter_cursor,
+                sorter_loop_start_label,
+                0,
+                P4::Unused,
+            );
+            self.resolve_label(after_offset, self.current_addr());
+        }
+
+        // Handle LIMIT: check if we've output enough rows
+        if let Some(limit_reg) = self.limit_counter_reg {
+            if let Some(done_label) = self.limit_done_label {
+                // If limit <= 0, we're done
+                self.emit(Opcode::IfNot, limit_reg, done_label, 0, P4::Unused);
+            }
+        }
+
         // Get the row data from sorter into a register
         let record_reg = self.alloc_reg();
         self.emit(Opcode::SorterData, sorter_cursor, record_reg, 0, P4::Unused);
@@ -2304,6 +2335,11 @@ impl<'s> SelectCompiler<'s> {
             }
         }
 
+        // Decrement limit after output
+        if let Some(limit_reg) = self.limit_counter_reg {
+            self.emit(Opcode::AddImm, limit_reg, -1, 0, P4::Unused);
+        }
+
         // Move to next sorted row
         self.emit(
             Opcode::SorterNext,
@@ -2313,8 +2349,11 @@ impl<'s> SelectCompiler<'s> {
             P4::Unused,
         );
 
-        // Sorting done
+        // Sorting done / limit done label
         self.resolve_label(sort_done_label, self.current_addr());
+        if let Some(done_label) = self.limit_done_label {
+            self.resolve_label(done_label, self.current_addr());
+        }
 
         // Close the sorter
         self.emit(Opcode::Close, sorter_cursor, 0, 0, P4::Unused);

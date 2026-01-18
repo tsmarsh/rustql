@@ -103,6 +103,8 @@ bitflags! {
         const SAVEPOSITION = 0x02;
         const AUXDELETE = 0x04;
         const APPEND = 0x08;
+        /// Use seek_result parameter to skip internal seek - cursor is already positioned
+        const USESEEKRESULT = 0x10;
         const PREFORMAT = 0x80;
     }
 }
@@ -270,6 +272,9 @@ pub struct BtCursor {
     pub page_stack: Vec<MemPage>,
     /// Pre-formatted cell data for BTREE_PREFORMAT inserts
     pub preformat_cell: Option<Vec<u8>>,
+    /// Result of last seek operation: -1 (cursor < key), 0 (exact match), +1 (cursor > key)
+    /// Used by insert to skip redundant seeks for sequential inserts
+    pub seek_result: i32,
 }
 
 #[derive(Clone)]
@@ -1088,6 +1093,7 @@ pub fn fake_valid_cursor(btree: Arc<Btree>) -> BtCursor {
         page: None,
         page_stack: Vec::new(),
         preformat_cell: None,
+        seek_result: 0,
     }
 }
 
@@ -3314,6 +3320,7 @@ impl Btree {
             page: None,
             page_stack: Vec::new(),
             preformat_cell: None,
+            seek_result: 0,
         })
     }
 
@@ -3355,7 +3362,22 @@ impl Btree {
         } else {
             PageLimits::new(shared_guard.page_size, shared_guard.usable_size)
         };
-        if !mem_page.is_leaf {
+
+        // Determine effective seek result - use parameter if provided, else use cursor's cached value
+        let use_seek_result = _flags.contains(BtreeInsertFlags::USESEEKRESULT);
+        let effective_seek_result = if use_seek_result && _seek_result != 0 {
+            _seek_result
+        } else if use_seek_result && _cursor.seek_result != 0 {
+            _cursor.seek_result
+        } else {
+            0
+        };
+
+        // Skip seek if USESEEKRESULT is set and we have a valid seek result
+        // (cursor is already positioned from a prior seek operation)
+        let need_seek = !use_seek_result || effective_seek_result == 0;
+
+        if !mem_page.is_leaf && need_seek {
             if mem_page.is_intkey {
                 let _ = _cursor.table_moveto(_payload.n_key, false)?;
             } else if let Some(key) = _payload.key.clone() {
@@ -3370,6 +3392,16 @@ impl Btree {
                 };
             } else {
                 return Err(Error::new(ErrorCode::Internal));
+            }
+        } else if !mem_page.is_leaf && !need_seek {
+            // USESEEKRESULT optimization: cursor already positioned, use cached page
+            if let Some(ref page) = _cursor.page {
+                mem_page = page.clone();
+                limits = if mem_page.pgno == 1 {
+                    PageLimits::for_page1(shared_guard.page_size, shared_guard.usable_size)
+                } else {
+                    PageLimits::new(shared_guard.page_size, shared_guard.usable_size)
+                };
             }
         }
 
@@ -4207,6 +4239,7 @@ impl BtCursor {
         self.page = None;
         self.page_stack.clear();
         self.preformat_cell = None;
+        self.seek_result = 0;
     }
 
     /// Set pre-formatted cell data for BTREE_PREFORMAT inserts.
@@ -4218,6 +4251,22 @@ impl BtCursor {
     /// Take the pre-formatted cell, returning None if not set.
     pub fn take_preformat_cell(&mut self) -> Option<Vec<u8>> {
         self.preformat_cell.take()
+    }
+
+    /// Get the result of the last seek operation.
+    /// Returns: -1 (cursor < key), 0 (exact match/invalid), +1 (cursor > key)
+    pub fn get_seek_result(&self) -> i32 {
+        self.seek_result
+    }
+
+    /// Set the seek result hint for use with USESEEKRESULT optimization.
+    pub fn set_seek_result(&mut self, result: i32) {
+        self.seek_result = result;
+    }
+
+    /// Clear the seek result (typically after insert/delete invalidates positioning).
+    pub fn clear_seek_result(&mut self) {
+        self.seek_result = 0;
     }
 
     /// sqlite3BtreeFirst
@@ -4586,6 +4635,7 @@ impl BtCursor {
             if mem_page.is_leaf {
                 if mem_page.n_cell == 0 {
                     self.state = CursorState::Invalid;
+                    self.seek_result = 1;
                     return Ok(1);
                 }
                 for i in 0..mem_page.n_cell {
@@ -4597,6 +4647,7 @@ impl BtCursor {
                         self.ix = i;
                         self.state = CursorState::Valid;
                         self.page = Some(mem_page);
+                        self.seek_result = 0;
                         return Ok(0);
                     }
                     if _int_key < info.n_key {
@@ -4605,6 +4656,7 @@ impl BtCursor {
                         self.ix = i;
                         self.state = CursorState::Valid;
                         self.page = Some(mem_page);
+                        self.seek_result = -1;
                         return Ok(-1);
                     }
                 }
@@ -4616,6 +4668,7 @@ impl BtCursor {
                 self.ix = last_index;
                 self.state = CursorState::Valid;
                 self.page = Some(mem_page);
+                self.seek_result = 1;
                 return Ok(1);
             }
 
@@ -4661,6 +4714,7 @@ impl BtCursor {
             if mem_page.is_leaf {
                 if mem_page.n_cell == 0 {
                     self.state = CursorState::Invalid;
+                    self.seek_result = 1;
                     return Ok(1);
                 }
                 for i in 0..mem_page.n_cell {
@@ -4682,6 +4736,7 @@ impl BtCursor {
                             self.ix = i;
                             self.state = CursorState::Valid;
                             self.page = Some(mem_page);
+                            self.seek_result = 0;
                             return Ok(0);
                         }
                         std::cmp::Ordering::Greater => {
@@ -4690,6 +4745,7 @@ impl BtCursor {
                             self.ix = i;
                             self.state = CursorState::Valid;
                             self.page = Some(mem_page);
+                            self.seek_result = -1;
                             return Ok(-1);
                         }
                         std::cmp::Ordering::Less => {}
@@ -4703,6 +4759,7 @@ impl BtCursor {
                 self.ix = last_index;
                 self.state = CursorState::Valid;
                 self.page = Some(mem_page);
+                self.seek_result = 1;
                 return Ok(1);
             }
 
@@ -6034,5 +6091,171 @@ mod tests {
             // Cell should be consumed regardless of success/failure
             assert!(cursor.preformat_cell.is_none());
         }
+    }
+
+    // ============================================================
+    // seekResult optimization tests
+    // ============================================================
+
+    #[test]
+    fn test_seek_result_initial_value() {
+        let btree = create_memory_btree();
+        let btree = unwrap_arc(btree);
+        let btree_arc = Arc::new(btree);
+        let cursor = btree_arc
+            .cursor(1, BtreeCursorFlags::empty(), None)
+            .unwrap();
+        // Initial seek_result should be 0 (no seek performed yet)
+        assert_eq!(cursor.get_seek_result(), 0);
+    }
+
+    #[test]
+    fn test_seek_result_set_and_get() {
+        let btree = create_memory_btree();
+        let btree = unwrap_arc(btree);
+        let btree_arc = Arc::new(btree);
+        let mut cursor = btree_arc
+            .cursor(1, BtreeCursorFlags::empty(), None)
+            .unwrap();
+
+        // Set seek_result to different values
+        cursor.set_seek_result(-1);
+        assert_eq!(cursor.get_seek_result(), -1);
+
+        cursor.set_seek_result(0);
+        assert_eq!(cursor.get_seek_result(), 0);
+
+        cursor.set_seek_result(1);
+        assert_eq!(cursor.get_seek_result(), 1);
+    }
+
+    #[test]
+    fn test_seek_result_clear() {
+        let btree = create_memory_btree();
+        let btree = unwrap_arc(btree);
+        let btree_arc = Arc::new(btree);
+        let mut cursor = btree_arc
+            .cursor(1, BtreeCursorFlags::empty(), None)
+            .unwrap();
+
+        cursor.set_seek_result(1);
+        assert_eq!(cursor.get_seek_result(), 1);
+
+        cursor.clear_seek_result();
+        assert_eq!(cursor.get_seek_result(), 0);
+    }
+
+    #[test]
+    fn test_seek_result_reset_clears() {
+        let btree = create_memory_btree();
+        let btree = unwrap_arc(btree);
+        let btree_arc = Arc::new(btree);
+        let mut cursor = btree_arc
+            .cursor(1, BtreeCursorFlags::empty(), None)
+            .unwrap();
+
+        cursor.set_seek_result(-1);
+        cursor.reset();
+        // reset() should clear seek_result to 0
+        assert_eq!(cursor.get_seek_result(), 0);
+    }
+
+    #[test]
+    fn test_table_moveto_sets_seek_result_exact_match() {
+        let btree = create_memory_btree();
+        let btree = unwrap_arc(btree);
+        let btree_arc = Arc::new(btree);
+        let mut cursor = btree_arc.cursor(1, BtreeCursorFlags::WRCSR, None).unwrap();
+
+        // Insert a record with key 10
+        let payload = make_payload(10, Some(b"value10".to_vec()));
+        btree_arc
+            .insert(&mut cursor, &payload, BtreeInsertFlags::empty(), 0)
+            .unwrap();
+
+        // table_moveto to exact match
+        let result = cursor.table_moveto(10, false).unwrap();
+        assert_eq!(result, 0); // exact match
+        assert_eq!(cursor.get_seek_result(), 0); // seek_result should be 0 for exact match
+    }
+
+    #[test]
+    fn test_table_moveto_sets_seek_result_greater_than() {
+        let btree = create_memory_btree();
+        let btree = unwrap_arc(btree);
+        let btree_arc = Arc::new(btree);
+        let mut cursor = btree_arc.cursor(1, BtreeCursorFlags::WRCSR, None).unwrap();
+
+        // Insert records
+        for i in [10i64, 20, 30] {
+            let payload = make_payload(i, Some(format!("value{}", i).into_bytes()));
+            btree_arc
+                .insert(&mut cursor, &payload, BtreeInsertFlags::empty(), 0)
+                .unwrap();
+        }
+
+        // table_moveto to a key less than all entries (cursor ends up at first entry which is > search key)
+        let result = cursor.table_moveto(5, false).unwrap();
+        assert_eq!(result, -1); // cursor at entry > search key
+        assert_eq!(cursor.get_seek_result(), -1);
+    }
+
+    #[test]
+    fn test_table_moveto_sets_seek_result_less_than() {
+        let btree = create_memory_btree();
+        let btree = unwrap_arc(btree);
+        let btree_arc = Arc::new(btree);
+        let mut cursor = btree_arc.cursor(1, BtreeCursorFlags::WRCSR, None).unwrap();
+
+        // Insert records
+        for i in [10i64, 20, 30] {
+            let payload = make_payload(i, Some(format!("value{}", i).into_bytes()));
+            btree_arc
+                .insert(&mut cursor, &payload, BtreeInsertFlags::empty(), 0)
+                .unwrap();
+        }
+
+        // table_moveto to a key greater than all entries (cursor ends up at last entry which is < search key)
+        let result = cursor.table_moveto(100, false).unwrap();
+        assert_eq!(result, 1); // cursor at entry < search key
+        assert_eq!(cursor.get_seek_result(), 1);
+    }
+
+    #[test]
+    fn test_useseekresult_flag_exists() {
+        // Verify the USESEEKRESULT flag is defined
+        let flags = BtreeInsertFlags::USESEEKRESULT;
+        assert_eq!(flags.bits(), 0x10);
+    }
+
+    #[test]
+    fn test_insert_with_useseekresult_flag() {
+        let btree = create_memory_btree();
+        let btree = unwrap_arc(btree);
+        let btree_arc = Arc::new(btree);
+        let mut cursor = btree_arc.cursor(1, BtreeCursorFlags::WRCSR, None).unwrap();
+
+        // Insert first record normally
+        let payload1 = make_payload(1, Some(b"value1".to_vec()));
+        btree_arc
+            .insert(&mut cursor, &payload1, BtreeInsertFlags::empty(), 0)
+            .unwrap();
+
+        // Do a seek to position cursor
+        let seek_res = cursor.table_moveto(5, false).unwrap();
+        // cursor should be at entry with key 1, and seek_res should be 1 (cursor < key)
+        assert_eq!(seek_res, 1);
+        assert_eq!(cursor.get_seek_result(), 1);
+
+        // Insert with USESEEKRESULT - should use the cached seek_result
+        let payload2 = make_payload(5, Some(b"value5".to_vec()));
+        // Use USESEEKRESULT with the seek_result from the prior seek
+        let result = btree_arc.insert(
+            &mut cursor,
+            &payload2,
+            BtreeInsertFlags::USESEEKRESULT,
+            seek_res,
+        );
+        assert!(result.is_ok());
     }
 }

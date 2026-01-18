@@ -325,6 +325,8 @@ pub struct UnpackedRecord {
 
 pub struct IntegrityCheckResult {
     pub errors: Vec<String>,
+    pub pages_checked: u32,
+    pub is_ok: bool,
 }
 
 pub struct IntegrityCk {
@@ -384,11 +386,297 @@ impl DbHeader {
 
 pub fn integrity_check(
     _db: &dyn Connection,
-    _btree: &Btree,
-    _roots: &[Pgno],
-    _max_errors: i32,
+    btree: &Btree,
+    roots: &[Pgno],
+    max_errors: i32,
 ) -> Result<IntegrityCheckResult> {
-    Err(Error::new(ErrorCode::Internal))
+    let mut shared = btree
+        .shared
+        .write()
+        .map_err(|_| Error::new(ErrorCode::Internal))?;
+    let page_count = shared.pager.page_count();
+    let max_err = if max_errors <= 0 {
+        i32::MAX
+    } else {
+        max_errors
+    };
+    let mut state = IntegrityCheckState {
+        page_refs: BitVec::new(page_count),
+        page_counts: vec![0u32; (page_count as usize).saturating_add(1)],
+        max_err,
+        n_err: 0,
+        errors: Vec::new(),
+        pages_checked: 0,
+        page_count,
+    };
+
+    if page_count == 0 {
+        state.add_error("Database has zero pages".to_string());
+        return Ok(state.into_result());
+    }
+
+    if let Ok(page) = shared.pager.get(1, PagerGetFlags::empty()) {
+        if DbHeader::parse(&page.data).is_err() {
+            state.add_error("Page 1: invalid database header".to_string());
+        }
+    } else {
+        state.add_error("Page 1: unable to read database header".to_string());
+    }
+
+    let mut roots_to_check = roots.to_vec();
+    if roots_to_check.is_empty() {
+        roots_to_check.push(1);
+    }
+
+    for root in roots_to_check {
+        if state.should_stop() {
+            break;
+        }
+        if root == 0 || root > page_count {
+            state.add_error(format!("Root page {} out of range", root));
+            continue;
+        }
+        check_tree_page(&mut state, &mut shared, root)?;
+    }
+
+    Ok(state.into_result())
+}
+
+struct IntegrityCheckState {
+    page_refs: BitVec,
+    page_counts: Vec<u32>,
+    max_err: i32,
+    n_err: i32,
+    errors: Vec<String>,
+    pages_checked: u32,
+    page_count: u32,
+}
+
+impl IntegrityCheckState {
+    fn add_error(&mut self, message: String) {
+        if self.n_err >= self.max_err {
+            return;
+        }
+        self.n_err += 1;
+        self.errors.push(message);
+    }
+
+    fn should_stop(&self) -> bool {
+        self.n_err >= self.max_err
+    }
+
+    fn into_result(self) -> IntegrityCheckResult {
+        IntegrityCheckResult {
+            is_ok: self.errors.is_empty(),
+            errors: self.errors,
+            pages_checked: self.pages_checked,
+        }
+    }
+}
+
+fn check_tree_page(
+    state: &mut IntegrityCheckState,
+    shared: &mut BtShared,
+    pgno: Pgno,
+) -> Result<()> {
+    if state.should_stop() {
+        return Ok(());
+    }
+    if pgno == 0 || pgno > state.page_count {
+        state.add_error(format!("Page {} out of range", pgno));
+        return Ok(());
+    }
+
+    if state.page_refs.test(pgno) {
+        state.add_error(format!("Page {} referenced multiple times", pgno));
+        return Ok(());
+    }
+    if state.page_refs.set(pgno) != ErrorCode::Ok {
+        state.add_error(format!("Page {} could not be marked as referenced", pgno));
+        return Ok(());
+    }
+    if let Some(count) = state.page_counts.get_mut(pgno as usize) {
+        *count += 1;
+    }
+    state.pages_checked = state.pages_checked.saturating_add(1);
+
+    let limits = if pgno == 1 {
+        PageLimits::for_page1(shared.page_size, shared.usable_size)
+    } else {
+        PageLimits::new(shared.page_size, shared.usable_size)
+    };
+
+    let page = match shared.pager.get(pgno, PagerGetFlags::empty()) {
+        Ok(page) => page,
+        Err(_) => {
+            state.add_error(format!("Page {}: unable to read page", pgno));
+            return Ok(());
+        }
+    };
+
+    let mem_page = match MemPage::parse_with_shared(pgno, page.data.clone(), limits, Some(shared)) {
+        Ok(mem_page) => mem_page,
+        Err(_) => {
+            state.add_error(format!("Page {}: invalid btree page", pgno));
+            return Ok(());
+        }
+    };
+
+    if mem_page.validate_layout(limits).is_err() {
+        state.add_error(format!("Page {}: invalid page layout", pgno));
+        return Ok(());
+    }
+
+    let mut prev_key: Option<i64> = None;
+    for i in 0..mem_page.n_cell {
+        if state.should_stop() {
+            return Ok(());
+        }
+        let cell_offset = match mem_page.cell_ptr(i, limits) {
+            Ok(offset) => offset,
+            Err(_) => {
+                state.add_error(format!("Page {}: invalid cell pointer {}", pgno, i));
+                return Ok(());
+            }
+        };
+        let info = match mem_page.parse_cell(cell_offset, limits) {
+            Ok(info) => info,
+            Err(_) => {
+                state.add_error(format!("Page {}: corrupt cell {}", pgno, i));
+                return Ok(());
+            }
+        };
+
+        if mem_page.is_intkey {
+            if let Some(prev) = prev_key {
+                if info.n_key <= prev {
+                    state.add_error(format!(
+                        "Page {}: cell {} out of order (rowid {})",
+                        pgno, i, info.n_key
+                    ));
+                    return Ok(());
+                }
+            }
+            prev_key = Some(info.n_key);
+        }
+
+        if info.n_size as u32 > limits.usable_size {
+            state.add_error(format!(
+                "Page {}: cell {} extends past end of page",
+                pgno, i
+            ));
+            return Ok(());
+        }
+
+        if info.n_payload > info.n_local as u32 {
+            let overflow_pgno = match info.overflow_pgno {
+                Some(pgno) => pgno,
+                None => {
+                    state.add_error(format!(
+                        "Page {}: cell {} missing overflow pointer",
+                        pgno, i
+                    ));
+                    return Ok(());
+                }
+            };
+            check_overflow_chain(
+                state,
+                shared,
+                overflow_pgno,
+                info.n_payload - info.n_local as u32,
+            )?;
+        } else if info.overflow_pgno.is_some() {
+            state.add_error(format!(
+                "Page {}: cell {} has unexpected overflow pointer",
+                pgno, i
+            ));
+            return Ok(());
+        }
+    }
+
+    if !mem_page.is_leaf {
+        for i in 0..=mem_page.n_cell {
+            if state.should_stop() {
+                return Ok(());
+            }
+            let child_pgno = match mem_page.child_pgno_for_index(i, limits) {
+                Ok(pgno) => pgno,
+                Err(_) => {
+                    state.add_error(format!("Page {}: invalid child pointer {}", pgno, i));
+                    return Ok(());
+                }
+            };
+            if child_pgno == 0 {
+                state.add_error(format!("Page {}: child pointer {} is zero", pgno, i));
+                return Ok(());
+            }
+            if child_pgno > state.page_count {
+                state.add_error(format!("Page {}: child pointer {} out of range", pgno, i));
+                return Ok(());
+            }
+            check_tree_page(state, shared, child_pgno)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn check_overflow_chain(
+    state: &mut IntegrityCheckState,
+    shared: &mut BtShared,
+    start_pgno: Pgno,
+    mut expected: u32,
+) -> Result<()> {
+    let chunk_size = shared.usable_size.saturating_sub(4);
+    let mut pgno = start_pgno;
+    let mut steps = 0u32;
+    while pgno != 0 {
+        if state.should_stop() {
+            return Ok(());
+        }
+        if pgno > state.page_count {
+            state.add_error(format!("Overflow page {} out of range", pgno));
+            return Ok(());
+        }
+        if state.page_refs.test(pgno) {
+            state.add_error(format!("Overflow page {} referenced multiple times", pgno));
+            return Ok(());
+        }
+        if state.page_refs.set(pgno) != ErrorCode::Ok {
+            state.add_error(format!("Overflow page {} could not be marked", pgno));
+            return Ok(());
+        }
+        if let Some(count) = state.page_counts.get_mut(pgno as usize) {
+            *count += 1;
+        }
+        state.pages_checked = state.pages_checked.saturating_add(1);
+
+        let page = match shared.pager.get(pgno, PagerGetFlags::empty()) {
+            Ok(page) => page,
+            Err(_) => {
+                state.add_error(format!("Overflow page {} unreadable", pgno));
+                return Ok(());
+            }
+        };
+        let next_pgno = read_u32(&page.data, 0).unwrap_or(0);
+        let take = std::cmp::min(chunk_size, expected);
+        expected = expected.saturating_sub(take);
+        steps += 1;
+        if expected == 0 && next_pgno != 0 {
+            state.add_error(format!("Overflow page {} chain too long", pgno));
+            return Ok(());
+        }
+        if expected > 0 && next_pgno == 0 {
+            state.add_error(format!("Overflow page {} chain too short", pgno));
+            return Ok(());
+        }
+        if steps > state.page_count {
+            state.add_error("Overflow chain contains a loop".to_string());
+            return Ok(());
+        }
+        pgno = next_pgno;
+    }
+    Ok(())
 }
 
 pub fn fake_valid_cursor(btree: Arc<Btree>) -> BtCursor {
@@ -3947,6 +4235,7 @@ impl BtCursor {
 mod tests {
     use super::*;
     use crate::api::StubVfs;
+    use crate::types::{ColumnType, Connection, Statement, StepResult, Value};
     use std::sync::Arc;
 
     fn create_memory_btree() -> Arc<Btree> {
@@ -3979,6 +4268,89 @@ mod tests {
             n_data,
             n_zero: 0,
         }
+    }
+
+    struct TestConn;
+
+    struct TestStmt;
+
+    impl Statement for TestStmt {
+        fn step(&mut self) -> Result<StepResult> {
+            Ok(StepResult::Done)
+        }
+        fn reset(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn finalize(self: Box<Self>) -> Result<()> {
+            Ok(())
+        }
+        fn clear_bindings(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn bind_null(&mut self, _idx: i32) -> Result<()> {
+            Ok(())
+        }
+        fn bind_i64(&mut self, _idx: i32, _value: i64) -> Result<()> {
+            Ok(())
+        }
+        fn bind_f64(&mut self, _idx: i32, _value: f64) -> Result<()> {
+            Ok(())
+        }
+        fn bind_text(&mut self, _idx: i32, _value: &str) -> Result<()> {
+            Ok(())
+        }
+        fn bind_blob(&mut self, _idx: i32, _value: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn bind_value(&mut self, _idx: i32, _value: &Value) -> Result<()> {
+            Ok(())
+        }
+        fn column_count(&self) -> i32 {
+            0
+        }
+        fn column_name(&self, _idx: i32) -> &str {
+            ""
+        }
+        fn column_type(&self, _idx: i32) -> ColumnType {
+            ColumnType::Null
+        }
+        fn column_i64(&self, _idx: i32) -> i64 {
+            0
+        }
+        fn column_f64(&self, _idx: i32) -> f64 {
+            0.0
+        }
+        fn column_text(&self, _idx: i32) -> &str {
+            ""
+        }
+        fn column_blob(&self, _idx: i32) -> &[u8] {
+            &[]
+        }
+        fn column_value(&self, _idx: i32) -> Value {
+            Value::Null
+        }
+    }
+
+    impl Connection for TestConn {
+        fn execute(&mut self, _sql: &str) -> Result<()> {
+            Ok(())
+        }
+        fn prepare(&mut self, _sql: &str) -> Result<Box<dyn Statement>> {
+            Ok(Box::new(TestStmt))
+        }
+        fn last_insert_rowid(&self) -> RowId {
+            0
+        }
+        fn changes(&self) -> i32 {
+            0
+        }
+        fn total_changes(&self) -> i64 {
+            0
+        }
+        fn get_autocommit(&self) -> bool {
+            true
+        }
+        fn interrupt(&self) {}
     }
 
     // ========================================================================
@@ -4363,5 +4735,132 @@ mod tests {
 
         // A newly created cursor is not valid until positioned
         assert!(!cursor.is_valid());
+    }
+
+    // ========================================================================
+    // Integrity Check
+    // ========================================================================
+
+    #[test]
+    fn test_integrity_check_valid_db() {
+        let btree = create_memory_btree();
+        let mut btree = unwrap_arc(btree);
+        btree.begin_trans(true).unwrap();
+
+        let root = btree.create_table(BTREE_INTKEY).unwrap();
+        let btree = Arc::new(btree);
+        let mut cursor = btree.cursor(root, BtreeCursorFlags::WRCSR, None).unwrap();
+        for i in 1..=8 {
+            let payload = make_payload(i, Some(vec![i as u8; 8]));
+            btree
+                .insert(&mut cursor, &payload, BtreeInsertFlags::empty(), 0)
+                .unwrap();
+        }
+
+        let conn = TestConn;
+        let result = integrity_check(&conn, &btree, &[root], 100).unwrap();
+        assert!(result.is_ok, "errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn test_integrity_check_detects_corrupt_header() {
+        let btree = create_memory_btree();
+        let mut btree = unwrap_arc(btree);
+        btree.begin_trans(true).unwrap();
+        let root = btree.create_table(BTREE_INTKEY).unwrap();
+
+        let mut page = btree.get_page_data(root).unwrap();
+        page[0] = 0;
+        btree.put_page_data(root, &page).unwrap();
+
+        let conn = TestConn;
+        let result = integrity_check(&conn, &btree, &[root], 10).unwrap();
+        assert!(!result.is_ok);
+        assert!(!result.errors.is_empty());
+    }
+
+    #[test]
+    fn test_integrity_check_key_order() {
+        let btree = create_memory_btree();
+        let mut btree = unwrap_arc(btree);
+        btree.begin_trans(true).unwrap();
+        let root = btree.create_table(BTREE_INTKEY).unwrap();
+
+        let btree = Arc::new(btree);
+        let mut cursor = btree.cursor(root, BtreeCursorFlags::WRCSR, None).unwrap();
+        for i in 1..=2 {
+            let payload = make_payload(i, Some(vec![i as u8; 4]));
+            btree
+                .insert(&mut cursor, &payload, BtreeInsertFlags::empty(), 0)
+                .unwrap();
+        }
+
+        let mut shared = btree.shared.write().unwrap();
+        let limits = PageLimits::new(shared.page_size, shared.usable_size);
+        let mut page = shared.pager.get(root, PagerGetFlags::empty()).unwrap();
+        let header_start = limits.header_start();
+        let ptr0 = read_u16(&page.data, header_start + 8).unwrap();
+        let ptr1 = read_u16(&page.data, header_start + 10).unwrap();
+        write_u16(&mut page.data, header_start + 8, ptr1).unwrap();
+        write_u16(&mut page.data, header_start + 10, ptr0).unwrap();
+        shared.pager.write_page_to_cache(&page);
+        drop(shared);
+
+        let conn = TestConn;
+        let result = integrity_check(&conn, &btree, &[root], 10).unwrap();
+        assert!(!result.is_ok);
+        assert!(result.errors.iter().any(|msg| msg.contains("out of order")));
+    }
+
+    #[test]
+    fn test_integrity_check_overflow_chain() {
+        let btree = create_memory_btree();
+        let mut btree = unwrap_arc(btree);
+        btree.begin_trans(true).unwrap();
+        let root = btree.create_table(BTREE_INTKEY).unwrap();
+
+        let btree = Arc::new(btree);
+        let mut cursor = btree.cursor(root, BtreeCursorFlags::WRCSR, None).unwrap();
+        let payload = make_payload(1, Some(vec![0x42; 5000]));
+        btree
+            .insert(&mut cursor, &payload, BtreeInsertFlags::empty(), 0)
+            .unwrap();
+
+        let mut shared = btree.shared.write().unwrap();
+        let limits = PageLimits::new(shared.page_size, shared.usable_size);
+        let page = shared.pager.get(root, PagerGetFlags::empty()).unwrap();
+        let mem_page =
+            MemPage::parse_with_shared(root, page.data.clone(), limits, Some(&shared)).unwrap();
+        let cell_offset = mem_page.cell_ptr(0, limits).unwrap();
+        let info = mem_page.parse_cell(cell_offset, limits).unwrap();
+        let overflow_pgno = info.overflow_pgno.unwrap();
+        drop(shared);
+
+        let mut overflow_page = btree.get_page_data(overflow_pgno).unwrap();
+        write_u32(&mut overflow_page, 0, 1).unwrap();
+        btree.put_page_data(overflow_pgno, &overflow_page).unwrap();
+
+        let conn = TestConn;
+        let result = integrity_check(&conn, &btree, &[root], 10).unwrap();
+        assert!(!result.is_ok);
+        assert!(result
+            .errors
+            .iter()
+            .any(|msg| msg.to_ascii_lowercase().contains("overflow")));
+    }
+
+    #[test]
+    fn test_integrity_check_max_errors() {
+        let btree = create_memory_btree();
+        let mut btree = unwrap_arc(btree);
+        btree.begin_trans(true).unwrap();
+        let root = btree.create_table(BTREE_INTKEY).unwrap();
+        let mut page = btree.get_page_data(root).unwrap();
+        page[0] = 0;
+        btree.put_page_data(root, &page).unwrap();
+
+        let conn = TestConn;
+        let result = integrity_check(&conn, &btree, &[root], 1).unwrap();
+        assert!(result.errors.len() <= 1);
     }
 }

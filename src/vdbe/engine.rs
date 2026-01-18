@@ -3357,15 +3357,23 @@ impl Vdbe {
 
             Opcode::SorterCompare => {
                 // SorterCompare P1 P2 P3 P4: jump if sorter key != record key
-                let n_key_cols = match op.p4 {
-                    P4::Int64(v) => v as usize,
+                // P4 can be Int64 (number of key columns) or KeyInfo (with collations)
+                let key_info = match &op.p4 {
+                    P4::KeyInfo(info) => Some(info),
+                    _ => None,
+                };
+                let n_key_cols = match &op.p4 {
+                    P4::Int64(v) => *v as usize,
+                    P4::KeyInfo(info) => info.n_key_field as usize,
                     _ => 0,
                 };
+
                 if n_key_cols != 0 {
                     if let Some(cursor) = self.cursor(op.p1) {
                         if cursor.sorter_index < cursor.sorter_data.len() {
                             let sorter_record = &cursor.sorter_data[cursor.sorter_index];
                             let record = self.mem(op.p3).to_blob();
+                            let sort_desc = cursor.sort_desc.clone();
 
                             let sorter_mems = self.decode_record_mems(sorter_record);
                             let record_mems = self.decode_record_mems(&record);
@@ -3385,7 +3393,21 @@ impl Vdbe {
                                 for i in 0..n_key_cols {
                                     let left = sorter_mems.get(i).unwrap_or(&null_mem);
                                     let right = record_mems.get(i).unwrap_or(&null_mem);
-                                    let col_cmp = left.compare(right);
+
+                                    // Get collation for this column
+                                    let collation = key_info
+                                        .and_then(|ki| ki.collations.get(i))
+                                        .map(|s| s.as_str())
+                                        .unwrap_or("BINARY");
+                                    let col_cmp = left.compare_with_collation(right, collation);
+
+                                    // Apply DESC sort order from cursor or KeyInfo
+                                    let desc = key_info
+                                        .and_then(|ki| ki.sort_orders.get(i).copied())
+                                        .or_else(|| sort_desc.get(i).copied())
+                                        .unwrap_or(false);
+                                    let col_cmp = if desc { col_cmp.reverse() } else { col_cmp };
+
                                     if col_cmp != std::cmp::Ordering::Equal {
                                         cmp = col_cmp;
                                         break;
@@ -3622,15 +3644,39 @@ impl Vdbe {
             }
 
             Opcode::Compare => {
-                // Compare P1 P2 P3: Compare registers [P1..P1+P3] with [P2..P2+P3]
+                // Compare P1 P2 P3 P4: Compare registers [P1..P1+P3] with [P2..P2+P3]
+                // P4 may contain KeyInfo with collations and sort orders
                 // Store result for following Jump opcode
                 let num_regs = op.p3 as usize;
+
+                // Extract KeyInfo if present
+                let key_info = match &op.p4 {
+                    P4::KeyInfo(info) => Some(info),
+                    _ => None,
+                };
+
                 let mut cmp_result = std::cmp::Ordering::Equal;
                 for i in 0..num_regs {
                     let left = self.mem(op.p1 + i as i32);
                     let right = self.mem(op.p2 + i as i32);
-                    cmp_result = left.compare(right);
-                    if cmp_result != std::cmp::Ordering::Equal {
+
+                    // Get collation for this column (default to BINARY)
+                    let collation = key_info
+                        .and_then(|ki| ki.collations.get(i))
+                        .map(|s| s.as_str())
+                        .unwrap_or("BINARY");
+
+                    // Compare with collation
+                    let col_cmp = left.compare_with_collation(right, collation);
+
+                    // Apply DESC sort order if specified
+                    let desc = key_info
+                        .and_then(|ki| ki.sort_orders.get(i).copied())
+                        .unwrap_or(false);
+                    let col_cmp = if desc { col_cmp.reverse() } else { col_cmp };
+
+                    if col_cmp != std::cmp::Ordering::Equal {
+                        cmp_result = col_cmp;
                         break;
                     }
                 }
@@ -3804,10 +3850,14 @@ impl Vdbe {
 
             Opcode::IdxGT => {
                 // IdxGT P1 P2 P3 P4: jump if index entry > key
-                let (key_cols, sort_desc) = match &op.p4 {
-                    P4::Int64(n) => (*n as usize, Vec::new()),
-                    P4::KeyInfo(info) => (info.n_key_field as usize, info.sort_orders.clone()),
-                    _ => (0, Vec::new()),
+                let key_info = match &op.p4 {
+                    P4::KeyInfo(info) => Some(info),
+                    _ => None,
+                };
+                let key_cols = match &op.p4 {
+                    P4::Int64(n) => *n as usize,
+                    P4::KeyInfo(info) => info.n_key_field as usize,
+                    _ => 0,
                 };
 
                 if key_cols != 0 {
@@ -3827,8 +3877,19 @@ impl Vdbe {
                                 for i in 0..key_cols {
                                     let idx_mem = index_mems.get(i).unwrap_or(&null_mem);
                                     let key_mem = self.mem(op.p3 + i as i32);
-                                    let col_cmp = idx_mem.compare(key_mem);
-                                    let desc = sort_desc.get(i).copied().unwrap_or(false);
+
+                                    // Get collation for this column
+                                    let collation = key_info
+                                        .and_then(|ki| ki.collations.get(i))
+                                        .map(|s| s.as_str())
+                                        .unwrap_or("BINARY");
+                                    let col_cmp =
+                                        idx_mem.compare_with_collation(key_mem, collation);
+
+                                    // Apply DESC sort order
+                                    let desc = key_info
+                                        .and_then(|ki| ki.sort_orders.get(i).copied())
+                                        .unwrap_or(false);
                                     let col_cmp = if desc { col_cmp.reverse() } else { col_cmp };
                                     if col_cmp != std::cmp::Ordering::Equal {
                                         cmp = col_cmp;
@@ -3848,10 +3909,14 @@ impl Vdbe {
 
             Opcode::IdxLE => {
                 // IdxLE P1 P2 P3 P4: jump if index entry <= key
-                let (key_cols, sort_desc) = match &op.p4 {
-                    P4::Int64(n) => (*n as usize, Vec::new()),
-                    P4::KeyInfo(info) => (info.n_key_field as usize, info.sort_orders.clone()),
-                    _ => (0, Vec::new()),
+                let key_info = match &op.p4 {
+                    P4::KeyInfo(info) => Some(info),
+                    _ => None,
+                };
+                let key_cols = match &op.p4 {
+                    P4::Int64(n) => *n as usize,
+                    P4::KeyInfo(info) => info.n_key_field as usize,
+                    _ => 0,
                 };
 
                 if key_cols != 0 {
@@ -3871,8 +3936,19 @@ impl Vdbe {
                                 for i in 0..key_cols {
                                     let idx_mem = index_mems.get(i).unwrap_or(&null_mem);
                                     let key_mem = self.mem(op.p3 + i as i32);
-                                    let col_cmp = idx_mem.compare(key_mem);
-                                    let desc = sort_desc.get(i).copied().unwrap_or(false);
+
+                                    // Get collation for this column
+                                    let collation = key_info
+                                        .and_then(|ki| ki.collations.get(i))
+                                        .map(|s| s.as_str())
+                                        .unwrap_or("BINARY");
+                                    let col_cmp =
+                                        idx_mem.compare_with_collation(key_mem, collation);
+
+                                    // Apply DESC sort order
+                                    let desc = key_info
+                                        .and_then(|ki| ki.sort_orders.get(i).copied())
+                                        .unwrap_or(false);
                                     let col_cmp = if desc { col_cmp.reverse() } else { col_cmp };
                                     if col_cmp != std::cmp::Ordering::Equal {
                                         cmp = col_cmp;
@@ -3895,10 +3971,14 @@ impl Vdbe {
 
             Opcode::IdxLT => {
                 // IdxLT P1 P2 P3 P4: jump if index entry < key
-                let (key_cols, sort_desc) = match &op.p4 {
-                    P4::Int64(n) => (*n as usize, Vec::new()),
-                    P4::KeyInfo(info) => (info.n_key_field as usize, info.sort_orders.clone()),
-                    _ => (0, Vec::new()),
+                let key_info = match &op.p4 {
+                    P4::KeyInfo(info) => Some(info),
+                    _ => None,
+                };
+                let key_cols = match &op.p4 {
+                    P4::Int64(n) => *n as usize,
+                    P4::KeyInfo(info) => info.n_key_field as usize,
+                    _ => 0,
                 };
 
                 if key_cols != 0 {
@@ -3918,8 +3998,19 @@ impl Vdbe {
                                 for i in 0..key_cols {
                                     let idx_mem = index_mems.get(i).unwrap_or(&null_mem);
                                     let key_mem = self.mem(op.p3 + i as i32);
-                                    let col_cmp = idx_mem.compare(key_mem);
-                                    let desc = sort_desc.get(i).copied().unwrap_or(false);
+
+                                    // Get collation for this column
+                                    let collation = key_info
+                                        .and_then(|ki| ki.collations.get(i))
+                                        .map(|s| s.as_str())
+                                        .unwrap_or("BINARY");
+                                    let col_cmp =
+                                        idx_mem.compare_with_collation(key_mem, collation);
+
+                                    // Apply DESC sort order
+                                    let desc = key_info
+                                        .and_then(|ki| ki.sort_orders.get(i).copied())
+                                        .unwrap_or(false);
                                     let col_cmp = if desc { col_cmp.reverse() } else { col_cmp };
                                     if col_cmp != std::cmp::Ordering::Equal {
                                         cmp = col_cmp;

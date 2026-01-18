@@ -554,6 +554,35 @@ impl Mem {
             _ => Ordering::Equal,
         }
     }
+
+    /// Compare with another memory cell using a collation sequence
+    pub fn compare_with_collation(&self, other: &Mem, collation: &str) -> Ordering {
+        // NULL handling
+        if self.is_null() && other.is_null() {
+            return Ordering::Equal;
+        }
+        if self.is_null() {
+            return Ordering::Less;
+        }
+        if other.is_null() {
+            return Ordering::Greater;
+        }
+
+        // For text types, apply collation
+        if self.is_str() && other.is_str() {
+            let sa = self.to_str();
+            let sb = other.to_str();
+
+            return match collation.to_uppercase().as_str() {
+                "NOCASE" => sa.to_ascii_lowercase().cmp(&sb.to_ascii_lowercase()),
+                "RTRIM" => sa.trim_end().cmp(sb.trim_end()),
+                _ => sa.cmp(&sb), // BINARY or default
+            };
+        }
+
+        // For non-text types, use standard comparison
+        self.compare(other)
+    }
 }
 
 impl fmt::Debug for Mem {
@@ -1066,5 +1095,86 @@ mod tests {
 
         // Zeroblob
         assert_eq!(Mem::from_zeroblob(10).to_sql_literal(), "zeroblob(10)");
+    }
+
+    // ========================================================================
+    // compare_with_collation tests
+    // ========================================================================
+
+    #[test]
+    fn test_compare_with_binary_collation() {
+        let a = Mem::from_str("abc");
+        let b = Mem::from_str("ABC");
+        let c = Mem::from_str("abc");
+
+        // BINARY: case-sensitive, 'ABC' < 'abc' because 'A' < 'a' in ASCII
+        assert_eq!(a.compare_with_collation(&b, "BINARY"), Ordering::Greater);
+        assert_eq!(b.compare_with_collation(&a, "BINARY"), Ordering::Less);
+        assert_eq!(a.compare_with_collation(&c, "BINARY"), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_compare_with_nocase_collation() {
+        let a = Mem::from_str("abc");
+        let b = Mem::from_str("ABC");
+        let c = Mem::from_str("Hello");
+        let d = Mem::from_str("HELLO");
+
+        // NOCASE: case-insensitive
+        assert_eq!(a.compare_with_collation(&b, "NOCASE"), Ordering::Equal);
+        assert_eq!(c.compare_with_collation(&d, "NOCASE"), Ordering::Equal);
+        assert_eq!(a.compare_with_collation(&c, "NOCASE"), Ordering::Less);
+    }
+
+    #[test]
+    fn test_compare_with_rtrim_collation() {
+        let a = Mem::from_str("abc");
+        let b = Mem::from_str("abc   ");
+        let c = Mem::from_str("abc  ");
+
+        // RTRIM: trailing spaces are ignored
+        assert_eq!(a.compare_with_collation(&b, "RTRIM"), Ordering::Equal);
+        assert_eq!(b.compare_with_collation(&c, "RTRIM"), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_compare_with_collation_null_handling() {
+        let null1 = Mem::new();
+        let null2 = Mem::new();
+        let int_val = Mem::from_int(42);
+        let str_val = Mem::from_str("test");
+
+        // NULL handling
+        assert_eq!(
+            null1.compare_with_collation(&null2, "BINARY"),
+            Ordering::Equal
+        );
+        assert_eq!(
+            null1.compare_with_collation(&int_val, "BINARY"),
+            Ordering::Less
+        );
+        assert_eq!(
+            int_val.compare_with_collation(&null1, "BINARY"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            null1.compare_with_collation(&str_val, "NOCASE"),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn test_compare_with_collation_non_text() {
+        // Non-text types should use standard comparison regardless of collation
+        let a = Mem::from_int(10);
+        let b = Mem::from_int(20);
+
+        assert_eq!(a.compare_with_collation(&b, "NOCASE"), Ordering::Less);
+        assert_eq!(a.compare_with_collation(&b, "BINARY"), Ordering::Less);
+
+        let c = Mem::from_real(3.14);
+        let d = Mem::from_real(2.71);
+
+        assert_eq!(c.compare_with_collation(&d, "NOCASE"), Ordering::Greater);
     }
 }

@@ -16,6 +16,7 @@ use crate::functions::aggregate::AggregateState;
 use crate::schema::Schema;
 use crate::storage::btree::{
     BtCursor, Btree, BtreeCursorFlags, BtreeInsertFlags, BtreePayload, UnpackedRecord,
+    BTREE_FILE_FORMAT, BTREE_SCHEMA_VERSION,
 };
 use crate::storage::pager::SavepointOp;
 use crate::types::{ColumnType, OpenFlags, Pgno, Value};
@@ -3478,13 +3479,26 @@ impl Vdbe {
 
             Opcode::ReadCookie => {
                 // ReadCookie P1 P2 P3: read meta cookie P3 into register P2
-                if op.p1 != 0 {
-                    return Err(Error::with_message(
-                        ErrorCode::Error,
-                        "unsupported database index",
-                    ));
-                }
-                let Some(ref btree) = self.btree else {
+                // P1 = database index (0=main, 1=temp, >1=attached)
+                let db_index = op.p1 as usize;
+
+                // Get btree for the specified database
+                let btree = if db_index == 0 {
+                    // Main database - use self.btree
+                    self.btree.as_ref()
+                } else if let Some(conn_ptr) = self.conn_ptr {
+                    // Get from connection's dbs array
+                    let conn = unsafe { &*conn_ptr };
+                    if db_index < conn.dbs.len() {
+                        conn.dbs[db_index].btree.as_ref()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let Some(btree) = btree else {
                     return Err(Error::with_message(
                         ErrorCode::Error,
                         "missing btree for ReadCookie",
@@ -3496,30 +3510,86 @@ impl Vdbe {
 
             Opcode::SetCookie => {
                 // SetCookie P1 P2 P3: write meta cookie P2 with value P3
-                if op.p1 != 0 {
-                    return Err(Error::with_message(
-                        ErrorCode::Error,
-                        "unsupported database index",
-                    ));
-                }
-                let Some(ref btree) = self.btree else {
+                // P1 = database index (0=main, 1=temp, >1=attached)
+                // P2 = cookie index (1=schema version, 2=file format, etc.)
+                // P3 = new value
+                let db_index = op.p1 as usize;
+                let cookie_index = op.p2 as usize;
+                let new_value = op.p3 as u32;
+
+                // Get btree and schema for the specified database
+                let (btree, schema) = if db_index == 0 {
+                    // Main database
+                    (self.btree.clone(), self.schema.clone())
+                } else if let Some(conn_ptr) = self.conn_ptr {
+                    let conn = unsafe { &*conn_ptr };
+                    if db_index < conn.dbs.len() {
+                        (
+                            conn.dbs[db_index].btree.clone(),
+                            conn.dbs[db_index].schema.clone(),
+                        )
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                };
+
+                let Some(btree) = btree else {
                     return Err(Error::with_message(
                         ErrorCode::Error,
                         "missing btree for SetCookie",
                     ));
                 };
-                btree.update_meta(op.p2 as usize, op.p3 as u32)?;
+
+                // Update the btree meta value
+                btree.update_meta(cookie_index, new_value)?;
+
+                // Side effects: update in-memory schema state
+                if let Some(schema) = schema {
+                    if let Ok(mut schema_guard) = schema.write() {
+                        match cookie_index {
+                            BTREE_SCHEMA_VERSION => {
+                                // Update schema cookie in memory
+                                schema_guard.schema_cookie = new_value;
+                            }
+                            BTREE_FILE_FORMAT => {
+                                // Update file format in memory
+                                schema_guard.file_format = new_value as u8;
+                            }
+                            _ => {
+                                // Other cookies don't need schema updates
+                            }
+                        }
+                    }
+                }
+
+                // Note: Statement invalidation for temp DB schema changes
+                // would be handled here if we had a statement cache
             }
 
             Opcode::VerifyCookie => {
                 // VerifyCookie P1 P2 P3: ensure meta cookie P2 equals P3
-                if op.p1 != 0 {
-                    return Err(Error::with_message(
-                        ErrorCode::Error,
-                        "unsupported database index",
-                    ));
-                }
-                let Some(ref btree) = self.btree else {
+                // P1 = database index (0=main, 1=temp, >1=attached)
+                // P2 = cookie index to check (usually schema version)
+                // P3 = expected value
+                let db_index = op.p1 as usize;
+
+                // Get btree for the specified database
+                let btree = if db_index == 0 {
+                    self.btree.as_ref()
+                } else if let Some(conn_ptr) = self.conn_ptr {
+                    let conn = unsafe { &*conn_ptr };
+                    if db_index < conn.dbs.len() {
+                        conn.dbs[db_index].btree.as_ref()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let Some(btree) = btree else {
                     return Err(Error::with_message(
                         ErrorCode::Error,
                         "missing btree for VerifyCookie",
@@ -6196,5 +6266,156 @@ mod tests {
         // Execute - should not fail
         let result = vdbe.step().unwrap();
         assert_eq!(result, ExecResult::Done);
+    }
+
+    // =========================================================================
+    // Cookie Opcode Tests
+    // =========================================================================
+
+    #[test]
+    fn test_read_cookie_main_db() {
+        // Test ReadCookie with main database (P1=0)
+        let mut conn = open_test_connection();
+        let conn_ptr = &mut *conn as *mut SqliteConnection;
+        let btree = conn.main_db().btree.as_ref().unwrap().clone();
+
+        let mut vdbe = Vdbe::from_ops(vec![
+            // ReadCookie P1=0 (main db), P2=1 (result reg), P3=1 (schema version)
+            VdbeOp::new(Opcode::ReadCookie, 0, 1, BTREE_SCHEMA_VERSION as i32),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        vdbe.set_btree(btree);
+        vdbe.set_connection(conn_ptr);
+
+        // Execute
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Done);
+
+        // Register 1 should contain the schema cookie value
+        let cookie_value = vdbe.mem(1).to_int();
+        // For a new database, schema version should be 0 or some initial value
+        assert!(cookie_value >= 0);
+    }
+
+    #[test]
+    fn test_set_cookie_main_db() {
+        // Test SetCookie updates the btree meta value
+        let mut conn = open_test_connection();
+        let conn_ptr = &mut *conn as *mut SqliteConnection;
+        let btree = conn.main_db().btree.as_ref().unwrap().clone();
+
+        // Start a write transaction
+        btree.begin_trans(true).unwrap();
+
+        let mut vdbe = Vdbe::from_ops(vec![
+            // SetCookie P1=0 (main db), P2=6 (user version), P3=42
+            VdbeOp::new(Opcode::SetCookie, 0, 6, 42), // Use user_version to avoid schema issues
+            // ReadCookie to verify
+            VdbeOp::new(Opcode::ReadCookie, 0, 1, 6),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        vdbe.set_btree(btree);
+        vdbe.set_connection(conn_ptr);
+
+        // Execute
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Done);
+
+        // Register 1 should contain 42
+        assert_eq!(vdbe.mem(1).to_int(), 42);
+    }
+
+    #[test]
+    fn test_set_cookie_updates_schema_cookie() {
+        // Test SetCookie updates in-memory schema cookie
+        let mut conn = open_test_connection();
+        let conn_ptr = &mut *conn as *mut SqliteConnection;
+        let btree = conn.main_db().btree.as_ref().unwrap().clone();
+        let schema = conn.main_db().schema.clone();
+
+        // Start a write transaction
+        btree.begin_trans(true).unwrap();
+
+        let mut vdbe = Vdbe::from_ops(vec![
+            // SetCookie P1=0, P2=1 (schema version), P3=100
+            VdbeOp::new(Opcode::SetCookie, 0, BTREE_SCHEMA_VERSION as i32, 100),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        vdbe.set_btree(btree);
+        if let Some(ref s) = schema {
+            vdbe.set_schema(s.clone());
+        }
+        vdbe.set_connection(conn_ptr);
+
+        // Execute
+        let result = vdbe.step().unwrap();
+        assert_eq!(result, ExecResult::Done);
+
+        // Verify schema cookie was updated in memory
+        if let Some(ref schema) = schema {
+            let schema_guard = schema.read().unwrap();
+            assert_eq!(schema_guard.schema_cookie, 100);
+        }
+    }
+
+    #[test]
+    fn test_verify_cookie_success() {
+        // Test VerifyCookie succeeds when cookie matches
+        let mut conn = open_test_connection();
+        let conn_ptr = &mut *conn as *mut SqliteConnection;
+        let btree = conn.main_db().btree.as_ref().unwrap().clone();
+
+        let mut vdbe = Vdbe::from_ops(vec![
+            // Read the current schema cookie
+            VdbeOp::new(Opcode::ReadCookie, 0, 1, BTREE_SCHEMA_VERSION as i32),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        vdbe.set_btree(btree.clone());
+        vdbe.set_connection(conn_ptr);
+        let _ = vdbe.step().unwrap();
+        let current_cookie = vdbe.mem(1).to_int();
+
+        // Now verify with the correct value
+        let mut vdbe2 = Vdbe::from_ops(vec![
+            VdbeOp::new(
+                Opcode::VerifyCookie,
+                0,
+                BTREE_SCHEMA_VERSION as i32,
+                current_cookie as i32,
+            ),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        vdbe2.set_btree(btree);
+        vdbe2.set_connection(conn_ptr);
+        let result = vdbe2.step().unwrap();
+        assert_eq!(result, ExecResult::Done);
+    }
+
+    #[test]
+    fn test_verify_cookie_mismatch() {
+        // Test VerifyCookie fails when cookie doesn't match
+        let mut conn = open_test_connection();
+        let conn_ptr = &mut *conn as *mut SqliteConnection;
+        let btree = conn.main_db().btree.as_ref().unwrap().clone();
+
+        let mut vdbe = Vdbe::from_ops(vec![
+            // VerifyCookie with wrong expected value
+            VdbeOp::new(Opcode::VerifyCookie, 0, BTREE_SCHEMA_VERSION as i32, 99999),
+            VdbeOp::new(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        vdbe.set_btree(btree);
+        vdbe.set_connection(conn_ptr);
+
+        // Should fail with schema error
+        let result = vdbe.step();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Schema);
     }
 }

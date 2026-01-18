@@ -2662,7 +2662,7 @@ impl<'s> SelectCompiler<'s> {
                     )
                 };
                 if is_aggregate {
-                    return Some(func_call.name.to_lowercase());
+                    return Some(func_call.name.to_uppercase());
                 }
                 // Check arguments
                 if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
@@ -2749,10 +2749,7 @@ impl<'s> SelectCompiler<'s> {
                     if arg_count < min_args {
                         return Err(crate::error::Error::with_message(
                             crate::error::ErrorCode::Error,
-                            format!(
-                                "wrong number of arguments to function {}()",
-                                name_upper.to_lowercase()
-                            ),
+                            format!("wrong number of arguments to function {}()", name_upper),
                         ));
                     }
 
@@ -2762,10 +2759,7 @@ impl<'s> SelectCompiler<'s> {
                         }
                         return Err(crate::error::Error::with_message(
                             crate::error::ErrorCode::Error,
-                            format!(
-                                "wrong number of arguments to function {}()",
-                                name_upper.to_lowercase()
-                            ),
+                            format!("wrong number of arguments to function {}()", name_upper),
                         ));
                     }
 

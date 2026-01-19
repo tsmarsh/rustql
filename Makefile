@@ -60,7 +60,7 @@ RUST_SOURCES := $(shell find src -name '*.rs' 2>/dev/null)
 # Generate test result targets
 TEST_RESULTS := $(addprefix $(RESULT_DIR)/,$(addsuffix .result,$(SQLITE_TESTS)))
 
-.PHONY: all test test-basic test-all clean clean-results tcl-extension rustql help list-tests
+.PHONY: all test test-basic test-all clean clean-results tcl-extension rustql help list-tests test-report
 
 all: tcl-extension
 
@@ -75,6 +75,7 @@ help:
 	@echo "  make test              - Run common SQLite TCL tests"
 	@echo "  make test-basic        - Run basic RustQL TCL tests (quick smoke test)"
 	@echo "  make test-<name>       - Run a specific test (e.g., make test-select1)"
+	@echo "  make test-report       - Show pass/fail statistics from test logs"
 	@echo ""
 	@echo "Other Targets:"
 	@echo "  make list-tests        - List all available test targets"
@@ -175,3 +176,44 @@ clean:
 # Clean only test results (keep build)
 clean-results:
 	rm -rf $(RESULT_DIR)
+
+# Show test statistics from log files
+test-report:
+	@if [ ! -d "$(RESULT_DIR)" ]; then \
+		echo "No test results found. Run 'make test' first."; \
+		exit 1; \
+	fi
+	@echo "=== Test Results by File ==="
+	@echo ""
+	@for log in $(RESULT_DIR)/*.log; do \
+		if [ -f "$$log" ]; then \
+			name=$$(basename "$$log" .log); \
+			pass=$$(grep -cE "^$${name}-.*\.\.\. Ok" "$$log" 2>/dev/null | tr -d '[:space:]'); \
+			total=$$(grep -cE "^$${name}-[0-9]" "$$log" 2>/dev/null | tr -d '[:space:]'); \
+			pass=$${pass:-0}; \
+			total=$${total:-0}; \
+			if [ "$$total" -gt 0 ] 2>/dev/null; then \
+				pct=$$((pass * 100 / total)); \
+				printf "%-12s %4d/%4d passed (%2d%%)\n" "$$name" "$$pass" "$$total" "$$pct"; \
+			fi; \
+		fi; \
+	done | sort -t'(' -k2 -rn
+	@echo ""
+	@echo "=== Overall ==="
+	@total_pass=0; total_tests=0; \
+	for log in $(RESULT_DIR)/*.log; do \
+		if [ -f "$$log" ]; then \
+			name=$$(basename "$$log" .log); \
+			pass=$$(grep -cE "^$${name}-.*\.\.\. Ok" "$$log" 2>/dev/null | tr -d '[:space:]'); \
+			total=$$(grep -cE "^$${name}-[0-9]" "$$log" 2>/dev/null | tr -d '[:space:]'); \
+			pass=$${pass:-0}; \
+			total=$${total:-0}; \
+			total_pass=$$((total_pass + pass)); \
+			total_tests=$$((total_tests + total)); \
+		fi; \
+	done; \
+	if [ "$$total_tests" -gt 0 ]; then \
+		echo "Total: $$total_pass/$$total_tests passed ($$((total_pass * 100 / total_tests))%)"; \
+	else \
+		echo "No test data found."; \
+	fi

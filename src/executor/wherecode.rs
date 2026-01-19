@@ -200,15 +200,25 @@ impl WhereCodeGen {
         level: &super::where_clause::WhereLevel,
         index_name: &str,
         eq_cols: i32,
-        _covering: bool,
+        covering: bool,
     ) -> Result<()> {
         let cursor = level.from_idx;
+        let index_cursor = cursor + 100;
         let cont_label = *self.loop_cont_addrs.last().unwrap();
 
-        // Open index
+        // Open table cursor (for column reads or non-covering fallback)
         self.emit(
             Opcode::OpenRead,
-            cursor + 100,
+            cursor,
+            0,
+            0,
+            P4::Text(level.table_name.clone()),
+        );
+
+        // Open index cursor
+        self.emit(
+            Opcode::OpenRead,
+            index_cursor,
             0,
             0,
             P4::Text(index_name.to_string()),
@@ -225,14 +235,34 @@ impl WhereCodeGen {
             // Seek to key
             self.emit(
                 Opcode::SeekGE,
-                cursor + 100,
+                index_cursor,
                 cont_label,
                 key_reg,
                 P4::Int64(eq_cols as i64),
             );
         } else {
             // Rewind to start
-            self.emit(Opcode::Rewind, cursor + 100, cont_label, 0, P4::Unused);
+            self.emit(Opcode::Rewind, index_cursor, cont_label, 0, P4::Unused);
+        }
+
+        // Set up deferred seek from index to table
+        // For covering indexes, column reads will be redirected to the index
+        // For non-covering, FinishSeek will complete the table lookup
+        if covering {
+            // When covering, we can potentially skip the table seek entirely
+            // by reading columns directly from the index
+            // P4 would contain the column mapping (alt_map) if we had schema info
+            self.emit(
+                Opcode::DeferredSeek,
+                cursor,
+                0,
+                index_cursor,
+                P4::Unused, // TODO: Add column mapping when schema info available
+            );
+        } else {
+            // For non-covering index scans, we need to seek to the table
+            // to read columns not in the index
+            self.emit(Opcode::DeferredSeek, cursor, 0, index_cursor, P4::Unused);
         }
 
         Ok(())

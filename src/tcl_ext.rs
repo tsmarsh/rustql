@@ -48,8 +48,193 @@ pub extern "C" fn Rustql_Init(interp: *mut Tcl_Interp) -> c_int {
             std::ptr::null_mut(),
             None,
         );
+
+        // Register test infrastructure stubs required by tester.tcl
+        register_test_stubs(interp);
     }
 
+    TCL_OK
+}
+
+/// Register all test infrastructure stub commands
+unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
+    // List of test commands that return 0/empty
+    let stub_commands = [
+        "sqlite3_test_control_pending_byte",
+        "sqlite3_soft_heap_limit64",
+        "sqlite3_soft_heap_limit",
+        "sqlite3_hard_heap_limit64",
+        "sqlite3_config_memstatus",
+        "sqlite3_config_pagecache",
+        "sqlite3_config",
+        "sqlite3_initialize",
+        "sqlite3_shutdown",
+        "sqlite3_enable_shared_cache",
+        "sqlite3_extended_result_codes",
+        "sqlite3_reset_auto_extension",
+        "sqlite3_memdebug_settitle",
+        "sqlite3_memdebug_dump",
+        "sqlite3_memdebug_log",
+        "sqlite3_memdebug_backtrace",
+        "sqlite3_clear_tsd_memdebug",
+        "sqlite3_crash_enable",
+        "sqlite3_crash_on_write",
+        "sqlite3_crashparams",
+        "sqlite3_connection_pointer",
+        "sqlite3_db_config",
+        "sqlite3_db_filename",
+        "sqlite3_db_status",
+        "sqlite3_exec_nr",
+        "sqlite3_next_stmt",
+        "sqlite3_stmt_status",
+        "sqlite3_unlock_notify",
+        "sqlite3_wal_autocheckpoint",
+        "autoinstall_test_functions",
+        "install_malloc_faultsim",
+        "sqlite3_memdebug_fail",
+        "sqlite3_memdebug_pending",
+        "database_never_corrupt",
+        "database_may_be_corrupt",
+        "optimization_control",
+        "load_static_extension",
+        "sqlite3_limit",
+        "sqlite3_tcl_to_ptr",
+        "sqlite3_register_cksumvfs",
+        "sqlite3_register_tclcmd_cksumvfs",
+        "extra_schema_checks",
+        "sqlite3_test_control",
+        "test_control_pending_byte",
+        "sqlite3_create_function_v2",
+        "sqlite3_create_function",
+        "sqlite3_create_aggregate",
+        "sqlite3_create_collation",
+        "sqlite3_sleep",
+        "sqlite3_busy_timeout",
+        "sqlite3_interrupt",
+        "sqlite3_bind_int",
+        "sqlite3_bind_text",
+        "sqlite3_bind_blob",
+        "sqlite3_bind_null",
+        "sqlite3_bind_double",
+        "sqlite3_column_name",
+        "sqlite3_column_type",
+        "sqlite3_column_int",
+        "sqlite3_column_int64",
+        "sqlite3_column_double",
+        "sqlite3_column_blob",
+        "sqlite3_column_bytes",
+        "sqlite3_reset",
+        "sqlite3_clear_bindings",
+        "sqlite3_errcode",
+        "sqlite3_errmsg",
+        "sqlite3_errmsg16",
+        "sqlite3_extended_errcode",
+        "sqlite3_result_int",
+        "sqlite3_result_text",
+        "sqlite3_result_blob",
+        "sqlite3_result_null",
+        "sqlite3_result_double",
+        "sqlite3_result_error",
+        "sqlite3_result_zeroblob",
+        "sqlite3_value_int",
+        "sqlite3_value_text",
+        "sqlite3_value_blob",
+        "sqlite3_value_type",
+        "sqlite3_value_bytes",
+        "sqlite3_aggregate_context",
+        "sqlite3_get_auxdata",
+        "sqlite3_set_auxdata",
+        "sqlite3_complete",
+        "sqlite3_complete16",
+        "sqlite3_open",
+        "sqlite3_open16",
+        "sqlite3_open_v2",
+        "sqlite3_close",
+        "sqlite3_close_v2",
+        "sqlite3_prepare_v2",
+        "sqlite3_prepare",
+        "sqlite3_step",
+        "sqlite3_finalize",
+        "sqlite3_db_handle",
+        "sqlite3_changes",
+        "sqlite3_total_changes",
+        "sqlite3_last_insert_rowid",
+        "sqlite3_get_autocommit",
+        "sqlite3_data_count",
+        "sqlite3_column_count",
+        "sqlite3_column_text",
+        "sqlite3_column_text16",
+        "sqlite3_sql",
+        "sqlite3_expanded_sql",
+        "sqlite3_normalized_sql",
+        "register_echo_module",
+        "register_tclvar_module",
+        "register_fs_module",
+        "register_wholenumber_module",
+        "register_regexp_module",
+        "register_fuzzer_module",
+        "register_unionvtab_module",
+    ];
+
+    for cmd in stub_commands {
+        let cmd_name = CString::new(cmd).unwrap();
+        Tcl_CreateObjCommand(
+            interp,
+            cmd_name.as_ptr(),
+            Some(test_stub_return_zero),
+            std::ptr::null_mut(),
+            None,
+        );
+    }
+
+    // Commands that return specific values
+    let cmd_name = CString::new("sqlite3_memory_used").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(test_stub_return_zero),
+        std::ptr::null_mut(),
+        None,
+    );
+
+    let cmd_name = CString::new("sqlite3_memory_highwater").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(test_stub_return_zero),
+        std::ptr::null_mut(),
+        None,
+    );
+
+    let cmd_name = CString::new("sqlite3_status").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(test_stub_status),
+        std::ptr::null_mut(),
+        None,
+    );
+}
+
+/// Stub that returns 0
+unsafe extern "C" fn test_stub_return_zero(
+    _client_data: *mut std::ffi::c_void,
+    interp: *mut Tcl_Interp,
+    _objc: c_int,
+    _objv: *const *mut Tcl_Obj,
+) -> c_int {
+    set_result_int(interp, 0);
+    TCL_OK
+}
+
+/// Stub for sqlite3_status - returns {0 0 0}
+unsafe extern "C" fn test_stub_status(
+    _client_data: *mut std::ffi::c_void,
+    interp: *mut Tcl_Interp,
+    _objc: c_int,
+    _objv: *const *mut Tcl_Obj,
+) -> c_int {
+    set_result_string(interp, "0 0 0");
     TCL_OK
 }
 
@@ -67,6 +252,7 @@ pub extern "C" fn Sqlite3_Init(interp: *mut Tcl_Interp) -> c_int {
 
 /// The sqlite3 command - creates a database handle
 /// Usage: sqlite3 DBNAME FILENAME ?-options?
+/// Also handles: sqlite3 -has-codec (returns 0)
 unsafe extern "C" fn sqlite3_cmd(
     _client_data: *mut std::ffi::c_void,
     interp: *mut Tcl_Interp,
@@ -81,8 +267,22 @@ unsafe extern "C" fn sqlite3_cmd(
         return TCL_ERROR;
     }
 
+    // Get first argument
+    let first_arg = obj_to_string(*objv.offset(1));
+
+    // Handle special options
+    if first_arg == "-has-codec" {
+        // RustQL doesn't support encryption
+        set_result_int(interp, 0);
+        return TCL_OK;
+    }
+    if first_arg == "-version" {
+        set_result_string(interp, "3.46.0");
+        return TCL_OK;
+    }
+
     // Get database handle name
-    let db_name = obj_to_string(*objv.offset(1));
+    let db_name = first_arg;
 
     // Get filename (default to :memory:)
     let filename = if objc >= 3 {

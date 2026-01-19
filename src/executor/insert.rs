@@ -556,7 +556,7 @@ impl<'a> InsertCompiler<'a> {
                     )
                 };
                 if is_aggregate {
-                    return Some(func_call.name.to_lowercase());
+                    return Some(func_call.name.clone());
                 }
                 // Check arguments
                 if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {

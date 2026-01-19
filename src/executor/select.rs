@@ -2685,6 +2685,23 @@ impl<'s> SelectCompiler<'s> {
                     let key_base_reg = self.alloc_regs(order_by_count);
                     if let Some(order_by) = &self.order_by_terms.clone() {
                         for (i, term) in order_by.iter().enumerate() {
+                            // Helper to generate ordinal error
+                            let make_range_error = |term_num: usize, count: usize| {
+                                let ordinal = match term_num {
+                                    1 => "1st".to_string(),
+                                    2 => "2nd".to_string(),
+                                    3 => "3rd".to_string(),
+                                    n => format!("{}th", n),
+                                };
+                                Error::with_message(
+                                    ErrorCode::Error,
+                                    format!(
+                                        "{} ORDER BY term out of range - should be between 1 and {}",
+                                        ordinal, count
+                                    ),
+                                )
+                            };
+
                             // Handle ORDER BY column index (e.g., ORDER BY 1, ORDER BY 2)
                             // These should reference result columns, not be literal values
                             if let Expr::Literal(Literal::Integer(col_idx)) = &term.expr {
@@ -2700,23 +2717,22 @@ impl<'s> SelectCompiler<'s> {
                                     );
                                     continue;
                                 } else {
-                                    // Column index out of range - produce descriptive error
-                                    let term_num = i + 1;
-                                    let ordinal = match term_num {
-                                        1 => "1st".to_string(),
-                                        2 => "2nd".to_string(),
-                                        3 => "3rd".to_string(),
-                                        n => format!("{}th", n),
-                                    };
-                                    return Err(Error::with_message(
-                                        ErrorCode::Error,
-                                        format!(
-                                            "{} ORDER BY term out of range - should be between 1 and {}",
-                                            ordinal, count
-                                        ),
-                                    ));
+                                    return Err(make_range_error(i + 1, count));
                                 }
                             }
+
+                            // Handle negative column indices (ORDER BY -1)
+                            if let Expr::Unary {
+                                op: crate::parser::ast::UnaryOp::Neg,
+                                expr: inner,
+                            } = &term.expr
+                            {
+                                if let Expr::Literal(Literal::Integer(_)) = inner.as_ref() {
+                                    // Negative column indices are always out of range
+                                    return Err(make_range_error(i + 1, count));
+                                }
+                            }
+
                             self.compile_expr(&term.expr, key_base_reg + i as i32)?;
                         }
                     }
@@ -2887,7 +2903,7 @@ impl<'s> SelectCompiler<'s> {
                     )
                 };
                 if is_aggregate {
-                    return Some(func_call.name.to_lowercase());
+                    return Some(func_call.name.clone());
                 }
                 // Check arguments
                 if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
@@ -3071,10 +3087,7 @@ impl<'s> SelectCompiler<'s> {
                     if arg_count < min_args {
                         return Err(crate::error::Error::with_message(
                             crate::error::ErrorCode::Error,
-                            format!(
-                                "wrong number of arguments to function {}()",
-                                name_upper.to_lowercase()
-                            ),
+                            format!("wrong number of arguments to function {}()", func_call.name),
                         ));
                     }
 
@@ -3084,10 +3097,7 @@ impl<'s> SelectCompiler<'s> {
                         }
                         return Err(crate::error::Error::with_message(
                             crate::error::ErrorCode::Error,
-                            format!(
-                                "wrong number of arguments to function {}()",
-                                name_upper.to_lowercase()
-                            ),
+                            format!("wrong number of arguments to function {}()", func_call.name),
                         ));
                     }
 

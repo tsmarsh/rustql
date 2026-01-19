@@ -121,6 +121,8 @@ pub struct VdbeCursor {
     pub rowid: Option<i64>,
     /// Cached row data
     pub row_data: Option<Vec<u8>>,
+    /// Cached decoded columns (to avoid re-decoding on repeated access)
+    pub cached_columns: Option<Vec<Mem>>,
     /// Number of columns
     pub n_field: i32,
     /// Null row flag (for outer joins)
@@ -207,6 +209,7 @@ impl VdbeCursor {
             key: None,
             rowid: None,
             row_data: None,
+            cached_columns: None,
             n_field: 0,
             null_row: false,
             seek_key: None,
@@ -1650,6 +1653,8 @@ impl Vdbe {
                 let btree = self.btree.clone();
                 let schema = self.schema.clone();
                 if let Some(cursor) = self.cursor_mut(op.p1) {
+                    // Invalidate column cache on cursor movement
+                    cursor.cached_columns = None;
                     if cursor.is_sqlite_master {
                         // Virtual cursor for sqlite_master
                         cursor.virtual_index = 0;
@@ -1797,6 +1802,8 @@ impl Vdbe {
                 let mut has_more = false;
                 let mut vtab_context: Option<(Option<String>, Option<i64>)> = None;
                 if let Some(cursor) = self.cursor_mut(op.p1) {
+                    // Invalidate column cache on cursor movement
+                    cursor.cached_columns = None;
                     if cursor.is_sqlite_master {
                         // Virtual cursor for sqlite_master
                         cursor.virtual_index += 1;
@@ -1910,6 +1917,8 @@ impl Vdbe {
                 // Move cursor to previous row, jump to P2 if has more rows
                 let mut has_more = false;
                 if let Some(cursor) = self.cursor_mut(op.p1) {
+                    // Invalidate column cache on cursor movement
+                    cursor.cached_columns = None;
                     if let Some(ref mut bt_cursor) = cursor.btree_cursor {
                         match bt_cursor.previous(0) {
                             Ok(()) => {

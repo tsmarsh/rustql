@@ -331,6 +331,12 @@ impl<'s> SelectCompiler<'s> {
         // Validate no aggregate aliases used in WHERE clause
         self.validate_no_aggregate_aliases_in_where(core.where_clause.as_deref(), &core.columns)?;
 
+        // Validate no aggregate aliases used inside aggregates in HAVING clause
+        self.validate_no_aggregate_alias_in_having_aggregate(
+            core.having.as_deref(),
+            &core.columns,
+        )?;
+
         // Process FROM clause - open cursors
         if let Some(from) = &core.from {
             self.compile_from_clause(from)?;
@@ -1011,6 +1017,9 @@ impl<'s> SelectCompiler<'s> {
         // Save the left side's column names (right side will add more but we only want left's names)
         let saved_column_names = self.result_column_names.clone();
 
+        // Track if we need sorted output (UNION, INTERSECT, EXCEPT all return sorted results)
+        let needs_sorted_output = !matches!(op, CompoundOp::UnionAll);
+
         match op {
             CompoundOp::UnionAll => {
                 // Clear tables before compiling right side (but keep column names from left)
@@ -1067,7 +1076,12 @@ impl<'s> SelectCompiler<'s> {
         self.result_column_names = saved_column_names;
 
         // Output results from ephemeral table
-        self.output_ephemeral_table(result_cursor, dest)?;
+        // UNION/INTERSECT/EXCEPT return sorted results, UNION ALL does not
+        if needs_sorted_output {
+            self.output_ephemeral_table_sorted(result_cursor, dest)?;
+        } else {
+            self.output_ephemeral_table(result_cursor, dest)?;
+        }
         self.emit(Opcode::Close, result_cursor, 0, 0, P4::Unused);
 
         Ok(())
@@ -2115,6 +2129,22 @@ impl<'s> SelectCompiler<'s> {
                         "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
                     );
 
+                // Validate aggregate function argument counts
+                if is_aggregate {
+                    let (min_args, max_args) = match name_upper.as_str() {
+                        "COUNT" => (0, 1),
+                        "SUM" | "AVG" | "TOTAL" | "MIN" | "MAX" => (1, 1),
+                        "GROUP_CONCAT" => (1, 2),
+                        _ => (0, 255),
+                    };
+                    if arg_count < min_args || arg_count > max_args {
+                        return Err(Error::with_message(
+                            ErrorCode::Error,
+                            format!("wrong number of arguments to function {}()", func_call.name),
+                        ));
+                    }
+                }
+
                 if is_aggregate && self.agg_final_idx < self.agg_final_regs.len() {
                     // Use pre-computed aggregate result
                     let agg_reg = self.agg_final_regs[self.agg_final_idx];
@@ -2805,17 +2835,31 @@ impl<'s> SelectCompiler<'s> {
                     crate::parser::ast::FunctionArgs::Star => 0,
                 };
                 // MIN/MAX with multiple args are scalar functions, not aggregates
-                if matches!(name_upper.as_str(), "MIN" | "MAX") && arg_count > 1 {
-                    return false;
+                let is_agg = if matches!(name_upper.as_str(), "MIN" | "MAX") && arg_count > 1 {
+                    false
+                } else {
+                    matches!(
+                        name_upper.as_str(),
+                        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
+                    )
+                };
+                if is_agg {
+                    return true;
                 }
-                matches!(
-                    name_upper.as_str(),
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
-                )
+                // Also check function arguments for aggregates (e.g., coalesce(min(f1), 0))
+                if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
+                    for arg in exprs {
+                        if self.expr_has_aggregate(arg) {
+                            return true;
+                        }
+                    }
+                }
+                false
             }
             Expr::Binary { left, right, .. } => {
                 self.expr_has_aggregate(left) || self.expr_has_aggregate(right)
             }
+            Expr::Unary { expr: inner, .. } => self.expr_has_aggregate(inner),
             _ => false,
         }
     }
@@ -3018,6 +3062,131 @@ impl<'s> SelectCompiler<'s> {
             }
         }
         Ok(())
+    }
+
+    /// Validate that HAVING clause does not use aggregate aliases inside aggregate functions
+    /// SQLite allows: SELECT min(f1) AS m FROM t GROUP BY f1 HAVING m > 5 (using alias outside agg)
+    /// SQLite rejects: SELECT min(f1) AS m FROM t GROUP BY f1 HAVING max(m) > 5 (alias inside agg)
+    fn validate_no_aggregate_alias_in_having_aggregate(
+        &self,
+        having: Option<&Expr>,
+        columns: &[ResultColumn],
+    ) -> Result<()> {
+        if let Some(having_expr) = having {
+            let agg_aliases = self.collect_aggregate_aliases(columns);
+            if !agg_aliases.is_empty() {
+                if let Some(alias) =
+                    self.find_aggregate_alias_in_aggregate(having_expr, &agg_aliases)
+                {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        format!("misuse of aliased aggregate {}", alias),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Find if any aggregate alias is used inside an aggregate function
+    /// Returns the original alias name (preserving case) if found
+    fn find_aggregate_alias_in_aggregate<'a>(
+        &self,
+        expr: &Expr,
+        aliases: &'a [String],
+    ) -> Option<String> {
+        match expr {
+            Expr::Function(func) => {
+                let is_agg = crate::functions::is_aggregate_function(&func.name);
+                if is_agg {
+                    // Inside an aggregate - check if any alias is used
+                    if let crate::parser::ast::FunctionArgs::Exprs(args) = &func.args {
+                        for arg in args {
+                            if let Some(alias) = self.find_aggregate_alias_in_expr(arg, aliases) {
+                                // Return the alias with its original case from the column definition
+                                return Some(alias.clone());
+                            }
+                        }
+                    }
+                }
+                // Also recurse into function arguments for non-aggregate functions
+                // (e.g., coalesce(max(m), 0))
+                if let crate::parser::ast::FunctionArgs::Exprs(args) = &func.args {
+                    for arg in args {
+                        if let Some(alias) = self.find_aggregate_alias_in_aggregate(arg, aliases) {
+                            return Some(alias);
+                        }
+                    }
+                }
+                None
+            }
+            Expr::Binary { left, right, .. } => self
+                .find_aggregate_alias_in_aggregate(left, aliases)
+                .or_else(|| self.find_aggregate_alias_in_aggregate(right, aliases)),
+            Expr::Unary { expr: inner, .. } => {
+                self.find_aggregate_alias_in_aggregate(inner, aliases)
+            }
+            Expr::IsNull { expr: inner, .. } => {
+                self.find_aggregate_alias_in_aggregate(inner, aliases)
+            }
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated: _,
+            } => self
+                .find_aggregate_alias_in_aggregate(expr, aliases)
+                .or_else(|| self.find_aggregate_alias_in_aggregate(low, aliases))
+                .or_else(|| self.find_aggregate_alias_in_aggregate(high, aliases)),
+            Expr::In {
+                expr,
+                list,
+                negated: _,
+            } => {
+                if let Some(alias) = self.find_aggregate_alias_in_aggregate(expr, aliases) {
+                    return Some(alias);
+                }
+                if let crate::parser::ast::InList::Values(values) = list {
+                    for item in values {
+                        if let Some(alias) = self.find_aggregate_alias_in_aggregate(item, aliases) {
+                            return Some(alias);
+                        }
+                    }
+                }
+                None
+            }
+            Expr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => {
+                if let Some(op) = operand {
+                    if let Some(alias) = self.find_aggregate_alias_in_aggregate(op, aliases) {
+                        return Some(alias);
+                    }
+                }
+                for clause in when_clauses {
+                    if let Some(alias) =
+                        self.find_aggregate_alias_in_aggregate(&clause.when, aliases)
+                    {
+                        return Some(alias);
+                    }
+                    if let Some(alias) =
+                        self.find_aggregate_alias_in_aggregate(&clause.then, aliases)
+                    {
+                        return Some(alias);
+                    }
+                }
+                if let Some(else_expr) = else_clause {
+                    if let Some(alias) = self.find_aggregate_alias_in_aggregate(else_expr, aliases)
+                    {
+                        return Some(alias);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
     }
 
     fn init_aggregates(&mut self, columns: &[ResultColumn]) -> Result<Vec<i32>> {
@@ -3510,6 +3679,109 @@ impl<'s> SelectCompiler<'s> {
 
         self.emit(Opcode::Next, cursor, loop_start_label, 0, P4::Unused);
         self.resolve_label(done_label, self.current_addr());
+
+        Ok(())
+    }
+
+    /// Output ephemeral table in sorted order (for UNION which requires sorted, distinct output)
+    fn output_ephemeral_table_sorted(&mut self, cursor: i32, dest: &SelectDest) -> Result<()> {
+        let col_count = if self.compound_column_count > 0 {
+            self.compound_column_count
+        } else {
+            1
+        };
+
+        // Create sorter for sorted output
+        let sorter_cursor = self.alloc_cursor();
+        self.emit(
+            Opcode::OpenEphemeral,
+            sorter_cursor,
+            col_count as i32,
+            0,
+            P4::Unused,
+        );
+
+        // Read all rows from ephemeral table into sorter
+        let done_label = self.alloc_label();
+        self.emit(Opcode::Rewind, cursor, done_label, 0, P4::Unused);
+
+        let loop_start_label = self.alloc_label();
+        self.resolve_label(loop_start_label, self.current_addr());
+
+        // Get columns from ephemeral table
+        let base_reg = self.next_reg;
+        for i in 0..col_count {
+            let reg = self.alloc_reg();
+            self.emit(Opcode::Column, cursor, i as i32, reg, P4::Unused);
+        }
+
+        // Make record and insert into sorter
+        let record_reg = self.alloc_reg();
+        self.emit(
+            Opcode::MakeRecord,
+            base_reg,
+            col_count as i32,
+            record_reg,
+            P4::Unused,
+        );
+        self.emit(
+            Opcode::SorterInsert,
+            sorter_cursor,
+            record_reg,
+            0,
+            P4::Unused,
+        );
+
+        self.emit(Opcode::Next, cursor, loop_start_label, 0, P4::Unused);
+        self.resolve_label(done_label, self.current_addr());
+
+        // Sort the data
+        let sort_done_label = self.alloc_label();
+        self.emit(
+            Opcode::SorterSort,
+            sorter_cursor,
+            sort_done_label,
+            0,
+            P4::Unused,
+        );
+
+        // Output sorted rows
+        let sorter_loop_label = self.alloc_label();
+        self.resolve_label(sorter_loop_label, self.current_addr());
+
+        // Get row data from sorter
+        let sorter_data_reg = self.alloc_reg();
+        self.emit(
+            Opcode::SorterData,
+            sorter_cursor,
+            sorter_data_reg,
+            0,
+            P4::Unused,
+        );
+
+        // Decode the record
+        let out_base_reg = self.alloc_regs(col_count);
+        self.emit(
+            Opcode::DecodeRecord,
+            sorter_data_reg,
+            out_base_reg,
+            col_count as i32,
+            P4::Unused,
+        );
+
+        // Output the row
+        self.output_row(dest, out_base_reg, col_count)?;
+
+        self.emit(
+            Opcode::SorterNext,
+            sorter_cursor,
+            sorter_loop_label,
+            0,
+            P4::Unused,
+        );
+        self.resolve_label(sort_done_label, self.current_addr());
+
+        self.emit(Opcode::Close, sorter_cursor, 0, 0, P4::Unused);
 
         Ok(())
     }

@@ -409,6 +409,8 @@ pub struct Column {
     pub collation: String,
     /// Is part of primary key
     pub is_primary_key: bool,
+    /// Has UNIQUE constraint
+    pub is_unique: bool,
     /// Is hidden (generated, rowid, etc.)
     pub is_hidden: bool,
     /// Generated column expression
@@ -426,6 +428,7 @@ impl Default for Column {
             default_value: None,
             collation: DEFAULT_COLLATION.to_string(),
             is_primary_key: false,
+            is_unique: false,
             is_hidden: false,
             generated: None,
         }
@@ -666,6 +669,7 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
                             default_value: None,
                             collation: DEFAULT_COLLATION.to_string(),
                             is_primary_key: false,
+                            is_unique: false,
                             is_hidden: false,
                             generated: None,
                         });
@@ -726,6 +730,7 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
                     default_value: None,
                     collation: DEFAULT_COLLATION.to_string(),
                     is_primary_key: false,
+                    is_unique: false,
                     is_hidden: false,
                     generated: None,
                 })
@@ -787,7 +792,32 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
         }
 
         let name = parts[0].to_string();
-        let type_name = parts.get(1).map(|s| (*s).to_string());
+
+        // Check for constraints in remaining parts
+        let col_def_upper = col_def.to_uppercase();
+        let is_unique = col_def_upper.contains(" UNIQUE");
+        let is_primary_key =
+            col_def_upper.contains(" PRIMARY KEY") || col_def_upper.contains(" PRIMARY");
+        let is_not_null = col_def_upper.contains(" NOT NULL");
+
+        // Determine type name - it's the second word if it's not a constraint keyword
+        let type_name = parts.get(1).and_then(|s| {
+            let upper = s.to_uppercase();
+            if upper == "UNIQUE"
+                || upper == "PRIMARY"
+                || upper == "NOT"
+                || upper == "KEY"
+                || upper == "NULL"
+                || upper == "REFERENCES"
+                || upper == "DEFAULT"
+                || upper == "CHECK"
+                || upper == "COLLATE"
+            {
+                None
+            } else {
+                Some((*s).to_string())
+            }
+        });
         let affinity = type_name
             .as_ref()
             .map(|t| type_affinity(t))
@@ -797,11 +827,12 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
             name,
             type_name,
             affinity,
-            not_null: false,
+            not_null: is_not_null,
             not_null_conflict: None,
             default_value: None,
             collation: DEFAULT_COLLATION.to_string(),
-            is_primary_key: false,
+            is_primary_key,
+            is_unique,
             is_hidden: false,
             generated: None,
         });
@@ -824,6 +855,79 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
         autoincrement: false,
         sql: Some(sql.to_string()),
         row_estimate: 0,
+    })
+}
+
+/// Parse a CREATE INDEX SQL string into an Index struct.
+pub fn parse_create_index_sql(sql: &str, _is_unique: bool) -> Option<Index> {
+    // Parse: CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table(col1, col2, ...)
+    let sql_upper = sql.to_uppercase();
+
+    // Find the index name
+    let idx_pos = sql_upper.find("INDEX")?;
+    let after_index = &sql[idx_pos + 5..].trim();
+
+    // Skip IF NOT EXISTS if present
+    let after_upper = after_index.to_uppercase();
+    let name_start = if after_upper.starts_with("IF NOT EXISTS") {
+        after_index[13..].trim()
+    } else {
+        after_index
+    };
+
+    // Find ON keyword
+    let on_pos = name_start.to_uppercase().find(" ON ")?;
+    let index_name = name_start[..on_pos].trim().to_string();
+    let after_on = name_start[on_pos + 4..].trim();
+
+    // Find table name and columns
+    let paren_pos = after_on.find('(')?;
+    let table_name = after_on[..paren_pos].trim().to_string();
+    let columns_str = after_on[paren_pos + 1..].trim();
+    let columns_str = columns_str.strip_suffix(')')?;
+
+    // Parse column list
+    let mut columns = Vec::new();
+    for col in columns_str.split(',') {
+        let col = col.trim();
+        if col.is_empty() {
+            continue;
+        }
+        // Handle "colname ASC" or "colname DESC"
+        let parts: Vec<&str> = col.split_whitespace().collect();
+        let col_name = parts.first()?.to_string();
+        let sort_order = if parts
+            .get(1)
+            .map(|s| s.to_uppercase() == "DESC")
+            .unwrap_or(false)
+        {
+            SortOrder::Desc
+        } else {
+            SortOrder::Asc
+        };
+        columns.push(IndexColumn {
+            column_idx: -1, // Will be resolved later when we have table schema
+            expr: Some(Expr::Column {
+                table: None,
+                column: col_name,
+            }),
+            sort_order,
+            collation: DEFAULT_COLLATION.to_string(),
+        });
+    }
+
+    let is_unique = sql_upper.contains("UNIQUE");
+
+    Some(Index {
+        name: index_name,
+        table: table_name,
+        columns,
+        unique: is_unique,
+        partial: None,
+        is_primary_key: false,
+        root_page: 0, // Will be set when actual btree is created
+        sql: Some(sql.to_string()),
+        stats: None,
     })
 }
 
@@ -1364,6 +1468,7 @@ impl Schema {
             default_value: None,
             collation: DEFAULT_COLLATION.to_string(),
             is_primary_key: false,
+            is_unique: false,
             is_hidden: false,
             generated: None,
         };
@@ -1419,8 +1524,9 @@ impl Schema {
                 column.not_null_conflict = *conflict;
             }
             ColumnConstraint::Unique { conflict: _ } => {
-                // Unique constraint creates an implicit index
-                // Will be handled during index creation
+                // Mark column as unique
+                column.is_unique = true;
+                // Note: Implicit index creation should happen at table creation time
             }
             ColumnConstraint::Check(expr) => {
                 table.checks.push(expr.clone());

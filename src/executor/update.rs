@@ -403,13 +403,25 @@ impl<'s> UpdateCompiler<'s> {
         }
 
         // Phase 2: Copy temp values to data registers
+        // Also track which columns are being updated for UNIQUE checks
+        let mut updated_columns: Vec<usize> = Vec::new();
         for (col_idx, temp_reg) in temp_assignments {
             let dest_reg = data_base + col_idx;
             self.emit(Opcode::SCopy, temp_reg, dest_reg, 0, P4::Unused);
+            updated_columns.push(col_idx as usize);
         }
 
         // Clear column_data_base since we're done with expressions
         self.column_data_base = None;
+
+        // Check UNIQUE constraints before making changes
+        self.emit_unique_constraint_checks(
+            cursor,
+            rowid_reg,
+            data_base,
+            &updated_columns,
+            conflict_action,
+        )?;
 
         // Handle conflict action
         self.emit_conflict_check(conflict_action)?;
@@ -644,6 +656,226 @@ impl<'s> UpdateCompiler<'s> {
                 // Delete existing row with same key
             }
         }
+        Ok(())
+    }
+
+    /// Emit UNIQUE constraint checking code
+    /// For each UNIQUE index/constraint that involves columns being updated,
+    /// generate code to scan the table and check for duplicate values
+    fn emit_unique_constraint_checks(
+        &mut self,
+        _write_cursor: i32,
+        rowid_reg: i32,
+        data_base: i32,
+        updated_columns: &[usize],
+        conflict_action: ConflictAction,
+    ) -> Result<()> {
+        let schema = match self.schema {
+            Some(s) => s,
+            None => return Ok(()), // No schema, can't check constraints
+        };
+
+        let table = match schema.tables.get(&self.table_name.to_lowercase()) {
+            Some(t) => t.clone(),
+            None => return Ok(()), // Table not found in schema
+        };
+
+        // Find all UNIQUE indexes on this table
+        let mut unique_checks: Vec<(String, Vec<usize>)> = Vec::new(); // (index_name, column_indices)
+
+        for index in &table.indexes {
+            if !index.unique {
+                continue;
+            }
+
+            // Check if any of the indexed columns are being updated
+            let indexed_col_indices: Vec<usize> = index
+                .columns
+                .iter()
+                .filter_map(|ic| {
+                    if ic.column_idx >= 0 {
+                        Some(ic.column_idx as usize)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let has_updated_column = indexed_col_indices
+                .iter()
+                .any(|idx| updated_columns.contains(idx));
+
+            if has_updated_column {
+                unique_checks.push((index.name.clone(), indexed_col_indices));
+            }
+        }
+
+        // Also check for UNIQUE constraints defined directly on columns (column.is_unique)
+        // and PRIMARY KEY columns (which also imply uniqueness)
+        for (col_idx, col) in table.columns.iter().enumerate() {
+            if !updated_columns.contains(&col_idx) {
+                continue;
+            }
+
+            // Check if column has direct UNIQUE constraint or is PRIMARY KEY
+            if col.is_unique || col.is_primary_key {
+                // Check if already covered by an explicit unique index
+                let has_unique_index = unique_checks
+                    .iter()
+                    .any(|(_, cols)| cols.len() == 1 && cols[0] == col_idx);
+
+                if !has_unique_index {
+                    // Add this column's UNIQUE constraint to checks
+                    unique_checks.push((col.name.clone(), vec![col_idx]));
+                }
+            }
+        }
+
+        // Generate constraint checking code for each unique constraint
+        // that involves updated columns
+        let (root_page, _) = self.lookup_table_info(&self.table_name)?;
+
+        for (idx_name, col_indices) in unique_checks {
+            // Determine column name for error message
+            let col_name = if col_indices.len() == 1 {
+                table
+                    .columns
+                    .get(col_indices[0])
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| "?".to_string())
+            } else {
+                col_indices
+                    .iter()
+                    .filter_map(|i| table.columns.get(*i))
+                    .map(|c| c.name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+
+            // Open a read cursor to scan for duplicates
+            let check_cursor = self.alloc_cursor();
+            self.emit(
+                Opcode::OpenRead,
+                check_cursor,
+                root_page as i32,
+                self.num_columns as i32,
+                P4::Text(self.table_name.clone()),
+            );
+
+            let scan_start = self.alloc_label();
+            let scan_end = self.alloc_label();
+            let conflict_label = self.alloc_label();
+            let no_conflict_label = self.alloc_label();
+
+            // Rewind to start of table
+            self.emit(Opcode::Rewind, check_cursor, scan_end, 0, P4::Unused);
+
+            // Scan loop
+            self.resolve_label(scan_start, self.current_addr() as i32);
+
+            // Get rowid of current row
+            let check_rowid_reg = self.alloc_reg();
+            self.emit(Opcode::Rowid, check_cursor, check_rowid_reg, 0, P4::Unused);
+
+            // Skip if same rowid (we're updating this row, so it's ok)
+            self.emit(
+                Opcode::Eq,
+                rowid_reg,
+                no_conflict_label,
+                check_rowid_reg,
+                P4::Unused,
+            );
+
+            // Check if all UNIQUE columns match
+            // For single-column UNIQUE: just compare
+            // For multi-column UNIQUE: all must match
+            let mut all_match_label = conflict_label;
+            for (i, &col_idx) in col_indices.iter().enumerate() {
+                let check_val_reg = self.alloc_reg();
+                self.emit(
+                    Opcode::Column,
+                    check_cursor,
+                    col_idx as i32,
+                    check_val_reg,
+                    P4::Unused,
+                );
+
+                // Compare with new value (in data_base + col_idx)
+                let new_val_reg = data_base + col_idx as i32;
+
+                if i == col_indices.len() - 1 {
+                    // Last column - if equal, we have a conflict
+                    self.emit(
+                        Opcode::Eq,
+                        new_val_reg,
+                        all_match_label,
+                        check_val_reg,
+                        P4::Unused,
+                    );
+                } else {
+                    // Not last column - if not equal, no conflict for this row
+                    self.emit(
+                        Opcode::Ne,
+                        new_val_reg,
+                        no_conflict_label,
+                        check_val_reg,
+                        P4::Unused,
+                    );
+                }
+            }
+
+            // No conflict for this row - move to next
+            self.resolve_label(no_conflict_label, self.current_addr() as i32);
+            self.emit(Opcode::Next, check_cursor, scan_start, 0, P4::Unused);
+
+            // End of scan - close cursor and continue
+            self.resolve_label(scan_end, self.current_addr() as i32);
+            self.emit(Opcode::Close, check_cursor, 0, 0, P4::Unused);
+
+            // Jump past the conflict handler
+            let after_conflict = self.alloc_label();
+            self.emit(Opcode::Goto, 0, after_conflict, 0, P4::Unused);
+
+            // Conflict detected - handle according to action
+            self.resolve_label(conflict_label, self.current_addr() as i32);
+            self.emit(Opcode::Close, check_cursor, 0, 0, P4::Unused);
+
+            match conflict_action {
+                ConflictAction::Abort | ConflictAction::Rollback | ConflictAction::Fail => {
+                    // Raise UNIQUE constraint error
+                    let error_msg =
+                        format!("UNIQUE constraint failed: {}.{}", self.table_name, col_name);
+                    self.emit(
+                        Opcode::Halt,
+                        crate::error::ErrorCode::Constraint as i32,
+                        2, // OE_Abort
+                        0,
+                        P4::Text(error_msg),
+                    );
+                }
+                ConflictAction::Ignore => {
+                    // Skip this row - jump past the delete/insert
+                    // This needs to jump to the next row in the update loop
+                    // For now, we'll just skip to after_conflict
+                }
+                ConflictAction::Replace => {
+                    // Need to delete the conflicting row
+                    // This is complex - for now just abort
+                    let error_msg =
+                        format!("UNIQUE constraint failed: {}.{}", self.table_name, col_name);
+                    self.emit(
+                        Opcode::Halt,
+                        crate::error::ErrorCode::Constraint as i32,
+                        2, // OE_Abort
+                        0,
+                        P4::Text(error_msg),
+                    );
+                }
+            }
+
+            self.resolve_label(after_conflict, self.current_addr() as i32);
+        }
+
         Ok(())
     }
 

@@ -363,6 +363,9 @@ pub enum Opcode {
     /// Parse a CREATE statement and add to schema
     ParseSchema,
 
+    /// Parse a CREATE INDEX statement and add to schema
+    ParseSchemaIndex,
+
     /// Remove table/index from schema (DROP TABLE/INDEX)
     DropSchema,
 
@@ -680,6 +683,7 @@ impl Opcode {
             Opcode::SorterConfig => "SorterConfig",
             Opcode::CreateBtree => "CreateBtree",
             Opcode::ParseSchema => "ParseSchema",
+            Opcode::ParseSchemaIndex => "ParseSchemaIndex",
             Opcode::DropSchema => "DropSchema",
             Opcode::Transaction => "Transaction",
             Opcode::AutoCommit => "AutoCommit",

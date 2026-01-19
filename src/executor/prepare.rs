@@ -936,7 +936,7 @@ impl<'s> StatementCompiler<'s> {
 
     /// Build CREATE TABLE SQL from AST for storage in schema
     fn build_create_table_sql(&self, create: &CreateTableStmt) -> String {
-        use crate::parser::ast::TableDefinition;
+        use crate::parser::ast::{ColumnConstraintKind, TableDefinition};
 
         let mut sql = String::from("CREATE TABLE ");
         if create.if_not_exists {
@@ -953,6 +953,32 @@ impl<'s> StatementCompiler<'s> {
                     if let Some(ref type_name) = col.type_name {
                         col_sql.push(' ');
                         col_sql.push_str(&type_name.name);
+                    }
+                    // Add constraints
+                    for constraint in &col.constraints {
+                        match &constraint.kind {
+                            ColumnConstraintKind::PrimaryKey { autoincrement, .. } => {
+                                col_sql.push_str(" PRIMARY KEY");
+                                if *autoincrement {
+                                    col_sql.push_str(" AUTOINCREMENT");
+                                }
+                            }
+                            ColumnConstraintKind::NotNull { .. } => {
+                                col_sql.push_str(" NOT NULL");
+                            }
+                            ColumnConstraintKind::Unique { .. } => {
+                                col_sql.push_str(" UNIQUE");
+                            }
+                            ColumnConstraintKind::Default(val) => {
+                                col_sql.push_str(" DEFAULT ");
+                                col_sql.push_str(&format!("{:?}", val));
+                            }
+                            ColumnConstraintKind::Collate(name) => {
+                                col_sql.push_str(" COLLATE ");
+                                col_sql.push_str(name);
+                            }
+                            _ => {}
+                        }
                     }
                     col_sql
                 })
@@ -1251,16 +1277,79 @@ impl<'s> StatementCompiler<'s> {
     }
 
     fn compile_create_index(&mut self, create: &CreateIndexStmt) -> Result<Vec<VdbeOp>> {
+        let index_name = &create.name.name;
+        let index_name_lower = index_name.to_lowercase();
+        let table_name = &create.table;
+        let table_name_lower = table_name.to_lowercase();
+
+        // Check if index already exists
+        if let Some(schema) = self.schema {
+            if schema.indexes.contains_key(&index_name_lower) {
+                if create.if_not_exists {
+                    // Return no-op
+                    let mut ops = Vec::new();
+                    ops.push(Self::make_op(Opcode::Init, 0, 1, 0, P4::Unused));
+                    ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
+                    return Ok(ops);
+                }
+                return Err(crate::error::Error::with_message(
+                    crate::error::ErrorCode::Error,
+                    format!("index {} already exists", index_name),
+                ));
+            }
+
+            // Check if target table exists
+            if !schema.tables.contains_key(&table_name_lower) {
+                return Err(crate::error::Error::with_message(
+                    crate::error::ErrorCode::Error,
+                    format!("no such table: {}", table_name),
+                ));
+            }
+        }
+
+        // Build CREATE INDEX SQL for ParseSchema
+        let unique_str = if create.unique { "UNIQUE " } else { "" };
+        let if_not_exists_str = if create.if_not_exists {
+            "IF NOT EXISTS "
+        } else {
+            ""
+        };
+        let columns_str: Vec<String> = create
+            .columns
+            .iter()
+            .map(|c| {
+                let name = match &c.column {
+                    crate::parser::ast::IndexedColumnKind::Name(n) => n.clone(),
+                    crate::parser::ast::IndexedColumnKind::Expr(_) => "expr".to_string(),
+                };
+                match c.order {
+                    Some(crate::parser::ast::SortOrder::Asc) => format!("{} ASC", name),
+                    Some(crate::parser::ast::SortOrder::Desc) => format!("{} DESC", name),
+                    None => name,
+                }
+            })
+            .collect();
+        let sql = format!(
+            "CREATE {}INDEX {}{} ON {}({})",
+            unique_str,
+            if_not_exists_str,
+            index_name,
+            table_name,
+            columns_str.join(", ")
+        );
+
         let mut ops = Vec::new();
-        ops.push(Self::make_op(Opcode::Init, 0, 1, 0, P4::Unused));
-        ops.push(Self::make_op(
-            Opcode::Noop,
-            0,
-            0,
-            0,
-            P4::Text(format!("CREATE INDEX {}", create.name)),
-        ));
+        ops.push(Self::make_op(Opcode::Init, 0, 2, 0, P4::Unused));
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
+        // Use ParseSchemaIndex to register the index
+        ops.push(Self::make_op(
+            Opcode::ParseSchemaIndex,
+            if create.unique { 1 } else { 0 },
+            0,
+            0,
+            P4::Text(sql),
+        ));
+        ops.push(Self::make_op(Opcode::Goto, 0, 1, 0, P4::Unused));
         Ok(ops)
     }
 
@@ -1293,27 +1382,35 @@ impl<'s> StatementCompiler<'s> {
     }
 
     fn compile_drop(&mut self, drop: &DropStmt, kind: &str) -> Result<Vec<VdbeOp>> {
-        let table_name = &drop.name.name;
-        let table_name_lower = table_name.to_lowercase();
+        let name = &drop.name.name;
+        let name_lower = name.to_lowercase();
 
         // Check for reserved names (sqlite_master, etc.) - cannot be dropped
-        if table_name_lower.starts_with("sqlite_") {
+        if name_lower.starts_with("sqlite_") {
             return Err(crate::error::Error::with_message(
                 crate::error::ErrorCode::Error,
-                format!("table {} may not be dropped", table_name),
+                format!("{} {} may not be dropped", kind, name),
             ));
         }
 
-        // Check if table exists in schema
+        // Check if the object exists in schema based on kind
         if let Some(schema) = self.schema {
-            if !schema.tables.contains_key(&table_name_lower) {
+            let exists = match kind {
+                "table" => schema.tables.contains_key(&name_lower),
+                "index" => schema.indexes.contains_key(&name_lower),
+                "view" => schema.tables.contains_key(&name_lower), // views stored in tables
+                "trigger" => schema.triggers.contains_key(&name_lower),
+                _ => true, // Unknown kind - let it through
+            };
+
+            if !exists {
                 if !drop.if_exists {
                     return Err(crate::error::Error::with_message(
                         crate::error::ErrorCode::Error,
-                        format!("no such {}: {}", kind, table_name),
+                        format!("no such {}: {}", kind, name),
                     ));
                 }
-                // IF EXISTS specified and table doesn't exist - return no-op
+                // IF EXISTS specified and object doesn't exist - return no-op
                 let mut ops = Vec::new();
                 ops.push(Self::make_op(Opcode::Init, 0, 1, 0, P4::Unused));
                 ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
@@ -1321,17 +1418,25 @@ impl<'s> StatementCompiler<'s> {
             }
         }
 
-        // Generate bytecode to drop the table
+        // Generate bytecode to drop the object
         let mut ops = Vec::new();
         ops.push(Self::make_op(Opcode::Init, 0, 2, 0, P4::Unused));
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
         // DropSchema opcode to remove from schema
+        // P1 encodes the type: 0=table, 1=index, 2=view, 3=trigger
+        let type_code = match kind {
+            "table" => 0,
+            "index" => 1,
+            "view" => 2,
+            "trigger" => 3,
+            _ => 0,
+        };
         ops.push(Self::make_op(
             Opcode::DropSchema,
+            type_code,
             0,
             0,
-            0,
-            P4::Text(table_name.clone()),
+            P4::Text(name.clone()),
         ));
         ops.push(Self::make_op(Opcode::Goto, 0, 1, 0, P4::Unused));
         Ok(ops)

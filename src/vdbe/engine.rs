@@ -921,10 +921,23 @@ impl Vdbe {
 
                     // If halt was due to error, propagate it
                     if self.rc != ErrorCode::Ok {
-                        return Ok(ExecResult::Done);
+                        let msg = self
+                            .error_msg
+                            .clone()
+                            .unwrap_or_else(|| "constraint failed".to_string());
+                        return Err(Error::with_message(self.rc, msg));
                     }
                     // Otherwise continue execution in parent
                 } else {
+                    // If halt was due to error (non-zero P1), return error
+                    if self.rc != ErrorCode::Ok {
+                        let msg = self
+                            .error_msg
+                            .clone()
+                            .unwrap_or_else(|| "constraint failed".to_string());
+                        return Err(Error::with_message(self.rc, msg));
+                    }
+
                     // Top-level halt - check if we need to return count_changes result
                     if !self.count_changes_returned && self.n_change > 0 {
                         if let Some(conn_ptr) = self.conn_ptr {
@@ -1367,6 +1380,7 @@ impl Vdbe {
                     let mut entries = Vec::new();
                     if let Some(ref schema) = self.schema {
                         if let Ok(schema_guard) = schema.read() {
+                            // Add tables
                             for (_, table) in schema_guard.tables.iter() {
                                 entries.push((
                                     "table".to_string(),
@@ -1374,6 +1388,16 @@ impl Vdbe {
                                     table.name.clone(),
                                     table.root_page,
                                     table.sql.clone(),
+                                ));
+                            }
+                            // Add indexes
+                            for (_, index) in schema_guard.indexes.iter() {
+                                entries.push((
+                                    "index".to_string(),
+                                    index.name.clone(),
+                                    index.table.clone(),
+                                    index.root_page,
+                                    index.sql.clone(),
                                 ));
                             }
                         }
@@ -4494,15 +4518,78 @@ impl Vdbe {
                 }
             }
 
+            Opcode::ParseSchemaIndex => {
+                // ParseSchemaIndex P1 P2 P3 P4
+                // Parse a CREATE INDEX statement and add to schema
+                // P1 = 1 if UNIQUE index
+                // P4 = SQL text of the CREATE INDEX statement
+                if let P4::Text(sql) = &op.p4 {
+                    if let Some(ref schema) = self.schema {
+                        if let Ok(mut schema_guard) = schema.write() {
+                            // Parse CREATE INDEX SQL
+                            if let Some(index) =
+                                crate::schema::parse_create_index_sql(sql, op.p1 != 0)
+                            {
+                                let index_name_lower = index.name.to_lowercase();
+                                let table_name_lower = index.table.to_lowercase();
+
+                                // Insert into schema.indexes
+                                schema_guard
+                                    .indexes
+                                    .insert(index_name_lower, std::sync::Arc::new(index.clone()));
+
+                                // Also add to the parent table's index list
+                                if let Some(table) = schema_guard.tables.get_mut(&table_name_lower)
+                                {
+                                    if let Some(table_mut) = std::sync::Arc::get_mut(table) {
+                                        table_mut.indexes.push(std::sync::Arc::new(index));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             Opcode::DropSchema => {
                 // DropSchema P1 P2 P3 P4
-                // Remove table/index from schema
-                // P4 = name of table/index to drop
+                // Remove object from schema
+                // P1 = type: 0=table, 1=index, 2=view, 3=trigger
+                // P4 = name of object to drop
                 if let P4::Text(name) = &op.p4 {
                     if let Some(ref schema) = self.schema {
                         if let Ok(mut schema_guard) = schema.write() {
                             let name_lower = name.to_lowercase();
-                            schema_guard.tables.remove(&name_lower);
+                            match op.p1 {
+                                0 => {
+                                    // Drop table
+                                    schema_guard.tables.remove(&name_lower);
+                                }
+                                1 => {
+                                    // Drop index
+                                    schema_guard.indexes.remove(&name_lower);
+                                    // Also remove from parent table's index list
+                                    for table in schema_guard.tables.values_mut() {
+                                        if let Some(table_mut) = std::sync::Arc::get_mut(table) {
+                                            table_mut.indexes.retain(|idx| {
+                                                idx.name.to_lowercase() != name_lower
+                                            });
+                                        }
+                                    }
+                                }
+                                2 => {
+                                    // Drop view (stored in tables)
+                                    schema_guard.tables.remove(&name_lower);
+                                }
+                                3 => {
+                                    // Drop trigger
+                                    schema_guard.triggers.remove(&name_lower);
+                                }
+                                _ => {
+                                    // Unknown type - try tables as fallback
+                                    schema_guard.tables.remove(&name_lower);
+                                }
+                            }
                         }
                     }
                 }

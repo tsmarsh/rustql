@@ -2121,6 +2121,16 @@ impl<'s> SelectCompiler<'s> {
                     self.agg_final_idx += 1;
                     self.emit(Opcode::Copy, agg_reg, dest_reg, 0, P4::Unused);
                 } else {
+                    // Check if function exists before compiling
+                    let is_known_function = is_aggregate
+                        || crate::functions::get_scalar_function(&func_call.name).is_some();
+                    if !is_known_function {
+                        return Err(Error::with_message(
+                            ErrorCode::Error,
+                            format!("no such function: {}", func_call.name.to_uppercase()),
+                        ));
+                    }
+
                     // Compile as scalar function
                     let arg_base = self.next_reg;
                     let argc = match &func_call.args {

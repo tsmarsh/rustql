@@ -217,6 +217,24 @@ impl<'s> SelectCompiler<'s> {
             self.process_with_clause(with)?;
         }
 
+        // Check for aggregates in ORDER BY without GROUP BY
+        if let Some(order_by) = &select.order_by {
+            let has_group_by = match &select.body {
+                SelectBody::Select(core) => core.group_by.is_some(),
+                SelectBody::Compound { .. } => false,
+            };
+            if !has_group_by {
+                for term in order_by {
+                    if let Some(agg_name) = self.find_aggregate_in_expr(&term.expr) {
+                        return Err(Error::with_message(
+                            ErrorCode::Error,
+                            format!("misuse of aggregate: {}()", agg_name),
+                        ));
+                    }
+                }
+            }
+        }
+
         // If ORDER BY is present, redirect output to a sorter
         let (actual_dest, sorter_cursor, order_by_cols) = if let Some(order_by) = &select.order_by {
             let sorter_cursor = self.alloc_cursor();
@@ -1404,12 +1422,98 @@ impl<'s> SelectCompiler<'s> {
     }
 
     /// Convert an expression to a column name
-    fn expr_to_name(&self, expr: &Expr, index: usize) -> String {
+    fn expr_to_name(&self, expr: &Expr, _index: usize) -> String {
+        self.expr_to_string(expr)
+    }
+
+    /// Convert an expression to its SQL string representation
+    fn expr_to_string(&self, expr: &Expr) -> String {
         match expr {
-            Expr::Column(col) => col.column.clone(),
-            Expr::Literal(lit) => format!("{:?}", lit),
-            Expr::Function(func) => func.name.clone(),
-            _ => format!("column{}", index),
+            Expr::Column(col) => {
+                if let Some(table) = &col.table {
+                    format!("{}.{}", table, col.column)
+                } else {
+                    col.column.clone()
+                }
+            }
+            Expr::Literal(lit) => match lit {
+                Literal::Integer(i) => i.to_string(),
+                Literal::Float(f) => f.to_string(),
+                Literal::String(s) => format!("'{}'", s),
+                Literal::Blob(b) => format!(
+                    "X'{}'",
+                    b.iter()
+                        .map(|byte| format!("{:02X}", byte))
+                        .collect::<String>()
+                ),
+                Literal::Null => "NULL".to_string(),
+                Literal::Bool(b) => {
+                    if *b {
+                        "TRUE".to_string()
+                    } else {
+                        "FALSE".to_string()
+                    }
+                }
+                Literal::CurrentTime => "CURRENT_TIME".to_string(),
+                Literal::CurrentDate => "CURRENT_DATE".to_string(),
+                Literal::CurrentTimestamp => "CURRENT_TIMESTAMP".to_string(),
+            },
+            Expr::Function(func) => {
+                use crate::parser::ast::FunctionArgs;
+                let args_str = match &func.args {
+                    FunctionArgs::Star => "*".to_string(),
+                    FunctionArgs::Exprs(exprs) => exprs
+                        .iter()
+                        .map(|e| self.expr_to_string(e))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                };
+                format!("{}({})", func.name.to_lowercase(), args_str)
+            }
+            Expr::Binary { op, left, right } => {
+                let op_str = match op {
+                    BinaryOp::Add => "+",
+                    BinaryOp::Sub => "-",
+                    BinaryOp::Mul => "*",
+                    BinaryOp::Div => "/",
+                    BinaryOp::Mod => "%",
+                    BinaryOp::Concat => "||",
+                    BinaryOp::Eq => "=",
+                    BinaryOp::Ne => "<>",
+                    BinaryOp::Lt => "<",
+                    BinaryOp::Le => "<=",
+                    BinaryOp::Gt => ">",
+                    BinaryOp::Ge => ">=",
+                    BinaryOp::And => " AND ",
+                    BinaryOp::Or => " OR ",
+                    BinaryOp::BitAnd => "&",
+                    BinaryOp::BitOr => "|",
+                    BinaryOp::ShiftLeft => "<<",
+                    BinaryOp::ShiftRight => ">>",
+                    BinaryOp::Is => " IS ",
+                    BinaryOp::IsNot => " IS NOT ",
+                };
+                format!(
+                    "{}{}{}",
+                    self.expr_to_string(left),
+                    op_str,
+                    self.expr_to_string(right)
+                )
+            }
+            Expr::Unary { op, expr } => {
+                use crate::parser::ast::UnaryOp;
+                let op_str = match op {
+                    UnaryOp::Neg => "-",
+                    UnaryOp::Pos => "+",
+                    UnaryOp::Not => "NOT ",
+                    UnaryOp::BitNot => "~",
+                };
+                format!("{}{}", op_str, self.expr_to_string(expr))
+            }
+            Expr::Cast { expr, type_name } => {
+                format!("CAST({} AS {})", self.expr_to_string(expr), type_name.name)
+            }
+            _ => "?".to_string(),
         }
     }
 
@@ -1966,9 +2070,7 @@ impl<'s> SelectCompiler<'s> {
                 self.compile_expr(inner, dest_reg)?;
                 match op {
                     crate::parser::ast::UnaryOp::Neg => {
-                        let zero_reg = self.alloc_reg();
-                        self.emit(Opcode::Integer, 0, zero_reg, 0, P4::Unused);
-                        self.emit(Opcode::Subtract, zero_reg, dest_reg, dest_reg, P4::Unused);
+                        self.emit(Opcode::Negative, dest_reg, dest_reg, 0, P4::Unused);
                     }
                     crate::parser::ast::UnaryOp::Pos => {
                         // No-op
@@ -2749,7 +2851,7 @@ impl<'s> SelectCompiler<'s> {
                     )
                 };
                 if is_aggregate {
-                    return Some(func_call.name.to_uppercase());
+                    return Some(func_call.name.to_lowercase());
                 }
                 // Check arguments
                 if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
@@ -2933,7 +3035,10 @@ impl<'s> SelectCompiler<'s> {
                     if arg_count < min_args {
                         return Err(crate::error::Error::with_message(
                             crate::error::ErrorCode::Error,
-                            format!("wrong number of arguments to function {}()", name_upper),
+                            format!(
+                                "wrong number of arguments to function {}()",
+                                name_upper.to_lowercase()
+                            ),
                         ));
                     }
 
@@ -2943,7 +3048,10 @@ impl<'s> SelectCompiler<'s> {
                         }
                         return Err(crate::error::Error::with_message(
                             crate::error::ErrorCode::Error,
-                            format!("wrong number of arguments to function {}()", name_upper),
+                            format!(
+                                "wrong number of arguments to function {}()",
+                                name_upper.to_lowercase()
+                            ),
                         ));
                     }
 
@@ -3273,8 +3381,50 @@ impl<'s> SelectCompiler<'s> {
     // Compound select helpers
     // ========================================================================
 
-    fn merge_distinct(&mut self, _left: i32, _right: i32) -> Result<()> {
-        // Placeholder - merge two tables keeping distinct rows
+    fn merge_distinct(&mut self, left: i32, right: i32) -> Result<()> {
+        // Iterate through right cursor and insert rows into left cursor
+        // Skip rows that already exist in left (for DISTINCT behavior)
+        let done_label = self.alloc_label();
+        self.emit(Opcode::Rewind, right, done_label, 0, P4::Unused);
+
+        let loop_label = self.alloc_label();
+        self.resolve_label(loop_label, self.current_addr());
+
+        // Get all columns from the right row
+        let col_count = if self.compound_column_count > 0 {
+            self.compound_column_count
+        } else {
+            1
+        };
+
+        let base_reg = self.next_reg;
+        for i in 0..col_count {
+            let reg = self.alloc_reg();
+            self.emit(Opcode::Column, right, i as i32, reg, P4::Unused);
+        }
+
+        // Make a record to check for duplicates
+        let record_reg = self.alloc_reg();
+        self.emit(
+            Opcode::MakeRecord,
+            base_reg,
+            col_count as i32,
+            record_reg,
+            P4::Unused,
+        );
+
+        // Skip this row if it already exists in left (NotFound jumps if NOT found)
+        let skip_label = self.alloc_label();
+        self.emit(Opcode::Found, left, skip_label, record_reg, P4::Unused);
+
+        // Row not found - insert it
+        let rowid_reg = self.alloc_reg();
+        self.emit(Opcode::NewRowid, left, rowid_reg, 0, P4::Unused);
+        self.emit(Opcode::Insert, left, record_reg, rowid_reg, P4::Unused);
+
+        self.resolve_label(skip_label, self.current_addr());
+        self.emit(Opcode::Next, right, loop_label, 0, P4::Unused);
+        self.resolve_label(done_label, self.current_addr());
         Ok(())
     }
 

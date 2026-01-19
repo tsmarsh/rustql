@@ -353,7 +353,15 @@ impl<'a> Parser<'a> {
 
         // Check for table.*
         if self.check(TokenKind::Identifier) {
-            let name = self.current_text().to_string();
+            let text = self.current_text();
+            // Strip quotes from quoted identifiers
+            let name = if text.starts_with('"') || text.starts_with('`') || text.starts_with('[') {
+                text[1..text.len() - 1]
+                    .replace("\"\"", "\"")
+                    .replace("``", "`")
+            } else {
+                text.to_string()
+            };
             if self.peek().kind == TokenKind::Dot {
                 self.advance(); // identifier
                 self.advance(); // .

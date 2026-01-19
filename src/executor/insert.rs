@@ -115,6 +115,8 @@ impl<'a> InsertCompiler<'a> {
                 self.compile_values(insert, rows, conflict_action)?;
             }
             InsertSource::Select(select) => {
+                // Validate ORDER BY doesn't contain aggregates without GROUP BY
+                self.validate_select_order_by(select)?;
                 self.compile_select(insert, select, conflict_action)?;
             }
             InsertSource::DefaultValues => {
@@ -514,6 +516,66 @@ impl<'a> InsertCompiler<'a> {
         self.num_columns
     }
 
+    /// Validate ORDER BY in SELECT doesn't contain aggregates without GROUP BY
+    fn validate_select_order_by(&self, select: &SelectStmt) -> Result<()> {
+        if let Some(order_by) = &select.order_by {
+            let has_group_by = match &select.body {
+                SelectBody::Select(core) => core.group_by.is_some(),
+                SelectBody::Compound { .. } => false,
+            };
+            if !has_group_by {
+                for term in order_by {
+                    if let Some(agg_name) = self.find_aggregate_in_expr(&term.expr) {
+                        return Err(crate::error::Error::with_message(
+                            crate::error::ErrorCode::Error,
+                            format!("misuse of aggregate: {}()", agg_name),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Find if an expression contains an aggregate function
+    fn find_aggregate_in_expr(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Function(func_call) => {
+                let name_upper = func_call.name.to_uppercase();
+                let arg_count = match &func_call.args {
+                    crate::parser::ast::FunctionArgs::Exprs(exprs) => exprs.len(),
+                    crate::parser::ast::FunctionArgs::Star => 0,
+                };
+                let is_aggregate = if matches!(name_upper.as_str(), "MIN" | "MAX") && arg_count > 1
+                {
+                    false
+                } else {
+                    matches!(
+                        name_upper.as_str(),
+                        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
+                    )
+                };
+                if is_aggregate {
+                    return Some(func_call.name.to_lowercase());
+                }
+                // Check arguments
+                if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
+                    for arg in exprs {
+                        if let Some(found) = self.find_aggregate_in_expr(arg) {
+                            return Some(found);
+                        }
+                    }
+                }
+                None
+            }
+            Expr::Binary { left, right, .. } => self
+                .find_aggregate_in_expr(left)
+                .or_else(|| self.find_aggregate_in_expr(right)),
+            Expr::Unary { expr, .. } => self.find_aggregate_in_expr(expr),
+            _ => None,
+        }
+    }
+
     /// Compile INSERT...DEFAULT VALUES
     fn compile_default_values(
         &mut self,
@@ -730,10 +792,7 @@ impl<'a> InsertCompiler<'a> {
                 self.compile_expr(inner, dest_reg)?;
                 match op {
                     crate::parser::ast::UnaryOp::Neg => {
-                        // Subtract computes P2 - P1, so we need 0 - value
-                        let zero_reg = self.alloc_reg();
-                        self.emit(Opcode::Integer, 0, zero_reg, 0, P4::Unused);
-                        self.emit(Opcode::Subtract, dest_reg, zero_reg, dest_reg, P4::Unused);
+                        self.emit(Opcode::Negative, dest_reg, dest_reg, 0, P4::Unused);
                     }
                     crate::parser::ast::UnaryOp::Not => {
                         self.emit(Opcode::Not, dest_reg, dest_reg, 0, P4::Unused);

@@ -2197,15 +2197,25 @@ impl<'s> SelectCompiler<'s> {
                 self.resolve_label(end_label, self.current_addr());
             }
             Expr::Subquery(select) => {
-                // Compile as scalar subquery
-                let mut subcompiler = SelectCompiler::new();
-                subcompiler.next_reg = self.next_reg;
-                subcompiler.next_cursor = self.next_cursor;
+                // Compile scalar subquery inline
+                // Save outer query state
+                let saved_tables = std::mem::take(&mut self.tables);
+                let saved_has_agg = self.has_aggregates;
+                let saved_has_window = self.has_window_functions;
+                let saved_result_names = std::mem::take(&mut self.result_column_names);
+
+                // Initialize result to NULL in case subquery returns no rows
+                self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+
+                // Compile the subquery body with Set destination
                 let sub_dest = SelectDest::Set { reg: dest_reg };
-                let _ = subcompiler.compile(select, &sub_dest)?;
-                self.next_reg = subcompiler.next_reg;
-                self.next_cursor = subcompiler.next_cursor;
-                // In real implementation, inline the ops
+                self.compile_body(&select.body, &sub_dest)?;
+
+                // Restore outer query state
+                self.tables = saved_tables;
+                self.has_aggregates = saved_has_agg;
+                self.has_window_functions = saved_has_window;
+                self.result_column_names = saved_result_names;
             }
             Expr::Like {
                 expr: text_expr,

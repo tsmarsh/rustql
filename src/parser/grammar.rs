@@ -375,7 +375,7 @@ impl<'a> Parser<'a> {
 
         let expr = self.parse_expr()?;
         let alias = if self.match_token(TokenKind::As) {
-            Some(self.expect_identifier()?)
+            Some(self.expect_identifier_or_string()?)
         } else if self.check(TokenKind::Identifier) && !self.check_keyword() {
             Some(self.expect_identifier()?)
         } else {
@@ -535,7 +535,8 @@ impl<'a> Parser<'a> {
 
     fn parse_table_alias(&mut self) -> Result<Option<String>> {
         if self.match_token(TokenKind::As) {
-            return Ok(Some(self.expect_identifier()?));
+            // SQLite accepts both identifiers and string literals as table aliases
+            return Ok(Some(self.expect_identifier_or_string()?));
         }
 
         if self.check(TokenKind::Identifier) && !self.check_keyword_for_alias() {
@@ -2733,6 +2734,18 @@ impl<'a> Parser<'a> {
             Ok(())
         } else {
             Err(self.error(&format!("expected {}", keyword)))
+        }
+    }
+
+    /// Expect an identifier or a string literal (for column aliases)
+    fn expect_identifier_or_string(&mut self) -> Result<String> {
+        // SQLite accepts both identifiers and string literals as aliases
+        if self.check(TokenKind::Identifier) || self.current().kind.is_keyword() {
+            self.expect_identifier()
+        } else if self.check(TokenKind::String) {
+            self.expect_string()
+        } else {
+            Err(self.error("expected identifier or string"))
         }
     }
 

@@ -132,6 +132,10 @@ pub struct SelectCompiler<'s> {
     group_by_regs: Vec<i32>,
     /// Expanded column names (populated during compile)
     result_column_names: Vec<String>,
+    /// Result column aliases mapped to their register (for ORDER BY alias resolution)
+    result_aliases: HashMap<String, i32>,
+    /// Result column alias expressions (for WHERE clause alias resolution)
+    alias_expressions: HashMap<String, Expr>,
     /// Schema for name resolution (optional)
     schema: Option<&'s crate::schema::Schema>,
     /// Register holding the remaining LIMIT counter (None if no limit)
@@ -167,6 +171,8 @@ impl<'s> SelectCompiler<'s> {
             has_window_functions: false,
             group_by_regs: Vec::new(),
             result_column_names: Vec::new(),
+            result_aliases: HashMap::new(),
+            alias_expressions: HashMap::new(),
             schema: None,
             limit_counter_reg: None,
             offset_counter_reg: None,
@@ -194,6 +200,8 @@ impl<'s> SelectCompiler<'s> {
             has_window_functions: false,
             group_by_regs: Vec::new(),
             result_column_names: Vec::new(),
+            result_aliases: HashMap::new(),
+            alias_expressions: HashMap::new(),
             schema: Some(schema),
             limit_counter_reg: None,
             offset_counter_reg: None,
@@ -235,39 +243,55 @@ impl<'s> SelectCompiler<'s> {
             }
         }
 
+        // Check if this is a simple aggregate query (aggregates without GROUP BY)
+        // For such queries, ORDER BY is meaningless since there's only one result row
+        let is_simple_aggregate = match &select.body {
+            SelectBody::Select(core) => {
+                let has_agg = self.check_for_aggregates(core);
+                has_agg && core.group_by.is_none()
+            }
+            SelectBody::Compound { .. } => false,
+        };
+
         // If ORDER BY is present, redirect output to a sorter
+        // Skip sorter for simple aggregate queries (only one row, ORDER BY is meaningless)
         let (actual_dest, sorter_cursor, order_by_cols) = if let Some(order_by) = &select.order_by {
-            let sorter_cursor = self.alloc_cursor();
-            let num_cols = order_by.len();
-            // Open ephemeral table for sorting
-            self.emit(
-                Opcode::OpenEphemeral,
-                sorter_cursor,
-                num_cols as i32,
-                0,
-                P4::Unused,
-            );
-            // Configure sort directions (0=ASC, 1=DESC)
-            let sort_dirs: Vec<u8> = order_by
-                .iter()
-                .map(|t| if t.order == SortOrder::Desc { 1 } else { 0 })
-                .collect();
-            self.emit(
-                Opcode::SorterConfig,
-                sorter_cursor,
-                0,
-                0,
-                P4::Blob(sort_dirs),
-            );
-            // Store ORDER BY terms so output_row_inner can include them in records
-            self.order_by_terms = Some(order_by.clone());
-            (
-                SelectDest::Sorter {
-                    cursor: sorter_cursor,
-                },
-                Some(sorter_cursor),
-                Some(order_by.clone()),
-            )
+            if is_simple_aggregate {
+                // Simple aggregate query - ignore ORDER BY
+                (dest.clone(), None, None)
+            } else {
+                let sorter_cursor = self.alloc_cursor();
+                let num_cols = order_by.len();
+                // Open ephemeral table for sorting
+                self.emit(
+                    Opcode::OpenEphemeral,
+                    sorter_cursor,
+                    num_cols as i32,
+                    0,
+                    P4::Unused,
+                );
+                // Configure sort directions (0=ASC, 1=DESC)
+                let sort_dirs: Vec<u8> = order_by
+                    .iter()
+                    .map(|t| if t.order == SortOrder::Desc { 1 } else { 0 })
+                    .collect();
+                self.emit(
+                    Opcode::SorterConfig,
+                    sorter_cursor,
+                    0,
+                    0,
+                    P4::Blob(sort_dirs),
+                );
+                // Store ORDER BY terms so output_row_inner can include them in records
+                self.order_by_terms = Some(order_by.clone());
+                (
+                    SelectDest::Sorter {
+                        cursor: sorter_cursor,
+                    },
+                    Some(sorter_cursor),
+                    Some(order_by.clone()),
+                )
+            }
         } else {
             (dest.clone(), None, None)
         };
@@ -319,6 +343,73 @@ impl<'s> SelectCompiler<'s> {
         }
     }
 
+    /// Compile a full SELECT statement for use in subqueries (handles ORDER BY/LIMIT)
+    /// Unlike compile(), this does not emit Halt or resolve labels
+    fn compile_subselect(&mut self, select: &SelectStmt, dest: &SelectDest) -> Result<()> {
+        // Handle WITH clause (CTEs)
+        if let Some(with) = &select.with {
+            self.process_with_clause(with)?;
+        }
+
+        // Check if ORDER BY is present
+        let (actual_dest, sorter_cursor, order_by_cols) = if let Some(order_by) = &select.order_by {
+            let sorter_cursor = self.alloc_cursor();
+            let num_cols = order_by.len();
+            // Open ephemeral table for sorting
+            self.emit(
+                Opcode::OpenEphemeral,
+                sorter_cursor,
+                num_cols as i32,
+                0,
+                P4::Unused,
+            );
+            // Configure sort directions (0=ASC, 1=DESC)
+            let sort_dirs: Vec<u8> = order_by
+                .iter()
+                .map(|t| if t.order == SortOrder::Desc { 1 } else { 0 })
+                .collect();
+            self.emit(
+                Opcode::SorterConfig,
+                sorter_cursor,
+                0,
+                0,
+                P4::Blob(sort_dirs),
+            );
+            // Store ORDER BY terms so output_row_inner can include them in records
+            self.order_by_terms = Some(order_by.clone());
+            (
+                SelectDest::Sorter {
+                    cursor: sorter_cursor,
+                },
+                Some(sorter_cursor),
+                Some(order_by.clone()),
+            )
+        } else {
+            (dest.clone(), None, None)
+        };
+
+        // Handle LIMIT/OFFSET - only compile for body if there's no ORDER BY
+        if sorter_cursor.is_none() {
+            if let Some(limit) = &select.limit {
+                self.compile_limit(limit)?;
+            }
+        }
+
+        // Compile the body with appropriate destination
+        self.compile_body(&select.body, &actual_dest)?;
+
+        // Handle ORDER BY output (after body has populated sorter)
+        if let (Some(sorter_cursor), Some(order_by)) = (sorter_cursor, order_by_cols) {
+            // When ORDER BY is present, compile LIMIT for the output phase
+            if let Some(limit) = &select.limit {
+                self.compile_limit(limit)?;
+            }
+            self.compile_order_by_output(&order_by, sorter_cursor, dest)?;
+        }
+
+        Ok(())
+    }
+
     /// Compile a simple SELECT (not compound)
     fn compile_select_core(&mut self, core: &SelectCore, dest: &SelectDest) -> Result<()> {
         // Check for aggregates and window functions
@@ -356,6 +447,9 @@ impl<'s> SelectCompiler<'s> {
 
     /// Compile a simple SELECT without aggregates
     fn compile_simple_select(&mut self, core: &SelectCore, dest: &SelectDest) -> Result<()> {
+        // Pre-scan result columns to extract alias expressions (for WHERE clause alias resolution)
+        self.prescan_result_aliases(&core.columns);
+
         let (fts3_filter, remaining_where) = match core.where_clause.as_deref() {
             Some(expr) => self.split_virtual_filter(expr),
             None => (None, None),
@@ -1347,6 +1441,20 @@ impl<'s> SelectCompiler<'s> {
         Ok(())
     }
 
+    /// Pre-scan result columns to extract alias expressions for WHERE clause resolution
+    /// SQLite allows referencing result column aliases in WHERE as an extension
+    fn prescan_result_aliases(&mut self, columns: &[ResultColumn]) {
+        self.alias_expressions.clear();
+        for col in columns {
+            if let ResultColumn::Expr { expr, alias } = col {
+                if let Some(alias_name) = alias {
+                    self.alias_expressions
+                        .insert(alias_name.to_lowercase(), expr.clone());
+                }
+            }
+        }
+    }
+
     /// Compile result columns
     fn compile_result_columns(&mut self, columns: &[ResultColumn]) -> Result<(i32, usize)> {
         // Track result registers explicitly since they may not be contiguous
@@ -1417,6 +1525,10 @@ impl<'s> SelectCompiler<'s> {
                         .clone()
                         .unwrap_or_else(|| self.expr_to_name(expr, result_regs.len()));
                     self.result_column_names.push(name.clone());
+                    // Track explicit aliases for ORDER BY resolution
+                    if let Some(alias_name) = alias {
+                        self.result_aliases.insert(alias_name.to_lowercase(), reg);
+                    }
                     self.columns.push(ColumnInfo {
                         name,
                         table: None,
@@ -1943,6 +2055,26 @@ impl<'s> SelectCompiler<'s> {
                 }
             }
             Expr::Column(col_ref) => {
+                // Check if this is a result column alias (for ORDER BY expressions)
+                if col_ref.table.is_none() {
+                    let alias_lower = col_ref.column.to_lowercase();
+                    // First check result_aliases (post-result-column compilation)
+                    if let Some(&alias_reg) = self.result_aliases.get(&alias_lower) {
+                        self.emit(Opcode::SCopy, alias_reg, dest_reg, 0, P4::Unused);
+                        return Ok(());
+                    }
+                    // Then check alias_expressions (for WHERE clause before result columns)
+                    // Avoid infinite recursion when alias name matches a column name
+                    if let Some(alias_expr) = self.alias_expressions.get(&alias_lower).cloned() {
+                        // Don't recurse if the alias expression is just the same column reference
+                        let is_same_column = matches!(&alias_expr, Expr::Column(c)
+                            if c.table.is_none() && c.column.eq_ignore_ascii_case(&col_ref.column));
+                        if !is_same_column {
+                            return self.compile_expr(&alias_expr, dest_reg);
+                        }
+                    }
+                }
+
                 if is_rowid_alias(&col_ref.column) {
                     let cursor = if let Some(table) = &col_ref.table {
                         self.tables
@@ -2372,17 +2504,27 @@ impl<'s> SelectCompiler<'s> {
                         let saved_tables = std::mem::take(&mut self.tables);
                         let saved_has_agg = self.has_aggregates;
                         let saved_has_window = self.has_window_functions;
+                        let saved_order_by = std::mem::take(&mut self.order_by_terms);
+                        let saved_limit_reg = self.limit_counter_reg.take();
+                        let saved_offset_reg = self.offset_counter_reg.take();
+                        let saved_limit_done = self.limit_done_label.take();
+                        let saved_result_names = std::mem::take(&mut self.result_column_names);
 
-                        // Compile subquery to fill ephemeral table
+                        // Compile full subquery (including ORDER BY/LIMIT) to fill ephemeral table
                         let subq_dest = SelectDest::EphemTable {
                             cursor: subq_cursor,
                         };
-                        self.compile_body(&subquery.body, &subq_dest)?;
+                        self.compile_subselect(subquery, &subq_dest)?;
 
                         // Restore outer query state
                         self.tables = saved_tables;
                         self.has_aggregates = saved_has_agg;
                         self.has_window_functions = saved_has_window;
+                        self.order_by_terms = saved_order_by;
+                        self.limit_counter_reg = saved_limit_reg;
+                        self.offset_counter_reg = saved_offset_reg;
+                        self.limit_done_label = saved_limit_done;
+                        self.result_column_names = saved_result_names;
 
                         // Check if value exists in ephemeral table
                         // Make a record from the value
@@ -2483,6 +2625,10 @@ impl<'s> SelectCompiler<'s> {
                 // Parenthesized expression - just compile the inner expression
                 self.compile_expr(inner, dest_reg)?;
             }
+            Expr::Collate { expr, .. } => {
+                // COLLATE affects comparison/sorting, but doesn't change the value
+                self.compile_expr(expr, dest_reg)?;
+            }
             _ => {
                 // For other expression types, emit NULL as placeholder
                 self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
@@ -2562,16 +2708,27 @@ impl<'s> SelectCompiler<'s> {
 
         // Output the result columns (skip ORDER BY keys)
         match dest {
-            SelectDest::Output => {
+            SelectDest::Table { cursor } | SelectDest::EphemTable { cursor } => {
+                // Insert into ephemeral/regular table
+                let record_reg = self.alloc_reg();
                 self.emit(
-                    Opcode::ResultRow,
+                    Opcode::MakeRecord,
                     result_base_reg,
                     num_result_cols as i32,
-                    0,
+                    record_reg,
+                    P4::Unused,
+                );
+                self.emit(Opcode::NewRowid, *cursor, result_base_reg, 0, P4::Unused);
+                self.emit(
+                    Opcode::Insert,
+                    *cursor,
+                    record_reg,
+                    result_base_reg,
                     P4::Unused,
                 );
             }
             _ => {
+                // Output as result row
                 self.emit(
                     Opcode::ResultRow,
                     result_base_reg,
@@ -2756,6 +2913,31 @@ impl<'s> SelectCompiler<'s> {
                                     continue;
                                 } else {
                                     return Err(make_range_error(i + 1, count));
+                                }
+                            }
+
+                            // Handle ORDER BY +N (unary plus on column index, e.g., ORDER BY +2)
+                            // Unary plus on an integer should be treated the same as the integer
+                            if let Expr::Unary {
+                                op: crate::parser::ast::UnaryOp::Pos,
+                                expr: inner,
+                            } = &term.expr
+                            {
+                                if let Expr::Literal(Literal::Integer(col_idx)) = inner.as_ref() {
+                                    let col_idx = *col_idx as i32;
+                                    if col_idx >= 1 && col_idx <= count as i32 {
+                                        // Copy from the result column (1-based index)
+                                        self.emit(
+                                            Opcode::SCopy,
+                                            base_reg + col_idx - 1,
+                                            key_base_reg + i as i32,
+                                            0,
+                                            P4::Unused,
+                                        );
+                                        continue;
+                                    } else {
+                                        return Err(make_range_error(i + 1, count));
+                                    }
                                 }
                             }
 
@@ -3240,7 +3422,13 @@ impl<'s> SelectCompiler<'s> {
                 let is_multi_arg_min_max =
                     matches!(name_upper.as_str(), "MIN" | "MAX") && arg_count > 1;
                 if is_multi_arg_min_max {
-                    return Ok(()); // Scalar function
+                    // Multi-arg min/max is scalar - recurse into arguments
+                    if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
+                        for arg in exprs {
+                            self.accumulate_aggregates_in_expr(arg, agg_regs, agg_idx)?;
+                        }
+                    }
+                    return Ok(());
                 }
 
                 if matches!(
@@ -3295,6 +3483,13 @@ impl<'s> SelectCompiler<'s> {
                     // Emit aggregate step opcode
                     self.emit(Opcode::AggStep, arg_reg, reg, 0, P4::Text(name_upper));
                     *agg_idx += 1;
+                } else {
+                    // Non-aggregate function - recurse into arguments to find nested aggregates
+                    if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
+                        for arg in exprs {
+                            self.accumulate_aggregates_in_expr(arg, agg_regs, agg_idx)?;
+                        }
+                    }
                 }
             }
             Expr::Binary { left, right, .. } => {
@@ -3368,6 +3563,37 @@ impl<'s> SelectCompiler<'s> {
                         let agg_reg = agg_regs[agg_idx];
                         self.emit(Opcode::AggFinal, agg_reg, dest_reg, 0, P4::Text(name_upper));
                         agg_idx += 1;
+                    } else if self.expr_has_aggregate(expr) {
+                        // Non-aggregate function with nested aggregates (e.g., coalesce(max(a), 'x'))
+                        let num_aggs = self.count_aggregates_in_expr(expr);
+                        self.agg_final_regs.clear();
+                        self.agg_final_idx = 0;
+
+                        // Emit AggFinal for each aggregate in this expression
+                        for _ in 0..num_aggs {
+                            if agg_idx < agg_regs.len() {
+                                let agg_reg = agg_regs[agg_idx];
+                                let result_reg = self.alloc_reg();
+                                let agg_name = self
+                                    .get_aggregate_name_at_index(expr, self.agg_final_regs.len());
+                                self.emit(
+                                    Opcode::AggFinal,
+                                    agg_reg,
+                                    result_reg,
+                                    0,
+                                    P4::Text(agg_name),
+                                );
+                                self.agg_final_regs.push(result_reg);
+                                agg_idx += 1;
+                            }
+                        }
+
+                        // Now compile the expression - it will use agg_final_regs
+                        self.compile_expr(expr, dest_reg)?;
+
+                        // Clear the aggregate context
+                        self.agg_final_regs.clear();
+                        self.agg_final_idx = 0;
                     } else {
                         self.compile_expr(expr, dest_reg)?;
                     }
@@ -3450,7 +3676,12 @@ impl<'s> SelectCompiler<'s> {
                 {
                     1
                 } else {
-                    0
+                    // Non-aggregate function - recurse into arguments to find nested aggregates
+                    if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
+                        exprs.iter().map(|e| self.count_aggregates_in_expr(e)).sum()
+                    } else {
+                        0
+                    }
                 }
             }
             Expr::Binary { left, right, .. } => {
@@ -3494,8 +3725,20 @@ impl<'s> SelectCompiler<'s> {
                         return Some(name_upper);
                     }
                     *current_idx += 1;
+                    None
+                } else {
+                    // Non-aggregate function - recurse into arguments
+                    if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
+                        for arg in exprs {
+                            if let Some(name) =
+                                self.find_aggregate_name(arg, target_idx, current_idx)
+                            {
+                                return Some(name);
+                            }
+                        }
+                    }
+                    None
                 }
-                None
             }
             Expr::Binary { left, right, .. } => self
                 .find_aggregate_name(left, target_idx, current_idx)

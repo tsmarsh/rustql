@@ -2490,6 +2490,22 @@ impl<'s> SelectCompiler<'s> {
                                         P4::Unused,
                                     );
                                     continue;
+                                } else {
+                                    // Column index out of range - produce descriptive error
+                                    let term_num = i + 1;
+                                    let ordinal = match term_num {
+                                        1 => "1st".to_string(),
+                                        2 => "2nd".to_string(),
+                                        3 => "3rd".to_string(),
+                                        n => format!("{}th", n),
+                                    };
+                                    return Err(Error::with_message(
+                                        ErrorCode::Error,
+                                        format!(
+                                            "{} ORDER BY term out of range - should be between 1 and {}",
+                                            ordinal, count
+                                        ),
+                                    ));
                                 }
                             }
                             self.compile_expr(&term.expr, key_base_reg + i as i32)?;

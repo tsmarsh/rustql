@@ -1784,7 +1784,9 @@ impl<'s> SelectCompiler<'s> {
                     }
                 } else {
                     // No table specified - search all tables for column
+                    // Must check for ambiguous column references
                     let mut found = None;
+                    let mut match_count = 0;
                     for tinfo in &self.tables {
                         if let Some(st) = &tinfo.schema_table {
                             if let Some(idx) = st
@@ -1792,10 +1794,18 @@ impl<'s> SelectCompiler<'s> {
                                 .iter()
                                 .position(|c| c.name.eq_ignore_ascii_case(&col_ref.column))
                             {
-                                found = Some((tinfo.cursor, idx as i32));
-                                break;
+                                match_count += 1;
+                                if found.is_none() {
+                                    found = Some((tinfo.cursor, idx as i32));
+                                }
                             }
                         }
+                    }
+                    if match_count > 1 {
+                        return Err(Error::with_message(
+                            ErrorCode::Error,
+                            format!("ambiguous column name: {}", col_ref.column),
+                        ));
                     }
                     found.unwrap_or_else(|| {
                         // Fallback to first table with col_idx=0

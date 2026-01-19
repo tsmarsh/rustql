@@ -15,9 +15,9 @@
 
 use crate::types::{ColumnType, StepResult};
 use crate::{
-    sqlite3_close, sqlite3_column_count, sqlite3_column_text, sqlite3_column_type,
-    sqlite3_finalize, sqlite3_initialize, sqlite3_open, sqlite3_prepare_v2, sqlite3_step,
-    SqliteConnection,
+    sqlite3_close, sqlite3_column_count, sqlite3_column_name, sqlite3_column_text,
+    sqlite3_column_type, sqlite3_finalize, sqlite3_initialize, sqlite3_open, sqlite3_prepare_v2,
+    sqlite3_step, SqliteConnection,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -420,6 +420,9 @@ unsafe extern "C" fn db_cmd(
 }
 
 /// Execute SQL and return results as a TCL list
+/// Supports three forms:
+/// - db eval SQL                    - returns results as a flat list
+/// - db eval SQL array-name script  - sets array elements and runs script for each row
 unsafe fn db_eval(
     db_name: &str,
     interp: *mut Tcl_Interp,
@@ -435,6 +438,15 @@ unsafe fn db_eval(
     }
 
     let sql = obj_to_string(*objv.offset(2));
+
+    // Check if we have array-name and script arguments
+    let (array_name, script) = if objc >= 5 {
+        let arr = obj_to_string(*objv.offset(3));
+        let scr = obj_to_string(*objv.offset(4));
+        (Some(arr), Some(scr))
+    } else {
+        (None, None)
+    };
 
     // Execute SQL and collect results
     let result_list = Tcl_NewListObj(0, std::ptr::null());
@@ -480,14 +492,70 @@ unsafe fn db_eval(
                 match sqlite3_step(&mut stmt) {
                     Ok(StepResult::Row) => {
                         let col_count = sqlite3_column_count(&stmt);
-                        for i in 0..col_count {
-                            let col_type = sqlite3_column_type(&stmt, i);
-                            let value = match col_type {
-                                ColumnType::Null => "".to_string(),
-                                _ => sqlite3_column_text(&stmt, i),
-                            };
-                            let obj = string_to_obj(&value);
-                            Tcl_ListObjAppendElement(interp, result_list, obj);
+
+                        if let (Some(ref arr_name), Some(ref scr)) = (&array_name, &script) {
+                            // Array-script form: set array elements and evaluate script
+                            let arr_c = CString::new(arr_name.as_str())
+                                .unwrap_or_else(|_| CString::new("").unwrap());
+
+                            // Build list of column names and set array elements
+                            let mut col_names: Vec<String> = Vec::new();
+                            for i in 0..col_count {
+                                let col_name =
+                                    sqlite3_column_name(&stmt, i).unwrap_or("").to_string();
+                                col_names.push(col_name.clone());
+
+                                let col_type = sqlite3_column_type(&stmt, i);
+                                let value = match col_type {
+                                    ColumnType::Null => "".to_string(),
+                                    _ => sqlite3_column_text(&stmt, i),
+                                };
+
+                                // Set array(column_name) = value
+                                let col_c = CString::new(col_name.as_str())
+                                    .unwrap_or_else(|_| CString::new("").unwrap());
+                                let val_obj = string_to_obj(&value);
+                                Tcl_SetVar2Ex(interp, arr_c.as_ptr(), col_c.as_ptr(), val_obj, 0);
+                            }
+
+                            // Set array(*) = list of column names
+                            let star = CString::new("*").unwrap();
+                            let names_list = Tcl_NewListObj(0, std::ptr::null());
+                            for name in &col_names {
+                                let name_obj = string_to_obj(name);
+                                Tcl_ListObjAppendElement(interp, names_list, name_obj);
+                            }
+                            Tcl_SetVar2Ex(interp, arr_c.as_ptr(), star.as_ptr(), names_list, 0);
+
+                            // Evaluate the script
+                            let script_c = CString::new(scr.as_str())
+                                .unwrap_or_else(|_| CString::new("").unwrap());
+                            let eval_result = Tcl_Eval(interp, script_c.as_ptr());
+
+                            // Check for break/continue/error
+                            const TCL_BREAK: c_int = 3;
+                            const TCL_CONTINUE: c_int = 4;
+
+                            if eval_result == TCL_BREAK {
+                                let _ = sqlite3_finalize(stmt);
+                                Tcl_SetObjResult(interp, result_list);
+                                return TCL_OK;
+                            } else if eval_result == TCL_ERROR {
+                                let _ = sqlite3_finalize(stmt);
+                                return TCL_ERROR;
+                            }
+                            // TCL_CONTINUE and TCL_OK: continue to next row
+                        } else {
+                            // Simple form: append values to result list
+                            for i in 0..col_count {
+                                let col_type = sqlite3_column_type(&stmt, i);
+                                let value = match col_type {
+                                    ColumnType::Null => "".to_string(),
+                                    _ => sqlite3_column_text(&stmt, i),
+                                };
+                                let obj = string_to_obj(&value);
+                                Tcl_ListObjAppendElement(interp, result_list, obj);
+                            }
                         }
                     }
                     Ok(StepResult::Done) => break,
@@ -685,4 +753,19 @@ extern "C" {
     ) -> c_int;
 
     fn Tcl_Eval(interp: *mut Tcl_Interp, script: *const c_char) -> c_int;
+
+    fn Tcl_SetVar2Ex(
+        interp: *mut Tcl_Interp,
+        part1: *const c_char,
+        part2: *const c_char,
+        newValuePtr: *mut Tcl_Obj,
+        flags: c_int,
+    ) -> *mut Tcl_Obj;
+
+    fn Tcl_UnsetVar2(
+        interp: *mut Tcl_Interp,
+        part1: *const c_char,
+        part2: *const c_char,
+        flags: c_int,
+    ) -> c_int;
 }

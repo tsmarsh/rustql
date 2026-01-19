@@ -697,6 +697,10 @@ pub struct SqliteConnection {
     /// Schema generation counter - incremented on schema changes
     /// Used to invalidate prepared statements
     pub schema_generation: AtomicU64,
+    /// Current memory usage for this connection
+    pub memory_used: AtomicI64,
+    /// Peak memory usage (highwater mark) for this connection
+    pub memory_highwater: AtomicI64,
 }
 
 /// Per-connection configuration flags
@@ -793,6 +797,8 @@ impl SqliteConnection {
                 vdbe_listing: false,      // Default OFF
             },
             schema_generation: AtomicU64::new(0),
+            memory_used: AtomicI64::new(0),
+            memory_highwater: AtomicI64::new(0),
         };
 
         // Add main and temp databases
@@ -860,6 +866,45 @@ impl SqliteConnection {
     /// Called when the schema changes (e.g., SetCookie on schema version)
     pub fn increment_schema_generation(&self) -> u64 {
         self.schema_generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Get current memory usage for this connection
+    pub fn memory_used(&self) -> i64 {
+        self.memory_used.load(Ordering::SeqCst)
+    }
+
+    /// Get peak memory usage (highwater mark) for this connection
+    pub fn memory_highwater(&self, reset: bool) -> i64 {
+        if reset {
+            self.memory_highwater
+                .swap(self.memory_used.load(Ordering::SeqCst), Ordering::SeqCst)
+        } else {
+            self.memory_highwater.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Track memory allocation
+    pub fn track_alloc(&self, bytes: i64) {
+        let new_used = self.memory_used.fetch_add(bytes, Ordering::SeqCst) + bytes;
+        // Update highwater mark if needed
+        loop {
+            let current_high = self.memory_highwater.load(Ordering::SeqCst);
+            if new_used <= current_high {
+                break;
+            }
+            if self
+                .memory_highwater
+                .compare_exchange(current_high, new_used, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
+
+    /// Track memory deallocation
+    pub fn track_free(&self, bytes: i64) {
+        self.memory_used.fetch_sub(bytes, Ordering::SeqCst);
     }
 
     /// Register a scalar function

@@ -163,17 +163,45 @@ cargo build --release
 
 RustQL can run SQLite's TCL test suite using the TCL extension. The canonical tests live in `sqlite3/test/`.
 
+### Using the Makefile
+
+The easiest way to run tests is via the Makefile:
+
+```bash
+# Quick smoke test (10 basic tests)
+make test-basic
+
+# Run a specific SQLite test
+make test-select1
+make test-insert
+make test-where
+
+# Run the full configured test suite
+make test
+
+# List all available test targets
+make list-tests
+```
+
+Test results are stored in `test-results/`:
+- `<test>.result` - PASSED, FAILED, or SKIPPED
+- `<test>.log` - Full test output
+
 ### Building the TCL Extension
 
 ```bash
+# Via Makefile (recommended)
+make tcl-extension
+
+# Or directly with cargo
 cargo build --release --features tcl
 ```
 
 This produces `target/release/librustql.so` (Linux) or `librustql.dylib` (macOS).
 
-### Running SQLite TCL Tests
+### Running Tests Manually
 
-Load the extension into `tclsh` and run tests against RustQL instead of SQLite:
+For interactive testing or debugging:
 
 ```bash
 cd sqlite3/test
@@ -191,7 +219,7 @@ source tester.tcl
 source select1.test
 ```
 
-Or run individual tests interactively:
+Or run individual queries interactively:
 
 ```tcl
 load ../../target/release/librustql.so
@@ -201,12 +229,13 @@ db eval {SELECT * FROM t}  ;# Returns: 1 2 3
 db close
 ```
 
-### Quick Smoke Tests
+### Test Wrapper Script
+
+For running individual tests with proper setup:
 
 ```bash
-# Run basic TCL extension tests
-cargo build --features tcl
-tclsh tests/run_tcl_test.tcl tests/basic_tcl.test
+tclsh scripts/run_sqlite_test.tcl select1
+tclsh scripts/run_sqlite_test.tcl insert
 ```
 
 ## Contributing And Workflow

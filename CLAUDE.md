@@ -177,8 +177,68 @@ Output includes: commit info, story changes (created, moved, edited, deleted), a
 
 - `sqlite3/src/parse.y` is a Lemon grammar (not yacc/bison). Rust cannot consume Lemon directly.
 - If translating the parser, prefer a Rust-native generator like `lalrpop` or a hand-written parser; keep `parse.y` as the source of truth.
-- SQLite’s “Why C?” rationale (`https://sqlite.org/whyc.html`) is important context; we intentionally diverge by using Rust while preserving behavior and design intent.
+- SQLite's "Why C?" rationale (`https://sqlite.org/whyc.html`) is important context; we intentionally diverge by using Rust while preserving behavior and design intent.
 - For FTS and other extensions, **do not** implement placeholder or approximate behavior. Port directly from the SQLite C sources in `sqlite3/ext/` and keep semantics aligned.
+
+## Testing
+
+### Running Tests
+
+Use the Makefile to run tests:
+
+```bash
+# Run Rust unit tests
+cargo test
+
+# Quick smoke test (basic RustQL TCL tests)
+make test-basic
+
+# Run a specific SQLite TCL test
+make test-select1
+make test-insert
+
+# Run the full SQLite TCL test suite
+make test
+
+# List all available test targets
+make list-tests
+```
+
+### Test Results
+
+Test results are stored in `test-results/`:
+- `<test>.result` - Contains PASSED, FAILED, or SKIPPED
+- `<test>.log` - Full test output for debugging
+
+### After Making Changes
+
+Always verify your changes don't break existing functionality:
+
+```bash
+# 1. Run Rust tests
+cargo test
+
+# 2. Run basic TCL smoke test
+make test-basic
+
+# 3. If modifying SELECT, run select tests
+make test-select1 test-select2
+
+# 4. If modifying specific functionality, run relevant tests
+make test-<relevant-test>
+```
+
+### TCL Extension
+
+The TCL extension (`librustql.so`) allows RustQL to be tested against SQLite's official TCL test suite:
+
+```bash
+# Build the TCL extension
+make tcl-extension
+
+# Run individual test with wrapper script
+tclsh scripts/run_sqlite_test.tcl select1
+```
 
 ## Agent Best Practices (Team Workflow)
 

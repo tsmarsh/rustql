@@ -936,7 +936,7 @@ impl<'s> StatementCompiler<'s> {
 
     /// Build CREATE TABLE SQL from AST for storage in schema
     fn build_create_table_sql(&self, create: &CreateTableStmt) -> String {
-        use crate::parser::ast::{ColumnConstraintKind, TableDefinition};
+        use crate::parser::ast::{ColumnConstraintKind, TableConstraintKind, TableDefinition};
 
         let mut sql = String::from("CREATE TABLE ");
         if create.if_not_exists {
@@ -945,7 +945,11 @@ impl<'s> StatementCompiler<'s> {
         sql.push_str(&create.name.name);
         sql.push_str(" (");
 
-        if let TableDefinition::Columns { columns, .. } = &create.definition {
+        if let TableDefinition::Columns {
+            columns,
+            constraints,
+        } = &create.definition
+        {
             let col_defs: Vec<String> = columns
                 .iter()
                 .map(|col| {
@@ -954,7 +958,7 @@ impl<'s> StatementCompiler<'s> {
                         col_sql.push(' ');
                         col_sql.push_str(&type_name.name);
                     }
-                    // Add constraints
+                    // Add column constraints
                     for constraint in &col.constraints {
                         match &constraint.kind {
                             ColumnConstraintKind::PrimaryKey { autoincrement, .. } => {
@@ -984,6 +988,68 @@ impl<'s> StatementCompiler<'s> {
                 })
                 .collect();
             sql.push_str(&col_defs.join(", "));
+
+            // Add table-level constraints
+            for constraint in constraints {
+                sql.push_str(", ");
+                if let Some(name) = &constraint.name {
+                    sql.push_str("CONSTRAINT ");
+                    sql.push_str(name);
+                    sql.push(' ');
+                }
+                match &constraint.kind {
+                    TableConstraintKind::PrimaryKey { columns, .. } => {
+                        sql.push_str("PRIMARY KEY (");
+                        let col_names: Vec<String> = columns
+                            .iter()
+                            .filter_map(|c| {
+                                if let crate::parser::ast::IndexedColumnKind::Name(name) = &c.column
+                                {
+                                    Some(name.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        sql.push_str(&col_names.join(", "));
+                        sql.push(')');
+                    }
+                    TableConstraintKind::Unique { columns, .. } => {
+                        sql.push_str("UNIQUE (");
+                        let col_names: Vec<String> = columns
+                            .iter()
+                            .filter_map(|c| {
+                                if let crate::parser::ast::IndexedColumnKind::Name(name) = &c.column
+                                {
+                                    Some(name.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        sql.push_str(&col_names.join(", "));
+                        sql.push(')');
+                    }
+                    TableConstraintKind::Check(expr) => {
+                        sql.push_str("CHECK (");
+                        sql.push_str(&format!("{:?}", expr));
+                        sql.push(')');
+                    }
+                    TableConstraintKind::ForeignKey {
+                        columns, clause, ..
+                    } => {
+                        sql.push_str("FOREIGN KEY (");
+                        sql.push_str(&columns.join(", "));
+                        sql.push_str(") REFERENCES ");
+                        sql.push_str(&clause.table);
+                        if let Some(ref_cols) = &clause.columns {
+                            sql.push_str(" (");
+                            sql.push_str(&ref_cols.join(", "));
+                            sql.push(')');
+                        }
+                    }
+                }
+            }
         }
         sql.push(')');
         sql

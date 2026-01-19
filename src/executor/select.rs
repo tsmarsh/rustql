@@ -2500,7 +2500,8 @@ impl<'s> SelectCompiler<'s> {
                         let subq_cursor = self.alloc_cursor();
                         self.emit(Opcode::OpenEphemeral, subq_cursor, 1, 0, P4::Unused);
 
-                        // Save outer query state
+                        // Save outer query state (including result_column_names to avoid
+                        // subquery columns being added to outer result set)
                         let saved_tables = std::mem::take(&mut self.tables);
                         let saved_has_agg = self.has_aggregates;
                         let saved_has_window = self.has_window_functions;

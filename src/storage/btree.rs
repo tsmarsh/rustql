@@ -4030,14 +4030,38 @@ impl Btree {
             return Err(Error::new(ErrorCode::Internal));
         }
 
-        // Calculate insert_index before checking if split is needed
-        // For intkey tables (rowid tables), always append since NewRowid generates sequential IDs
-        let insert_index = if mem_page.is_intkey
-            || _flags.contains(BtreeInsertFlags::APPEND)
-            || _cursor.state != CursorState::Valid
-        {
+        // Calculate insert_index - find correct sorted position for intkey tables
+        let insert_index = if _flags.contains(BtreeInsertFlags::APPEND) {
+            // APPEND flag: always append to end (optimization for sequential inserts)
+            mem_page.n_cell
+        } else if mem_page.is_intkey && mem_page.is_leaf {
+            // For intkey leaf tables, find correct position by binary search on rowid
+            // This is needed because UPDATE deletes and reinserts with the same rowid
+            let target_key = _payload.n_key;
+            let mut lo = 0u16;
+            let mut hi = mem_page.n_cell;
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if let Ok(cell_offset) = mem_page.cell_ptr(mid, limits) {
+                    if let Ok(info) = mem_page.parse_cell(cell_offset, limits) {
+                        if info.n_key < target_key {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
+                        }
+                    } else {
+                        hi = mid;
+                    }
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
+        } else if _cursor.state != CursorState::Valid {
+            // Cursor not valid, append to end
             mem_page.n_cell
         } else {
+            // Use cursor position (set by prior moveto operation)
             _cursor.ix.min(mem_page.n_cell)
         };
 

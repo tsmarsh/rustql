@@ -736,7 +736,8 @@ impl<'s> UpdateCompiler<'s> {
         let (root_page, _) = self.lookup_table_info(&self.table_name)?;
 
         for (idx_name, col_indices) in unique_checks {
-            // Determine column name for error message
+            // Determine column name(s) for error message
+            // Format: "table.col" for single column, "table.col1, table.col2" for multiple
             let col_name = if col_indices.len() == 1 {
                 table
                     .columns
@@ -747,9 +748,16 @@ impl<'s> UpdateCompiler<'s> {
                 col_indices
                     .iter()
                     .filter_map(|i| table.columns.get(*i))
-                    .map(|c| c.name.clone())
+                    .map(|c| format!("{}.{}", self.table_name, c.name))
                     .collect::<Vec<_>>()
                     .join(", ")
+            };
+            // For multi-column constraints, format is already "table.col1, table.col2",
+            // so we need to adjust the error message format
+            let error_col_name = if col_indices.len() == 1 {
+                format!("{}.{}", self.table_name, col_name)
+            } else {
+                col_name.clone() // Already has table prefix on each column
             };
 
             // Open a read cursor to scan for duplicates
@@ -843,8 +851,7 @@ impl<'s> UpdateCompiler<'s> {
             match conflict_action {
                 ConflictAction::Abort | ConflictAction::Rollback | ConflictAction::Fail => {
                     // Raise UNIQUE constraint error
-                    let error_msg =
-                        format!("UNIQUE constraint failed: {}.{}", self.table_name, col_name);
+                    let error_msg = format!("UNIQUE constraint failed: {}", error_col_name);
                     self.emit(
                         Opcode::Halt,
                         crate::error::ErrorCode::Constraint as i32,
@@ -861,8 +868,7 @@ impl<'s> UpdateCompiler<'s> {
                 ConflictAction::Replace => {
                     // Need to delete the conflicting row
                     // This is complex - for now just abort
-                    let error_msg =
-                        format!("UNIQUE constraint failed: {}.{}", self.table_name, col_name);
+                    let error_msg = format!("UNIQUE constraint failed: {}", error_col_name);
                     self.emit(
                         Opcode::Halt,
                         crate::error::ErrorCode::Constraint as i32,
@@ -1102,6 +1108,251 @@ impl<'s> UpdateCompiler<'s> {
                 else_clause,
             } => {
                 self.compile_case(operand, when_clauses, else_clause, dest_reg)?;
+            }
+            Expr::In {
+                expr: val_expr,
+                list,
+                negated,
+            } => {
+                // Compile IN expression
+                let val_reg = self.alloc_reg();
+                self.compile_expr(val_expr, val_reg)?;
+
+                match list {
+                    crate::parser::ast::InList::Values(values) => {
+                        if values.is_empty() {
+                            // Empty list - always false (or true if negated)
+                            self.emit(
+                                Opcode::Integer,
+                                if *negated { 1 } else { 0 },
+                                dest_reg,
+                                0,
+                                P4::Unused,
+                            );
+                        } else {
+                            let match_label = self.alloc_label();
+                            let end_label = self.alloc_label();
+
+                            for value in values {
+                                let cmp_reg = self.alloc_reg();
+                                self.compile_expr(value, cmp_reg)?;
+                                // If equal, jump to match
+                                self.emit(Opcode::Eq, val_reg, match_label, cmp_reg, P4::Unused);
+                            }
+
+                            // No match found
+                            self.emit(
+                                Opcode::Integer,
+                                if *negated { 1 } else { 0 },
+                                dest_reg,
+                                0,
+                                P4::Unused,
+                            );
+                            self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+
+                            // Match found
+                            self.resolve_label(match_label, self.current_addr() as i32);
+                            self.emit(
+                                Opcode::Integer,
+                                if *negated { 0 } else { 1 },
+                                dest_reg,
+                                0,
+                                P4::Unused,
+                            );
+
+                            self.resolve_label(end_label, self.current_addr() as i32);
+                        }
+                    }
+                    crate::parser::ast::InList::Subquery(subquery) => {
+                        // For IN subquery in UPDATE, we need to compile the subquery
+                        // and check if the value exists in the result set.
+                        // This is complex - for now use a simplified approach:
+                        // compile subquery into ephemeral table and use Found opcode
+                        let subq_cursor = self.alloc_cursor();
+                        self.emit(Opcode::OpenEphemeral, subq_cursor, 1, 0, P4::Unused);
+
+                        // For subquery compilation, we need to use the select compiler
+                        // Save and restore table cursor since subquery might use cursor 0
+                        let saved_cursor = self.table_cursor;
+
+                        // Compile subquery using the select compiler
+                        // For now, emit a simple check - the subquery needs full compilation
+                        // which requires integrating with select.rs
+                        // As a workaround, we can iterate the subquery results manually
+                        // TODO: proper subquery compilation integration
+
+                        // Simplified: check if we can get the subquery to evaluate
+                        // For the specific case of IN (SELECT col FROM table), we can
+                        // open the table and scan it
+
+                        if let crate::parser::ast::SelectBody::Select(sel) = &subquery.body {
+                            if let Some(from) = &sel.from {
+                                if from.tables.len() == 1 {
+                                    if let crate::parser::ast::TableRef::Table { name, .. } =
+                                        &from.tables[0]
+                                    {
+                                        // Get root page for the table
+                                        if let Some(schema) = self.schema {
+                                            if let Some(table_def) = schema.table(&name.name) {
+                                                let root_page = table_def.root_page;
+                                                let scan_cursor = self.alloc_cursor();
+
+                                                // Open table for reading
+                                                self.emit(
+                                                    Opcode::OpenRead,
+                                                    scan_cursor,
+                                                    root_page as i32,
+                                                    0,
+                                                    P4::Int64(table_def.columns.len() as i64),
+                                                );
+
+                                                // Populate ephemeral table with subquery results
+                                                let loop_start = self.alloc_label();
+                                                let loop_end = self.alloc_label();
+
+                                                self.emit(
+                                                    Opcode::Rewind,
+                                                    scan_cursor,
+                                                    loop_end,
+                                                    0,
+                                                    P4::Unused,
+                                                );
+                                                self.resolve_label(
+                                                    loop_start,
+                                                    self.current_addr() as i32,
+                                                );
+
+                                                // Get the column from SELECT
+                                                let col_reg = self.alloc_reg();
+                                                let col_idx = if let Some(ResultColumn::Expr {
+                                                    expr,
+                                                    ..
+                                                }) = sel.columns.first()
+                                                {
+                                                    if let Expr::Column(col_ref) = expr {
+                                                        // Find column index
+                                                        table_def
+                                                            .columns
+                                                            .iter()
+                                                            .position(|c| c.name == col_ref.column)
+                                                            .unwrap_or(0)
+                                                    } else {
+                                                        0
+                                                    }
+                                                } else {
+                                                    0
+                                                };
+
+                                                self.emit(
+                                                    Opcode::Column,
+                                                    scan_cursor,
+                                                    col_idx as i32,
+                                                    col_reg,
+                                                    P4::Unused,
+                                                );
+
+                                                // Insert into ephemeral table
+                                                let record_reg = self.alloc_reg();
+                                                self.emit(
+                                                    Opcode::MakeRecord,
+                                                    col_reg,
+                                                    1,
+                                                    record_reg,
+                                                    P4::Unused,
+                                                );
+                                                let key_reg = self.alloc_reg();
+                                                self.emit(
+                                                    Opcode::NewRowid,
+                                                    subq_cursor,
+                                                    key_reg,
+                                                    0,
+                                                    P4::Unused,
+                                                );
+                                                self.emit(
+                                                    Opcode::Insert,
+                                                    subq_cursor,
+                                                    record_reg,
+                                                    key_reg,
+                                                    P4::Unused,
+                                                );
+
+                                                // Next row
+                                                self.emit(
+                                                    Opcode::Next,
+                                                    scan_cursor,
+                                                    loop_start,
+                                                    0,
+                                                    P4::Unused,
+                                                );
+                                                self.resolve_label(
+                                                    loop_end,
+                                                    self.current_addr() as i32,
+                                                );
+
+                                                self.emit(
+                                                    Opcode::Close,
+                                                    scan_cursor,
+                                                    0,
+                                                    0,
+                                                    P4::Unused,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        self.table_cursor = saved_cursor;
+
+                        // Check if value exists in ephemeral table
+                        let record_reg = self.alloc_reg();
+                        self.emit(Opcode::MakeRecord, val_reg, 1, record_reg, P4::Unused);
+
+                        let found_label = self.alloc_label();
+                        let end_label = self.alloc_label();
+
+                        self.emit(
+                            Opcode::Found,
+                            subq_cursor,
+                            found_label,
+                            record_reg,
+                            P4::Unused,
+                        );
+
+                        // Not found
+                        self.emit(
+                            Opcode::Integer,
+                            if *negated { 1 } else { 0 },
+                            dest_reg,
+                            0,
+                            P4::Unused,
+                        );
+                        self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+
+                        // Found
+                        self.resolve_label(found_label, self.current_addr() as i32);
+                        self.emit(
+                            Opcode::Integer,
+                            if *negated { 0 } else { 1 },
+                            dest_reg,
+                            0,
+                            P4::Unused,
+                        );
+
+                        self.resolve_label(end_label, self.current_addr() as i32);
+                    }
+                    crate::parser::ast::InList::Table(_) => {
+                        // Table IN - treat as false for now
+                        self.emit(
+                            Opcode::Integer,
+                            if *negated { 1 } else { 0 },
+                            dest_reg,
+                            0,
+                            P4::Unused,
+                        );
+                    }
+                }
             }
             _ => {
                 // Default to NULL for unsupported expressions

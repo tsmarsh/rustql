@@ -778,11 +778,77 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
     let columns_str = after_create[paren_pos + 1..].trim();
     let columns_str = columns_str.strip_suffix(')')?;
 
-    // Parse columns
+    // Parse columns and table constraints
+    // We need to be careful about commas inside parentheses (e.g., UNIQUE(c, d))
     let mut columns = Vec::new();
-    for col_def in columns_str.split(',') {
+    let mut indexes = Vec::new();
+    let mut depth = 0;
+    let mut current = String::new();
+    let mut parts_list = Vec::new();
+
+    for ch in columns_str.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                depth -= 1;
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                parts_list.push(current.trim().to_string());
+                current = String::new();
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.trim().is_empty() {
+        parts_list.push(current.trim().to_string());
+    }
+
+    let mut auto_idx_num = 0;
+    for col_def in parts_list {
         let col_def = col_def.trim();
         if col_def.is_empty() {
+            continue;
+        }
+
+        let col_def_upper = col_def.to_uppercase();
+
+        // Check for table-level constraints
+        if col_def_upper.starts_with("UNIQUE") && col_def_upper.contains('(') {
+            // Parse UNIQUE(col1, col2, ...)
+            if let Some(paren_start) = col_def.find('(') {
+                if let Some(paren_end) = col_def.rfind(')') {
+                    let col_list = &col_def[paren_start + 1..paren_end];
+                    let col_names: Vec<String> = col_list
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+
+                    auto_idx_num += 1;
+                    let index_name = format!("sqlite_autoindex_{}_{}", table_name, auto_idx_num);
+
+                    // We'll fill in column indices after all columns are parsed
+                    indexes.push((index_name, col_names, true)); // true = unique
+                }
+            }
+            continue;
+        }
+
+        if col_def_upper.starts_with("PRIMARY KEY") && col_def_upper.contains('(') {
+            // Parse PRIMARY KEY(col1, col2, ...)
+            // Skip for now - will be handled by primary_key detection below
+            continue;
+        }
+
+        if col_def_upper.starts_with("FOREIGN KEY")
+            || col_def_upper.starts_with("CHECK")
+            || col_def_upper.starts_with("CONSTRAINT")
+        {
+            // Skip other table constraints for now
             continue;
         }
 
@@ -794,7 +860,6 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
         let name = parts[0].to_string();
 
         // Check for constraints in remaining parts
-        let col_def_upper = col_def.to_uppercase();
         let is_unique = col_def_upper.contains(" UNIQUE");
         let is_primary_key =
             col_def_upper.contains(" PRIMARY KEY") || col_def_upper.contains(" PRIMARY");
@@ -838,13 +903,46 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
         });
     }
 
+    // Now build the index structures with proper column indices
+    let mut index_list = Vec::new();
+    for (index_name, col_names, is_unique) in indexes {
+        let mut index_columns = Vec::new();
+        for col_name in &col_names {
+            // Find column index
+            if let Some(col_idx) = columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(col_name))
+            {
+                index_columns.push(IndexColumn {
+                    column_idx: col_idx as i32,
+                    expr: None,
+                    sort_order: SortOrder::Asc,
+                    collation: DEFAULT_COLLATION.to_string(),
+                });
+            }
+        }
+        if !index_columns.is_empty() {
+            index_list.push(std::sync::Arc::new(Index {
+                name: index_name,
+                table: table_name.clone(),
+                columns: index_columns,
+                root_page: 0, // No separate btree for implicit indexes
+                unique: is_unique,
+                partial: None,
+                is_primary_key: false,
+                sql: None,
+                stats: None,
+            }));
+        }
+    }
+
     Some(Table {
         name: table_name,
         db_idx: 0,
         root_page,
         columns,
         primary_key: None,
-        indexes: Vec::new(),
+        indexes: index_list,
         foreign_keys: Vec::new(),
         checks: Vec::new(),
         without_rowid: false,
@@ -1594,11 +1692,54 @@ impl Schema {
                 table.primary_key = Some(pk_indices);
             }
             TableConstraint::Unique {
-                columns: _,
+                columns,
                 conflict: _,
             } => {
-                // Unique constraint creates an implicit index
-                // Will be handled during index creation
+                // Create an implicit unique index for this constraint
+                // Generate an automatic index name like "sqlite_autoindex_tablename_N"
+                let auto_idx_num = table.indexes.len() + 1;
+                let index_name = format!("sqlite_autoindex_{}_{}", table.name, auto_idx_num);
+
+                let mut index_columns = Vec::new();
+                for indexed_col in columns {
+                    if let Some(name) = &indexed_col.name {
+                        let col_idx = table.find_column(name)?;
+                        index_columns.push(IndexColumn {
+                            column_idx: col_idx,
+                            expr: indexed_col.expr.clone(),
+                            sort_order: indexed_col.order.unwrap_or(SortOrder::Asc),
+                            collation: indexed_col
+                                .collation
+                                .clone()
+                                .unwrap_or_else(|| "BINARY".to_string()),
+                        });
+                    } else if let Some(expr) = &indexed_col.expr {
+                        // Expression index
+                        index_columns.push(IndexColumn {
+                            column_idx: -1,
+                            expr: Some(expr.clone()),
+                            sort_order: indexed_col.order.unwrap_or(SortOrder::Asc),
+                            collation: indexed_col
+                                .collation
+                                .clone()
+                                .unwrap_or_else(|| "BINARY".to_string()),
+                        });
+                    }
+                }
+
+                if !index_columns.is_empty() {
+                    table.indexes.push(std::sync::Arc::new(Index {
+                        name: index_name,
+                        table: table.name.clone(),
+                        columns: index_columns,
+                        root_page: 0, // Will be set when btree is created
+                        unique: true,
+                        partial: None,
+                        is_primary_key: false,
+                        sql: None,
+                        stats: None,
+                    }));
+                }
             }
             TableConstraint::Check(expr) => {
                 table.checks.push(expr.clone());

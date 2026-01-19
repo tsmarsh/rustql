@@ -15,9 +15,9 @@
 
 use crate::types::{ColumnType, StepResult};
 use crate::{
-    sqlite3_close, sqlite3_column_count, sqlite3_column_name, sqlite3_column_text,
-    sqlite3_column_type, sqlite3_finalize, sqlite3_initialize, sqlite3_open, sqlite3_prepare_v2,
-    sqlite3_step, SqliteConnection,
+    sqlite3_changes, sqlite3_close, sqlite3_column_count, sqlite3_column_name, sqlite3_column_text,
+    sqlite3_column_type, sqlite3_finalize, sqlite3_initialize, sqlite3_last_insert_rowid,
+    sqlite3_open, sqlite3_prepare_v2, sqlite3_step, sqlite3_total_changes, SqliteConnection,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -343,15 +343,36 @@ unsafe extern "C" fn db_cmd(
             TCL_OK
         }
         "changes" => {
-            set_result_int(interp, 0);
+            CONNECTIONS.with(|connections| {
+                let conns = connections.borrow();
+                if let Some(conn) = conns.get(db_name) {
+                    set_result_int(interp, sqlite3_changes(conn) as c_int);
+                } else {
+                    set_result_int(interp, 0);
+                }
+            });
             TCL_OK
         }
         "total_changes" => {
-            set_result_int(interp, 0);
+            CONNECTIONS.with(|connections| {
+                let conns = connections.borrow();
+                if let Some(conn) = conns.get(db_name) {
+                    set_result_int(interp, sqlite3_total_changes(conn) as c_int);
+                } else {
+                    set_result_int(interp, 0);
+                }
+            });
             TCL_OK
         }
         "last_insert_rowid" => {
-            set_result_int(interp, 0);
+            CONNECTIONS.with(|connections| {
+                let conns = connections.borrow();
+                if let Some(conn) = conns.get(db_name) {
+                    set_result_int(interp, sqlite3_last_insert_rowid(conn) as c_int);
+                } else {
+                    set_result_int(interp, 0);
+                }
+            });
             TCL_OK
         }
         "exists" => {

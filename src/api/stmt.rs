@@ -2,6 +2,8 @@
 //!
 //! This module implements sqlite3_stmt (prepared statement) and related functions.
 
+use std::sync::atomic::Ordering;
+
 use crate::error::{Error, ErrorCode, Result};
 use crate::executor::analyze::execute_analyze;
 use crate::executor::pragma::{execute_pragma, pragma_columns};
@@ -453,6 +455,13 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
         if let Some(conn_ptr) = stmt.conn_ptr {
             // SAFETY: conn_ptr is valid for the lifetime of the statement
             let conn = unsafe { &*conn_ptr };
+
+            // Reset the changes counter only for write statements
+            // (SELECT and other read-only statements should not reset it)
+            if !stmt.read_only {
+                conn.changes.store(0, Ordering::SeqCst);
+            }
+
             if let Some(main_db) = conn.find_db("main") {
                 if let Some(ref btree) = main_db.btree {
                     vdbe.set_btree(btree.clone());
@@ -785,7 +794,15 @@ pub fn sqlite3_clear_bindings(stmt: &mut PreparedStmt) -> Result<()> {
 
 /// sqlite3_column_count - Get number of result columns
 pub fn sqlite3_column_count(stmt: &PreparedStmt) -> i32 {
-    stmt.column_names.len() as i32
+    // If we have explicit column names, use that count
+    if !stmt.column_names.is_empty() {
+        return stmt.column_names.len() as i32;
+    }
+    // Otherwise check if VDBE has a result (e.g., from count_changes)
+    if let Some(ref vdbe) = stmt.vdbe {
+        return vdbe.column_count();
+    }
+    0
 }
 
 /// sqlite3_column_name - Get column name

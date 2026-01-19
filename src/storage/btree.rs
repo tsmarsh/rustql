@@ -4948,10 +4948,23 @@ impl BtCursor {
         if self.skip_next != 0 {
             self.skip_next = 0;
             // After delete, cursor is already at the "next" row (cells shifted down)
-            // Just verify cursor is still valid
-            if let Some(ref page) = self.page {
+            // We need to update self.info to point to the new cell at this position
+            if let Some(page) = self.page.clone() {
                 if self.ix < page.n_cell {
-                    self.state = CursorState::Valid;
+                    let shared = self
+                        .bt_shared
+                        .upgrade()
+                        .ok_or(Error::new(ErrorCode::Internal))?;
+                    let shared_guard =
+                        shared.read().map_err(|_| Error::new(ErrorCode::Internal))?;
+                    let limits = if page.pgno == 1 {
+                        PageLimits::for_page1(shared_guard.page_size, shared_guard.usable_size)
+                    } else {
+                        PageLimits::new(shared_guard.page_size, shared_guard.usable_size)
+                    };
+                    drop(shared_guard);
+                    // Update self.info to the new cell at current position
+                    self.set_to_cell(page, limits, self.ix)?;
                     return Ok(());
                 }
             }

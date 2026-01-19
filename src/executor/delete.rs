@@ -20,7 +20,7 @@ fn is_rowid_alias(name: &str) -> bool {
 // ============================================================================
 
 /// Compiles DELETE statements to VDBE opcodes
-pub struct DeleteCompiler {
+pub struct DeleteCompiler<'s> {
     /// Generated VDBE operations
     ops: Vec<VdbeOp>,
 
@@ -44,9 +44,12 @@ pub struct DeleteCompiler {
 
     /// Column name to index mapping
     column_map: HashMap<String, usize>,
+
+    /// Schema for column resolution
+    schema: Option<&'s crate::schema::Schema>,
 }
 
-impl DeleteCompiler {
+impl<'s> DeleteCompiler<'s> {
     /// Create a new DELETE compiler
     pub fn new() -> Self {
         DeleteCompiler {
@@ -58,6 +61,22 @@ impl DeleteCompiler {
             table_cursor: 0,
             num_columns: 0,
             column_map: HashMap::new(),
+            schema: None,
+        }
+    }
+
+    /// Create DELETE compiler with schema for column resolution
+    pub fn with_schema(schema: &'s crate::schema::Schema) -> Self {
+        DeleteCompiler {
+            ops: Vec::new(),
+            next_reg: 1,
+            next_cursor: 0,
+            next_label: -1,
+            labels: HashMap::new(),
+            table_cursor: 0,
+            num_columns: 0,
+            column_map: HashMap::new(),
+            schema: Some(schema),
         }
     }
 
@@ -76,12 +95,32 @@ impl DeleteCompiler {
             P4::Text(delete.table.name.clone()),
         );
 
-        // For now, assume a simple table structure
-        // In a real implementation, we'd look up the schema
-        self.num_columns = 5; // Placeholder
-
-        // Build column map for lookups
-        self.build_column_map();
+        // Populate column map from schema if available
+        if let Some(schema) = self.schema {
+            if let Some(table) = schema.tables.get(&delete.table.name) {
+                self.num_columns = table.columns.len();
+                for (idx, col) in table.columns.iter().enumerate() {
+                    self.column_map.insert(col.name.to_lowercase(), idx);
+                }
+            } else {
+                // Table not found in schema - try lowercase
+                let table_lower = delete.table.name.to_lowercase();
+                if let Some(table) = schema.tables.get(&table_lower) {
+                    self.num_columns = table.columns.len();
+                    for (idx, col) in table.columns.iter().enumerate() {
+                        self.column_map.insert(col.name.to_lowercase(), idx);
+                    }
+                } else {
+                    // Fallback - assume 5 columns
+                    self.num_columns = 5;
+                    self.build_column_map();
+                }
+            }
+        } else {
+            // No schema - use placeholder
+            self.num_columns = 5;
+            self.build_column_map();
+        }
 
         // Compile the DELETE body
         self.compile_delete_body(delete)?;
@@ -317,14 +356,18 @@ impl DeleteCompiler {
         }
     }
 
-    /// Get column index by name (simplified lookup)
-    fn get_column_index(&self, name: &str) -> usize {
+    /// Get column index by name
+    fn get_column_index(&self, name: &str) -> Option<usize> {
+        // Try exact match first
         if let Some(&idx) = self.column_map.get(name) {
-            idx
-        } else {
-            let hash: usize = name.bytes().fold(0, |acc, b| acc.wrapping_add(b as usize));
-            hash % self.num_columns
+            return Some(idx);
         }
+        // Try case-insensitive match
+        let name_lower = name.to_lowercase();
+        if let Some(&idx) = self.column_map.get(&name_lower) {
+            return Some(idx);
+        }
+        None
     }
 
     /// Compile RETURNING clause
@@ -401,23 +444,29 @@ impl DeleteCompiler {
                     self.emit(Opcode::Rowid, self.table_cursor, dest_reg, 0, P4::Unused);
                     return Ok(());
                 }
-                let col_idx = col_ref.column_index.unwrap_or_else(|| {
-                    if let Some(&idx) = self.column_map.get(&col_ref.column) {
-                        idx as i32
-                    } else {
-                        self.get_column_index(&col_ref.column) as i32
+                // Try to get column index from explicit annotation, schema, or column_map
+                let col_idx = col_ref
+                    .column_index
+                    .or_else(|| self.get_column_index(&col_ref.column).map(|i| i as i32));
+
+                match col_idx {
+                    Some(idx) if idx < 0 => {
+                        // Negative index indicates rowid
+                        self.emit(Opcode::Rowid, self.table_cursor, dest_reg, 0, P4::Unused);
                     }
-                });
-                if col_idx < 0 {
-                    self.emit(Opcode::Rowid, self.table_cursor, dest_reg, 0, P4::Unused);
-                } else {
-                    self.emit(
-                        Opcode::Column,
-                        self.table_cursor,
-                        col_idx,
-                        dest_reg,
-                        P4::Unused,
-                    );
+                    Some(idx) => {
+                        self.emit(Opcode::Column, self.table_cursor, idx, dest_reg, P4::Unused);
+                    }
+                    None => {
+                        // Column not found - emit with name in P4 for runtime resolution
+                        self.emit(
+                            Opcode::Column,
+                            self.table_cursor,
+                            0,
+                            dest_reg,
+                            P4::Text(col_ref.column.clone()),
+                        );
+                    }
                 }
             }
             Expr::Binary { op, left, right } => {
@@ -426,32 +475,70 @@ impl DeleteCompiler {
                 self.compile_expr(left, left_reg)?;
                 self.compile_expr(right, right_reg)?;
 
-                let opcode = match op {
-                    crate::parser::ast::BinaryOp::Add => Opcode::Add,
-                    crate::parser::ast::BinaryOp::Sub => Opcode::Subtract,
-                    crate::parser::ast::BinaryOp::Mul => Opcode::Multiply,
-                    crate::parser::ast::BinaryOp::Div => Opcode::Divide,
-                    crate::parser::ast::BinaryOp::Concat => Opcode::Concat,
-                    crate::parser::ast::BinaryOp::Eq => Opcode::Eq,
-                    crate::parser::ast::BinaryOp::Ne => Opcode::Ne,
-                    crate::parser::ast::BinaryOp::Lt => Opcode::Lt,
-                    crate::parser::ast::BinaryOp::Le => Opcode::Le,
-                    crate::parser::ast::BinaryOp::Gt => Opcode::Gt,
-                    crate::parser::ast::BinaryOp::Ge => Opcode::Ge,
-                    crate::parser::ast::BinaryOp::And => Opcode::And,
-                    crate::parser::ast::BinaryOp::Or => Opcode::Or,
-                    crate::parser::ast::BinaryOp::BitAnd => Opcode::BitAnd,
-                    crate::parser::ast::BinaryOp::BitOr => Opcode::BitOr,
-                    crate::parser::ast::BinaryOp::Mod => Opcode::Remainder,
-                    crate::parser::ast::BinaryOp::ShiftLeft => Opcode::ShiftLeft,
-                    crate::parser::ast::BinaryOp::ShiftRight => Opcode::ShiftRight,
-                    _ => Opcode::Add, // Default fallback
-                };
+                // Check if this is a comparison operator
+                let is_comparison = matches!(
+                    op,
+                    crate::parser::ast::BinaryOp::Eq
+                        | crate::parser::ast::BinaryOp::Ne
+                        | crate::parser::ast::BinaryOp::Lt
+                        | crate::parser::ast::BinaryOp::Le
+                        | crate::parser::ast::BinaryOp::Gt
+                        | crate::parser::ast::BinaryOp::Ge
+                );
 
-                // Binary opcodes: P1=right operand, P2=left operand, P3=dest
-                // Arithmetic: r[P2] op r[P1] stored in r[P3]
-                // Comparison: jump to P2 if r[P3] op r[P1]
-                self.emit(opcode, right_reg, left_reg, dest_reg, P4::Unused);
+                if is_comparison {
+                    // Comparison operators are jump-based in VDBE, so we need to
+                    // convert them to produce a boolean result in dest_reg.
+                    // Pattern:
+                    //   1. Set dest_reg = 1 (true, assuming condition will be true)
+                    //   2. Jump over "set false" if condition IS true
+                    //   3. Set dest_reg = 0 (false)
+                    //   4. done_label:
+
+                    let done_label = self.alloc_label();
+
+                    // Set dest_reg = 1 (true) by default
+                    self.emit(Opcode::Integer, 1, dest_reg, 0, P4::Unused);
+
+                    // Emit the comparison opcode - it jumps to done_label if true
+                    // Comparison: jump to P2 if r[P3] op r[P1]
+                    let opcode = match op {
+                        crate::parser::ast::BinaryOp::Eq => Opcode::Eq,
+                        crate::parser::ast::BinaryOp::Ne => Opcode::Ne,
+                        crate::parser::ast::BinaryOp::Lt => Opcode::Lt,
+                        crate::parser::ast::BinaryOp::Le => Opcode::Le,
+                        crate::parser::ast::BinaryOp::Gt => Opcode::Gt,
+                        crate::parser::ast::BinaryOp::Ge => Opcode::Ge,
+                        _ => unreachable!(),
+                    };
+                    self.emit(opcode, right_reg, done_label, left_reg, P4::Unused);
+
+                    // If we get here, condition was false - set dest_reg = 0
+                    self.emit(Opcode::Integer, 0, dest_reg, 0, P4::Unused);
+
+                    // done_label:
+                    self.resolve_label(done_label, self.current_addr() as i32);
+                } else {
+                    // Non-comparison operators (arithmetic, logical, etc.)
+                    let opcode = match op {
+                        crate::parser::ast::BinaryOp::Add => Opcode::Add,
+                        crate::parser::ast::BinaryOp::Sub => Opcode::Subtract,
+                        crate::parser::ast::BinaryOp::Mul => Opcode::Multiply,
+                        crate::parser::ast::BinaryOp::Div => Opcode::Divide,
+                        crate::parser::ast::BinaryOp::Concat => Opcode::Concat,
+                        crate::parser::ast::BinaryOp::And => Opcode::And,
+                        crate::parser::ast::BinaryOp::Or => Opcode::Or,
+                        crate::parser::ast::BinaryOp::BitAnd => Opcode::BitAnd,
+                        crate::parser::ast::BinaryOp::BitOr => Opcode::BitOr,
+                        crate::parser::ast::BinaryOp::Mod => Opcode::Remainder,
+                        crate::parser::ast::BinaryOp::ShiftLeft => Opcode::ShiftLeft,
+                        crate::parser::ast::BinaryOp::ShiftRight => Opcode::ShiftRight,
+                        _ => Opcode::Add, // Default fallback
+                    };
+
+                    // Arithmetic: r[P2] op r[P1] stored in r[P3]
+                    self.emit(opcode, right_reg, left_reg, dest_reg, P4::Unused);
+                }
             }
             Expr::Unary { op, expr: inner } => {
                 self.compile_expr(inner, dest_reg)?;
@@ -469,6 +556,19 @@ impl DeleteCompiler {
                 }
             }
             Expr::Function(func_call) => {
+                // Validate function exists
+                let name = &func_call.name;
+                let is_aggregate = matches!(
+                    name.to_uppercase().as_str(),
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
+                );
+                if !is_aggregate && crate::functions::get_scalar_function(name).is_none() {
+                    return Err(crate::error::Error::with_message(
+                        crate::error::ErrorCode::Error,
+                        format!("no such function: {}", name),
+                    ));
+                }
+
                 let arg_base = self.next_reg;
                 let argc = match &func_call.args {
                     crate::parser::ast::FunctionArgs::Exprs(exprs) => {
@@ -557,7 +657,7 @@ impl DeleteCompiler {
     }
 }
 
-impl Default for DeleteCompiler {
+impl Default for DeleteCompiler<'_> {
     fn default() -> Self {
         Self::new()
     }
@@ -570,6 +670,15 @@ impl Default for DeleteCompiler {
 /// Compile a DELETE statement to VDBE opcodes
 pub fn compile_delete(delete: &DeleteStmt) -> Result<Vec<VdbeOp>> {
     let mut compiler = DeleteCompiler::new();
+    compiler.compile(delete)
+}
+
+/// Compile a DELETE statement to VDBE opcodes with schema access
+pub fn compile_delete_with_schema(
+    delete: &DeleteStmt,
+    schema: &crate::schema::Schema,
+) -> Result<Vec<VdbeOp>> {
+    let mut compiler = DeleteCompiler::with_schema(schema);
     compiler.compile(delete)
 }
 

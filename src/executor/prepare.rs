@@ -12,7 +12,7 @@ use crate::parser::grammar::Parser;
 use crate::types::ColumnType;
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
-use super::delete::compile_delete;
+use super::delete::{compile_delete, compile_delete_with_schema};
 use super::insert::{compile_insert, compile_insert_with_schema};
 use super::select::{SelectCompiler, SelectDest};
 use super::update::{compile_update, compile_update_with_schema};
@@ -198,7 +198,11 @@ impl<'s> StatementCompiler<'s> {
             }
 
             Stmt::Delete(delete) => {
-                let ops = compile_delete(delete)?;
+                let ops = if let Some(schema) = self.schema {
+                    compile_delete_with_schema(delete, schema)?
+                } else {
+                    compile_delete(delete)?
+                };
                 Ok((ops, StmtType::Delete, Vec::new(), Vec::new()))
             }
 

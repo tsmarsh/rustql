@@ -318,6 +318,9 @@ pub struct Vdbe {
     /// Number of rows modified
     n_change: i64,
 
+    /// Whether count_changes result row has been returned
+    count_changes_returned: bool,
+
     /// Start time (for timeout)
     start_time: Option<Instant>,
 
@@ -421,6 +424,7 @@ impl Vdbe {
             has_result: false,
             error_msg: None,
             n_change: 0,
+            count_changes_returned: false,
             start_time: None,
             vars: Vec::new(),
             var_names: Vec::new(),
@@ -708,6 +712,7 @@ impl Vdbe {
         self.has_result = false;
         self.error_msg = None;
         self.n_change = 0;
+        self.count_changes_returned = false;
         self.start_time = None;
         self.interrupted = false;
         self.magic = VDBE_MAGIC_INIT;
@@ -920,7 +925,25 @@ impl Vdbe {
                     }
                     // Otherwise continue execution in parent
                 } else {
-                    // Top-level halt - execution is done
+                    // Top-level halt - check if we need to return count_changes result
+                    if !self.count_changes_returned && self.n_change > 0 {
+                        if let Some(conn_ptr) = self.conn_ptr {
+                            let conn = unsafe { &*conn_ptr };
+                            if conn.db_config.count_changes {
+                                // Return the change count as a result row
+                                self.count_changes_returned = true;
+                                // Allocate a register for the count and set result
+                                let count_reg = 1; // Use register 1 for the count
+                                self.set_mem(count_reg, Mem::from_int(self.n_change));
+                                self.result_start = count_reg;
+                                self.result_count = 1;
+                                // Don't increment PC so we come back here after returning Row
+                                self.pc -= 1;
+                                return Ok(ExecResult::Row);
+                            }
+                        }
+                    }
+                    // execution is done
                     return Ok(ExecResult::Done);
                 }
             }
@@ -2944,8 +2967,12 @@ impl Vdbe {
                         // Actually insert into btree
                         if let Some(ref btree) = btree_arc {
                             if let Some(ref mut bt_cursor) = cursor.btree_cursor {
-                                // Extract conflict resolution mode from P5 (lower 5 bits)
-                                let on_error = (op.p5 as u8) & OE_MASK;
+                                // Extract conflict resolution mode from P4 (if Int64)
+                                // This allows P5 to be used for OPFLAG_NCHANGE and similar flags
+                                let on_error = match &op.p4 {
+                                    P4::Int64(flags) => (*flags as u8) & OE_MASK,
+                                    _ => OE_NONE,
+                                };
 
                                 // Check if rowid already exists (for conflict detection)
                                 let mut row_exists = false;

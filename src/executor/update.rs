@@ -15,6 +15,9 @@ use crate::error::Result;
 use crate::parser::ast::{ConflictAction, Expr, ResultColumn, UpdateStmt};
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
+/// Flag to indicate that this operation should update the change counter
+const OPFLAG_NCHANGE: u16 = 0x01;
+
 fn is_rowid_alias(name: &str) -> bool {
     name.eq_ignore_ascii_case("rowid")
         || name.eq_ignore_ascii_case("_rowid_")
@@ -57,6 +60,9 @@ pub struct UpdateCompiler<'s> {
     /// Table name being updated
     table_name: String,
 
+    /// Table alias (e.g., UPDATE t1 AS xyz -> alias is "xyz")
+    table_alias: Option<String>,
+
     /// Base register where column values are loaded (for expression compilation)
     /// When set, column references should use these registers instead of emitting Column opcodes
     column_data_base: Option<i32>,
@@ -76,6 +82,7 @@ impl<'s> UpdateCompiler<'s> {
             column_map: HashMap::new(),
             schema: None,
             table_name: String::new(),
+            table_alias: None,
             column_data_base: None,
         }
     }
@@ -93,14 +100,16 @@ impl<'s> UpdateCompiler<'s> {
             column_map: HashMap::new(),
             schema: Some(schema),
             table_name: String::new(),
+            table_alias: None,
             column_data_base: None,
         }
     }
 
     /// Compile an UPDATE statement
     pub fn compile(&mut self, update: &UpdateStmt) -> Result<Vec<VdbeOp>> {
-        // Store table name for later reference
+        // Store table name and alias for later reference
         self.table_name = update.table.name.clone();
+        self.table_alias = update.alias.clone();
 
         // Check for system tables that cannot be modified
         let table_name_lower = update.table.name.to_lowercase();
@@ -360,23 +369,29 @@ impl<'s> UpdateCompiler<'s> {
         // Set column_data_base so compile_expr knows to use registers for column refs
         self.column_data_base = Some(data_base);
 
-        // Apply assignments - overwrite columns being updated
+        // Two-phase assignment to handle cases like SET F2=f1, F1=f2 correctly:
+        // Phase 1: Compile all expressions to temporary registers (using ORIGINAL values)
+        // Phase 2: Copy from temp registers to data registers
+        // This ensures all expressions see the original values, not partially modified ones.
+        let mut temp_assignments: Vec<(i32, i32)> = Vec::new(); // (dest_col_idx, temp_reg)
+
         for assignment in &update.assignments {
             for col_name in &assignment.columns {
                 if let Some(col_idx) = self.get_column_index(col_name) {
-                    // Column found in schema - update the corresponding register
-                    let dest_reg = data_base + col_idx as i32;
-                    self.compile_expr(&assignment.expr, dest_reg)?;
+                    // Column found in schema - compile to a temp register
+                    let temp_reg = self.alloc_reg();
+                    self.compile_expr(&assignment.expr, temp_reg)?;
+                    temp_assignments.push((col_idx as i32, temp_reg));
                 } else if self.schema.is_none() {
                     // No schema available - use a fallback register
-                    // This happens in tests or when schema info isn't available
                     let fallback_idx = assignment
                         .columns
                         .iter()
                         .position(|c| c == col_name)
-                        .unwrap_or(0);
-                    let dest_reg = data_base + fallback_idx as i32;
-                    self.compile_expr(&assignment.expr, dest_reg)?;
+                        .unwrap_or(0) as i32;
+                    let temp_reg = self.alloc_reg();
+                    self.compile_expr(&assignment.expr, temp_reg)?;
+                    temp_assignments.push((fallback_idx, temp_reg));
                 } else {
                     // Schema exists but column not found - this is an error
                     return Err(crate::error::Error::with_message(
@@ -385,6 +400,12 @@ impl<'s> UpdateCompiler<'s> {
                     ));
                 }
             }
+        }
+
+        // Phase 2: Copy temp values to data registers
+        for (col_idx, temp_reg) in temp_assignments {
+            let dest_reg = data_base + col_idx;
+            self.emit(Opcode::SCopy, temp_reg, dest_reg, 0, P4::Unused);
         }
 
         // Clear column_data_base since we're done with expressions
@@ -407,13 +428,15 @@ impl<'s> UpdateCompiler<'s> {
         );
 
         // Insert the updated row with same rowid
+        // Set OPFLAG_NCHANGE so the changes counter is updated
         let flags = self.conflict_flags(conflict_action);
-        self.emit(
+        self.emit_with_p5(
             Opcode::Insert,
             cursor,
             record_reg,
             rowid_reg,
             P4::Int64(flags),
+            OPFLAG_NCHANGE,
         );
 
         Ok(())
@@ -464,14 +487,21 @@ impl<'s> UpdateCompiler<'s> {
     fn validate_expr_columns(&self, expr: &Expr) -> Result<()> {
         match expr {
             Expr::Column(col_ref) => {
-                // Check for table-qualified column (e.g., test2.f1)
-                if let Some(ref table_name) = col_ref.table {
-                    // If a different table is specified, it's an error
-                    // (we're in single-table UPDATE context)
-                    if table_name.to_lowercase() != self.table_name.to_lowercase() {
+                // Check for table-qualified column (e.g., test2.f1 or xyz.f1)
+                if let Some(ref prefix) = col_ref.table {
+                    // The prefix must match either the table name or the alias
+                    let prefix_lower = prefix.to_lowercase();
+                    let matches_table = prefix_lower == self.table_name.to_lowercase();
+                    let matches_alias = self
+                        .table_alias
+                        .as_ref()
+                        .map(|a| a.to_lowercase() == prefix_lower)
+                        .unwrap_or(false);
+
+                    if !matches_table && !matches_alias {
                         return Err(crate::error::Error::with_message(
                             crate::error::ErrorCode::Error,
-                            format!("no such column: {}.{}", table_name, col_ref.column),
+                            format!("no such column: {}.{}", prefix, col_ref.column),
                         ));
                     }
                 }
@@ -502,6 +532,19 @@ impl<'s> UpdateCompiler<'s> {
             }
             Expr::Unary { expr: inner, .. } => self.validate_expr_columns(inner),
             Expr::Function(func_call) => {
+                // Validate function exists
+                let name = &func_call.name;
+                let is_aggregate = matches!(
+                    name.to_uppercase().as_str(),
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
+                );
+                if !is_aggregate && crate::functions::get_scalar_function(name).is_none() {
+                    return Err(crate::error::Error::with_message(
+                        crate::error::ErrorCode::Error,
+                        format!("no such function: {}", name),
+                    ));
+                }
+                // Validate function arguments
                 if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
                     for arg in exprs {
                         self.validate_expr_columns(arg)?;
@@ -928,6 +971,11 @@ impl<'s> UpdateCompiler<'s> {
 
     fn emit(&mut self, opcode: Opcode, p1: i32, p2: i32, p3: i32, p4: P4) {
         self.ops.push(VdbeOp::with_p4(opcode, p1, p2, p3, p4));
+    }
+
+    fn emit_with_p5(&mut self, opcode: Opcode, p1: i32, p2: i32, p3: i32, p4: P4, p5: u16) {
+        self.ops
+            .push(VdbeOp::with_p4(opcode, p1, p2, p3, p4).with_p5(p5));
     }
 
     fn resolve_labels(&mut self) -> Result<()> {

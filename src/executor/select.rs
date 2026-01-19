@@ -310,6 +310,9 @@ impl<'s> SelectCompiler<'s> {
         // Validate no nested aggregates (e.g., SUM(min(f1)))
         self.validate_no_nested_aggregates(&core.columns)?;
 
+        // Validate no aggregate aliases used in WHERE clause
+        self.validate_no_aggregate_aliases_in_where(core.where_clause.as_deref(), &core.columns)?;
+
         // Process FROM clause - open cursors
         if let Some(from) = &core.from {
             self.compile_from_clause(from)?;
@@ -2706,6 +2709,103 @@ impl<'s> SelectCompiler<'s> {
             Expr::Unary { expr: inner, .. } => self.find_aggregate_in_expr(inner),
             _ => None,
         }
+    }
+
+    /// Collect aliases that refer to aggregate expressions
+    fn collect_aggregate_aliases(&self, columns: &[ResultColumn]) -> Vec<String> {
+        let mut aliases = Vec::new();
+        for col in columns {
+            if let ResultColumn::Expr { expr, alias } = col {
+                if let Some(alias_name) = alias {
+                    if self.expr_has_aggregate(expr) {
+                        aliases.push(alias_name.to_lowercase());
+                    }
+                }
+            }
+        }
+        aliases
+    }
+
+    /// Check if expression references any aggregate alias
+    /// Returns Some(alias_name) if found
+    fn find_aggregate_alias_in_expr<'a>(
+        &self,
+        expr: &Expr,
+        aliases: &'a [String],
+    ) -> Option<&'a String> {
+        match expr {
+            Expr::Column(col_ref) => {
+                // If no table qualifier, check if column name matches an alias
+                if col_ref.table.is_none() {
+                    let col_lower = col_ref.column.to_lowercase();
+                    aliases.iter().find(|a| **a == col_lower)
+                } else {
+                    None
+                }
+            }
+            Expr::Binary { left, right, .. } => self
+                .find_aggregate_alias_in_expr(left, aliases)
+                .or_else(|| self.find_aggregate_alias_in_expr(right, aliases)),
+            Expr::Unary { expr: inner, .. } => self.find_aggregate_alias_in_expr(inner, aliases),
+            Expr::Function(func) => {
+                if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func.args {
+                    for arg in exprs {
+                        if let Some(alias) = self.find_aggregate_alias_in_expr(arg, aliases) {
+                            return Some(alias);
+                        }
+                    }
+                }
+                None
+            }
+            Expr::IsNull { expr: inner, .. } => self.find_aggregate_alias_in_expr(inner, aliases),
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated: _,
+            } => self
+                .find_aggregate_alias_in_expr(expr, aliases)
+                .or_else(|| self.find_aggregate_alias_in_expr(low, aliases))
+                .or_else(|| self.find_aggregate_alias_in_expr(high, aliases)),
+            Expr::In {
+                expr,
+                list,
+                negated: _,
+            } => {
+                if let Some(alias) = self.find_aggregate_alias_in_expr(expr, aliases) {
+                    return Some(alias);
+                }
+                if let crate::parser::ast::InList::Values(values) = list {
+                    for item in values {
+                        if let Some(alias) = self.find_aggregate_alias_in_expr(item, aliases) {
+                            return Some(alias);
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Validate that WHERE clause does not reference aggregate aliases
+    fn validate_no_aggregate_aliases_in_where(
+        &self,
+        where_clause: Option<&Expr>,
+        columns: &[ResultColumn],
+    ) -> Result<()> {
+        if let Some(where_expr) = where_clause {
+            let agg_aliases = self.collect_aggregate_aliases(columns);
+            if !agg_aliases.is_empty() {
+                if let Some(alias) = self.find_aggregate_alias_in_expr(where_expr, &agg_aliases) {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        format!("misuse of aliased aggregate {}", alias),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn init_aggregates(&mut self, columns: &[ResultColumn]) -> Result<Vec<i32>> {

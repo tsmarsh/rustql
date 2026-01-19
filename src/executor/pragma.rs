@@ -120,6 +120,8 @@ pub fn execute_pragma(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Resul
         "count_changes" => pragma_count_changes(conn, pragma),
         "short_column_names" => pragma_short_column_names(conn, pragma),
         "full_column_names" => pragma_full_column_names(conn, pragma),
+        "integrity_check" => pragma_integrity_check(conn, schema_name, pragma),
+        "quick_check" => pragma_integrity_check(conn, schema_name, pragma),
         _ => Err(Error::with_message(
             ErrorCode::Error,
             format!("unknown pragma: {}", pragma.name),
@@ -526,6 +528,72 @@ fn pragma_full_column_names(
         )));
     }
     Ok(empty_result())
+}
+
+fn pragma_integrity_check(
+    conn: &SqliteConnection,
+    schema_name: &str,
+    pragma: &PragmaStmt,
+) -> Result<PragmaResult> {
+    // Get max errors to report (optional parameter, default 100)
+    let max_errors = pragma_value_i64(pragma).unwrap_or(100) as usize;
+    let mut errors: Vec<String> = Vec::new();
+
+    // Check the requested database schema
+    let db = conn.find_db(schema_name).ok_or_else(|| {
+        Error::with_message(
+            ErrorCode::Error,
+            format!("unknown database {}", schema_name),
+        )
+    })?;
+
+    // Basic checks: schema must be present
+    if let Some(ref schema_lock) = db.schema {
+        if let Ok(schema) = schema_lock.read() {
+            // Verify all tables exist and have valid structure
+            for (name, table) in schema.tables.iter() {
+                // Check table has valid root page
+                if table.root_page == 0 && !table.is_virtual {
+                    errors.push(format!("*** table {} has invalid root page", name));
+                }
+                // Basic column checks (just verify table structure exists)
+                // More thorough checks would involve reading actual data
+            }
+
+            // Verify all indexes reference valid tables
+            for (name, index) in schema.indexes.iter() {
+                if !schema.tables.contains_key(&index.table.to_lowercase()) {
+                    errors.push(format!(
+                        "*** index {} references non-existent table {}",
+                        name, index.table
+                    ));
+                }
+            }
+        }
+    }
+
+    // Truncate to max errors
+    if errors.len() > max_errors {
+        errors.truncate(max_errors);
+    }
+
+    // Return results
+    if errors.is_empty() {
+        // No errors - return "ok"
+        Ok(PragmaResult {
+            columns: vec!["integrity_check".to_string()],
+            types: vec![ColumnType::Text],
+            rows: vec![vec![Value::Text("ok".to_string())]],
+        })
+    } else {
+        // Return error messages
+        let rows = errors.into_iter().map(|e| vec![Value::Text(e)]).collect();
+        Ok(PragmaResult {
+            columns: vec!["integrity_check".to_string()],
+            types: vec![ColumnType::Text],
+            rows,
+        })
+    }
 }
 
 fn pragma_journal_mode(

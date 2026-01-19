@@ -651,11 +651,13 @@ impl<'s> SelectCompiler<'s> {
                 }
                 ResultColumn::TableStar(table_name) => {
                     // Expand table.* to columns from specific table
+                    // Note: Only match on table.name (alias if provided, or original name if no alias)
+                    // SQLite doesn't allow using the original table name when an alias is provided
                     let tables_snapshot: Vec<_> = self.tables.clone();
+                    let mut found = false;
                     for table in &tables_snapshot {
-                        if table.name.eq_ignore_ascii_case(table_name)
-                            || table.table_name.eq_ignore_ascii_case(table_name)
-                        {
+                        if table.name.eq_ignore_ascii_case(table_name) {
+                            found = true;
                             if let Some(schema_table) = &table.schema_table {
                                 for (col_idx, _) in schema_table.columns.iter().enumerate() {
                                     let reg = self.alloc_reg();
@@ -671,6 +673,12 @@ impl<'s> SelectCompiler<'s> {
                             }
                             break;
                         }
+                    }
+                    if !found {
+                        return Err(Error::with_message(
+                            ErrorCode::Error,
+                            format!("no such table: {}", table_name),
+                        ));
                     }
                 }
                 ResultColumn::Expr { expr, .. } => {
@@ -1347,11 +1355,13 @@ impl<'s> SelectCompiler<'s> {
                 }
                 ResultColumn::TableStar(table_name) => {
                     // Expand table.* to columns from specific table
+                    // Note: Only match on table.name (alias if provided, or original name if no alias)
+                    // SQLite doesn't allow using the original table name when an alias is provided
                     let tables_snapshot: Vec<_> = self.tables.clone();
+                    let mut found = false;
                     for table in &tables_snapshot {
-                        if table.name.eq_ignore_ascii_case(table_name)
-                            || table.table_name.eq_ignore_ascii_case(table_name)
-                        {
+                        if table.name.eq_ignore_ascii_case(table_name) {
+                            found = true;
                             if let Some(schema_table) = &table.schema_table {
                                 for (col_idx, col_def) in schema_table.columns.iter().enumerate() {
                                     let reg = self.alloc_reg();
@@ -1368,6 +1378,12 @@ impl<'s> SelectCompiler<'s> {
                             }
                             break;
                         }
+                    }
+                    if !found {
+                        return Err(Error::with_message(
+                            ErrorCode::Error,
+                            format!("no such table: {}", table_name),
+                        ));
                     }
                 }
                 ResultColumn::Expr { expr, alias } => {

@@ -122,6 +122,7 @@ pub fn execute_pragma(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Resul
         "full_column_names" => pragma_full_column_names(conn, pragma),
         "integrity_check" => pragma_integrity_check(conn, schema_name, pragma),
         "quick_check" => pragma_integrity_check(conn, schema_name, pragma),
+        "vdbe_listing" => pragma_vdbe_listing(conn, pragma),
         _ => Err(Error::with_message(
             ErrorCode::Error,
             format!("unknown pragma: {}", pragma.name),
@@ -526,6 +527,18 @@ fn pragma_full_column_names(
         return Ok(single_int_result(i64::from(
             conn.db_config.full_column_names,
         )));
+    }
+    Ok(empty_result())
+}
+
+fn pragma_vdbe_listing(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Result<PragmaResult> {
+    if let Some(value) = pragma_value_i64(pragma) {
+        conn.db_config.vdbe_listing = value != 0;
+    } else if let Some(value) = pragma_value_string(pragma) {
+        conn.db_config.vdbe_listing = parse_bool_value(&value);
+    }
+    if pragma.value.is_none() {
+        return Ok(single_int_result(i64::from(conn.db_config.vdbe_listing)));
     }
     Ok(empty_result())
 }

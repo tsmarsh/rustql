@@ -732,6 +732,8 @@ pub struct DbConfigFlags {
     pub short_column_names: bool,
     /// Full column names - always use table.column format (default OFF)
     pub full_column_names: bool,
+    /// Print VDBE bytecode during prepare (default OFF)
+    pub vdbe_listing: bool,
 }
 
 impl Default for SqliteConnection {
@@ -788,6 +790,7 @@ impl SqliteConnection {
                 count_changes: false,
                 short_column_names: true, // Default ON
                 full_column_names: false, // Default OFF
+                vdbe_listing: false,      // Default OFF
             },
             schema_generation: AtomicU64::new(0),
         };

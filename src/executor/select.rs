@@ -1146,6 +1146,64 @@ impl<'s> SelectCompiler<'s> {
                         sql: None,
                         row_estimate: 0,
                     }))
+                } else if table_name_lower == "sqlite_stat1" {
+                    // Create virtual schema for sqlite_stat1
+                    use crate::schema::{Affinity, Column, Table};
+                    Some(std::sync::Arc::new(Table {
+                        name: "sqlite_stat1".to_string(),
+                        db_idx: 0,
+                        root_page: 0, // Virtual table, no root page
+                        columns: vec![
+                            Column {
+                                name: "tbl".to_string(),
+                                type_name: Some("TEXT".to_string()),
+                                affinity: Affinity::Text,
+                                not_null: false,
+                                not_null_conflict: None,
+                                default_value: None,
+                                collation: "BINARY".to_string(),
+                                is_primary_key: false,
+                                is_hidden: false,
+                                generated: None,
+                            },
+                            Column {
+                                name: "idx".to_string(),
+                                type_name: Some("TEXT".to_string()),
+                                affinity: Affinity::Text,
+                                not_null: false,
+                                not_null_conflict: None,
+                                default_value: None,
+                                collation: "BINARY".to_string(),
+                                is_primary_key: false,
+                                is_hidden: false,
+                                generated: None,
+                            },
+                            Column {
+                                name: "stat".to_string(),
+                                type_name: Some("TEXT".to_string()),
+                                affinity: Affinity::Text,
+                                not_null: false,
+                                not_null_conflict: None,
+                                default_value: None,
+                                collation: "BINARY".to_string(),
+                                is_primary_key: false,
+                                is_hidden: false,
+                                generated: None,
+                            },
+                        ],
+                        primary_key: None,
+                        indexes: Vec::new(),
+                        foreign_keys: Vec::new(),
+                        checks: Vec::new(),
+                        without_rowid: false,
+                        strict: false,
+                        is_virtual: false,
+                        virtual_module: None,
+                        virtual_args: Vec::new(),
+                        autoincrement: false,
+                        sql: None,
+                        row_estimate: 0,
+                    }))
                 } else if let Some(schema) = self.schema {
                     // Check if table exists (but not for sqlite_ internal tables)
                     if !table_name_lower.starts_with("sqlite_")

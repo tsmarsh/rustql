@@ -141,12 +141,16 @@ pub struct VdbeCursor {
     pub table_name: Option<String>,
     /// Is this a sqlite_master virtual cursor?
     pub is_sqlite_master: bool,
+    /// Is this a sqlite_stat1 virtual cursor?
+    pub is_sqlite_stat1: bool,
     /// Is this a virtual table cursor (custom module)
     pub is_virtual: bool,
     /// Current index for virtual cursors (sqlite_master iteration)
     pub virtual_index: usize,
     /// Cached schema entries for sqlite_master (type, name, tbl_name, rootpage, sql)
     pub schema_entries: Option<Vec<(String, String, String, u32, Option<String>)>>,
+    /// Cached stat1 entries for sqlite_stat1 (tbl, idx, stat)
+    pub stat1_entries: Option<Vec<(String, Option<String>, String)>>,
     /// Virtual table name (for module lookup)
     pub vtab_name: Option<String>,
     /// Virtual table rowids for current scan
@@ -213,9 +217,11 @@ impl VdbeCursor {
             btree_cursor: None,
             table_name: None,
             is_sqlite_master: false,
+            is_sqlite_stat1: false,
             is_virtual: false,
             virtual_index: 0,
             schema_entries: None,
+            stat1_entries: None,
             vtab_name: None,
             vtab_rowids: Vec::new(),
             vtab_row_index: 0,
@@ -1324,6 +1330,12 @@ impl Vdbe {
                     .map(|n| n.eq_ignore_ascii_case("sqlite_master"))
                     .unwrap_or(false);
 
+                // Check for sqlite_stat1 virtual table
+                let is_sqlite_stat1 = table_name
+                    .as_ref()
+                    .map(|n| n.eq_ignore_ascii_case("sqlite_stat1"))
+                    .unwrap_or(false);
+
                 if is_sqlite_master {
                     // Populate schema entries from current schema BEFORE borrowing cursor
                     let mut entries = Vec::new();
@@ -1348,6 +1360,25 @@ impl Vdbe {
                         cursor.table_name = table_name;
                         cursor.is_sqlite_master = true;
                         cursor.schema_entries = Some(entries);
+                    }
+                } else if is_sqlite_stat1 {
+                    // Populate stat1 entries from schema
+                    let mut entries: Vec<(String, Option<String>, String)> = Vec::new();
+                    if let Some(ref schema) = self.schema {
+                        if let Ok(schema_guard) = schema.read() {
+                            for ((tbl, idx), row) in schema_guard.stat1.iter() {
+                                entries.push((tbl.clone(), idx.clone(), row.stat.clone()));
+                            }
+                        }
+                    }
+
+                    // Create virtual cursor for sqlite_stat1
+                    self.open_cursor(op.p1, 0, false)?;
+                    if let Some(cursor) = self.cursor_mut(op.p1) {
+                        cursor.n_field = 3; // tbl, idx, stat
+                        cursor.table_name = table_name;
+                        cursor.is_sqlite_stat1 = true;
+                        cursor.stat1_entries = Some(entries);
                     }
                 } else {
                     let mut table_meta = None;
@@ -1630,6 +1661,17 @@ impl Vdbe {
                                 cursor.state = CursorState::AtEnd;
                             }
                         }
+                    } else if cursor.is_sqlite_stat1 {
+                        // Virtual cursor for sqlite_stat1
+                        cursor.virtual_index = 0;
+                        if let Some(ref entries) = cursor.stat1_entries {
+                            is_empty = entries.is_empty();
+                            if !is_empty {
+                                cursor.state = CursorState::Valid;
+                            } else {
+                                cursor.state = CursorState::AtEnd;
+                            }
+                        }
                     } else if cursor.is_ephemeral {
                         // Ephemeral table cursor - start at first row
                         cursor.ephemeral_index = 0;
@@ -1759,6 +1801,17 @@ impl Vdbe {
                         // Virtual cursor for sqlite_master
                         cursor.virtual_index += 1;
                         if let Some(ref entries) = cursor.schema_entries {
+                            has_more = cursor.virtual_index < entries.len();
+                            cursor.state = if has_more {
+                                CursorState::Valid
+                            } else {
+                                CursorState::AtEnd
+                            };
+                        }
+                    } else if cursor.is_sqlite_stat1 {
+                        // Virtual cursor for sqlite_stat1
+                        cursor.virtual_index += 1;
+                        if let Some(ref entries) = cursor.stat1_entries {
                             has_more = cursor.virtual_index < entries.len();
                             cursor.state = if has_more {
                                 CursorState::Valid
@@ -1922,6 +1975,14 @@ impl Vdbe {
                                 "sql" => 4,
                                 _ => col_idx,
                             };
+                        } else if cursor.is_sqlite_stat1 {
+                            // sqlite_stat1 columns: tbl, idx, stat
+                            col_idx = match col_name.to_lowercase().as_str() {
+                                "tbl" => 0,
+                                "idx" => 1,
+                                "stat" => 2,
+                                _ => col_idx,
+                            };
                         } else if let Some(ref table_name) = cursor.table_name {
                             if let Some(ref schema) = self.schema {
                                 if let Ok(schema_guard) = schema.read() {
@@ -1958,6 +2019,38 @@ impl Vdbe {
                                         }
                                     }
                                     _ => Mem::new(), // null
+                                };
+                                Some(result)
+                            } else {
+                                Some(Mem::new()) // null
+                            }
+                        } else {
+                            Some(Mem::new()) // null
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                // Handle sqlite_stat1 virtual cursor separately
+                let sqlite_stat1_value: Option<Mem> = if let Some(cursor) = self.cursor(op.p1) {
+                    if cursor.is_sqlite_stat1 {
+                        if let Some(ref entries) = cursor.stat1_entries {
+                            if cursor.virtual_index < entries.len() {
+                                let entry = &entries[cursor.virtual_index];
+                                let result = match col_idx {
+                                    0 => Mem::from_str(&entry.0), // tbl
+                                    1 => {
+                                        if let Some(ref idx) = entry.1 {
+                                            Mem::from_str(idx) // idx
+                                        } else {
+                                            Mem::new() // null
+                                        }
+                                    }
+                                    2 => Mem::from_str(&entry.2), // stat
+                                    _ => Mem::new(),              // null
                                 };
                                 Some(result)
                             } else {
@@ -2085,7 +2178,10 @@ impl Vdbe {
                 };
 
                 let mut affinity = None;
-                if sqlite_master_value.is_none() && vtab_value.is_none() {
+                if sqlite_master_value.is_none()
+                    && sqlite_stat1_value.is_none()
+                    && vtab_value.is_none()
+                {
                     if let Some(cursor) = self.cursor(op.p1) {
                         if let Some(ref table_name) = cursor.table_name {
                             if let Some(ref schema) = self.schema {
@@ -2100,6 +2196,8 @@ impl Vdbe {
                 }
 
                 if let Some(value) = sqlite_master_value {
+                    *self.mem_mut(op.p3) = value;
+                } else if let Some(value) = sqlite_stat1_value {
                     *self.mem_mut(op.p3) = value;
                 } else if let Some(value) = vtab_value {
                     let (vtab_name, vtab_rowid) = if let Some(cursor) = self.cursor(op.p1) {

@@ -728,6 +728,10 @@ pub struct DbConfigFlags {
     pub no_ckpt_on_close: bool,
     /// Count changes - return row count for INSERT/UPDATE/DELETE
     pub count_changes: bool,
+    /// Short column names - use column name only without table prefix (default ON)
+    pub short_column_names: bool,
+    /// Full column names - always use table.column format (default OFF)
+    pub full_column_names: bool,
 }
 
 impl Default for SqliteConnection {
@@ -782,6 +786,8 @@ impl SqliteConnection {
                 legacy_file_format: false,
                 no_ckpt_on_close: false,
                 count_changes: false,
+                short_column_names: true, // Default ON
+                full_column_names: false, // Default OFF
             },
             schema_generation: AtomicU64::new(0),
         };

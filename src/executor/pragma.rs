@@ -118,6 +118,8 @@ pub fn execute_pragma(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Resul
         "auto_vacuum" => pragma_auto_vacuum(conn, pragma),
         "encoding" => pragma_encoding(conn, pragma),
         "count_changes" => pragma_count_changes(conn, pragma),
+        "short_column_names" => pragma_short_column_names(conn, pragma),
+        "full_column_names" => pragma_full_column_names(conn, pragma),
         _ => Err(Error::with_message(
             ErrorCode::Error,
             format!("unknown pragma: {}", pragma.name),
@@ -488,6 +490,40 @@ fn pragma_count_changes(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Res
     }
     if pragma.value.is_none() {
         return Ok(single_int_result(i64::from(conn.db_config.count_changes)));
+    }
+    Ok(empty_result())
+}
+
+fn pragma_short_column_names(
+    conn: &mut SqliteConnection,
+    pragma: &PragmaStmt,
+) -> Result<PragmaResult> {
+    if let Some(value) = pragma_value_i64(pragma) {
+        conn.db_config.short_column_names = value != 0;
+    } else if let Some(value) = pragma_value_string(pragma) {
+        conn.db_config.short_column_names = parse_bool_value(&value);
+    }
+    if pragma.value.is_none() {
+        return Ok(single_int_result(i64::from(
+            conn.db_config.short_column_names,
+        )));
+    }
+    Ok(empty_result())
+}
+
+fn pragma_full_column_names(
+    conn: &mut SqliteConnection,
+    pragma: &PragmaStmt,
+) -> Result<PragmaResult> {
+    if let Some(value) = pragma_value_i64(pragma) {
+        conn.db_config.full_column_names = value != 0;
+    } else if let Some(value) = pragma_value_string(pragma) {
+        conn.db_config.full_column_names = parse_bool_value(&value);
+    }
+    if pragma.value.is_none() {
+        return Ok(single_int_result(i64::from(
+            conn.db_config.full_column_names,
+        )));
     }
     Ok(empty_result())
 }

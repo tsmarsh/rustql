@@ -219,14 +219,19 @@ test-report:
 		echo "No test data found."; \
 	fi
 
-# Run all tests and output pass rates to stdout
-pass-rates: $(TCL_EXT) $(RESULT_DIR)
+# Output pass rates from existing test logs (run 'make test' first)
+pass-rates:
+	@if [ ! -d "$(RESULT_DIR)" ]; then \
+		echo "No test results found. Run 'make test' first."; \
+		exit 1; \
+	fi
 	@total_pass=0; total_tests=0; \
 	for t in $(SQLITE_TESTS); do \
-		if [ -f "$(TEST_DIR)/$$t.test" ]; then \
-			timeout $(TIMEOUT) $(TCLSH) $(TCL_WRAPPER) $$t > $(RESULT_DIR)/$$t.log 2>&1 || true; \
-			pass=$$(grep -cE "^$$t-.*\.\.\. Ok$$" "$(RESULT_DIR)/$$t.log" 2>/dev/null || echo 0); \
-			total=$$(grep -cE "^$$t-[0-9].*\.\.\." "$(RESULT_DIR)/$$t.log" 2>/dev/null || echo 0); \
+		if [ -f "$(RESULT_DIR)/$$t.log" ]; then \
+			pass=$$(grep -cE "^$$t-.*\.\.\. Ok$$" "$(RESULT_DIR)/$$t.log" 2>/dev/null | tr -d '[:space:]'); \
+			total=$$(grep -cE "^$$t-[0-9].*\.\.\." "$(RESULT_DIR)/$$t.log" 2>/dev/null | tr -d '[:space:]'); \
+			pass=$${pass:-0}; \
+			total=$${total:-0}; \
 			if [ "$$total" -gt 0 ] 2>/dev/null; then \
 				pct=$$((pass * 100 / total)); \
 				printf "%-15s %4d / %4d  (%3d%%)\n" "$$t" "$$pass" "$$total" "$$pct"; \

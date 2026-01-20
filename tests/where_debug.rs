@@ -1,6 +1,7 @@
 //! Debug tests for WHERE clause issues
 
 use rustql::types::StepResult;
+use rustql::vdbe::reset_search_count;
 use rustql::{
     sqlite3_close, sqlite3_column_count, sqlite3_column_text, sqlite3_finalize, sqlite3_initialize,
     sqlite3_open, sqlite3_prepare_v2, sqlite3_step, SqliteConnection,
@@ -171,6 +172,49 @@ fn test_insert_select_with_scalar_subquery() {
 }
 
 #[test]
+fn test_insert_select_arithmetic_simple() {
+    // Test INSERT...SELECT with simple arithmetic (no subqueries)
+    // This mimics where-6.1 setup: INSERT INTO t3 SELECT w, 101-w, y FROM t1
+    init();
+    let mut conn = sqlite3_open(":memory:").expect("open memory db");
+
+    // Setup t1
+    exec(&mut conn, "CREATE TABLE t1(w int, x int, y int)");
+    exec(&mut conn, "INSERT INTO t1 VALUES(1, 0, 4)");
+    exec(&mut conn, "INSERT INTO t1 VALUES(2, 1, 9)");
+    exec(&mut conn, "INSERT INTO t1 VALUES(3, 1, 16)");
+
+    // Create t3 with arithmetic expression 101-w
+    exec(&mut conn, "CREATE TABLE t3(a int, b int, c int)");
+    exec(&mut conn, "INSERT INTO t3 SELECT w, 101-w, y FROM t1");
+
+    // For w=1: a=1, b=100, c=4
+    // For w=2: a=2, b=99, c=9
+    // For w=3: a=3, b=98, c=16
+    let results = query(&mut conn, "SELECT a, b, c FROM t3 ORDER BY a");
+    println!("t3 results: {:?}", results);
+
+    assert_eq!(results.len(), 3, "t3 should have 3 rows");
+    assert_eq!(
+        results[0],
+        vec!["1", "100", "4"],
+        "Row 1: a=1, b=101-1=100, c=4"
+    );
+    assert_eq!(
+        results[1],
+        vec!["2", "99", "9"],
+        "Row 2: a=2, b=101-2=99, c=9"
+    );
+    assert_eq!(
+        results[2],
+        vec!["3", "98", "16"],
+        "Row 3: a=3, b=101-3=98, c=16"
+    );
+
+    let _ = sqlite3_close(conn);
+}
+
+#[test]
 fn test_where_test_setup() {
     // This test mimics the where.test setup from SQLite
     init();
@@ -214,6 +258,68 @@ fn test_where_test_setup() {
     assert_eq!(t2_rows[2], vec!["98", "1", "21", "16"]);
     assert_eq!(t2_rows[3], vec!["99", "1", "28", "9"]);
     assert_eq!(t2_rows[4], vec!["100", "0", "33", "4"]);
+
+    let _ = sqlite3_close(conn);
+}
+
+#[test]
+fn test_left_join_empty_table() {
+    // Test LEFT JOIN with empty right table (where-18.1)
+    init();
+    let mut conn = sqlite3_open(":memory:").expect("open memory db");
+
+    exec(&mut conn, "CREATE TABLE t181(a)");
+    exec(&mut conn, "CREATE TABLE t182(b, c)");
+    exec(&mut conn, "INSERT INTO t181 VALUES(1)");
+    // Note: t182 is empty
+
+    // First, verify basic query works
+    let basic_result = query(&mut conn, "SELECT a FROM t181");
+    println!("Basic SELECT result: {:?}", basic_result);
+    assert_eq!(basic_result, vec![vec!["1"]], "Basic SELECT should work");
+
+    // LEFT JOIN should return the left row with NULLs for the right side
+    // We select *, to see all columns
+    let result_star = query(&mut conn, "SELECT * FROM t181 LEFT JOIN t182 ON a=b");
+    println!("LEFT JOIN SELECT * result: {:?}", result_star);
+
+    // Now select just a
+    let result = query(&mut conn, "SELECT a FROM t181 LEFT JOIN t182 ON a=b");
+    println!("LEFT JOIN SELECT a result: {:?}", result);
+    assert_eq!(result.len(), 1, "Should have one row");
+    assert_eq!(result[0][0], "1", "First column should be 1");
+
+    let _ = sqlite3_close(conn);
+}
+
+#[test]
+fn test_sqlite_search_count() {
+    // Test that sqlite_search_count() function works
+    init();
+    let mut conn = sqlite3_open(":memory:").expect("open memory db");
+
+    // Setup
+    exec(&mut conn, "CREATE TABLE t1(w int, x int, y int)");
+    exec(&mut conn, "CREATE INDEX i1w ON t1(w)");
+    exec(&mut conn, "INSERT INTO t1 VALUES(1, 0, 4)");
+    exec(&mut conn, "INSERT INTO t1 VALUES(2, 1, 9)");
+    exec(&mut conn, "INSERT INTO t1 VALUES(3, 1, 16)");
+
+    // Reset the search count before our test query
+    reset_search_count();
+
+    // Run a query that should use the index
+    let result = query_flat(&mut conn, "SELECT x, y, w FROM t1 WHERE w=2");
+    println!("Query result: {:?}", result);
+    assert_eq!(result, vec!["1", "9", "2"]);
+
+    // Check the search count using the SQL function
+    let count_result = query_flat(&mut conn, "SELECT sqlite_search_count()");
+    println!("Search count: {:?}", count_result);
+
+    // The search count should be > 0 (includes seek and possibly next operations)
+    let count: i64 = count_result[0].parse().unwrap();
+    assert!(count > 0, "Search count should be > 0, got {}", count);
 
     let _ = sqlite3_close(conn);
 }

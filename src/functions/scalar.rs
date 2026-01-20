@@ -89,6 +89,9 @@ pub fn get_scalar_function(name: &str) -> Option<ScalarFunc> {
         #[cfg(feature = "fts5")]
         "HIGHLIGHT" => Some(func_highlight),
 
+        // Test infrastructure functions
+        "SQLITE_SEARCH_COUNT" => Some(func_sqlite_search_count),
+
         _ => None,
     }
 }
@@ -1067,6 +1070,17 @@ fn match_char_class(pattern: &[char], c: char) -> Option<(bool, usize)> {
     } else {
         None
     }
+}
+
+// ============================================================================
+// Test Infrastructure Functions
+// ============================================================================
+
+/// sqlite_search_count() - Returns the number of VDBE search operations
+/// This is used by SQLite's test suite to verify query optimization.
+fn func_sqlite_search_count(_args: &[Value]) -> Result<Value> {
+    let count = crate::vdbe::get_search_count();
+    Ok(Value::Integer(count as i64))
 }
 
 // ============================================================================

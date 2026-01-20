@@ -913,7 +913,9 @@ impl<'a> InsertCompiler<'a> {
                     _ => Opcode::Add,
                 };
 
-                self.emit(opcode, left_reg, right_reg, dest_reg, P4::Unused);
+                // Arithmetic opcodes: P1=right operand, P2=left operand, P3=dest
+                // Add/Sub/Mul/Div compute r[P2] op r[P1] and store in r[P3]
+                self.emit(opcode, right_reg, left_reg, dest_reg, P4::Unused);
             }
             Expr::Unary { op, expr: inner } => {
                 self.compile_select_expr(inner, dest_reg, source_cursor, col_map)?;

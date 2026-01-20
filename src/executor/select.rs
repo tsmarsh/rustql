@@ -513,8 +513,9 @@ impl<'s> SelectCompiler<'s> {
             None
         };
 
-        // Collect table cursors to avoid borrow checker issues
+        // Collect table cursors and join types to avoid borrow checker issues
         let table_cursors: Vec<i32> = self.tables.iter().map(|t| t.cursor).collect();
+        let table_join_types: Vec<JoinType> = self.tables.iter().map(|t| t.join_type).collect();
 
         // Generate proper nested loop structure for cross joins
         // For N tables, we need nested Rewind/Next pairs where inner tables
@@ -531,11 +532,49 @@ impl<'s> SelectCompiler<'s> {
         //   Next A → outer_loop
         // done_all:
         //
+        // For LEFT JOIN, we need to emit the outer row even when inner is empty/unmatched:
+        //   Rewind A → done_all
+        // outer_loop:
+        //   Integer 0, found_match_reg    ; initialize "found match" flag
+        //   Rewind B → check_match        ; if empty, check if need to emit null row
+        // inner_loop:
+        //   ... body ...
+        //   Integer 1, found_match_reg    ; set "found match"
+        //   Next B → inner_loop
+        // check_match:
+        //   If found_match_reg > 0 → next_outer  ; if matched, skip null output
+        //   NullRow B                            ; set B columns to NULL
+        //   ... output row ...                   ; output with NULL right columns
+        // next_outer:
+        //   Next A → outer_loop
+        // done_all:
+        //
         let mut loop_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
         let mut next_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
+        let mut found_match_regs: Vec<Option<i32>> = Vec::with_capacity(table_cursors.len());
 
         // Emit Rewind/loop structure for each table level
-        for (_i, cursor) in table_cursors.iter().enumerate() {
+        // First, allocate found_match registers for outer joins (but don't emit initialization yet)
+        for i in 0..table_cursors.len() {
+            let is_outer_join = matches!(
+                table_join_types[i],
+                JoinType::Left
+                    | JoinType::Right
+                    | JoinType::Full
+                    | JoinType::NaturalLeft
+                    | JoinType::NaturalRight
+                    | JoinType::NaturalFull
+            );
+            let found_match_reg = if is_outer_join && i > 0 {
+                Some(self.alloc_reg())
+            } else {
+                None
+            };
+            found_match_regs.push(found_match_reg);
+        }
+
+        // Now emit the Rewind/loop structure
+        for (i, cursor) in table_cursors.iter().enumerate() {
             // Handle FTS3 filter if applicable
             if let Some(filter) = &fts3_filter {
                 if filter.cursor == *cursor {
@@ -562,6 +601,14 @@ impl<'s> SelectCompiler<'s> {
             let loop_label = self.alloc_label();
             self.resolve_label(loop_label, self.current_addr());
             loop_labels.push(loop_label);
+
+            // Initialize found_match for the NEXT table (if it's an outer join)
+            // This must be INSIDE the current loop (after loop_label) so it resets on each iteration
+            if i + 1 < table_cursors.len() {
+                if let Some(reg) = found_match_regs[i + 1] {
+                    self.emit(Opcode::Integer, 0, reg, 0, P4::Unused);
+                }
+            }
         }
 
         // Inner loop start is the innermost loop label
@@ -622,6 +669,13 @@ impl<'s> SelectCompiler<'s> {
             self.output_row(dest, result_regs.0, result_regs.1)?;
         }
 
+        // For outer joins, mark that we found a matching row
+        for found_match_reg in &found_match_regs {
+            if let Some(reg) = found_match_reg {
+                self.emit(Opcode::Integer, 1, *reg, 0, P4::Unused);
+            }
+        }
+
         // Loop continuation target (for WHERE skip, DISTINCT skip, OFFSET skip)
         self.resolve_label(loop_continue_label, self.current_addr());
         if let Some(label) = where_skip_label {
@@ -644,8 +698,39 @@ impl<'s> SelectCompiler<'s> {
             // Next jumps back to this table's loop start
             self.emit(Opcode::Next, cursor, loop_label, 0, P4::Unused);
 
-            // Resolve the skip label (where Rewind jumps on empty/exhausted)
-            self.resolve_label(next_labels[i], self.current_addr());
+            // For outer joins: if no match was found, emit null row
+            // Both empty Rewind and exhausted Next come here
+            if let Some(found_match_reg) = found_match_regs[i] {
+                // Resolve the skip label HERE so Rewind jumps to check_match, not past it
+                self.resolve_label(next_labels[i], self.current_addr());
+
+                // Label to skip null row output if we found a match
+                let skip_null_output = self.alloc_label();
+
+                // If found_match > 0, skip null row output
+                self.emit(
+                    Opcode::IfPos,
+                    found_match_reg,
+                    skip_null_output,
+                    0,
+                    P4::Unused,
+                );
+
+                // Set cursor to null row mode (columns will return NULL)
+                self.emit(Opcode::NullRow, cursor, 0, 0, P4::Unused);
+
+                // Re-evaluate result columns with null row
+                let null_result_regs = self.compile_result_columns(&core.columns)?;
+
+                // Output the null row
+                self.output_row(dest, null_result_regs.0, null_result_regs.1)?;
+
+                // Skip null output target
+                self.resolve_label(skip_null_output, self.current_addr());
+            } else {
+                // Non-outer join: resolve skip label after Next
+                self.resolve_label(next_labels[i], self.current_addr());
+            }
         }
 
         // Close cursors

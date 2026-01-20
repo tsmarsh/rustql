@@ -37,3 +37,5 @@ pub use trace::{expand_sql, TraceCallback, TraceEvent, TraceFlags, TraceInfo, Tr
 pub use bytecode::{
     bytecode_schema, explain_bytecode, explain_query_plan, BytecodeIterator, BytecodeRow,
 };
+
+pub use engine::{get_search_count, reset_search_count};

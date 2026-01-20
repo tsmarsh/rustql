@@ -6,9 +6,32 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::sync::atomic::Ordering as AtomicOrdering;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
+
+// ============================================================================
+// Global Search Counter (for sqlite_search_count compatibility)
+// ============================================================================
+
+/// Global counter for tracking VDBE search operations (SeekGE, SeekGT, etc.)
+/// This is used by sqlite_search_count() for test compatibility.
+static SEARCH_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Get the current search count (for sqlite_search_count() function)
+pub fn get_search_count() -> u64 {
+    SEARCH_COUNT.load(AtomicOrdering::Relaxed)
+}
+
+/// Reset the search count to zero
+pub fn reset_search_count() {
+    SEARCH_COUNT.store(0, AtomicOrdering::Relaxed);
+}
+
+/// Increment the search count
+fn inc_search_count() {
+    SEARCH_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+}
 
 use crate::api::{SqliteConnection, TransactionState};
 use crate::error::{Error, ErrorCode, Result};
@@ -1846,6 +1869,7 @@ impl Vdbe {
 
             Opcode::Next => {
                 // Move cursor to next row, jump to P2 if has more rows
+                inc_search_count();
                 let mut has_more = false;
                 let mut vtab_context: Option<(Option<String>, Option<i64>)> = None;
                 if let Some(cursor) = self.cursor_mut(op.p1) {
@@ -1962,6 +1986,7 @@ impl Vdbe {
 
             Opcode::Prev => {
                 // Move cursor to previous row, jump to P2 if has more rows
+                inc_search_count();
                 let mut has_more = false;
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     // Invalidate column cache on cursor movement
@@ -3097,6 +3122,7 @@ impl Vdbe {
             Opcode::SeekRowid => {
                 // SeekRowid P1 P2 P3: Move cursor P1 to rowid in register P3
                 // If not found, jump to P2. Register P3 must be an integer.
+                inc_search_count();
                 let rowid = self.mem(op.p3).to_int();
                 let mut found = false;
 
@@ -3127,6 +3153,7 @@ impl Vdbe {
 
             Opcode::NotExists => {
                 // NotExists P1 P2 P3: If rowid P3 does NOT exist in cursor P1, jump to P2
+                inc_search_count();
                 let rowid = self.mem(op.p3).to_int();
                 let mut exists = false;
 
@@ -3322,6 +3349,7 @@ impl Vdbe {
             // Other opcodes (placeholder implementations)
             // ================================================================
             Opcode::SeekGE => {
+                inc_search_count();
                 let mut jump = true;
                 let index_key = self.mem(op.p3).to_blob();
                 let rowid_key = self.mem(op.p3).to_int();
@@ -3355,6 +3383,7 @@ impl Vdbe {
             }
 
             Opcode::SeekGT => {
+                inc_search_count();
                 let mut jump = true;
                 let index_key = self.mem(op.p3).to_blob();
                 let rowid_key = self.mem(op.p3).to_int();
@@ -3388,6 +3417,7 @@ impl Vdbe {
             }
 
             Opcode::SeekLE => {
+                inc_search_count();
                 let mut jump = true;
                 let index_key = self.mem(op.p3).to_blob();
                 let rowid_key = self.mem(op.p3).to_int();
@@ -3421,6 +3451,7 @@ impl Vdbe {
             }
 
             Opcode::SeekLT => {
+                inc_search_count();
                 let mut jump = true;
                 let index_key = self.mem(op.p3).to_blob();
                 let rowid_key = self.mem(op.p3).to_int();

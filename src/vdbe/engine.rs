@@ -430,7 +430,7 @@ impl Vdbe {
             var_names: Vec::new(),
             interrupted: false,
             instruction_count: 0,
-            max_instructions: 100_000, // Default 100K instruction limit
+            max_instructions: 100_000_000, // Default 100M instruction limit
             result_start: 0,
             result_count: 0,
             column_names: Vec::new(),

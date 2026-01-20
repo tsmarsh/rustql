@@ -12,6 +12,8 @@ use crate::parser::ast::{
 use crate::schema::Schema;
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
+use super::select::{SelectCompiler, SelectDest};
+
 fn is_rowid_alias(name: &str) -> bool {
     name.eq_ignore_ascii_case("rowid")
         || name.eq_ignore_ascii_case("_rowid_")
@@ -314,13 +316,26 @@ impl<'a> InsertCompiler<'a> {
         // Build column index map
         let col_targets = self.build_column_map(&insert.columns)?;
 
+        // Extract SELECT expressions to check for complexity
+        let select_exprs = self.get_select_expressions(select);
+        let select_col_count = select_exprs.len();
+
+        // Check if any expressions contain subqueries
+        // If so, use SelectCompiler for the entire SELECT
+        if Self::has_subquery(&select_exprs) {
+            return self.compile_select_with_subqueries(
+                insert,
+                select,
+                conflict_action,
+                &col_targets,
+            );
+        }
+
+        // Simple path: no subqueries, use direct expression compilation
+
         // Extract source table from SELECT
         // For now, we support simple "SELECT * FROM table" or "SELECT cols FROM table"
         let source_table = self.get_source_table(select)?;
-
-        // Extract SELECT expressions
-        let select_exprs = self.get_select_expressions(select);
-        let select_col_count = select_exprs.len();
 
         // Build column name to index map for the source table
         let source_col_map = self.build_source_column_map(&source_table);
@@ -394,6 +409,184 @@ impl<'a> InsertCompiler<'a> {
 
         // Close source cursor - we're done reading
         self.emit(Opcode::Close, source_cursor, 0, 0, P4::Unused);
+
+        // ========================================================================
+        // Phase 2: Insert from ephemeral table into target
+        // ========================================================================
+        let insert_loop_start = self.alloc_label();
+        let insert_loop_end = self.alloc_label();
+
+        // Rewind ephemeral table
+        self.emit(Opcode::Rewind, eph_cursor, insert_loop_end, 0, P4::Unused);
+        self.resolve_label(insert_loop_start, self.current_addr() as i32);
+
+        // Allocate rowid register for target table
+        let rowid_reg = self.alloc_reg();
+        self.emit(
+            Opcode::NewRowid,
+            self.table_cursor,
+            rowid_reg,
+            0,
+            P4::Unused,
+        );
+
+        // Read columns from ephemeral row and map to target columns
+        let data_base = self.next_reg;
+        let _data_regs = self.alloc_regs(self.num_columns);
+
+        let mut present = vec![false; self.num_columns];
+        for (i, target) in col_targets.iter().enumerate() {
+            if i >= select_col_count {
+                break;
+            }
+            match *target {
+                InsertColumnTarget::Rowid => {
+                    self.emit(Opcode::Column, eph_cursor, i as i32, rowid_reg, P4::Unused);
+                }
+                InsertColumnTarget::Column(col_idx) => {
+                    let dest_reg = data_base + col_idx as i32;
+                    self.emit(Opcode::Column, eph_cursor, i as i32, dest_reg, P4::Unused);
+                    if col_idx < present.len() {
+                        present[col_idx] = true;
+                    }
+                }
+            }
+        }
+
+        // Fill NULLs for unspecified columns
+        for (i, seen) in present.iter().enumerate() {
+            if !*seen {
+                let reg = data_base + i as i32;
+                self.emit(Opcode::Null, 0, reg, 0, P4::Unused);
+            }
+        }
+
+        // Handle conflict
+        self.emit_conflict_check(conflict_action)?;
+
+        // Make and insert record
+        let record_reg = self.alloc_reg();
+        self.emit(
+            Opcode::MakeRecord,
+            data_base,
+            self.num_columns as i32,
+            record_reg,
+            P4::Unused,
+        );
+
+        let flags = self.conflict_flags(conflict_action);
+        self.emit(
+            Opcode::Insert,
+            self.table_cursor,
+            record_reg,
+            rowid_reg,
+            P4::Int64(flags),
+        );
+
+        // Next row in ephemeral table
+        self.emit(Opcode::Next, eph_cursor, insert_loop_start, 0, P4::Unused);
+        self.resolve_label(insert_loop_end, self.current_addr() as i32);
+
+        // Close ephemeral cursor
+        self.emit(Opcode::Close, eph_cursor, 0, 0, P4::Unused);
+
+        Ok(())
+    }
+
+    /// Compile INSERT...SELECT when the SELECT contains subqueries
+    /// Uses SelectCompiler for the SELECT portion to handle complex expressions
+    fn compile_select_with_subqueries(
+        &mut self,
+        insert: &InsertStmt,
+        select: &SelectStmt,
+        conflict_action: ConflictAction,
+        col_targets: &[InsertColumnTarget],
+    ) -> Result<()> {
+        // Get the number of columns in the SELECT result
+        let select_col_count = self.get_select_column_count(select);
+
+        // Use SelectCompiler to compile the SELECT first
+        // We'll use a high cursor number for the ephemeral table to avoid conflicts
+        // with cursors allocated by SelectCompiler for nested subqueries
+        let mut sub_compiler = if let Some(schema) = self.schema {
+            SelectCompiler::with_schema(schema)
+        } else {
+            SelectCompiler::new()
+        };
+
+        // Use a high cursor number that won't conflict with SelectCompiler's allocations
+        // SelectCompiler starts at cursor 0, so we use 100 to be safe
+        let eph_cursor = 100;
+        let sub_dest = SelectDest::EphemTable { cursor: eph_cursor };
+        let sub_ops = sub_compiler.compile(select, &sub_dest)?;
+
+        // Now open the ephemeral table with the high cursor number
+        self.emit(
+            Opcode::OpenEphemeral,
+            eph_cursor,
+            select_col_count as i32,
+            0,
+            P4::Unused,
+        );
+
+        // Get the cursor offset for adjusting SelectCompiler's cursor numbers
+        let cursor_offset = self.next_cursor;
+
+        // Filter out Init and Halt from the subquery ops and inline them
+        // Adjust jump addresses and cursor numbers
+        let base_addr = self.ops.len() as i32;
+        for mut op in sub_ops {
+            if op.opcode == Opcode::Init || op.opcode == Opcode::Halt {
+                continue;
+            }
+            // Adjust jump addresses
+            if op.opcode.is_jump() && op.p2 > 0 {
+                op.p2 += base_addr;
+            }
+            // Adjust cursor numbers - p1 is usually the cursor for table operations
+            // But we need to be careful: eph_cursor should NOT be adjusted since we
+            // already have it at the right value
+            if op.opcode == Opcode::OpenRead || op.opcode == Opcode::OpenWrite {
+                op.p1 += cursor_offset;
+            } else if matches!(
+                op.opcode,
+                Opcode::Rewind
+                    | Opcode::Next
+                    | Opcode::Column
+                    | Opcode::Close
+                    | Opcode::Insert
+                    | Opcode::NewRowid
+                    | Opcode::SeekGE
+                    | Opcode::SeekGT
+                    | Opcode::SeekLE
+                    | Opcode::SeekLT
+                    | Opcode::SeekRowid
+                    | Opcode::IdxGE
+                    | Opcode::IdxGT
+                    | Opcode::IdxLE
+                    | Opcode::IdxLT
+                    | Opcode::Found
+                    | Opcode::NotFound
+                    | Opcode::SorterInsert
+                    | Opcode::SorterSort
+                    | Opcode::SorterNext
+                    | Opcode::SorterData
+                    | Opcode::OpenEphemeral
+                    | Opcode::OpenAutoindex
+            ) {
+                // Don't adjust if it's our ephemeral cursor
+                if op.p1 != eph_cursor {
+                    op.p1 += cursor_offset;
+                }
+            }
+            self.ops.push(op);
+        }
+
+        // Update cursor count to account for cursors used by SelectCompiler
+        self.next_cursor += 10; // Reserve space for SelectCompiler cursors
+
+        // Reserve registers used by SelectCompiler
+        self.next_reg += 100;
 
         // ========================================================================
         // Phase 2: Insert from ephemeral table into target
@@ -570,6 +763,80 @@ impl<'a> InsertCompiler<'a> {
         map
     }
 
+    /// Check if any expression contains a subquery
+    fn has_subquery(exprs: &[Expr]) -> bool {
+        for expr in exprs {
+            if Self::expr_has_subquery(expr) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if an expression contains a subquery
+    fn expr_has_subquery(expr: &Expr) -> bool {
+        match expr {
+            Expr::Subquery(_) => true,
+            Expr::Binary { left, right, .. } => {
+                Self::expr_has_subquery(left) || Self::expr_has_subquery(right)
+            }
+            Expr::Unary { expr, .. } => Self::expr_has_subquery(expr),
+            Expr::Function(func) => {
+                if let crate::parser::ast::FunctionArgs::Exprs(args) = &func.args {
+                    for arg in args {
+                        if Self::expr_has_subquery(arg) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            Expr::In { expr, list, .. } => {
+                if Self::expr_has_subquery(expr) {
+                    return true;
+                }
+                if let crate::parser::ast::InList::Subquery(_) = list {
+                    return true;
+                }
+                if let crate::parser::ast::InList::Values(vals) = list {
+                    for v in vals {
+                        if Self::expr_has_subquery(v) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            Expr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+                ..
+            } => {
+                if let Some(op) = operand {
+                    if Self::expr_has_subquery(op) {
+                        return true;
+                    }
+                }
+                for clause in when_clauses {
+                    if Self::expr_has_subquery(&clause.when)
+                        || Self::expr_has_subquery(&clause.then)
+                    {
+                        return true;
+                    }
+                }
+                if let Some(else_expr) = else_clause {
+                    if Self::expr_has_subquery(else_expr) {
+                        return true;
+                    }
+                }
+                false
+            }
+            Expr::Exists { .. } => true,
+            _ => false,
+        }
+    }
+
     /// Compile a SELECT expression with proper column resolution
     fn compile_select_expr(
         &mut self,
@@ -615,9 +882,13 @@ impl<'a> InsertCompiler<'a> {
                 }
             },
             Expr::Column(col_ref) => {
-                // Look up column index from the map
-                let col_name = col_ref.column.to_lowercase();
-                let col_idx = col_map.get(&col_name).copied().unwrap_or(0);
+                // Use explicit column_index if set (for SELECT *), otherwise look up by name
+                let col_idx = if let Some(idx) = col_ref.column_index {
+                    idx as usize
+                } else {
+                    let col_name = col_ref.column.to_lowercase();
+                    col_map.get(&col_name).copied().unwrap_or(0)
+                };
                 self.emit(
                     Opcode::Column,
                     source_cursor,
@@ -677,6 +948,12 @@ impl<'a> InsertCompiler<'a> {
                     dest_reg,
                     P4::Text(func_call.name.clone()),
                 );
+            }
+            Expr::Subquery(_select) => {
+                // Scalar subqueries in INSERT...SELECT require special handling.
+                // For now, fall back to NULL - this is a known limitation.
+                // TODO: Use SelectCompiler to evaluate subqueries properly.
+                self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
             }
             _ => {
                 // Default to NULL for unsupported expressions

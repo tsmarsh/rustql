@@ -4513,6 +4513,29 @@ pub fn compile_select_to(select: &SelectStmt, dest: &SelectDest) -> Result<Vec<V
     compiler.compile(select, dest)
 }
 
+impl<'a> SelectCompiler<'a> {
+    /// Compile a SELECT statement for use in INSERT...SELECT context
+    /// Returns ops without Init/Halt wrapper, suitable for inlining
+    pub fn compile_for_insert(
+        &mut self,
+        select: &SelectStmt,
+        dest: &SelectDest,
+    ) -> Result<Vec<VdbeOp>> {
+        // Handle WITH clause (CTEs) if present
+        if let Some(with) = &select.with {
+            self.process_with_clause(with)?;
+        }
+
+        // Compile the body directly without Init/Halt
+        self.compile_body(&select.body, dest)?;
+
+        // Handle ORDER BY and LIMIT if present (for simple cases)
+        // For scalar subqueries this is usually not needed
+
+        Ok(std::mem::take(&mut self.ops))
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================

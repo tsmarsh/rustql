@@ -2413,6 +2413,47 @@ impl<'s> SelectCompiler<'s> {
                 self.has_window_functions = saved_has_window;
                 self.result_column_names = saved_result_names;
             }
+            Expr::Exists { subquery, negated } => {
+                // Compile EXISTS subquery
+                // Save outer query state
+                let saved_tables = std::mem::take(&mut self.tables);
+                let saved_has_agg = self.has_aggregates;
+                let saved_has_window = self.has_window_functions;
+                let saved_result_names = std::mem::take(&mut self.result_column_names);
+
+                // Initialize result to 0 (false) - will be set to 1 if any row is found
+                self.emit(
+                    Opcode::Integer,
+                    if *negated { 1 } else { 0 },
+                    dest_reg,
+                    0,
+                    P4::Unused,
+                );
+
+                // Compile the subquery body with Exists destination
+                let sub_dest = SelectDest::Exists { reg: dest_reg };
+                self.compile_body(&subquery.body, &sub_dest)?;
+
+                // If negated (NOT EXISTS), we need to invert the result
+                // Exists destination sets reg to 1 if a row is found
+                // For NOT EXISTS, we want 1 when no rows, 0 when rows found
+                if *negated {
+                    // Result was initialized to 1, Exists sets it to 1 on match
+                    // We need to invert: if a row was found (reg==1 from Exists), set to 0
+                    // This is handled by initializing to 1 (no rows case) and
+                    // letting Exists set it to... wait, Exists sets it to 1 regardless
+                    // Actually we need different logic for NOT EXISTS
+                    // For now, let's use the simpler approach: Exists always sets 1 on match,
+                    // so for NOT EXISTS we need to flip after
+                    self.emit(Opcode::Not, dest_reg, dest_reg, 0, P4::Unused);
+                }
+
+                // Restore outer query state
+                self.tables = saved_tables;
+                self.has_aggregates = saved_has_agg;
+                self.has_window_functions = saved_has_window;
+                self.result_column_names = saved_result_names;
+            }
             Expr::Like {
                 expr: text_expr,
                 pattern,

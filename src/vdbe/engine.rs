@@ -4562,8 +4562,12 @@ impl Vdbe {
                             let name_lower = name.to_lowercase();
                             match op.p1 {
                                 0 => {
-                                    // Drop table
+                                    // Drop table - also remove all indexes for this table
                                     schema_guard.tables.remove(&name_lower);
+                                    // Remove indexes that reference this table from the global index map
+                                    schema_guard
+                                        .indexes
+                                        .retain(|_, idx| idx.table.to_lowercase() != name_lower);
                                 }
                                 1 => {
                                     // Drop index

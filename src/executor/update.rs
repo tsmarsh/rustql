@@ -1354,9 +1354,273 @@ impl<'s> UpdateCompiler<'s> {
                     }
                 }
             }
+            Expr::Exists { subquery, negated } => {
+                // Compile EXISTS subquery for UPDATE
+                // For a simple implementation, we scan the subquery table and check if any rows match
+
+                // Initialize result based on negation
+                // EXISTS: 0 (no rows found yet), NOT EXISTS: 1 (assumed true until row found)
+                self.emit(
+                    Opcode::Integer,
+                    if *negated { 1 } else { 0 },
+                    dest_reg,
+                    0,
+                    P4::Unused,
+                );
+
+                // Try to compile a simple EXISTS (SELECT ... FROM table WHERE condition)
+                if let crate::parser::ast::SelectBody::Select(sel) = &subquery.body {
+                    if let Some(from) = &sel.from {
+                        if from.tables.len() == 1 {
+                            if let crate::parser::ast::TableRef::Table { name, alias, .. } =
+                                &from.tables[0]
+                            {
+                                if let Some(schema) = self.schema {
+                                    if let Some(table_def) = schema.table(&name.name) {
+                                        let root_page = table_def.root_page;
+                                        let scan_cursor = self.alloc_cursor();
+
+                                        // Open table for reading
+                                        self.emit(
+                                            Opcode::OpenRead,
+                                            scan_cursor,
+                                            root_page as i32,
+                                            0,
+                                            P4::Int64(table_def.columns.len() as i64),
+                                        );
+
+                                        let loop_start = self.alloc_label();
+                                        let loop_end = self.alloc_label();
+                                        let found_label = self.alloc_label();
+
+                                        self.emit(
+                                            Opcode::Rewind,
+                                            scan_cursor,
+                                            loop_end,
+                                            0,
+                                            P4::Unused,
+                                        );
+                                        self.resolve_label(loop_start, self.current_addr() as i32);
+
+                                        // Evaluate WHERE clause if present
+                                        if let Some(where_expr) = &sel.where_clause {
+                                            // We need to evaluate the WHERE expression with the subquery table
+                                            // For correlated subqueries, we need access to outer table columns
+                                            // For now, compile simple conditions
+
+                                            let cond_reg = self.alloc_reg();
+
+                                            // Save current cursor and compile with subquery's cursor
+                                            let saved_cursor = self.table_cursor;
+
+                                            // Compile WHERE condition with subquery cursor
+                                            // This is tricky for correlated subqueries
+                                            // For correlated references, we need the outer table's cursor
+                                            self.compile_exists_where(
+                                                where_expr,
+                                                cond_reg,
+                                                scan_cursor,
+                                                &table_def.columns,
+                                                alias.as_deref().unwrap_or(&name.name),
+                                            )?;
+
+                                            self.table_cursor = saved_cursor;
+
+                                            // Skip to next if condition is false
+                                            self.emit(
+                                                Opcode::IfNot,
+                                                cond_reg,
+                                                loop_end,
+                                                1,
+                                                P4::Unused,
+                                            );
+                                        }
+
+                                        // Found a matching row
+                                        self.emit(
+                                            Opcode::Integer,
+                                            if *negated { 0 } else { 1 },
+                                            dest_reg,
+                                            0,
+                                            P4::Unused,
+                                        );
+                                        self.emit(Opcode::Goto, 0, found_label, 0, P4::Unused);
+
+                                        // Loop to next row (only reached if no early exit)
+                                        self.resolve_label(loop_end, self.current_addr() as i32);
+
+                                        // No matching rows - keep initial value
+                                        self.resolve_label(found_label, self.current_addr() as i32);
+
+                                        self.emit(Opcode::Close, scan_cursor, 0, 0, P4::Unused);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             _ => {
                 // Default to NULL for unsupported expressions
                 self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile WHERE clause for EXISTS subquery with correlated reference support
+    fn compile_exists_where(
+        &mut self,
+        expr: &Expr,
+        dest_reg: i32,
+        subq_cursor: i32,
+        subq_columns: &[crate::schema::Column],
+        subq_table_name: &str,
+    ) -> Result<()> {
+        match expr {
+            Expr::Binary { op, left, right } => {
+                let left_reg = self.alloc_reg();
+                let right_reg = self.alloc_reg();
+
+                self.compile_exists_operand(
+                    left,
+                    left_reg,
+                    subq_cursor,
+                    subq_columns,
+                    subq_table_name,
+                )?;
+                self.compile_exists_operand(
+                    right,
+                    right_reg,
+                    subq_cursor,
+                    subq_columns,
+                    subq_table_name,
+                )?;
+
+                // Emit comparison
+                let is_comparison = matches!(
+                    op,
+                    crate::parser::ast::BinaryOp::Eq
+                        | crate::parser::ast::BinaryOp::Ne
+                        | crate::parser::ast::BinaryOp::Lt
+                        | crate::parser::ast::BinaryOp::Le
+                        | crate::parser::ast::BinaryOp::Gt
+                        | crate::parser::ast::BinaryOp::Ge
+                );
+
+                if is_comparison {
+                    let set_true_label = self.alloc_label();
+                    let end_label = self.alloc_label();
+
+                    // Default to false
+                    self.emit(Opcode::Integer, 0, dest_reg, 0, P4::Unused);
+
+                    let cmp_opcode = match op {
+                        crate::parser::ast::BinaryOp::Eq => Opcode::Eq,
+                        crate::parser::ast::BinaryOp::Ne => Opcode::Ne,
+                        crate::parser::ast::BinaryOp::Lt => Opcode::Lt,
+                        crate::parser::ast::BinaryOp::Le => Opcode::Le,
+                        crate::parser::ast::BinaryOp::Gt => Opcode::Gt,
+                        crate::parser::ast::BinaryOp::Ge => Opcode::Ge,
+                        _ => Opcode::Eq,
+                    };
+                    self.emit(cmp_opcode, right_reg, set_true_label, left_reg, P4::Unused);
+
+                    self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+
+                    self.resolve_label(set_true_label, self.current_addr() as i32);
+                    self.emit(Opcode::Integer, 1, dest_reg, 0, P4::Unused);
+
+                    self.resolve_label(end_label, self.current_addr() as i32);
+                } else {
+                    // Non-comparison binary ops
+                    self.emit(Opcode::Integer, 1, dest_reg, 0, P4::Unused);
+                }
+            }
+            _ => {
+                // Default to true (no condition)
+                self.emit(Opcode::Integer, 1, dest_reg, 0, P4::Unused);
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile an operand in EXISTS WHERE clause, handling table references
+    fn compile_exists_operand(
+        &mut self,
+        expr: &Expr,
+        dest_reg: i32,
+        subq_cursor: i32,
+        subq_columns: &[crate::schema::Column],
+        subq_table_name: &str,
+    ) -> Result<()> {
+        match expr {
+            Expr::Column(col_ref) => {
+                // Determine if this is a subquery table reference or outer table reference
+                let is_subq_ref = col_ref
+                    .table
+                    .as_ref()
+                    .map(|t| t.eq_ignore_ascii_case(subq_table_name))
+                    .unwrap_or(false);
+
+                if is_subq_ref {
+                    // Reference to subquery table - use subq_cursor
+                    let col_idx = subq_columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(&col_ref.column))
+                        .unwrap_or(0);
+                    self.emit(
+                        Opcode::Column,
+                        subq_cursor,
+                        col_idx as i32,
+                        dest_reg,
+                        P4::Unused,
+                    );
+                } else {
+                    // Reference to outer table (possibly correlated) - use main table_cursor
+                    // Find column in the main table being updated
+                    if let Some(schema) = self.schema {
+                        if let Some(table_def) = schema.table(&self.table_name) {
+                            let col_idx = table_def
+                                .columns
+                                .iter()
+                                .position(|c| c.name.eq_ignore_ascii_case(&col_ref.column))
+                                .unwrap_or(0);
+                            self.emit(
+                                Opcode::Column,
+                                self.table_cursor,
+                                col_idx as i32,
+                                dest_reg,
+                                P4::Unused,
+                            );
+                        } else {
+                            self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                        }
+                    } else {
+                        self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                    }
+                }
+            }
+            Expr::Literal(lit) => match lit {
+                crate::parser::ast::Literal::Integer(n) => {
+                    self.emit(Opcode::Integer, *n as i32, dest_reg, 0, P4::Unused);
+                }
+                crate::parser::ast::Literal::Float(f) => {
+                    self.emit(Opcode::Real, 0, dest_reg, 0, P4::Real(*f));
+                }
+                crate::parser::ast::Literal::String(s) => {
+                    self.emit(Opcode::String8, 0, dest_reg, 0, P4::Text(s.clone()));
+                }
+                crate::parser::ast::Literal::Null => {
+                    self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                }
+                _ => {
+                    self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                }
+            },
+            _ => {
+                // For other expressions, use the default compile_expr
+                self.compile_expr(expr, dest_reg)?;
             }
         }
         Ok(())

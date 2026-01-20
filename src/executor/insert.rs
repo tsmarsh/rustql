@@ -301,7 +301,7 @@ impl<'a> InsertCompiler<'a> {
     /// Steps:
     /// 1. Open source table for reading
     /// 2. Open ephemeral table to buffer rows
-    /// 3. First loop: Read from source, insert into ephemeral table
+    /// 3. First loop: Read from source, evaluate expressions, insert into ephemeral table
     /// 4. Close source cursor
     /// 5. Second loop: Read from ephemeral table, insert into target
     /// 6. Close ephemeral cursor
@@ -318,8 +318,12 @@ impl<'a> InsertCompiler<'a> {
         // For now, we support simple "SELECT * FROM table" or "SELECT cols FROM table"
         let source_table = self.get_source_table(select)?;
 
-        // Get number of columns to read from SELECT
-        let select_col_count = self.get_select_column_count(select);
+        // Extract SELECT expressions
+        let select_exprs = self.get_select_expressions(select);
+        let select_col_count = select_exprs.len();
+
+        // Build column name to index map for the source table
+        let source_col_map = self.build_source_column_map(&source_table);
 
         // Open source table for reading
         let source_cursor = self.alloc_cursor();
@@ -352,19 +356,13 @@ impl<'a> InsertCompiler<'a> {
         self.emit(Opcode::Rewind, source_cursor, read_loop_end, 0, P4::Unused);
         self.resolve_label(read_loop_start, self.current_addr() as i32);
 
-        // Read columns from source row into registers
+        // Compile each SELECT expression and store in registers
         let temp_base = self.next_reg;
         let _temp_regs = self.alloc_regs(select_col_count);
 
-        for i in 0..select_col_count {
+        for (i, expr) in select_exprs.iter().enumerate() {
             let dest_reg = temp_base + i as i32;
-            self.emit(
-                Opcode::Column,
-                source_cursor,
-                i as i32,
-                dest_reg,
-                P4::Unused,
-            );
+            self.compile_select_expr(expr, dest_reg, source_cursor, &source_col_map)?;
         }
 
         // Allocate a rowid for the ephemeral table
@@ -514,6 +512,178 @@ impl<'a> InsertCompiler<'a> {
             return count.max(1);
         }
         self.num_columns
+    }
+
+    /// Extract expressions from SELECT clause
+    fn get_select_expressions(&self, select: &SelectStmt) -> Vec<Expr> {
+        if let SelectBody::Select(core) = &select.body {
+            let mut exprs = Vec::new();
+            for col in &core.columns {
+                match col {
+                    ResultColumn::Star | ResultColumn::TableStar(_) => {
+                        // For SELECT *, generate column references for all columns
+                        for i in 0..self.num_columns {
+                            exprs.push(Expr::Column(crate::parser::ast::ColumnRef {
+                                database: None,
+                                table: None,
+                                column: format!("col{}", i),
+                                column_index: Some(i as i32),
+                            }));
+                        }
+                    }
+                    ResultColumn::Expr { expr, .. } => {
+                        exprs.push(expr.clone());
+                    }
+                }
+            }
+            if exprs.is_empty() {
+                // Fallback: return a single column reference
+                exprs.push(Expr::Column(crate::parser::ast::ColumnRef {
+                    database: None,
+                    table: None,
+                    column: "col0".to_string(),
+                    column_index: Some(0),
+                }));
+            }
+            return exprs;
+        }
+        // Fallback for compound selects
+        vec![Expr::Column(crate::parser::ast::ColumnRef {
+            database: None,
+            table: None,
+            column: "col0".to_string(),
+            column_index: Some(0),
+        })]
+    }
+
+    /// Build column name to index map for source table
+    fn build_source_column_map(&self, table_name: &str) -> HashMap<String, usize> {
+        let mut map = HashMap::new();
+        if let Some(schema) = self.schema {
+            let table_lower = table_name.to_lowercase();
+            if let Some(table) = schema.tables.get(&table_lower) {
+                for (i, col) in table.columns.iter().enumerate() {
+                    map.insert(col.name.to_lowercase(), i);
+                }
+            }
+        }
+        map
+    }
+
+    /// Compile a SELECT expression with proper column resolution
+    fn compile_select_expr(
+        &mut self,
+        expr: &Expr,
+        dest_reg: i32,
+        source_cursor: i32,
+        col_map: &HashMap<String, usize>,
+    ) -> Result<()> {
+        match expr {
+            Expr::Literal(lit) => match lit {
+                crate::parser::ast::Literal::Null => {
+                    self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                }
+                crate::parser::ast::Literal::Integer(n) => {
+                    self.emit(Opcode::Integer, *n as i32, dest_reg, 0, P4::Unused);
+                }
+                crate::parser::ast::Literal::Float(f) => {
+                    self.emit(Opcode::Real, 0, dest_reg, 0, P4::Real(*f));
+                }
+                crate::parser::ast::Literal::String(s) => {
+                    self.emit(Opcode::String8, 0, dest_reg, 0, P4::Text(s.clone()));
+                }
+                crate::parser::ast::Literal::Blob(b) => {
+                    self.emit(
+                        Opcode::Blob,
+                        b.len() as i32,
+                        dest_reg,
+                        0,
+                        P4::Blob(b.clone()),
+                    );
+                }
+                crate::parser::ast::Literal::Bool(b) => {
+                    self.emit(
+                        Opcode::Integer,
+                        if *b { 1 } else { 0 },
+                        dest_reg,
+                        0,
+                        P4::Unused,
+                    );
+                }
+                _ => {
+                    self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                }
+            },
+            Expr::Column(col_ref) => {
+                // Look up column index from the map
+                let col_name = col_ref.column.to_lowercase();
+                let col_idx = col_map.get(&col_name).copied().unwrap_or(0);
+                self.emit(
+                    Opcode::Column,
+                    source_cursor,
+                    col_idx as i32,
+                    dest_reg,
+                    P4::Unused,
+                );
+            }
+            Expr::Binary { op, left, right } => {
+                let left_reg = self.alloc_reg();
+                let right_reg = self.alloc_reg();
+                self.compile_select_expr(left, left_reg, source_cursor, col_map)?;
+                self.compile_select_expr(right, right_reg, source_cursor, col_map)?;
+
+                let opcode = match op {
+                    crate::parser::ast::BinaryOp::Add => Opcode::Add,
+                    crate::parser::ast::BinaryOp::Sub => Opcode::Subtract,
+                    crate::parser::ast::BinaryOp::Mul => Opcode::Multiply,
+                    crate::parser::ast::BinaryOp::Div => Opcode::Divide,
+                    crate::parser::ast::BinaryOp::Concat => Opcode::Concat,
+                    crate::parser::ast::BinaryOp::Mod => Opcode::Remainder,
+                    _ => Opcode::Add,
+                };
+
+                self.emit(opcode, left_reg, right_reg, dest_reg, P4::Unused);
+            }
+            Expr::Unary { op, expr: inner } => {
+                self.compile_select_expr(inner, dest_reg, source_cursor, col_map)?;
+                match op {
+                    crate::parser::ast::UnaryOp::Neg => {
+                        self.emit(Opcode::Negative, dest_reg, dest_reg, 0, P4::Unused);
+                    }
+                    crate::parser::ast::UnaryOp::Not => {
+                        self.emit(Opcode::Not, dest_reg, dest_reg, 0, P4::Unused);
+                    }
+                    _ => {}
+                }
+            }
+            Expr::Function(func_call) => {
+                // Compile function arguments
+                let arg_base = self.next_reg;
+                let argc = match &func_call.args {
+                    crate::parser::ast::FunctionArgs::Exprs(exprs) => {
+                        for arg in exprs {
+                            let reg = self.alloc_reg();
+                            self.compile_select_expr(arg, reg, source_cursor, col_map)?;
+                        }
+                        exprs.len()
+                    }
+                    crate::parser::ast::FunctionArgs::Star => 0,
+                };
+
+                self.emit(
+                    Opcode::Function,
+                    argc as i32,
+                    arg_base,
+                    dest_reg,
+                    P4::Text(func_call.name.clone()),
+                );
+            }
+            _ => {
+                // Default to NULL for unsupported expressions
+                self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+            }
+        }
+        Ok(())
     }
 
     /// Validate ORDER BY in SELECT doesn't contain aggregates without GROUP BY
@@ -1049,5 +1219,202 @@ mod tests {
         assert_eq!(compiler.conflict_flags(ConflictAction::Fail), 2);
         assert_eq!(compiler.conflict_flags(ConflictAction::Ignore), 3);
         assert_eq!(compiler.conflict_flags(ConflictAction::Replace), 4);
+    }
+
+    #[test]
+    fn test_compile_insert_select_with_expression() {
+        use crate::parser::ast::{
+            BinaryOp, ColumnRef, Distinct, FromClause, SelectBody, SelectCore, SelectStmt,
+        };
+
+        // INSERT INTO t2 SELECT a+10 FROM t1
+        let select = SelectStmt {
+            with: None,
+            body: SelectBody::Select(SelectCore {
+                distinct: Distinct::All,
+                columns: vec![ResultColumn::Expr {
+                    expr: Expr::Binary {
+                        op: BinaryOp::Add,
+                        left: Box::new(Expr::Column(ColumnRef {
+                            database: None,
+                            table: None,
+                            column: "a".to_string(),
+                            column_index: None,
+                        })),
+                        right: Box::new(Expr::Literal(Literal::Integer(10))),
+                    },
+                    alias: None,
+                }],
+                from: Some(FromClause {
+                    tables: vec![TableRef::Table {
+                        name: QualifiedName::new("t1"),
+                        alias: None,
+                        indexed_by: None,
+                    }],
+                }),
+                where_clause: None,
+                group_by: None,
+                having: None,
+                window: None,
+            }),
+            order_by: None,
+            limit: None,
+        };
+
+        let insert = InsertStmt {
+            with: None,
+            or_action: None,
+            table: QualifiedName::new("t2"),
+            alias: None,
+            columns: None,
+            source: InsertSource::Select(Box::new(select)),
+            on_conflict: None,
+            returning: None,
+        };
+
+        let ops = compile_insert(&insert).unwrap();
+        assert!(!ops.is_empty());
+
+        // Should have OpenRead for source table
+        assert!(ops.iter().any(|op| op.opcode == Opcode::OpenRead));
+
+        // Should have OpenEphemeral for buffering (critical for self-referential queries)
+        assert!(ops.iter().any(|op| op.opcode == Opcode::OpenEphemeral));
+
+        // Should have Add opcode for the a+10 expression
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::Add),
+            "Should compile binary Add expression"
+        );
+
+        // Should have proper loop structure with Rewind and Next
+        assert!(ops.iter().any(|op| op.opcode == Opcode::Rewind));
+        assert!(ops.iter().any(|op| op.opcode == Opcode::Next));
+    }
+
+    #[test]
+    fn test_get_select_expressions_extracts_binary_expr() {
+        use crate::parser::ast::{
+            BinaryOp, ColumnRef, Distinct, SelectBody, SelectCore, SelectStmt,
+        };
+
+        let compiler = InsertCompiler::new();
+
+        let select = SelectStmt {
+            with: None,
+            body: SelectBody::Select(SelectCore {
+                distinct: Distinct::All,
+                columns: vec![ResultColumn::Expr {
+                    expr: Expr::Binary {
+                        op: BinaryOp::Add,
+                        left: Box::new(Expr::Column(ColumnRef {
+                            database: None,
+                            table: None,
+                            column: "x".to_string(),
+                            column_index: None,
+                        })),
+                        right: Box::new(Expr::Literal(Literal::Integer(100))),
+                    },
+                    alias: None,
+                }],
+                from: None,
+                where_clause: None,
+                group_by: None,
+                having: None,
+                window: None,
+            }),
+            order_by: None,
+            limit: None,
+        };
+
+        let exprs = compiler.get_select_expressions(&select);
+        assert_eq!(exprs.len(), 1);
+
+        // Verify it's a Binary expression
+        match &exprs[0] {
+            Expr::Binary { op, .. } => {
+                assert!(matches!(op, BinaryOp::Add));
+            }
+            _ => panic!("Expected Binary expression, got {:?}", exprs[0]),
+        }
+    }
+
+    #[test]
+    fn test_compile_select_expr_handles_column_reference() {
+        let mut compiler = InsertCompiler::new();
+        compiler.next_cursor = 1; // Simulate having allocated a cursor
+
+        let mut col_map = HashMap::new();
+        col_map.insert("a".to_string(), 0usize);
+        col_map.insert("b".to_string(), 1usize);
+
+        let expr = Expr::Column(crate::parser::ast::ColumnRef {
+            database: None,
+            table: None,
+            column: "a".to_string(),
+            column_index: None,
+        });
+
+        let dest_reg = 5;
+        let source_cursor = 0;
+        compiler
+            .compile_select_expr(&expr, dest_reg, source_cursor, &col_map)
+            .unwrap();
+
+        // Should emit Column opcode with correct cursor and column index
+        assert_eq!(compiler.ops.len(), 1);
+        let op = &compiler.ops[0];
+        assert_eq!(op.opcode, Opcode::Column);
+        assert_eq!(op.p1, source_cursor); // cursor
+        assert_eq!(op.p2, 0); // column index for "a"
+        assert_eq!(op.p3, dest_reg); // destination register
+    }
+
+    #[test]
+    fn test_compile_select_expr_handles_binary_add() {
+        let mut compiler = InsertCompiler::new();
+
+        let col_map = HashMap::new(); // Empty map - literals don't need column resolution
+
+        // Expression: 5 + 10
+        let expr = Expr::Binary {
+            op: crate::parser::ast::BinaryOp::Add,
+            left: Box::new(Expr::Literal(Literal::Integer(5))),
+            right: Box::new(Expr::Literal(Literal::Integer(10))),
+        };
+
+        let dest_reg = 1;
+        compiler
+            .compile_select_expr(&expr, dest_reg, 0, &col_map)
+            .unwrap();
+
+        // Should have: Integer(5), Integer(10), Add
+        assert!(compiler.ops.iter().any(|op| op.opcode == Opcode::Integer));
+        assert!(compiler.ops.iter().any(|op| op.opcode == Opcode::Add));
+
+        // The Add should write to dest_reg
+        let add_op = compiler
+            .ops
+            .iter()
+            .find(|op| op.opcode == Opcode::Add)
+            .unwrap();
+        assert_eq!(add_op.p3, dest_reg);
+    }
+
+    #[test]
+    fn test_build_source_column_map_with_schema() {
+        use crate::schema::{Column, Schema, Table};
+        use std::sync::Arc;
+
+        let mut schema = Schema::new();
+        let mut table = Table::new("mytable");
+        table.columns = vec![Column::new("id"), Column::new("value")];
+        schema.tables.insert("mytable".to_string(), Arc::new(table));
+
+        let compiler = InsertCompiler::with_schema(&schema);
+        let col_map = compiler.build_source_column_map("mytable");
+
+        assert_eq!(col_map.get("id"), Some(&0));
+        assert_eq!(col_map.get("value"), Some(&1));
     }
 }

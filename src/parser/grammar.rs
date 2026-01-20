@@ -442,47 +442,85 @@ impl<'a> Parser<'a> {
         Ok(table)
     }
 
-    fn parse_join_type(&mut self) -> Option<JoinType> {
+    fn parse_join_type(&mut self) -> Option<JoinFlags> {
+        // Parse join type keywords and return appropriate JoinFlags
+        // Matches SQLite's JT_* flags from sqliteInt.h
+
         if self.match_token(TokenKind::Natural) {
             if self.match_token(TokenKind::Left) {
-                self.match_token(TokenKind::Outer);
-                return Some(JoinType::NaturalLeft);
+                let has_outer = self.match_token(TokenKind::Outer);
+                // NATURAL LEFT [OUTER] JOIN
+                let mut flags = JoinFlags::NATURAL | JoinFlags::LEFT;
+                if has_outer {
+                    flags |= JoinFlags::OUTER;
+                }
+                return Some(flags);
             } else if self.match_token(TokenKind::Right) {
-                self.match_token(TokenKind::Outer);
-                return Some(JoinType::NaturalRight);
+                let has_outer = self.match_token(TokenKind::Outer);
+                // NATURAL RIGHT [OUTER] JOIN
+                let mut flags = JoinFlags::NATURAL | JoinFlags::RIGHT;
+                if has_outer {
+                    flags |= JoinFlags::OUTER;
+                }
+                return Some(flags);
             } else if self.match_token(TokenKind::Full) {
-                self.match_token(TokenKind::Outer);
-                return Some(JoinType::NaturalFull);
+                let has_outer = self.match_token(TokenKind::Outer);
+                // NATURAL FULL [OUTER] JOIN = LEFT | RIGHT
+                let mut flags = JoinFlags::NATURAL | JoinFlags::LEFT | JoinFlags::RIGHT;
+                if has_outer {
+                    flags |= JoinFlags::OUTER;
+                }
+                return Some(flags);
             } else {
-                return Some(JoinType::Natural);
+                // NATURAL [INNER] JOIN
+                self.match_token(TokenKind::Inner);
+                return Some(JoinFlags::NATURAL | JoinFlags::INNER);
             }
         }
 
         if self.match_token(TokenKind::Cross) {
-            return Some(JoinType::Cross);
+            // CROSS JOIN
+            return Some(JoinFlags::INNER | JoinFlags::CROSS);
         }
 
         if self.match_token(TokenKind::Left) {
-            self.match_token(TokenKind::Outer);
-            return Some(JoinType::Left);
+            let has_outer = self.match_token(TokenKind::Outer);
+            // LEFT [OUTER] JOIN
+            let mut flags = JoinFlags::LEFT;
+            if has_outer {
+                flags |= JoinFlags::OUTER;
+            }
+            return Some(flags);
         }
 
         if self.match_token(TokenKind::Right) {
-            self.match_token(TokenKind::Outer);
-            return Some(JoinType::Right);
+            let has_outer = self.match_token(TokenKind::Outer);
+            // RIGHT [OUTER] JOIN
+            let mut flags = JoinFlags::RIGHT;
+            if has_outer {
+                flags |= JoinFlags::OUTER;
+            }
+            return Some(flags);
         }
 
         if self.match_token(TokenKind::Full) {
-            self.match_token(TokenKind::Outer);
-            return Some(JoinType::Full);
+            let has_outer = self.match_token(TokenKind::Outer);
+            // FULL [OUTER] JOIN
+            let mut flags = JoinFlags::LEFT | JoinFlags::RIGHT;
+            if has_outer {
+                flags |= JoinFlags::OUTER;
+            }
+            return Some(flags);
         }
 
         if self.match_token(TokenKind::Inner) {
-            return Some(JoinType::Inner);
+            // INNER JOIN
+            return Some(JoinFlags::INNER);
         }
 
         if self.check(TokenKind::Join) {
-            return Some(JoinType::Inner);
+            // Plain JOIN = INNER JOIN
+            return Some(JoinFlags::INNER);
         }
 
         None
@@ -1496,11 +1534,44 @@ impl<'a> Parser<'a> {
 
     fn parse_indexed_column(&mut self) -> Result<IndexedColumn> {
         let column = if self.match_token(TokenKind::LParen) {
+            // Explicit parenthesized expression
             let expr = self.parse_expr()?;
             self.expect(TokenKind::RParen)?;
             IndexedColumnKind::Expr(Box::new(expr))
+        } else if self.check(TokenKind::Identifier) || self.check(TokenKind::String) {
+            // Could be a simple column name or a function call expression
+            // Peek ahead to see if it's followed by '(' indicating a function call
+            let name = self.expect_identifier_or_string()?;
+            if self.check(TokenKind::LParen) {
+                // It's a function call - parse the full expression
+                // We need to re-parse as an expression since we already consumed the name
+                // Create an Expr::Column for the name and then parse the function call
+                self.expect(TokenKind::LParen)?;
+                let args = if self.check(TokenKind::RParen) {
+                    crate::parser::ast::FunctionArgs::Exprs(vec![])
+                } else if self.match_token(TokenKind::Star) {
+                    crate::parser::ast::FunctionArgs::Star
+                } else {
+                    let mut exprs = vec![self.parse_expr()?];
+                    while self.match_token(TokenKind::Comma) {
+                        exprs.push(self.parse_expr()?);
+                    }
+                    crate::parser::ast::FunctionArgs::Exprs(exprs)
+                };
+                self.expect(TokenKind::RParen)?;
+                let func_expr = Expr::Function(crate::parser::ast::FunctionCall {
+                    name,
+                    args,
+                    distinct: false,
+                    filter: None,
+                    over: None,
+                });
+                IndexedColumnKind::Expr(Box::new(func_expr))
+            } else {
+                IndexedColumnKind::Name(name)
+            }
         } else {
-            IndexedColumnKind::Name(self.expect_identifier()?)
+            return Err(self.error("expected column name or expression"));
         };
 
         let collation = if self.match_token(TokenKind::Collate) {

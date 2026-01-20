@@ -206,13 +206,271 @@ pub enum ResultColumn {
     Expr { expr: Expr, alias: Option<String> },
 }
 
-/// FROM clause
+// ============================================================================
+// FROM clause - matches SQLite's SrcList/SrcItem structure
+// ============================================================================
+
+/// FROM clause as a flat list of source items (like SQLite's SrcList)
+///
+/// SQLite represents `FROM t1 JOIN t2 ON x JOIN t3 USING(a)` as a flat array:
+/// ```text
+/// items[0] = { source: t1, join_type: 0 }
+/// items[1] = { source: t2, join_type: INNER, on_clause: x }
+/// items[2] = { source: t3, join_type: INNER, using_columns: [a] }
+/// ```
+///
+/// The join_type on each item describes the join with the *previous* item.
+/// The first item's join_type is always empty (no previous item to join with).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SrcList {
+    pub items: Vec<SrcItem>,
+}
+
+/// A single source item in FROM clause (like SQLite's SrcItem)
+#[derive(Debug, Clone, PartialEq)]
+pub struct SrcItem {
+    /// The source (table, subquery, or table function)
+    pub source: TableSource,
+    /// Table alias (the "B" in "A AS B")
+    pub alias: Option<String>,
+    /// Join type flags for joining with the *previous* item in the list.
+    /// For the first item, this should be JoinFlags::empty().
+    pub join_type: JoinFlags,
+    /// ON clause - mutually exclusive with using_columns
+    pub on_clause: Option<Box<Expr>>,
+    /// USING columns - mutually exclusive with on_clause
+    pub using_columns: Option<Vec<String>>,
+    /// INDEXED BY / NOT INDEXED clause
+    pub indexed_by: Option<IndexedBy>,
+}
+
+impl SrcItem {
+    /// Create a simple table source item (first item in FROM, no join)
+    pub fn table(name: QualifiedName) -> Self {
+        SrcItem {
+            source: TableSource::Table(name),
+            alias: None,
+            join_type: JoinFlags::empty(),
+            on_clause: None,
+            using_columns: None,
+            indexed_by: None,
+        }
+    }
+
+    /// Create a table source with alias
+    pub fn table_with_alias(name: QualifiedName, alias: String) -> Self {
+        SrcItem {
+            source: TableSource::Table(name),
+            alias: Some(alias),
+            join_type: JoinFlags::empty(),
+            on_clause: None,
+            using_columns: None,
+            indexed_by: None,
+        }
+    }
+}
+
+/// The actual source of data in a FROM item
+#[derive(Debug, Clone, PartialEq)]
+pub enum TableSource {
+    /// Simple table reference
+    Table(QualifiedName),
+    /// Subquery (SELECT ...)
+    Subquery(Box<SelectStmt>),
+    /// Table-valued function
+    TableFunction { name: String, args: Vec<Expr> },
+}
+
+bitflags::bitflags! {
+    /// Join type flags - matches SQLite's JT_* flags from sqliteInt.h
+    ///
+    /// These flags can be combined. For example:
+    /// - `LEFT | OUTER` = LEFT OUTER JOIN
+    /// - `NATURAL | INNER` = NATURAL JOIN
+    /// - `NATURAL | LEFT | OUTER` = NATURAL LEFT OUTER JOIN
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct JoinFlags: u8 {
+        /// Any kind of inner or cross join (JT_INNER)
+        const INNER   = 0x01;
+        /// Explicit use of the CROSS keyword (JT_CROSS)
+        const CROSS   = 0x02;
+        /// True for a "natural" join (JT_NATURAL)
+        const NATURAL = 0x04;
+        /// Left outer join (JT_LEFT)
+        const LEFT    = 0x08;
+        /// Right outer join (JT_RIGHT)
+        const RIGHT   = 0x10;
+        /// The "OUTER" keyword is present (JT_OUTER)
+        const OUTER   = 0x20;
+    }
+}
+
+impl JoinFlags {
+    /// Check if this is an outer join (LEFT, RIGHT, or FULL)
+    pub fn is_outer(&self) -> bool {
+        self.intersects(JoinFlags::LEFT | JoinFlags::RIGHT)
+    }
+
+    /// Check if this is a NATURAL join
+    pub fn is_natural(&self) -> bool {
+        self.contains(JoinFlags::NATURAL)
+    }
+}
+
+/// INDEXED BY clause
+#[derive(Debug, Clone, PartialEq)]
+pub enum IndexedBy {
+    /// INDEXED BY index_name
+    Index(String),
+    /// NOT INDEXED
+    NotIndexed,
+}
+
+// ============================================================================
+// Legacy FROM clause types - to be removed after migration
+// ============================================================================
+
+/// Legacy FROM clause - wrapper around TableRef tree
+/// Will be converted to SrcList before code generation
 #[derive(Debug, Clone, PartialEq)]
 pub struct FromClause {
     pub tables: Vec<TableRef>,
 }
 
-/// Table reference in FROM clause
+impl FromClause {
+    /// Convert legacy FROM clause to flat SrcList (SQLite model)
+    pub fn to_src_list(&self) -> SrcList {
+        let mut items = Vec::new();
+        for table_ref in &self.tables {
+            flatten_table_ref(table_ref, &mut items, JoinFlags::empty());
+        }
+        SrcList { items }
+    }
+}
+
+/// Flatten a TableRef tree into a flat list of SrcItems
+fn flatten_table_ref(table_ref: &TableRef, items: &mut Vec<SrcItem>, join_type: JoinFlags) {
+    match table_ref {
+        TableRef::Table {
+            name,
+            alias,
+            indexed_by,
+        } => {
+            items.push(SrcItem {
+                source: TableSource::Table(name.clone()),
+                alias: alias.clone(),
+                join_type,
+                on_clause: None,
+                using_columns: None,
+                indexed_by: indexed_by.clone(),
+            });
+        }
+        TableRef::Subquery { query, alias } => {
+            items.push(SrcItem {
+                source: TableSource::Subquery(query.clone()),
+                alias: alias.clone(),
+                join_type,
+                on_clause: None,
+                using_columns: None,
+                indexed_by: None,
+            });
+        }
+        TableRef::Join {
+            left,
+            join_type: jt,
+            right,
+            constraint,
+        } => {
+            // Flatten left side first (with inherited join_type for first item)
+            flatten_table_ref(left, items, join_type);
+
+            // Right side gets the actual join type and constraint
+            let (on_clause, using_columns) = match constraint {
+                Some(JoinConstraint::On(expr)) => (Some(expr.clone()), None),
+                Some(JoinConstraint::Using(cols)) => (None, Some(cols.clone())),
+                None => (None, None),
+            };
+
+            // Flatten right side with the join info
+            match right.as_ref() {
+                TableRef::Table {
+                    name,
+                    alias,
+                    indexed_by,
+                } => {
+                    items.push(SrcItem {
+                        source: TableSource::Table(name.clone()),
+                        alias: alias.clone(),
+                        join_type: *jt,
+                        on_clause,
+                        using_columns,
+                        indexed_by: indexed_by.clone(),
+                    });
+                }
+                TableRef::Subquery { query, alias } => {
+                    items.push(SrcItem {
+                        source: TableSource::Subquery(query.clone()),
+                        alias: alias.clone(),
+                        join_type: *jt,
+                        on_clause,
+                        using_columns,
+                        indexed_by: None,
+                    });
+                }
+                TableRef::TableFunction { name, args, alias } => {
+                    items.push(SrcItem {
+                        source: TableSource::TableFunction {
+                            name: name.clone(),
+                            args: args.clone(),
+                        },
+                        alias: alias.clone(),
+                        join_type: *jt,
+                        on_clause,
+                        using_columns,
+                        indexed_by: None,
+                    });
+                }
+                // For nested joins on the right, we need to handle recursively
+                // but apply the constraint to the first item of the right side
+                TableRef::Join { .. } | TableRef::Parens(_) => {
+                    let start_idx = items.len();
+                    flatten_table_ref(right, items, *jt);
+                    // Apply constraint to first item added from right side
+                    if start_idx < items.len() {
+                        items[start_idx].on_clause = on_clause;
+                        items[start_idx].using_columns = using_columns;
+                    }
+                }
+            }
+        }
+        TableRef::TableFunction { name, args, alias } => {
+            items.push(SrcItem {
+                source: TableSource::TableFunction {
+                    name: name.clone(),
+                    args: args.clone(),
+                },
+                alias: alias.clone(),
+                join_type,
+                on_clause: None,
+                using_columns: None,
+                indexed_by: None,
+            });
+        }
+        TableRef::Parens(inner) => {
+            flatten_table_ref(inner, items, join_type);
+        }
+    }
+}
+
+/// Legacy JOIN constraint enum
+#[derive(Debug, Clone, PartialEq)]
+pub enum JoinConstraint {
+    On(Box<Expr>),
+    Using(Vec<String>),
+}
+
+/// Legacy table reference enum (tree structure)
+/// Parser produces this, then it's flattened to SrcList
 #[derive(Debug, Clone, PartialEq)]
 pub enum TableRef {
     /// Simple table reference
@@ -226,10 +484,10 @@ pub enum TableRef {
         query: Box<SelectStmt>,
         alias: Option<String>,
     },
-    /// JOIN
+    /// JOIN - will be flattened into SrcList
     Join {
         left: Box<TableRef>,
-        join_type: JoinType,
+        join_type: JoinFlags,
         right: Box<TableRef>,
         constraint: Option<JoinConstraint>,
     },
@@ -243,36 +501,8 @@ pub enum TableRef {
     Parens(Box<TableRef>),
 }
 
-/// INDEXED BY clause
-#[derive(Debug, Clone, PartialEq)]
-pub enum IndexedBy {
-    /// INDEXED BY index_name
-    Index(String),
-    /// NOT INDEXED
-    NotIndexed,
-}
-
-/// JOIN type
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum JoinType {
-    #[default]
-    Inner,
-    Left,
-    Right,
-    Full,
-    Cross,
-    Natural,
-    NaturalLeft,
-    NaturalRight,
-    NaturalFull,
-}
-
-/// JOIN constraint
-#[derive(Debug, Clone, PartialEq)]
-pub enum JoinConstraint {
-    On(Box<Expr>),
-    Using(Vec<String>),
-}
+// Type alias for gradual migration - parser still uses JoinType
+pub type JoinType = JoinFlags;
 
 /// ORDER BY term
 #[derive(Debug, Clone, PartialEq)]

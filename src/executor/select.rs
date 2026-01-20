@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use crate::error::{Error, ErrorCode, Result};
 use crate::executor::window::{select_has_window_functions, WindowCompiler};
 use crate::parser::ast::{
-    BinaryOp, CompoundOp, Distinct, Expr, FromClause, JoinType, LikeOp, LimitClause, Literal,
-    OrderingTerm, ResultColumn, SelectBody, SelectCore, SelectStmt, SortOrder, TableRef,
-    WithClause,
+    BinaryOp, ColumnRef, CompoundOp, Distinct, Expr, FromClause, JoinFlags, JoinType, LikeOp,
+    LimitClause, Literal, OrderingTerm, ResultColumn, SelectBody, SelectCore, SelectStmt,
+    SortOrder, TableRef, WithClause,
 };
 use crate::schema::{Affinity, Table};
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
@@ -163,6 +163,9 @@ pub struct SelectCompiler<'s> {
     full_column_names: bool,
     /// Counter for anonymous subquery naming (subquery-0, subquery-1, etc.)
     next_subquery: usize,
+    /// Join conditions collected from ON/USING/NATURAL in FROM clause
+    /// These are merged with WHERE clause during compilation
+    join_conditions: Vec<Expr>,
 }
 
 impl<'s> SelectCompiler<'s> {
@@ -196,6 +199,7 @@ impl<'s> SelectCompiler<'s> {
             full_column_names: false, // Default OFF
             next_subquery: 0,
             compound_aliases: HashMap::new(),
+            join_conditions: Vec::new(),
         }
     }
 
@@ -229,6 +233,7 @@ impl<'s> SelectCompiler<'s> {
             full_column_names: false, // Default OFF
             next_subquery: 0,
             compound_aliases: HashMap::new(),
+            join_conditions: Vec::new(),
         }
     }
 
@@ -498,10 +503,14 @@ impl<'s> SelectCompiler<'s> {
         // Pre-scan result columns to extract alias expressions (for WHERE clause alias resolution)
         self.prescan_result_aliases(&core.columns);
 
-        let (fts3_filter, remaining_where) = match core.where_clause.as_deref() {
+        let (fts3_filter, original_where) = match core.where_clause.as_deref() {
             Some(expr) => self.split_virtual_filter(expr),
             None => (None, None),
         };
+
+        // Merge join conditions (from NATURAL/USING/ON) with WHERE clause
+        // This follows SQLite's approach of adding join conditions to pWhere
+        let remaining_where = self.merge_join_conditions(original_where);
 
         // Determine if we need DISTINCT processing
         let distinct_cursor = if core.distinct == Distinct::Distinct {
@@ -556,15 +565,8 @@ impl<'s> SelectCompiler<'s> {
         // Emit Rewind/loop structure for each table level
         // First, allocate found_match registers for outer joins (but don't emit initialization yet)
         for i in 0..table_cursors.len() {
-            let is_outer_join = matches!(
-                table_join_types[i],
-                JoinType::Left
-                    | JoinType::Right
-                    | JoinType::Full
-                    | JoinType::NaturalLeft
-                    | JoinType::NaturalRight
-                    | JoinType::NaturalFull
-            );
+            // Outer join if LEFT or RIGHT flags are set
+            let is_outer_join = table_join_types[i].is_outer();
             let found_match_reg = if is_outer_join && i > 0 {
                 Some(self.alloc_reg())
             } else {
@@ -1363,11 +1365,327 @@ impl<'s> SelectCompiler<'s> {
     }
 
     /// Compile FROM clause - open cursors for tables
+    ///
+    /// This converts the FROM clause to a flat SrcList (like SQLite) and then
+    /// opens cursors for each table. Join constraints (ON/USING/NATURAL) are
+    /// collected and processed after all tables are registered.
     fn compile_from_clause(&mut self, from: &FromClause) -> Result<()> {
-        for table_ref in &from.tables {
-            self.compile_table_ref(table_ref, JoinType::Inner)?;
+        // Convert tree structure to flat SrcList (SQLite model)
+        let src_list = from.to_src_list();
+
+        // Open cursors for each source item
+        for (i, item) in src_list.items.iter().enumerate() {
+            self.compile_src_item(item, i)?;
+        }
+
+        // Process join constraints (NATURAL, USING, ON) and add to join_conditions
+        self.process_joins(&src_list)?;
+
+        Ok(())
+    }
+
+    /// Compile a single source item from the SrcList
+    fn compile_src_item(
+        &mut self,
+        item: &crate::parser::ast::SrcItem,
+        _index: usize,
+    ) -> Result<()> {
+        use crate::parser::ast::TableSource;
+
+        match &item.source {
+            TableSource::Table(name) => {
+                let cursor = self.alloc_cursor();
+                let table_name = &name.name;
+                let table_name_lower = table_name.to_lowercase();
+
+                // Look up table in schema if available
+                let schema_table = self.lookup_table_schema(&table_name_lower);
+
+                // Emit OpenRead for the table
+                if schema_table.is_some() {
+                    self.emit(Opcode::OpenRead, cursor, 0, 0, P4::Text(table_name.clone()));
+                } else {
+                    // CTE or unknown table - will be handled elsewhere
+                    self.emit(Opcode::OpenRead, cursor, 0, 0, P4::Text(table_name.clone()));
+                }
+
+                let display_name = item.alias.clone().unwrap_or_else(|| table_name.clone());
+                self.tables.push(TableInfo {
+                    name: display_name,
+                    table_name: table_name.clone(),
+                    cursor,
+                    schema_table,
+                    is_subquery: false,
+                    join_type: item.join_type,
+                    subquery_columns: None,
+                });
+            }
+            TableSource::Subquery(query) => {
+                let cursor = self.alloc_cursor();
+
+                // Compile subquery to ephemeral table
+                let (subquery_ops, subquery_col_names) = {
+                    let mut sub_compiler = SelectCompiler::new();
+                    if let Some(schema) = self.schema {
+                        sub_compiler.schema = Some(schema);
+                    }
+                    sub_compiler.compile(query, &SelectDest::Output)?;
+                    (sub_compiler.ops, sub_compiler.result_column_names)
+                };
+
+                // Create ephemeral table for subquery results
+                self.emit(
+                    Opcode::OpenEphemeral,
+                    cursor,
+                    subquery_col_names.len() as i32,
+                    0,
+                    P4::Unused,
+                );
+
+                // Execute subquery and populate ephemeral table
+                let sub_base_reg = self.alloc_reg();
+                for op in subquery_ops {
+                    self.ops.push(op);
+                }
+                self.emit(Opcode::Insert, cursor, sub_base_reg, 0, P4::Unused);
+
+                let subquery_name = item.alias.clone().unwrap_or_else(|| {
+                    let name = format!("(subquery-{})", self.next_subquery);
+                    self.next_subquery += 1;
+                    name
+                });
+                self.tables.push(TableInfo {
+                    name: subquery_name,
+                    table_name: String::new(),
+                    cursor,
+                    schema_table: None,
+                    is_subquery: true,
+                    join_type: item.join_type,
+                    subquery_columns: Some(subquery_col_names),
+                });
+            }
+            TableSource::TableFunction { name, args: _ } => {
+                return Err(Error::with_message(
+                    ErrorCode::Error,
+                    format!("Table-valued function {} not yet supported", name),
+                ));
+            }
         }
         Ok(())
+    }
+
+    /// Look up table schema, returning None if not found
+    fn lookup_table_schema(&self, table_name_lower: &str) -> Option<std::sync::Arc<Table>> {
+        use crate::schema::Column;
+
+        if table_name_lower == "sqlite_master" {
+            // Create a virtual schema for sqlite_master
+            Some(std::sync::Arc::new(Table {
+                name: "sqlite_master".to_string(),
+                db_idx: 0,
+                root_page: 1,
+                columns: vec![
+                    Column {
+                        name: "type".to_string(),
+                        type_name: Some("TEXT".to_string()),
+                        affinity: Affinity::Text,
+                        ..Default::default()
+                    },
+                    Column {
+                        name: "name".to_string(),
+                        type_name: Some("TEXT".to_string()),
+                        affinity: Affinity::Text,
+                        ..Default::default()
+                    },
+                    Column {
+                        name: "tbl_name".to_string(),
+                        type_name: Some("TEXT".to_string()),
+                        affinity: Affinity::Text,
+                        ..Default::default()
+                    },
+                    Column {
+                        name: "rootpage".to_string(),
+                        type_name: Some("INTEGER".to_string()),
+                        affinity: Affinity::Integer,
+                        ..Default::default()
+                    },
+                    Column {
+                        name: "sql".to_string(),
+                        type_name: Some("TEXT".to_string()),
+                        affinity: Affinity::Text,
+                        ..Default::default()
+                    },
+                ],
+                primary_key: None,
+                indexes: Vec::new(),
+                without_rowid: false,
+                strict: false,
+                is_virtual: false,
+                virtual_module: None,
+                virtual_args: Vec::new(),
+                foreign_keys: Vec::new(),
+                checks: Vec::new(),
+                autoincrement: false,
+                sql: None,
+                row_estimate: 0,
+            }))
+        } else if let Some(schema) = self.schema {
+            schema.table(table_name_lower).map(|t| t.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Process join constraints (NATURAL, USING, ON) and generate WHERE conditions
+    ///
+    /// This matches SQLite's sqlite3ProcessJoin() function from select.c:
+    /// - NATURAL joins: find common columns between tables and generate equalities
+    /// - USING: generate equalities for specified columns
+    /// - ON: use the expression directly
+    fn process_joins(&mut self, src_list: &crate::parser::ast::SrcList) -> Result<()> {
+        use crate::parser::ast::{BinaryOp, ColumnRef, Expr};
+
+        for (i, item) in src_list.items.iter().enumerate() {
+            if i == 0 {
+                // First table has no join with previous
+                continue;
+            }
+
+            let current_table = &self.tables[i];
+
+            // Handle NATURAL join - find common columns
+            if item.join_type.is_natural() {
+                let common_cols = self.find_common_columns(i);
+                for col_name in common_cols {
+                    // Generate: prev_table.col = current_table.col
+                    let left_expr = Expr::Column(ColumnRef {
+                        database: None,
+                        table: Some(self.tables[i - 1].name.clone()),
+                        column: col_name.clone(),
+                        column_index: None,
+                    });
+                    let right_expr = Expr::Column(ColumnRef {
+                        database: None,
+                        table: Some(current_table.name.clone()),
+                        column: col_name,
+                        column_index: None,
+                    });
+                    let eq_expr = Expr::Binary {
+                        op: BinaryOp::Eq,
+                        left: Box::new(left_expr),
+                        right: Box::new(right_expr),
+                    };
+                    self.join_conditions.push(eq_expr);
+                }
+            }
+            // Handle USING clause
+            else if let Some(using_cols) = &item.using_columns {
+                for col_name in using_cols {
+                    // Generate: prev_table.col = current_table.col
+                    let left_expr = Expr::Column(ColumnRef {
+                        database: None,
+                        table: Some(self.tables[i - 1].name.clone()),
+                        column: col_name.clone(),
+                        column_index: None,
+                    });
+                    let right_expr = Expr::Column(ColumnRef {
+                        database: None,
+                        table: Some(current_table.name.clone()),
+                        column: col_name.clone(),
+                        column_index: None,
+                    });
+                    let eq_expr = Expr::Binary {
+                        op: BinaryOp::Eq,
+                        left: Box::new(left_expr),
+                        right: Box::new(right_expr),
+                    };
+                    self.join_conditions.push(eq_expr);
+                }
+            }
+            // Handle ON clause
+            else if let Some(on_expr) = &item.on_clause {
+                // on_expr is &Box<Expr>, so we need to deref twice to get &Expr
+                self.join_conditions.push((**on_expr).clone());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Find column names that exist in both the current table and any previous table
+    fn find_common_columns(&self, current_idx: usize) -> Vec<String> {
+        let mut common = Vec::new();
+        let current_table = &self.tables[current_idx];
+
+        // Get columns from current table
+        let current_cols: Vec<String> = if let Some(schema) = &current_table.schema_table {
+            schema
+                .columns
+                .iter()
+                .map(|c| c.name.to_lowercase())
+                .collect()
+        } else if let Some(subq_cols) = &current_table.subquery_columns {
+            subq_cols.iter().map(|c| c.to_lowercase()).collect()
+        } else {
+            return common;
+        };
+
+        // Check against all previous tables
+        for prev_idx in 0..current_idx {
+            let prev_table = &self.tables[prev_idx];
+            let prev_cols: Vec<String> = if let Some(schema) = &prev_table.schema_table {
+                schema
+                    .columns
+                    .iter()
+                    .map(|c| c.name.to_lowercase())
+                    .collect()
+            } else if let Some(subq_cols) = &prev_table.subquery_columns {
+                subq_cols.iter().map(|c| c.to_lowercase()).collect()
+            } else {
+                continue;
+            };
+
+            // Find intersection
+            for col in &current_cols {
+                if prev_cols.contains(col) && !common.contains(col) {
+                    common.push(col.clone());
+                }
+            }
+        }
+
+        common
+    }
+
+    /// Merge collected join conditions with the original WHERE clause
+    ///
+    /// Returns a new WHERE expression that combines:
+    /// - The original WHERE clause (if any)
+    /// - All join conditions from NATURAL/USING/ON clauses
+    ///
+    /// Conditions are combined with AND.
+    fn merge_join_conditions(&mut self, original_where: Option<Expr>) -> Option<Expr> {
+        if self.join_conditions.is_empty() {
+            return original_where;
+        }
+
+        // Take ownership of join conditions
+        let conditions = std::mem::take(&mut self.join_conditions);
+
+        // Build combined expression: original_where AND cond1 AND cond2 AND ...
+        let mut result = original_where;
+
+        for cond in conditions {
+            result = Some(match result {
+                Some(existing) => Expr::Binary {
+                    op: BinaryOp::And,
+                    left: Box::new(existing),
+                    right: Box::new(cond),
+                },
+                None => cond,
+            });
+        }
+
+        result
     }
 
     /// Compile a table reference
@@ -1608,8 +1926,8 @@ impl<'s> SelectCompiler<'s> {
                 right,
                 constraint: _,
             } => {
-                // Compile left side
-                self.compile_table_ref(left, JoinType::Inner)?;
+                // Compile left side (no join type - it's the base)
+                self.compile_table_ref(left, JoinFlags::empty())?;
                 // Compile right side with join type
                 self.compile_table_ref(right, *jt)?;
                 // Join constraint is handled in WHERE clause processing

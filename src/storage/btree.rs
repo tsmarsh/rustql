@@ -1301,6 +1301,9 @@ fn allocate_page(shared: &mut BtShared) -> Pgno {
                 pgno += 1;
             }
         }
+        // Update db_size so subsequent allocations get unique page numbers
+        shared.pager.db_size = pgno;
+        shared.n_page = pgno;
         pgno
     }
 }
@@ -2005,10 +2008,12 @@ fn split_internal_root(
     let mut left_page = shared.pager.get(left_pgno, PagerGetFlags::empty())?;
     shared.pager.write(&mut left_page)?;
     left_page.data = left_data;
+    shared.pager.write_page_to_cache(&left_page);
 
     let mut right_page = shared.pager.get(right_pgno, PagerGetFlags::empty())?;
     shared.pager.write(&mut right_page)?;
     right_page.data = right_data;
+    shared.pager.write_page_to_cache(&right_page);
 
     shared.pager.db_size = right_pgno.max(shared.pager.db_size);
     shared.n_page = shared.pager.db_size;
@@ -2046,6 +2051,7 @@ fn split_internal_root(
     let mut root_page = shared.pager.get(root_pgno, PagerGetFlags::empty())?;
     shared.pager.write(&mut root_page)?;
     root_page.data = root_data;
+    shared.pager.write_page_to_cache(&root_page);
     Ok(())
 }
 
@@ -2087,10 +2093,12 @@ fn split_internal_with_parent(
     let mut left_page = shared.pager.get(left_pgno, PagerGetFlags::empty())?;
     shared.pager.write(&mut left_page)?;
     left_page.data = left_data;
+    shared.pager.write_page_to_cache(&left_page);
 
     let mut right_page = shared.pager.get(right_pgno, PagerGetFlags::empty())?;
     shared.pager.write(&mut right_page)?;
     right_page.data = right_data;
+    shared.pager.write_page_to_cache(&right_page);
 
     shared.pager.db_size = right_pgno.max(shared.pager.db_size);
     shared.n_page = shared.pager.db_size;
@@ -2118,6 +2126,7 @@ fn split_internal_with_parent(
     match new_data {
         Ok(data) => {
             grand_page.data = data;
+            shared.pager.write_page_to_cache(&grand_page);
             Ok(())
         }
         Err(_) => split_internal_root(shared, grandparent.pgno, grandparent, grand_limits),
@@ -2616,10 +2625,12 @@ fn split_root_leaf(
     let mut left_page = shared.pager.get(left_pgno, PagerGetFlags::empty())?;
     shared.pager.write(&mut left_page)?;
     left_page.data = left_data;
+    shared.pager.write_page_to_cache(&left_page);
 
     let mut right_page = shared.pager.get(right_pgno, PagerGetFlags::empty())?;
     shared.pager.write(&mut right_page)?;
     right_page.data = right_data;
+    shared.pager.write_page_to_cache(&right_page);
 
     shared.pager.db_size = right_pgno.max(shared.pager.db_size);
     shared.n_page = shared.pager.db_size;
@@ -2646,6 +2657,7 @@ fn split_root_leaf(
     let mut root_page = shared.pager.get(root_pgno, PagerGetFlags::empty())?;
     shared.pager.write(&mut root_page)?;
     root_page.data = root_data;
+    shared.pager.write_page_to_cache(&root_page);
     Ok(())
 }
 
@@ -2695,11 +2707,13 @@ fn split_leaf_with_parent(
     let mut left_page = shared.pager.get(leaf_pgno, PagerGetFlags::empty())?;
     shared.pager.write(&mut left_page)?;
     left_page.data = left_data;
+    shared.pager.write_page_to_cache(&left_page);
 
     let right_pgno = allocate_page(shared);
     let mut right_page = shared.pager.get(right_pgno, PagerGetFlags::empty())?;
     shared.pager.write(&mut right_page)?;
     right_page.data = right_data;
+    shared.pager.write_page_to_cache(&right_page);
 
     shared.pager.db_size = right_pgno.max(shared.pager.db_size);
     shared.n_page = shared.pager.db_size;
@@ -2724,6 +2738,7 @@ fn split_leaf_with_parent(
     match parent_data {
         Ok(data) => {
             parent_page.data = data;
+            shared.pager.write_page_to_cache(&parent_page);
             Ok(())
         }
         Err(_) => split_internal_root(shared, parent.pgno, parent, parent_limits),
@@ -3961,9 +3976,12 @@ impl Btree {
 
         if !mem_page.is_leaf && need_seek {
             if mem_page.is_intkey {
-                let _ = _cursor.table_moveto(_payload.n_key, false)?;
+                // Use the internal version to avoid deadlock (we already hold the lock)
+                let _ =
+                    _cursor.table_moveto_with_shared(&mut shared_guard, _payload.n_key, false)?;
             } else if let Some(key) = _payload.key.clone() {
-                let _ = _cursor.index_moveto(&UnpackedRecord::new(key))?;
+                let _ = _cursor
+                    .index_moveto_with_shared(&mut shared_guard, &UnpackedRecord::new(key))?;
             }
             if let Some(ref page) = _cursor.page {
                 mem_page = page.clone();
@@ -4089,7 +4107,7 @@ impl Btree {
                         parent,
                         parent_limits,
                         *child_index,
-                        root_pgno,
+                        mem_page.pgno, // Use actual leaf page, not root_pgno
                         &mem_page,
                         limits,
                         insert_index,
@@ -4151,7 +4169,10 @@ impl Btree {
         };
 
         // Get page from pager and sync mem_page changes
-        let mut page = shared_guard.pager.get(root_pgno, PagerGetFlags::empty())?;
+        // Use mem_page.pgno, not root_pgno - after splits, we're inserting into a leaf page
+        let mut page = shared_guard
+            .pager
+            .get(mem_page.pgno, PagerGetFlags::empty())?;
         shared_guard.pager.write(&mut page)?;
 
         // Copy mem_page.data (which has updated free block chain) to page.data
@@ -5295,65 +5316,101 @@ impl BtCursor {
         let mut shared_guard = shared
             .write()
             .map_err(|_| Error::new(ErrorCode::Internal))?;
+        self.table_moveto_with_shared(&mut shared_guard, _int_key, _bias)
+    }
+
+    /// Internal version that takes an already-acquired shared guard
+    fn table_moveto_with_shared(
+        &mut self,
+        shared_guard: &mut BtShared,
+        _int_key: RowId,
+        _bias: bool,
+    ) -> Result<i32> {
         let mut pgno = self.root_page;
         self.page_stack.clear();
         self.idx_stack.clear();
 
         loop {
-            let (mem_page, limits) = self.load_page(&mut shared_guard, pgno)?;
+            let (mem_page, limits) = self.load_page(shared_guard, pgno)?;
             if mem_page.is_leaf {
                 if mem_page.n_cell == 0 {
                     self.state = CursorState::Invalid;
                     self.seek_result = 1;
                     return Ok(1);
                 }
-                for i in 0..mem_page.n_cell {
-                    let cell_offset = mem_page.cell_ptr(i, limits)?;
+                // Binary search for the key position - O(log n) instead of O(n)
+                let mut lo: u16 = 0;
+                let mut hi: u16 = mem_page.n_cell;
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    let cell_offset = mem_page.cell_ptr(mid, limits)?;
                     let info = mem_page.parse_cell(cell_offset, limits)?;
-                    if info.n_key == _int_key {
+                    if info.n_key < _int_key {
+                        lo = mid + 1;
+                    } else if info.n_key > _int_key {
+                        hi = mid;
+                    } else {
+                        // Exact match
                         self.info = info;
                         self.n_key = _int_key;
-                        self.ix = i;
+                        self.ix = mid;
                         self.state = CursorState::Valid;
                         self.page = Some(mem_page);
                         self.seek_result = 0;
                         return Ok(0);
                     }
-                    if _int_key < info.n_key {
-                        self.info = info;
-                        self.n_key = self.info.n_key;
-                        self.ix = i;
-                        self.state = CursorState::Valid;
-                        self.page = Some(mem_page);
-                        self.seek_result = -1;
-                        return Ok(-1);
-                    }
                 }
-                let last_index = mem_page.n_cell - 1;
-                let cell_offset = mem_page.cell_ptr(last_index, limits)?;
-                let info = mem_page.parse_cell(cell_offset, limits)?;
-                self.info = info;
-                self.n_key = self.info.n_key;
-                self.ix = last_index;
-                self.state = CursorState::Valid;
-                self.page = Some(mem_page);
-                self.seek_result = 1;
-                return Ok(1);
+                // Not found - lo is the insertion point
+                if lo < mem_page.n_cell {
+                    let cell_offset = mem_page.cell_ptr(lo, limits)?;
+                    let info = mem_page.parse_cell(cell_offset, limits)?;
+                    self.info = info;
+                    self.n_key = self.info.n_key;
+                    self.ix = lo;
+                    self.state = CursorState::Valid;
+                    self.page = Some(mem_page);
+                    self.seek_result = -1; // cursor is at entry > search key
+                    return Ok(-1);
+                } else {
+                    // Search key is greater than all entries
+                    let last_index = mem_page.n_cell - 1;
+                    let cell_offset = mem_page.cell_ptr(last_index, limits)?;
+                    let info = mem_page.parse_cell(cell_offset, limits)?;
+                    self.info = info;
+                    self.n_key = self.info.n_key;
+                    self.ix = last_index;
+                    self.state = CursorState::Valid;
+                    self.page = Some(mem_page);
+                    self.seek_result = 1; // cursor is at entry < search key
+                    return Ok(1);
+                }
             }
 
-            let mut child = mem_page
-                .rightmost_ptr
-                .ok_or(Error::new(ErrorCode::Corrupt))?;
-            let mut child_index = mem_page.n_cell;
-            for i in 0..mem_page.n_cell {
-                let cell_offset = mem_page.cell_ptr(i, limits)?;
+            // Binary search for child page in internal node - O(log n)
+            let mut lo: u16 = 0;
+            let mut hi: u16 = mem_page.n_cell;
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                let cell_offset = mem_page.cell_ptr(mid, limits)?;
                 let info = mem_page.parse_cell(cell_offset, limits)?;
-                if _int_key < info.n_key {
-                    child = mem_page.child_pgno(cell_offset)?;
-                    child_index = i;
-                    break;
+                if info.n_key <= _int_key {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
                 }
             }
+            // lo is now the index of first cell with key > _int_key
+            let (child, child_index) = if lo < mem_page.n_cell {
+                let cell_offset = mem_page.cell_ptr(lo, limits)?;
+                (mem_page.child_pgno(cell_offset)?, lo)
+            } else {
+                (
+                    mem_page
+                        .rightmost_ptr
+                        .ok_or(Error::new(ErrorCode::Corrupt))?,
+                    mem_page.n_cell,
+                )
+            };
             self.page_stack.push(mem_page);
             self.idx_stack.push(child_index);
             pgno = child;
@@ -5371,6 +5428,15 @@ impl BtCursor {
         let mut shared_guard = shared
             .write()
             .map_err(|_| Error::new(ErrorCode::Internal))?;
+        self.index_moveto_with_shared(&mut shared_guard, search_key)
+    }
+
+    /// Internal version that takes an already-acquired shared guard
+    fn index_moveto_with_shared(
+        &mut self,
+        shared_guard: &mut BtShared,
+        search_key: &UnpackedRecord,
+    ) -> Result<i32> {
         let mut pgno = self.root_page;
         self.page_stack.clear();
         self.idx_stack.clear();
@@ -5379,7 +5445,7 @@ impl BtCursor {
         let key_info = search_key.key_info.as_ref().or(self.key_info.as_ref());
 
         loop {
-            let (mem_page, limits) = self.load_page(&mut shared_guard, pgno)?;
+            let (mem_page, limits) = self.load_page(shared_guard, pgno)?;
             if mem_page.is_leaf {
                 if mem_page.n_cell == 0 {
                     self.state = CursorState::Invalid;
@@ -7257,5 +7323,280 @@ mod tests {
         let (ptype, parent) = ptrmap_get(&mut shared, 5).unwrap();
         assert_eq!(ptype, 0);
         assert_eq!(parent, 0);
+    }
+
+    // ============================================================
+    // Page allocation correctness tests
+    // ============================================================
+
+    #[test]
+    fn test_allocate_page_returns_unique_pages() {
+        let btree = create_memory_btree();
+        let btree = unwrap_arc(btree);
+
+        let mut shared = btree.shared.write().unwrap();
+        shared.pager.db_size = 1; // Start with only page 1
+
+        // Allocate multiple pages and verify they're all unique
+        let page1 = allocate_page(&mut shared);
+        let page2 = allocate_page(&mut shared);
+        let page3 = allocate_page(&mut shared);
+
+        assert_ne!(
+            page1, page2,
+            "Consecutive page allocations must return different pages"
+        );
+        assert_ne!(
+            page2, page3,
+            "Consecutive page allocations must return different pages"
+        );
+        assert_ne!(page1, page3, "All allocated pages must be unique");
+
+        // Pages should be sequential
+        assert_eq!(page2, page1 + 1, "Pages should be allocated sequentially");
+        assert_eq!(page3, page2 + 1, "Pages should be allocated sequentially");
+    }
+
+    #[test]
+    fn test_allocate_page_updates_db_size() {
+        let btree = create_memory_btree();
+        let btree = unwrap_arc(btree);
+
+        let mut shared = btree.shared.write().unwrap();
+        let initial_size = shared.pager.db_size;
+
+        let pgno = allocate_page(&mut shared);
+
+        // db_size should be updated to the allocated page number
+        assert_eq!(
+            shared.pager.db_size, pgno,
+            "db_size should be updated after allocation"
+        );
+        assert!(
+            shared.pager.db_size > initial_size,
+            "db_size should increase"
+        );
+    }
+
+    // ============================================================
+    // Large insert tests (trigger page splits)
+    // ============================================================
+
+    #[test]
+    fn test_insert_many_rows_no_corruption() {
+        let btree = create_memory_btree();
+        let btree_arc = Arc::new(unwrap_arc(btree));
+
+        btree_arc.begin_trans(true).unwrap();
+        let root_page = btree_arc.create_table(BTREE_INTKEY).unwrap();
+
+        let mut cursor = btree_arc
+            .cursor(root_page, BtreeCursorFlags::WRCSR, None)
+            .unwrap();
+
+        // Insert 1000 rows - this should trigger multiple page splits
+        for i in 1..=1000 {
+            let payload = make_payload(i, Some(format!("value{}", i).into_bytes()));
+            let result = btree_arc.insert(&mut cursor, &payload, BtreeInsertFlags::APPEND, 0);
+            assert!(result.is_ok(), "Insert of rowid {} should succeed", i);
+        }
+
+        // Verify we can read back all rows by traversing with first/next
+        let is_empty = cursor.first().unwrap();
+        assert!(!is_empty, "Table should not be empty after inserts");
+
+        let mut count = 1;
+        while cursor.next(0).is_ok() && cursor.is_valid() {
+            count += 1;
+        }
+
+        assert_eq!(
+            count, 1000,
+            "Should have exactly 1000 rows after inserting 1000 rows"
+        );
+    }
+
+    #[test]
+    fn test_insert_triggers_page_split() {
+        let btree = create_memory_btree();
+        let btree_arc = Arc::new(unwrap_arc(btree));
+
+        btree_arc.begin_trans(true).unwrap();
+        let root_page = btree_arc.create_table(BTREE_INTKEY).unwrap();
+
+        let mut cursor = btree_arc
+            .cursor(root_page, BtreeCursorFlags::WRCSR, None)
+            .unwrap();
+
+        let initial_db_size = {
+            let shared = btree_arc.shared.read().unwrap();
+            shared.pager.db_size
+        };
+
+        // Insert enough rows to trigger a page split (with 4KB pages, ~480 small rows fit)
+        for i in 1..=500 {
+            let payload = make_payload(i, Some(vec![i as u8; 4]));
+            btree_arc
+                .insert(&mut cursor, &payload, BtreeInsertFlags::APPEND, 0)
+                .unwrap();
+        }
+
+        let final_db_size = {
+            let shared = btree_arc.shared.read().unwrap();
+            shared.pager.db_size
+        };
+
+        // After 500 inserts, we should have allocated new pages (root split into internal + 2 leaves)
+        assert!(
+            final_db_size > initial_db_size + 1,
+            "Page split should allocate additional pages: initial={}, final={}",
+            initial_db_size,
+            final_db_size
+        );
+    }
+
+    #[test]
+    fn test_last_returns_correct_key_after_split() {
+        let btree = create_memory_btree();
+        let btree_arc = Arc::new(unwrap_arc(btree));
+
+        btree_arc.begin_trans(true).unwrap();
+        let root_page = btree_arc.create_table(BTREE_INTKEY).unwrap();
+
+        let mut cursor = btree_arc
+            .cursor(root_page, BtreeCursorFlags::WRCSR, None)
+            .unwrap();
+
+        // Insert 600 rows (enough to trigger a split around row 483)
+        for i in 1..=600 {
+            let payload = make_payload(i, Some(vec![i as u8; 4]));
+            btree_arc
+                .insert(&mut cursor, &payload, BtreeInsertFlags::APPEND, 0)
+                .unwrap();
+
+            // After each insert, verify last() returns the correct key
+            cursor.last().unwrap();
+            let last_key = cursor.integer_key();
+            assert_eq!(
+                last_key, i,
+                "After inserting rowid {}, last() should return {} but got {}",
+                i, i, last_key
+            );
+        }
+    }
+
+    #[test]
+    fn test_cursor_navigation_after_split() {
+        let btree = create_memory_btree();
+        let btree_arc = Arc::new(unwrap_arc(btree));
+
+        btree_arc.begin_trans(true).unwrap();
+        let root_page = btree_arc.create_table(BTREE_INTKEY).unwrap();
+
+        let mut cursor = btree_arc
+            .cursor(root_page, BtreeCursorFlags::WRCSR, None)
+            .unwrap();
+
+        // Insert 500 rows
+        for i in 1..=500 {
+            let payload = make_payload(i, Some(vec![i as u8; 4]));
+            btree_arc
+                .insert(&mut cursor, &payload, BtreeInsertFlags::APPEND, 0)
+                .unwrap();
+        }
+
+        // Verify first() returns 1
+        let is_empty = cursor.first().unwrap();
+        assert!(!is_empty);
+        assert_eq!(cursor.integer_key(), 1, "first() should return rowid 1");
+
+        // Verify we can traverse all rows in order
+        let mut prev_key = 1;
+        while cursor.next(0).is_ok() && cursor.is_valid() {
+            let key = cursor.integer_key();
+            assert_eq!(
+                key,
+                prev_key + 1,
+                "Keys should be sequential: expected {} but got {}",
+                prev_key + 1,
+                key
+            );
+            prev_key = key;
+        }
+        assert_eq!(prev_key, 500, "Should traverse all 500 rows");
+    }
+
+    #[test]
+    fn test_first_before_and_after_split() {
+        let btree = create_memory_btree();
+        let btree_arc = Arc::new(unwrap_arc(btree));
+
+        btree_arc.begin_trans(true).unwrap();
+        let root_page = btree_arc.create_table(BTREE_INTKEY).unwrap();
+
+        let mut cursor = btree_arc
+            .cursor(root_page, BtreeCursorFlags::WRCSR, None)
+            .unwrap();
+
+        // Insert first 10 rows (no split yet)
+        for i in 1..=10 {
+            let payload = make_payload(i, Some(vec![i as u8; 4]));
+            btree_arc
+                .insert(&mut cursor, &payload, BtreeInsertFlags::APPEND, 0)
+                .unwrap();
+        }
+
+        // Verify first() returns 1 before split
+        let is_empty = cursor.first().unwrap();
+        assert!(!is_empty, "Table should not be empty");
+        assert_eq!(
+            cursor.integer_key(),
+            1,
+            "first() should return rowid 1 before split"
+        );
+
+        // Continue inserting until split occurs (around row 483)
+        for i in 11..=500 {
+            let payload = make_payload(i, Some(vec![i as u8; 4]));
+            btree_arc
+                .insert(&mut cursor, &payload, BtreeInsertFlags::APPEND, 0)
+                .unwrap();
+        }
+
+        // Verify first() still returns 1 after split
+        let is_empty = cursor.first().unwrap();
+        assert!(!is_empty, "Table should not be empty after split");
+        assert_eq!(
+            cursor.integer_key(),
+            1,
+            "first() should still return rowid 1 after split, but got {}",
+            cursor.integer_key()
+        );
+    }
+
+    #[test]
+    fn test_first_returns_1_with_100_rows() {
+        let btree = create_memory_btree();
+        let btree_arc = Arc::new(unwrap_arc(btree));
+
+        btree_arc.begin_trans(true).unwrap();
+        let root_page = btree_arc.create_table(BTREE_INTKEY).unwrap();
+
+        let mut cursor = btree_arc
+            .cursor(root_page, BtreeCursorFlags::WRCSR, None)
+            .unwrap();
+
+        // Insert 100 rows (no split should occur with small data)
+        for i in 1..=100 {
+            let payload = make_payload(i, Some(vec![i as u8; 4]));
+            btree_arc
+                .insert(&mut cursor, &payload, BtreeInsertFlags::APPEND, 0)
+                .unwrap();
+        }
+
+        // Verify first() returns 1
+        let is_empty = cursor.first().unwrap();
+        assert!(!is_empty);
+        assert_eq!(cursor.integer_key(), 1, "first() should return rowid 1");
     }
 }

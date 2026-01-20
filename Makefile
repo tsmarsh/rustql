@@ -60,7 +60,7 @@ RUST_SOURCES := $(shell find src -name '*.rs' 2>/dev/null)
 # Generate test result targets
 TEST_RESULTS := $(addprefix $(RESULT_DIR)/,$(addsuffix .result,$(SQLITE_TESTS)))
 
-.PHONY: all test test-basic test-all clean clean-results tcl-extension rustql help list-tests test-report
+.PHONY: all test test-basic test-all clean clean-results tcl-extension rustql help list-tests test-report pass-rates
 
 all: tcl-extension
 
@@ -75,7 +75,8 @@ help:
 	@echo "  make test              - Run common SQLite TCL tests"
 	@echo "  make test-basic        - Run basic RustQL TCL tests (quick smoke test)"
 	@echo "  make test-<name>       - Run a specific test (e.g., make test-select1)"
-	@echo "  make test-report       - Show pass/fail statistics from test logs"
+	@echo "  make pass-rates        - Run all tests and show pass rates"
+	@echo "  make test-report       - Show pass/fail statistics from existing logs"
 	@echo ""
 	@echo "Other Targets:"
 	@echo "  make list-tests        - List all available test targets"
@@ -216,4 +217,26 @@ test-report:
 		echo "Total: $$total_pass/$$total_tests passed ($$((total_pass * 100 / total_tests))%)"; \
 	else \
 		echo "No test data found."; \
+	fi
+
+# Run all tests and output pass rates to stdout
+pass-rates: $(TCL_EXT) $(RESULT_DIR)
+	@total_pass=0; total_tests=0; \
+	for t in $(SQLITE_TESTS); do \
+		if [ -f "$(TEST_DIR)/$$t.test" ]; then \
+			timeout $(TIMEOUT) $(TCLSH) $(TCL_WRAPPER) $$t > $(RESULT_DIR)/$$t.log 2>&1 || true; \
+			pass=$$(grep -cE "^$$t-.*\.\.\. Ok$$" "$(RESULT_DIR)/$$t.log" 2>/dev/null || echo 0); \
+			total=$$(grep -cE "^$$t-[0-9].*\.\.\." "$(RESULT_DIR)/$$t.log" 2>/dev/null || echo 0); \
+			if [ "$$total" -gt 0 ] 2>/dev/null; then \
+				pct=$$((pass * 100 / total)); \
+				printf "%-15s %4d / %4d  (%3d%%)\n" "$$t" "$$pass" "$$total" "$$pct"; \
+				total_pass=$$((total_pass + pass)); \
+				total_tests=$$((total_tests + total)); \
+			fi; \
+		fi; \
+	done; \
+	echo ""; \
+	echo "----------------------------------------"; \
+	if [ "$$total_tests" -gt 0 ]; then \
+		printf "%-15s %4d / %4d  (%3d%%)\n" "TOTAL" "$$total_pass" "$$total_tests" "$$((total_pass * 100 / total_tests))"; \
 	fi

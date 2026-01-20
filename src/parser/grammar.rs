@@ -81,6 +81,16 @@ impl<'a> Parser<'a> {
             _ => Err(self.error("expected statement")),
         }?;
 
+        // Validate that we're at a statement boundary (semicolon or EOF)
+        // This catches syntax errors like: SELECT f1 ORDER BY f1 where;
+        if !self.is_eof() && !self.check(TokenKind::Semicolon) {
+            let token_text = self.current().text(self.source);
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                format!("near \"{}\": syntax error", token_text),
+            ));
+        }
+
         self.skip_semicolons();
         Ok(stmt)
     }
@@ -2816,12 +2826,18 @@ impl<'a> Parser<'a> {
         Ok(exprs)
     }
 
-    fn error(&self, msg: &str) -> Error {
+    fn error(&self, _msg: &str) -> Error {
         let token = self.current();
-        Error::with_message(
-            ErrorCode::Error,
-            format!("{} at line {}, column {}", msg, token.line, token.column),
-        )
+        let token_text = token.text(self.source);
+        // Use SQLite-compatible error format
+        if token.kind == TokenKind::Eof {
+            Error::with_message(ErrorCode::Error, "incomplete input".to_string())
+        } else {
+            Error::with_message(
+                ErrorCode::Error,
+                format!("near \"{}\": syntax error", token_text),
+            )
+        }
     }
 }
 

@@ -79,6 +79,8 @@ pub struct TableInfo {
     pub is_subquery: bool,
     /// Join type (for joined tables)
     pub join_type: JoinType,
+    /// Subquery result column names (for * expansion)
+    pub subquery_columns: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +154,15 @@ pub struct SelectCompiler<'s> {
     agg_final_idx: usize,
     /// Number of columns in compound select (for UNION, INTERSECT, EXCEPT output)
     compound_column_count: usize,
+    /// Aliases from compound SELECT parts (for ORDER BY resolution)
+    /// Maps alias name to column position (0-based)
+    compound_aliases: HashMap<String, usize>,
+    /// PRAGMA short_column_names (default ON) - use just column name
+    short_column_names: bool,
+    /// PRAGMA full_column_names (default OFF) - use table.column format
+    full_column_names: bool,
+    /// Counter for anonymous subquery naming (subquery-0, subquery-1, etc.)
+    next_subquery: usize,
 }
 
 impl<'s> SelectCompiler<'s> {
@@ -181,6 +192,10 @@ impl<'s> SelectCompiler<'s> {
             agg_final_regs: Vec::new(),
             agg_final_idx: 0,
             compound_column_count: 0,
+            short_column_names: true, // Default ON
+            full_column_names: false, // Default OFF
+            next_subquery: 0,
+            compound_aliases: HashMap::new(),
         }
     }
 
@@ -210,7 +225,17 @@ impl<'s> SelectCompiler<'s> {
             agg_final_regs: Vec::new(),
             agg_final_idx: 0,
             compound_column_count: 0,
+            short_column_names: true, // Default ON
+            full_column_names: false, // Default OFF
+            next_subquery: 0,
+            compound_aliases: HashMap::new(),
         }
+    }
+
+    /// Set column naming flags from PRAGMA settings
+    pub fn set_column_name_flags(&mut self, short_column_names: bool, full_column_names: bool) {
+        self.short_column_names = short_column_names;
+        self.full_column_names = full_column_names;
     }
 
     /// Get the expanded column names after compilation
@@ -306,6 +331,29 @@ impl<'s> SelectCompiler<'s> {
 
         // Compile the body with appropriate destination
         self.compile_body(&select.body, &actual_dest)?;
+
+        // For compound SELECTs with ORDER BY, validate that ORDER BY terms match result columns
+        if self.is_compound {
+            if let Some(order_by) = &select.order_by {
+                for (idx, term) in order_by.iter().enumerate() {
+                    if !self.is_valid_compound_order_by_term(&term.expr) {
+                        let ordinal = match idx {
+                            0 => "1st".to_string(),
+                            1 => "2nd".to_string(),
+                            2 => "3rd".to_string(),
+                            n => format!("{}th", n + 1),
+                        };
+                        return Err(Error::with_message(
+                            ErrorCode::Error,
+                            format!(
+                                "{} ORDER BY term does not match any column in the result set",
+                                ordinal
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
 
         // Handle ORDER BY output (after body has populated sorter)
         if let (Some(sorter_cursor), Some(order_by)) = (sorter_cursor, order_by_cols) {
@@ -468,9 +516,27 @@ impl<'s> SelectCompiler<'s> {
         // Collect table cursors to avoid borrow checker issues
         let table_cursors: Vec<i32> = self.tables.iter().map(|t| t.cursor).collect();
 
-        // Generate Rewind for each table cursor
-        let mut rewind_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
-        for cursor in &table_cursors {
+        // Generate proper nested loop structure for cross joins
+        // For N tables, we need nested Rewind/Next pairs where inner tables
+        // get rewound for each row of outer tables.
+        //
+        // Structure for 2 tables (A, B):
+        //   Rewind A → done_all
+        // outer_loop:
+        //   Rewind B → next_outer
+        // inner_loop:
+        //   ... body ...
+        //   Next B → inner_loop
+        // next_outer:
+        //   Next A → outer_loop
+        // done_all:
+        //
+        let mut loop_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
+        let mut next_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
+
+        // Emit Rewind/loop structure for each table level
+        for (_i, cursor) in table_cursors.iter().enumerate() {
+            // Handle FTS3 filter if applicable
             if let Some(filter) = &fts3_filter {
                 if filter.cursor == *cursor {
                     match &filter.pattern {
@@ -485,14 +551,21 @@ impl<'s> SelectCompiler<'s> {
                     }
                 }
             }
-            let label = self.alloc_label();
-            self.emit(Opcode::Rewind, *cursor, label, 0, P4::Unused);
-            rewind_labels.push(label);
+
+            // For the outermost table, jump to done_all on empty
+            // For inner tables, jump to next_outer (advance outer cursor)
+            let skip_label = self.alloc_label();
+            self.emit(Opcode::Rewind, *cursor, skip_label, 0, P4::Unused);
+            next_labels.push(skip_label);
+
+            // Mark the loop start for this level
+            let loop_label = self.alloc_label();
+            self.resolve_label(loop_label, self.current_addr());
+            loop_labels.push(loop_label);
         }
 
-        // Inner loop start - use a label to avoid conflict with resolve_labels
-        let loop_start_label = self.alloc_label();
-        self.resolve_label(loop_start_label, self.current_addr());
+        // Inner loop start is the innermost loop label
+        let loop_start_label = *loop_labels.last().unwrap_or(&self.alloc_label());
 
         // Evaluate WHERE clause
         let where_skip_label = if let Some(where_expr) = remaining_where.as_ref() {
@@ -560,10 +633,19 @@ impl<'s> SelectCompiler<'s> {
             self.resolve_label(label, self.current_addr());
         }
 
-        // Generate Next for each table (in reverse order for nested loops)
-        for (i, cursor) in table_cursors.iter().enumerate().rev() {
-            self.emit(Opcode::Next, *cursor, loop_start_label, 0, P4::Unused);
-            self.resolve_label(rewind_labels[i], self.current_addr());
+        // Generate Next for each table in reverse order (innermost first)
+        // Each table's Next jumps back to its own loop start
+        // When a table's Next fails, fall through to resolve the skip label
+        // which then tries Next on the outer table
+        for i in (0..table_cursors.len()).rev() {
+            let cursor = table_cursors[i];
+            let loop_label = loop_labels[i];
+
+            // Next jumps back to this table's loop start
+            self.emit(Opcode::Next, cursor, loop_label, 0, P4::Unused);
+
+            // Resolve the skip label (where Rewind jumps on empty/exhausted)
+            self.resolve_label(next_labels[i], self.current_addr());
         }
 
         // Close cursors
@@ -1166,6 +1248,20 @@ impl<'s> SelectCompiler<'s> {
             }
         }
 
+        // Capture aliases from the right side's columns for ORDER BY resolution
+        // Right side columns are at positions [left_col_count..], map them to [0..]
+        let left_col_count = saved_column_names.len();
+        for (i, name) in self
+            .result_column_names
+            .iter()
+            .enumerate()
+            .skip(left_col_count)
+        {
+            let result_pos = i - left_col_count;
+            self.compound_aliases
+                .insert(name.to_lowercase(), result_pos);
+        }
+
         // Restore left side's column names (right side added its own but we want only left's names)
         self.result_column_names = saved_column_names;
 
@@ -1371,6 +1467,7 @@ impl<'s> SelectCompiler<'s> {
                     schema_table,
                     is_subquery: false,
                     join_type,
+                    subquery_columns: None,
                 });
             }
             TableRef::Subquery { query, alias } => {
@@ -1387,7 +1484,12 @@ impl<'s> SelectCompiler<'s> {
                 };
                 subcompiler.next_reg = self.next_reg;
                 subcompiler.next_cursor = self.next_cursor;
+                // Pass column naming settings to subquery compiler
+                subcompiler.set_column_name_flags(self.short_column_names, self.full_column_names);
                 let subquery_ops = subcompiler.compile(query, &subquery_dest)?;
+
+                // Capture subquery result column names for * expansion
+                let subquery_col_names = subcompiler.result_column_names.clone();
 
                 // Inline the subquery ops
                 for op in subquery_ops {
@@ -1399,15 +1501,20 @@ impl<'s> SelectCompiler<'s> {
                 self.next_reg = subcompiler.next_reg;
                 self.next_cursor = subcompiler.next_cursor;
 
+                // SQLite uses "(subquery-N)" format for anonymous subqueries
+                let subquery_name = alias.clone().unwrap_or_else(|| {
+                    let name = format!("(subquery-{})", self.next_subquery);
+                    self.next_subquery += 1;
+                    name
+                });
                 self.tables.push(TableInfo {
-                    name: alias
-                        .clone()
-                        .unwrap_or_else(|| format!("subquery_{}", cursor)),
+                    name: subquery_name,
                     table_name: String::new(),
                     cursor,
                     schema_table: None,
                     is_subquery: true,
                     join_type,
+                    subquery_columns: Some(subquery_col_names),
                 });
             }
             TableRef::Join {
@@ -1468,6 +1575,7 @@ impl<'s> SelectCompiler<'s> {
                     let tables_snapshot: Vec<_> = self.tables.clone();
                     for table in &tables_snapshot {
                         if let Some(schema_table) = &table.schema_table {
+                            // Regular table - expand from schema
                             for (col_idx, col_def) in schema_table.columns.iter().enumerate() {
                                 let reg = self.alloc_reg();
                                 self.emit(
@@ -1477,7 +1585,38 @@ impl<'s> SelectCompiler<'s> {
                                     reg,
                                     P4::Unused,
                                 );
-                                self.result_column_names.push(col_def.name.clone());
+                                // Generate column name based on PRAGMA settings
+                                // For * expansion, only short_column_names matters:
+                                //  - short_column_names=ON: just column name
+                                //  - short_column_names=OFF: use alias.column (regardless of full_column_names)
+                                let col_name = if self.short_column_names {
+                                    // short_column_names=ON: always use just column name for *
+                                    col_def.name.clone()
+                                } else {
+                                    // short_column_names=OFF: use alias prefix (table.name is alias or table name)
+                                    format!("{}.{}", table.name, col_def.name)
+                                };
+                                self.result_column_names.push(col_name);
+                                result_regs.push(reg);
+                            }
+                        } else if let Some(subquery_cols) = &table.subquery_columns {
+                            // Subquery - expand from captured column names
+                            for (col_idx, subquery_col_name) in subquery_cols.iter().enumerate() {
+                                let reg = self.alloc_reg();
+                                self.emit(
+                                    Opcode::Column,
+                                    table.cursor,
+                                    col_idx as i32,
+                                    reg,
+                                    P4::Unused,
+                                );
+                                // Generate column name - use subquery alias prefix when short_column_names=OFF
+                                let col_name = if self.short_column_names {
+                                    subquery_col_name.clone()
+                                } else {
+                                    format!("{}.{}", table.name, subquery_col_name)
+                                };
+                                self.result_column_names.push(col_name);
                                 result_regs.push(reg);
                             }
                         }
@@ -1493,6 +1632,7 @@ impl<'s> SelectCompiler<'s> {
                         if table.name.eq_ignore_ascii_case(table_name) {
                             found = true;
                             if let Some(schema_table) = &table.schema_table {
+                                // Regular table - expand from schema
                                 for (col_idx, col_def) in schema_table.columns.iter().enumerate() {
                                     let reg = self.alloc_reg();
                                     self.emit(
@@ -1503,6 +1643,21 @@ impl<'s> SelectCompiler<'s> {
                                         P4::Unused,
                                     );
                                     self.result_column_names.push(col_def.name.clone());
+                                    result_regs.push(reg);
+                                }
+                            } else if let Some(subquery_cols) = &table.subquery_columns {
+                                // Subquery - expand from captured column names
+                                for (col_idx, subquery_col_name) in subquery_cols.iter().enumerate()
+                                {
+                                    let reg = self.alloc_reg();
+                                    self.emit(
+                                        Opcode::Column,
+                                        table.cursor,
+                                        col_idx as i32,
+                                        reg,
+                                        P4::Unused,
+                                    );
+                                    self.result_column_names.push(subquery_col_name.clone());
                                     result_regs.push(reg);
                                 }
                             }
@@ -1571,9 +1726,91 @@ impl<'s> SelectCompiler<'s> {
         }
     }
 
-    /// Convert an expression to a column name
+    /// Convert an expression to a column name, respecting PRAGMA settings
     fn expr_to_name(&self, expr: &Expr, _index: usize) -> String {
-        self.expr_to_string(expr)
+        match expr {
+            Expr::Column(col) => {
+                // Handle column naming based on PRAGMA settings
+                // full_column_names=ON: use "realTable.column"
+                // short_column_names=ON (default): use just "column"
+                // Both OFF: use original format
+
+                if self.full_column_names {
+                    // full_column_names takes precedence - use real table name
+                    let real_table_name = if let Some(alias_or_name) = &col.table {
+                        // Look up the real table name from the alias
+                        self.tables
+                            .iter()
+                            .find(|t| t.name.eq_ignore_ascii_case(alias_or_name))
+                            .map(|t| {
+                                // Use real table name, not alias (unless it's a subquery)
+                                if t.table_name.is_empty() {
+                                    t.name.clone() // Subquery - use alias
+                                } else {
+                                    t.table_name.clone()
+                                }
+                            })
+                            .unwrap_or_else(|| alias_or_name.clone())
+                    } else {
+                        // No table specified - try to find which table has this column
+                        self.tables
+                            .iter()
+                            .find(|t| {
+                                t.schema_table.as_ref().map_or(false, |st| {
+                                    st.columns
+                                        .iter()
+                                        .any(|c| c.name.eq_ignore_ascii_case(&col.column))
+                                })
+                            })
+                            .map(|t| t.table_name.clone())
+                            .unwrap_or_default()
+                    };
+
+                    if real_table_name.is_empty() {
+                        col.column.clone()
+                    } else {
+                        format!("{}.{}", real_table_name, col.column)
+                    }
+                } else if self.short_column_names {
+                    // short_column_names=ON (default): just column name
+                    col.column.clone()
+                } else {
+                    // Both OFF: use real table name (like full_column_names)
+                    let real_table_name = if let Some(alias_or_name) = &col.table {
+                        self.tables
+                            .iter()
+                            .find(|t| t.name.eq_ignore_ascii_case(alias_or_name))
+                            .map(|t| {
+                                if t.table_name.is_empty() {
+                                    t.name.clone()
+                                } else {
+                                    t.table_name.clone()
+                                }
+                            })
+                            .unwrap_or_else(|| alias_or_name.clone())
+                    } else {
+                        self.tables
+                            .iter()
+                            .find(|t| {
+                                t.schema_table.as_ref().map_or(false, |st| {
+                                    st.columns
+                                        .iter()
+                                        .any(|c| c.name.eq_ignore_ascii_case(&col.column))
+                                })
+                            })
+                            .map(|t| t.table_name.clone())
+                            .unwrap_or_default()
+                    };
+
+                    if real_table_name.is_empty() {
+                        col.column.clone()
+                    } else {
+                        format!("{}.{}", real_table_name, col.column)
+                    }
+                }
+            }
+            _ => self.expr_to_string(expr),
+        }
     }
 
     /// Convert an expression to its SQL string representation
@@ -2098,7 +2335,21 @@ impl<'s> SelectCompiler<'s> {
 
                 // Find the table and column index
                 let (cursor, col_idx) = if let Some(table) = &col_ref.table {
-                    if let Some(tinfo) = self.tables.iter().find(|t| t.name == *table) {
+                    // Check for multiple tables with the same name/alias (ambiguous)
+                    let matching_tables: Vec<_> = self
+                        .tables
+                        .iter()
+                        .filter(|t| t.name.eq_ignore_ascii_case(table))
+                        .collect();
+
+                    if matching_tables.len() > 1 {
+                        return Err(Error::with_message(
+                            ErrorCode::Error,
+                            format!("ambiguous column name: {}.{}", table, col_ref.column),
+                        ));
+                    }
+
+                    if let Some(tinfo) = matching_tables.first() {
                         // Use column_index if set, otherwise look up from schema
                         let idx = col_ref.column_index.unwrap_or_else(|| {
                             tinfo
@@ -2995,6 +3246,42 @@ impl<'s> SelectCompiler<'s> {
                                 }
                             }
 
+                            // For compound selects, check if ORDER BY references a result column name
+                            // (e.g., ORDER BY x where x is an alias)
+                            if self.is_compound {
+                                if let Expr::Column(col_ref) = &term.expr {
+                                    // Look for matching result column name
+                                    if let Some(col_idx) = self
+                                        .result_column_names
+                                        .iter()
+                                        .position(|name| name.eq_ignore_ascii_case(&col_ref.column))
+                                    {
+                                        // Copy from the result column (0-based index)
+                                        self.emit(
+                                            Opcode::SCopy,
+                                            base_reg + col_idx as i32,
+                                            key_base_reg + i as i32,
+                                            0,
+                                            P4::Unused,
+                                        );
+                                        continue;
+                                    }
+                                    // Also check compound_aliases (for aliases from other SELECTs in UNION)
+                                    if let Some(&col_idx) =
+                                        self.compound_aliases.get(&col_ref.column.to_lowercase())
+                                    {
+                                        self.emit(
+                                            Opcode::SCopy,
+                                            base_reg + col_idx as i32,
+                                            key_base_reg + i as i32,
+                                            0,
+                                            P4::Unused,
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+
                             self.compile_expr(&term.expr, key_base_reg + i as i32)?;
                         }
                     }
@@ -3196,6 +3483,72 @@ impl<'s> SelectCompiler<'s> {
                 .or_else(|| self.find_aggregate_in_expr(right)),
             Expr::Unary { expr: inner, .. } => self.find_aggregate_in_expr(inner),
             _ => None,
+        }
+    }
+
+    /// Check if ORDER BY term is valid for compound SELECT
+    /// Valid terms: column position numbers, column names, and expressions matching result columns
+    fn is_valid_compound_order_by_term(&self, expr: &Expr) -> bool {
+        match expr {
+            // Integer literal = column position (1-based)
+            Expr::Literal(Literal::Integer(n)) => {
+                let pos = *n as usize;
+                pos >= 1 && pos <= self.result_column_names.len()
+            }
+            // Column reference (simple identifier or table.column) - always allowed
+            // SQLite allows referencing column names from any part of the UNION
+            Expr::Column(_) => true,
+            // For complex expressions (like f2+101), check if they match a result column name
+            // These must match exactly or be invalid
+            _ => {
+                // Try to convert expression to string and match against result column names
+                let expr_str = self.expr_to_simple_string(expr);
+                if expr_str.is_empty() {
+                    // Can't determine - allow it (SQLite may do runtime check)
+                    true
+                } else {
+                    self.result_column_names
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&expr_str))
+                }
+            }
+        }
+    }
+
+    /// Convert expression to simple string for comparison (used for ORDER BY validation)
+    fn expr_to_simple_string(&self, expr: &Expr) -> String {
+        match expr {
+            Expr::Column(col_ref) => {
+                if let Some(table) = &col_ref.table {
+                    format!("{}.{}", table, col_ref.column)
+                } else {
+                    col_ref.column.clone()
+                }
+            }
+            Expr::Literal(lit) => match lit {
+                Literal::Integer(n) => n.to_string(),
+                Literal::Float(f) => f.to_string(),
+                Literal::String(s) => s.clone(),
+                Literal::Blob(b) => format!("x'{}'", hex::encode(b)),
+                Literal::Null => "NULL".to_string(),
+                Literal::CurrentTime => "CURRENT_TIME".to_string(),
+                Literal::CurrentDate => "CURRENT_DATE".to_string(),
+                Literal::CurrentTimestamp => "CURRENT_TIMESTAMP".to_string(),
+                Literal::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+            },
+            Expr::Binary { op, left, right } => {
+                let left_str = self.expr_to_simple_string(left);
+                let right_str = self.expr_to_simple_string(right);
+                let op_str = match op {
+                    BinaryOp::Add => "+",
+                    BinaryOp::Sub => "-",
+                    BinaryOp::Mul => "*",
+                    BinaryOp::Div => "/",
+                    _ => "?",
+                };
+                format!("{}{}{}", left_str, op_str, right_str)
+            }
+            _ => String::new(),
         }
     }
 
@@ -3570,7 +3923,12 @@ impl<'s> SelectCompiler<'s> {
 
         for col in columns {
             let dest_reg = self.alloc_reg();
-            if let ResultColumn::Expr { expr, .. } = col {
+            if let ResultColumn::Expr { expr, alias } = col {
+                // Populate result_column_names for this column
+                let col_name = alias
+                    .clone()
+                    .unwrap_or_else(|| self.expr_to_name(expr, count + 1));
+                self.result_column_names.push(col_name);
                 // Check if this column matches a GROUP BY expression
                 if let Some(group_exprs) = group_by {
                     if let Some(idx) = self.find_matching_group_expr(expr, group_exprs) {

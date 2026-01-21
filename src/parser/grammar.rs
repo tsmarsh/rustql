@@ -539,6 +539,23 @@ impl<'a> Parser<'a> {
             return Some(JoinFlags::INNER);
         }
 
+        // Handle OUTER as a leading keyword (OUTER LEFT/RIGHT/FULL [NATURAL] JOIN)
+        if self.match_token(TokenKind::Outer) {
+            let mut flags = JoinFlags::OUTER;
+            if self.match_token(TokenKind::Left) {
+                flags |= JoinFlags::LEFT;
+            } else if self.match_token(TokenKind::Right) {
+                flags |= JoinFlags::RIGHT;
+            } else if self.match_token(TokenKind::Full) {
+                flags |= JoinFlags::LEFT | JoinFlags::RIGHT;
+            }
+            // Check for optional NATURAL after OUTER LEFT/RIGHT/FULL
+            if self.match_token(TokenKind::Natural) {
+                flags |= JoinFlags::NATURAL;
+            }
+            return Some(flags);
+        }
+
         if self.check(TokenKind::Join) {
             // Plain JOIN = INNER JOIN
             return Some(JoinFlags::INNER);

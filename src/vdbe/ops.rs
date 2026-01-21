@@ -526,6 +526,7 @@ impl Opcode {
                 | Opcode::FkIfZero
                 | Opcode::Program
                 | Opcode::TriggerTest
+                | Opcode::IfPos
         )
     }
 

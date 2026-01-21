@@ -2633,10 +2633,12 @@ impl Vdbe {
                 let desired_autocommit = desired == 1;
 
                 if desired_autocommit == current {
+                    if rollback && desired_autocommit {
+                        // SQLite treats ROLLBACK with no active transaction as a no-op.
+                        return Ok(ExecResult::Continue);
+                    }
                     let msg = if !desired_autocommit {
                         "cannot start a transaction within a transaction"
-                    } else if rollback {
-                        "cannot rollback - no transaction is active"
                     } else {
                         "cannot commit - no transaction is active"
                     };

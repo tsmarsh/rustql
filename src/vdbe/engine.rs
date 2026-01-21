@@ -2557,6 +2557,9 @@ impl Vdbe {
                 };
                 // SAFETY: conn_ptr is valid for the lifetime of the statement/VDBE.
                 let conn = unsafe { &mut *conn_ptr };
+                if !conn.autocommit.load(AtomicOrdering::SeqCst) {
+                    return Ok(ExecResult::Continue);
+                }
 
                 let write = op.p2 > 0;
                 if write && conn.flags.contains(OpenFlags::READONLY) {
@@ -2574,9 +2577,6 @@ impl Vdbe {
                 };
 
                 let current = conn.transaction_state;
-                if !conn.autocommit.load(AtomicOrdering::SeqCst) {
-                    return Ok(ExecResult::Continue);
-                }
                 if write {
                     if current != TransactionState::Write {
                         btree.begin_trans(true)?;

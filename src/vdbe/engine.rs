@@ -2574,6 +2574,9 @@ impl Vdbe {
                 };
 
                 let current = conn.transaction_state;
+                if !conn.autocommit.load(AtomicOrdering::SeqCst) {
+                    return Ok(ExecResult::Continue);
+                }
                 if write {
                     if current != TransactionState::Write {
                         btree.begin_trans(true)?;

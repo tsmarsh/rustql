@@ -1491,8 +1491,10 @@ impl Vdbe {
                                     }
                                 }
                             }
-                            // Table not found - return proper error
-                            if root_page == 0 {
+                            // Table not found - return error (but not if it's a virtual table)
+                            let is_virtual =
+                                table_meta.as_ref().map(|t| t.is_virtual).unwrap_or(false);
+                            if root_page == 0 && !is_virtual && table_meta.is_none() {
                                 return Err(Error::with_message(
                                     ErrorCode::Error,
                                     format!("no such table: {}", tname),
@@ -1544,37 +1546,36 @@ impl Vdbe {
                     op.p2 as Pgno
                 };
 
-                // If root_page is 0 and we have a table name in P4, look it up in schema
-                if root_page == 0 {
-                    if let P4::Text(table_name) = &op.p4 {
-                        if let Some(ref schema) = self.schema {
-                            if let Ok(schema_guard) = schema.read() {
-                                if let Some(table) = schema_guard.tables.get(table_name) {
-                                    root_page = table.root_page;
-                                }
-                            }
-                        }
-                        // Table not found - return proper error
-                        if root_page == 0 {
-                            return Err(Error::with_message(
-                                ErrorCode::Error,
-                                format!("no such table: {}", table_name),
-                            ));
-                        }
-                    }
-                }
-
+                // Look up table info from schema first (need to check is_virtual before
+                // deciding if root_page=0 is an error)
                 let mut is_virtual = false;
                 let mut table_name = None;
                 let mut table_columns = None;
+                let mut table_found = false;
                 if let P4::Text(name) = &op.p4 {
                     table_name = Some(name.clone());
                     if let Some(ref schema) = self.schema {
                         if let Ok(schema_guard) = schema.read() {
                             if let Some(table) = schema_guard.tables.get(name) {
+                                table_found = true;
                                 is_virtual = table.is_virtual;
                                 table_columns = Some(table.columns.len() as i32);
+                                if root_page == 0 {
+                                    root_page = table.root_page;
+                                }
                             }
+                        }
+                    }
+                }
+
+                // For non-virtual tables, root_page=0 means table not found
+                if root_page == 0 && !is_virtual {
+                    if let Some(ref tname) = table_name {
+                        if !table_found {
+                            return Err(Error::with_message(
+                                ErrorCode::Error,
+                                format!("no such table: {}", tname),
+                            ));
                         }
                     }
                 }

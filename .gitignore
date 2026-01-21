@@ -36,3 +36,7 @@
 .moth/.current
 .current
 .compat-test-results.log
+
+# Test artifacts
+test-results/
+sqlite3/test/testdir/test*.db*

@@ -1,7 +1,9 @@
 # RustQL Makefile for TCL Test Suite
 #
 # Usage:
-#   make test                    - Run all TCL tests
+#   make test                    - Run all TCL tests in parallel
+#   make test -j8                - Run tests with 8 parallel jobs
+#   make test-seq                - Run all TCL tests sequentially (old behavior)
 #   make test-select1            - Run select1.test
 #   make test-basic              - Run basic RustQL tests (quick)
 #   make clean                   - Remove build artifacts and test results
@@ -12,6 +14,9 @@
 CARGO := cargo
 TCLSH := tclsh
 TIMEOUT := 120
+
+# Parallel jobs (can override with make test JOBS=8)
+JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 
 # Build outputs
 TCL_EXT := target/release/librustql.so
@@ -60,7 +65,7 @@ RUST_SOURCES := $(shell find src -name '*.rs' 2>/dev/null)
 # Generate test result targets
 TEST_RESULTS := $(addprefix $(RESULT_DIR)/,$(addsuffix .result,$(SQLITE_TESTS)))
 
-.PHONY: all test test-basic test-all clean clean-results tcl-extension rustql help list-tests test-report pass-rates
+.PHONY: all test test-seq test-basic test-all clean clean-results tcl-extension rustql help list-tests test-report pass-rates test-summary
 
 all: tcl-extension
 
@@ -72,10 +77,12 @@ help:
 	@echo "  make rustql            - Build the rustql binary"
 	@echo ""
 	@echo "Test Targets:"
-	@echo "  make test              - Run common SQLite TCL tests"
+	@echo "  make test              - Run all TCL tests in PARALLEL (default)"
+	@echo "  make test -j8          - Run tests with 8 parallel jobs"
+	@echo "  make test-seq          - Run all TCL tests sequentially"
 	@echo "  make test-basic        - Run basic RustQL TCL tests (quick smoke test)"
 	@echo "  make test-<name>       - Run a specific test (e.g., make test-select1)"
-	@echo "  make pass-rates        - Run all tests and show pass rates"
+	@echo "  make pass-rates        - Show pass rates from existing logs"
 	@echo "  make test-report       - Show pass/fail statistics from existing logs"
 	@echo ""
 	@echo "Other Targets:"
@@ -105,9 +112,63 @@ $(RUSTQL_BIN): $(RUST_SOURCES) Cargo.toml
 $(RESULT_DIR):
 	@mkdir -p $(RESULT_DIR)
 
-# Run all configured tests
-test: $(TCL_EXT) $(RESULT_DIR)
-	@echo "Running SQLite TCL test suite..."
+# ============================================================================
+# Parallel test execution (default)
+# ============================================================================
+
+# Run all tests in parallel, then show summary
+test: $(TCL_EXT) | $(RESULT_DIR)
+	@echo "Running SQLite TCL test suite in parallel ($(JOBS) jobs)..."
+	@echo ""
+	@$(MAKE) --no-print-directory -j$(JOBS) $(TEST_RESULTS)
+	@$(MAKE) --no-print-directory test-summary
+
+# Pattern rule for generating individual test results (used by parallel execution)
+$(RESULT_DIR)/%.result: $(TCL_EXT) | $(RESULT_DIR)
+	@if [ -f "$(TEST_DIR)/$*.test" ]; then \
+		if timeout $(TIMEOUT) $(TCLSH) $(TCL_WRAPPER) $* > $(RESULT_DIR)/$*.log 2>&1; then \
+			echo "PASSED" > $@; \
+			printf "  %-20s PASSED\n" "$*"; \
+		else \
+			echo "FAILED" > $@; \
+			printf "  %-20s FAILED\n" "$*"; \
+		fi; \
+	else \
+		echo "SKIPPED" > $@; \
+		printf "  %-20s SKIPPED (not found)\n" "$*"; \
+	fi
+
+# Print test summary after parallel execution
+test-summary:
+	@echo ""
+	@echo "========================================"
+	@echo "Test Summary"
+	@echo "========================================"
+	@passed=$$(grep -l "PASSED" $(RESULT_DIR)/*.result 2>/dev/null | wc -l); \
+	failed=$$(grep -l "FAILED" $(RESULT_DIR)/*.result 2>/dev/null | wc -l); \
+	skipped=$$(grep -l "SKIPPED" $(RESULT_DIR)/*.result 2>/dev/null | wc -l); \
+	total=$$((passed + failed + skipped)); \
+	echo "Passed:  $$passed"; \
+	echo "Failed:  $$failed"; \
+	echo "Skipped: $$skipped"; \
+	echo "Total:   $$total"; \
+	echo ""; \
+	if [ $$failed -gt 0 ]; then \
+		echo "Failed tests:"; \
+		for f in $(RESULT_DIR)/*.result; do \
+			if grep -q "FAILED" "$$f" 2>/dev/null; then \
+				name=$$(basename "$$f" .result); \
+				echo "  - $$name (see $(RESULT_DIR)/$$name.log)"; \
+			fi; \
+		done; \
+	fi
+
+# ============================================================================
+# Sequential test execution (old behavior)
+# ============================================================================
+
+test-seq: $(TCL_EXT) $(RESULT_DIR)
+	@echo "Running SQLite TCL test suite sequentially..."
 	@echo ""
 	@passed=0; failed=0; skipped=0; \
 	for t in $(SQLITE_TESTS); do \
@@ -146,12 +207,16 @@ test: $(TCL_EXT) $(RESULT_DIR)
 		done; \
 	fi
 
+# ============================================================================
+# Individual test targets
+# ============================================================================
+
 # Run basic RustQL tests (quick smoke test)
 test-basic: $(TCL_EXT)
 	@echo "Running basic RustQL TCL tests..."
 	@$(TCLSH) tests/run_tcl_test.tcl tests/basic_tcl.test
 
-# Pattern rule for individual tests
+# Pattern rule for running individual tests interactively (with output to terminal)
 test-%: $(TCL_EXT) $(RESULT_DIR)
 	@if [ -f "$(TEST_DIR)/$*.test" ]; then \
 		echo "Running $*.test..."; \
@@ -169,16 +234,21 @@ test-%: $(TCL_EXT) $(RESULT_DIR)
 		exit 1; \
 	fi
 
-# Clean up
+# ============================================================================
+# Cleanup
+# ============================================================================
+
 clean:
 	rm -rf $(RESULT_DIR)
 	$(CARGO) clean
 
-# Clean only test results (keep build)
 clean-results:
 	rm -rf $(RESULT_DIR)
 
-# Show test statistics from log files
+# ============================================================================
+# Reporting
+# ============================================================================
+
 test-report:
 	@if [ ! -d "$(RESULT_DIR)" ]; then \
 		echo "No test results found. Run 'make test' first."; \
@@ -219,7 +289,6 @@ test-report:
 		echo "No test data found."; \
 	fi
 
-# Output pass rates from existing test logs (run 'make test' first)
 pass-rates:
 	@if [ ! -d "$(RESULT_DIR)" ]; then \
 		echo "No test results found. Run 'make test' first."; \

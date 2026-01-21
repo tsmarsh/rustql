@@ -3511,13 +3511,7 @@ impl<'s> SelectCompiler<'s> {
                     P4::Unused,
                 );
                 self.emit(Opcode::NewRowid, *cursor, rowid_reg, 0, P4::Unused);
-                self.emit(
-                    Opcode::Insert,
-                    *cursor,
-                    record_reg,
-                    rowid_reg,
-                    P4::Unused,
-                );
+                self.emit(Opcode::Insert, *cursor, record_reg, rowid_reg, P4::Unused);
             }
             _ => {
                 // Output as result row

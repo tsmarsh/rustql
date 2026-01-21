@@ -229,6 +229,21 @@ impl<'a> Parser<'a> {
 
         // Handle compound operators
         loop {
+            if self.check(TokenKind::Order) || self.check(TokenKind::Limit) {
+                if let Some(op_name) = self.find_compound_op_after_clause(self.pos) {
+                    let clause = if self.check(TokenKind::Order) {
+                        "ORDER BY"
+                    } else {
+                        "LIMIT"
+                    };
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        format!("{clause} clause should come after {op_name} not before"),
+                    ));
+                }
+                break;
+            }
+
             let op = if self.match_token(TokenKind::Union) {
                 if self.match_token(TokenKind::All) {
                     CompoundOp::UnionAll
@@ -566,7 +581,10 @@ impl<'a> Parser<'a> {
 
     fn parse_table_primary(&mut self) -> Result<TableRef> {
         if self.match_token(TokenKind::LParen) {
-            if self.check(TokenKind::Select) || self.check(TokenKind::With) {
+            if self.check(TokenKind::Select)
+                || self.check(TokenKind::With)
+                || self.check(TokenKind::Values)
+            {
                 let query = self.parse_select_stmt()?;
                 self.expect(TokenKind::RParen)?;
                 let alias = self.parse_table_alias()?;
@@ -2238,7 +2256,10 @@ impl<'a> Parser<'a> {
     fn parse_in_expr(&mut self, left: Expr, negated: bool) -> Result<Expr> {
         self.expect(TokenKind::LParen)?;
 
-        let list = if self.check(TokenKind::Select) || self.check(TokenKind::With) {
+        let list = if self.check(TokenKind::Select)
+            || self.check(TokenKind::With)
+            || self.check(TokenKind::Values)
+        {
             InList::Subquery(Box::new(self.parse_select_stmt()?))
         } else if self.check(TokenKind::RParen) {
             InList::Values(Vec::new())
@@ -2511,7 +2532,10 @@ impl<'a> Parser<'a> {
 
         // Parenthesized expression or subquery
         if self.match_token(TokenKind::LParen) {
-            if self.check(TokenKind::Select) || self.check(TokenKind::With) {
+            if self.check(TokenKind::Select)
+                || self.check(TokenKind::With)
+                || self.check(TokenKind::Values)
+            {
                 let subquery = self.parse_select_stmt()?;
                 self.expect(TokenKind::RParen)?;
                 return Ok(Expr::Subquery(Box::new(subquery)));
@@ -2933,6 +2957,46 @@ impl<'a> Parser<'a> {
             exprs.push(self.parse_expr()?);
         }
         Ok(exprs)
+    }
+
+    fn find_compound_op_after_clause(&self, start: usize) -> Option<String> {
+        let mut depth: i32 = 0;
+        let mut i = start;
+        while i < self.tokens.len() {
+            match self.tokens[i].kind {
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                TokenKind::Semicolon | TokenKind::Eof => {
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                TokenKind::Union if depth == 0 => {
+                    let op = if self
+                        .tokens
+                        .get(i + 1)
+                        .map(|token| token.kind == TokenKind::All)
+                        .unwrap_or(false)
+                    {
+                        "UNION ALL".to_string()
+                    } else {
+                        "UNION".to_string()
+                    };
+                    return Some(op);
+                }
+                TokenKind::Except if depth == 0 => return Some("EXCEPT".to_string()),
+                TokenKind::Intersect if depth == 0 => return Some("INTERSECT".to_string()),
+                _ => {}
+            }
+            i += 1;
+        }
+
+        None
     }
 
     fn error(&self, _msg: &str) -> Error {

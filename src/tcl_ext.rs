@@ -214,6 +214,73 @@ unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         std::ptr::null_mut(),
         None,
     );
+
+    // Initialize sqlite_options array with capability flags
+    // These flags tell the test harness which features are supported
+    let sqlite_options = [
+        // Core features we support
+        ("cast", "1"),
+        ("altertable", "1"),
+        ("schema_pragmas", "1"),
+        ("pragma", "1"),
+        ("subquery", "1"),
+        ("compound", "1"),
+        ("view", "1"),
+        ("trigger", "0"), // Triggers not fully supported yet
+        ("foreignkey", "0"),
+        ("vtab", "0"), // Virtual tables not supported
+        ("auth", "0"), // Authorization not supported
+        ("like_opt", "1"),
+        ("cursorhints", "0"),
+        ("stat4", "0"),
+        ("lookaside", "0"),
+        ("uri", "0"),
+        ("wal", "0"),
+        ("pager_pragmas", "1"),
+        ("attach", "1"),
+        ("vacuum", "0"), // Vacuum not fully supported yet
+        ("tempdb", "1"),
+        ("memorydb", "1"),
+        ("explain", "1"),
+        ("bloblit", "1"),
+        ("integrityck", "0"),
+        ("autoindex", "0"),
+        ("analyze", "0"),
+        ("datetime", "1"),
+        ("long_double", "0"),
+        ("encoding", "1"),
+        ("incrblob", "0"),
+        ("progress", "0"),
+        ("windowfunc", "0"),
+        ("cte", "0"),
+        ("conflict", "1"),
+        ("or_opt", "1"),
+        ("update_delete_limit", "0"),
+        ("between_opt", "1"),
+    ];
+
+    let arr_name = CString::new("::sqlite_options").unwrap();
+    for (key, value) in &sqlite_options {
+        let key_c = CString::new(*key).unwrap();
+        let val_obj = Tcl_NewIntObj(value.parse::<c_int>().unwrap_or(0));
+        Tcl_SetVar2Ex(
+            interp,
+            arr_name.as_ptr(),
+            key_c.as_ptr(),
+            val_obj,
+            TCL_GLOBAL_ONLY,
+        );
+    }
+
+    // Also set bitmask_size variable used by join3.test
+    let bitmask_size_name = CString::new("::bitmask_size").unwrap();
+    let bitmask_size_val = CString::new("64").unwrap();
+    Tcl_SetVar(
+        interp,
+        bitmask_size_name.as_ptr(),
+        bitmask_size_val.as_ptr(),
+        TCL_GLOBAL_ONLY,
+    );
 }
 
 /// Stub that returns 0
@@ -382,7 +449,7 @@ unsafe extern "C" fn db_cmd(
             }
             db_exists(db_name, interp, objv)
         }
-        "onecolumn" => {
+        "onecolumn" | "one" => {
             if objc < 3 {
                 set_result_string(interp, "wrong # args: should be \"db onecolumn SQL\"");
                 return TCL_ERROR;
@@ -476,107 +543,172 @@ unsafe fn db_eval(
         (None, None)
     };
 
-    // Execute SQL and collect results
-    let result_list = Tcl_NewListObj(0, std::ptr::null());
+    // For array-script form, we need to collect rows first, then release the
+    // connection borrow before calling Tcl_Eval (which may re-enter db_eval)
+    if let (Some(ref arr_name), Some(ref scr)) = (&array_name, &script) {
+        // Collect all rows with their column names and values
+        let collected_rows: Result<Vec<(Vec<String>, Vec<String>)>, String> =
+            CONNECTIONS.with(|connections| {
+                let mut conns = connections.borrow_mut();
+                let conn = match conns.get_mut(db_name) {
+                    Some(c) => c.as_mut(),
+                    None => {
+                        return Err(format!("no such database: {}", db_name));
+                    }
+                };
 
-    CONNECTIONS.with(|connections| {
-        let mut conns = connections.borrow_mut();
-        let conn = match conns.get_mut(db_name) {
-            Some(c) => c.as_mut(),
-            None => {
-                set_result_string(interp, &format!("no such database: {}", db_name));
-                return TCL_ERROR;
-            }
-        };
+                let mut rows = Vec::new();
+                let mut remaining = sql.as_str();
 
-        let mut remaining = sql.as_str();
+                while !remaining.trim().is_empty() {
+                    let trimmed = remaining.trim_start();
+                    if trimmed.starts_with("--") {
+                        if let Some(pos) = trimmed.find('\n') {
+                            remaining = &trimmed[pos + 1..];
+                            continue;
+                        } else {
+                            break;
+                        }
+                    }
 
-        while !remaining.trim().is_empty() {
-            let trimmed = remaining.trim_start();
-            if trimmed.starts_with("--") {
-                if let Some(pos) = trimmed.find('\n') {
-                    remaining = &trimmed[pos + 1..];
-                    continue;
-                } else {
-                    break;
+                    let (mut stmt, tail) = match sqlite3_prepare_v2(conn, remaining) {
+                        Ok(r) => r,
+                        Err(e) => return Err(e.sqlite_errmsg()),
+                    };
+
+                    if stmt.sql().is_empty() {
+                        remaining = tail;
+                        continue;
+                    }
+
+                    loop {
+                        match sqlite3_step(&mut stmt) {
+                            Ok(StepResult::Row) => {
+                                let col_count = sqlite3_column_count(&stmt);
+                                let mut col_names = Vec::new();
+                                let mut col_values = Vec::new();
+
+                                for i in 0..col_count {
+                                    let col_name =
+                                        sqlite3_column_name(&stmt, i).unwrap_or("").to_string();
+                                    col_names.push(col_name);
+
+                                    let col_type = sqlite3_column_type(&stmt, i);
+                                    let value = match col_type {
+                                        ColumnType::Null => "".to_string(),
+                                        _ => sqlite3_column_text(&stmt, i),
+                                    };
+                                    col_values.push(value);
+                                }
+
+                                rows.push((col_names, col_values));
+                            }
+                            Ok(StepResult::Done) => break,
+                            Err(e) => {
+                                let _ = sqlite3_finalize(stmt);
+                                return Err(e.sqlite_errmsg());
+                            }
+                        }
+                    }
+
+                    let _ = sqlite3_finalize(stmt);
+                    remaining = tail;
                 }
-            }
 
-            let (mut stmt, tail) = match sqlite3_prepare_v2(conn, remaining) {
-                Ok(r) => r,
-                Err(e) => {
-                    // result_list is unmanaged, but TCL handles cleanup
-                    set_result_string(interp, &e.sqlite_errmsg());
+                Ok(rows)
+            });
+
+        // Now process the collected rows outside the borrow
+        match collected_rows {
+            Ok(rows) => {
+                let arr_c =
+                    CString::new(arr_name.as_str()).unwrap_or_else(|_| CString::new("").unwrap());
+                let script_c =
+                    CString::new(scr.as_str()).unwrap_or_else(|_| CString::new("").unwrap());
+
+                const TCL_BREAK: c_int = 3;
+                const TCL_CONTINUE: c_int = 4;
+
+                for (col_names, col_values) in rows {
+                    // Set array elements
+                    for (name, value) in col_names.iter().zip(col_values.iter()) {
+                        let col_c = CString::new(name.as_str())
+                            .unwrap_or_else(|_| CString::new("").unwrap());
+                        let val_obj = string_to_obj(value);
+                        Tcl_SetVar2Ex(interp, arr_c.as_ptr(), col_c.as_ptr(), val_obj, 0);
+                    }
+
+                    // Set array(*) = list of column names
+                    let star = CString::new("*").unwrap();
+                    let names_list = Tcl_NewListObj(0, std::ptr::null());
+                    for name in &col_names {
+                        let name_obj = string_to_obj(name);
+                        Tcl_ListObjAppendElement(interp, names_list, name_obj);
+                    }
+                    Tcl_SetVar2Ex(interp, arr_c.as_ptr(), star.as_ptr(), names_list, 0);
+
+                    // Evaluate the script (now safe to call Tcl_Eval)
+                    let eval_result = Tcl_Eval(interp, script_c.as_ptr());
+
+                    if eval_result == TCL_BREAK {
+                        return TCL_OK;
+                    } else if eval_result == TCL_ERROR {
+                        return TCL_ERROR;
+                    }
+                    // TCL_CONTINUE and TCL_OK: continue to next row
+                }
+
+                TCL_OK
+            }
+            Err(msg) => {
+                set_result_string(interp, &msg);
+                TCL_ERROR
+            }
+        }
+    } else {
+        // Simple form: execute SQL and collect results as a flat list
+        let result_list = Tcl_NewListObj(0, std::ptr::null());
+
+        CONNECTIONS.with(|connections| {
+            let mut conns = connections.borrow_mut();
+            let conn = match conns.get_mut(db_name) {
+                Some(c) => c.as_mut(),
+                None => {
+                    set_result_string(interp, &format!("no such database: {}", db_name));
                     return TCL_ERROR;
                 }
             };
 
-            if stmt.sql().is_empty() {
-                remaining = tail;
-                continue;
-            }
+            let mut remaining = sql.as_str();
 
-            let mut got_row = false;
-            loop {
-                match sqlite3_step(&mut stmt) {
-                    Ok(StepResult::Row) => {
-                        got_row = true;
-                        let col_count = sqlite3_column_count(&stmt);
+            while !remaining.trim().is_empty() {
+                let trimmed = remaining.trim_start();
+                if trimmed.starts_with("--") {
+                    if let Some(pos) = trimmed.find('\n') {
+                        remaining = &trimmed[pos + 1..];
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
 
-                        if let (Some(ref arr_name), Some(ref scr)) = (&array_name, &script) {
-                            // Array-script form: set array elements and evaluate script
-                            let arr_c = CString::new(arr_name.as_str())
-                                .unwrap_or_else(|_| CString::new("").unwrap());
+                let (mut stmt, tail) = match sqlite3_prepare_v2(conn, remaining) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        set_result_string(interp, &e.sqlite_errmsg());
+                        return TCL_ERROR;
+                    }
+                };
 
-                            // Build list of column names and set array elements
-                            let mut col_names: Vec<String> = Vec::new();
-                            for i in 0..col_count {
-                                let col_name =
-                                    sqlite3_column_name(&stmt, i).unwrap_or("").to_string();
-                                col_names.push(col_name.clone());
+                if stmt.sql().is_empty() {
+                    remaining = tail;
+                    continue;
+                }
 
-                                let col_type = sqlite3_column_type(&stmt, i);
-                                let value = match col_type {
-                                    ColumnType::Null => "".to_string(),
-                                    _ => sqlite3_column_text(&stmt, i),
-                                };
-
-                                // Set array(column_name) = value
-                                let col_c = CString::new(col_name.as_str())
-                                    .unwrap_or_else(|_| CString::new("").unwrap());
-                                let val_obj = string_to_obj(&value);
-                                Tcl_SetVar2Ex(interp, arr_c.as_ptr(), col_c.as_ptr(), val_obj, 0);
-                            }
-
-                            // Set array(*) = list of column names
-                            let star = CString::new("*").unwrap();
-                            let names_list = Tcl_NewListObj(0, std::ptr::null());
-                            for name in &col_names {
-                                let name_obj = string_to_obj(name);
-                                Tcl_ListObjAppendElement(interp, names_list, name_obj);
-                            }
-                            Tcl_SetVar2Ex(interp, arr_c.as_ptr(), star.as_ptr(), names_list, 0);
-
-                            // Evaluate the script
-                            let script_c = CString::new(scr.as_str())
-                                .unwrap_or_else(|_| CString::new("").unwrap());
-                            let eval_result = Tcl_Eval(interp, script_c.as_ptr());
-
-                            // Check for break/continue/error
-                            const TCL_BREAK: c_int = 3;
-                            const TCL_CONTINUE: c_int = 4;
-
-                            if eval_result == TCL_BREAK {
-                                let _ = sqlite3_finalize(stmt);
-                                Tcl_SetObjResult(interp, result_list);
-                                return TCL_OK;
-                            } else if eval_result == TCL_ERROR {
-                                let _ = sqlite3_finalize(stmt);
-                                return TCL_ERROR;
-                            }
-                            // TCL_CONTINUE and TCL_OK: continue to next row
-                        } else {
-                            // Simple form: append values to result list
+                loop {
+                    match sqlite3_step(&mut stmt) {
+                        Ok(StepResult::Row) => {
+                            let col_count = sqlite3_column_count(&stmt);
                             for i in 0..col_count {
                                 let col_type = sqlite3_column_type(&stmt, i);
                                 let value = match col_type {
@@ -587,46 +719,23 @@ unsafe fn db_eval(
                                 Tcl_ListObjAppendElement(interp, result_list, obj);
                             }
                         }
-                    }
-                    Ok(StepResult::Done) => {
-                        // Handle empty_result_callbacks: set column names even for empty results
-                        if !got_row && conn.db_config.empty_result_callbacks && array_name.is_some()
-                        {
-                            let col_count = sqlite3_column_count(&stmt);
-                            if col_count > 0 {
-                                let arr_name = array_name.as_ref().unwrap();
-                                let arr_c = CString::new(arr_name.as_str())
-                                    .unwrap_or_else(|_| CString::new("").unwrap());
-
-                                // Set array(*) = list of column names
-                                let star = CString::new("*").unwrap();
-                                let names_list = Tcl_NewListObj(0, std::ptr::null());
-                                for i in 0..col_count {
-                                    let col_name =
-                                        sqlite3_column_name(&stmt, i).unwrap_or("").to_string();
-                                    let name_obj = string_to_obj(&col_name);
-                                    Tcl_ListObjAppendElement(interp, names_list, name_obj);
-                                }
-                                Tcl_SetVar2Ex(interp, arr_c.as_ptr(), star.as_ptr(), names_list, 0);
-                            }
+                        Ok(StepResult::Done) => break,
+                        Err(e) => {
+                            let _ = sqlite3_finalize(stmt);
+                            set_result_string(interp, &e.sqlite_errmsg());
+                            return TCL_ERROR;
                         }
-                        break;
-                    }
-                    Err(e) => {
-                        let _ = sqlite3_finalize(stmt);
-                        set_result_string(interp, &e.sqlite_errmsg());
-                        return TCL_ERROR;
                     }
                 }
+
+                let _ = sqlite3_finalize(stmt);
+                remaining = tail;
             }
 
-            let _ = sqlite3_finalize(stmt);
-            remaining = tail;
-        }
-
-        Tcl_SetObjResult(interp, result_list);
-        TCL_OK
-    })
+            Tcl_SetObjResult(interp, result_list);
+            TCL_OK
+        })
+    }
 }
 
 /// Check if query returns any rows
@@ -758,6 +867,7 @@ unsafe fn set_result_int(interp: *mut Tcl_Interp, i: i32) {
 // TCL C API bindings
 const TCL_OK: c_int = 0;
 const TCL_ERROR: c_int = 1;
+const TCL_GLOBAL_ONLY: c_int = 1;
 
 #[repr(C)]
 pub struct Tcl_Interp {
@@ -821,4 +931,11 @@ extern "C" {
         part2: *const c_char,
         flags: c_int,
     ) -> c_int;
+
+    fn Tcl_SetVar(
+        interp: *mut Tcl_Interp,
+        varName: *const c_char,
+        newValue: *const c_char,
+        flags: c_int,
+    ) -> *const c_char;
 }

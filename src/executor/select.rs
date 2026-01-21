@@ -1205,12 +1205,20 @@ impl<'s> SelectCompiler<'s> {
         );
 
         // Finalize and output previous group
+        // Save column names length - finalize_aggregates_with_group adds to result_column_names
+        // but we only want the names added once (first iteration only)
+        let saved_result_column_names_prev = self.result_column_names.len();
         let result_regs = self.finalize_aggregates_with_group(
             &core.columns,
             &agg_regs,
             Some(group_by),
             prev_group_regs,
         )?;
+        // Only keep names from first group output (truncate to saved length unless this is first)
+        if saved_result_column_names_prev > 0 {
+            self.result_column_names
+                .truncate(saved_result_column_names_prev);
+        }
 
         // HAVING clause
         if let Some(having) = &core.having {
@@ -1254,12 +1262,17 @@ impl<'s> SelectCompiler<'s> {
         );
 
         // Output final group
+        // Save column names length - finalize_aggregates_with_group adds to result_column_names
+        // but we only want the names added once (they were added during the first group output)
+        let saved_result_column_names = self.result_column_names.len();
         let result_regs = self.finalize_aggregates_with_group(
             &core.columns,
             &agg_regs,
             Some(group_by),
             prev_group_regs,
         )?;
+        // Restore column names (don't double-count for final group output)
+        self.result_column_names.truncate(saved_result_column_names);
         if let Some(having) = &core.having {
             let skip_output_label = self.alloc_label();
             self.compile_where_condition(having, skip_output_label)?;
@@ -4717,7 +4730,14 @@ impl<'s> SelectCompiler<'s> {
                         )
                     {
                         let arg_reg = self.alloc_reg();
-                        self.emit(Opcode::Column, cursor, col_idx as i32, arg_reg, P4::Unused);
+                        // For COUNT(*) (arg_count == 0), use a constant instead of reading from sorter
+                        // because COUNT(*) has no argument stored in the sorter
+                        if arg_count == 0 && name_upper == "COUNT" {
+                            self.emit(Opcode::Integer, 1, arg_reg, 0, P4::Unused);
+                        } else {
+                            self.emit(Opcode::Column, cursor, col_idx as i32, arg_reg, P4::Unused);
+                            col_idx += 1;
+                        }
                         self.emit(
                             Opcode::AggStep,
                             arg_reg,
@@ -4726,7 +4746,6 @@ impl<'s> SelectCompiler<'s> {
                             P4::Text(name_upper),
                         );
                         agg_idx += 1;
-                        col_idx += 1;
                     }
                 }
             }

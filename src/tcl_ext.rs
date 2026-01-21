@@ -391,8 +391,15 @@ unsafe extern "C" fn db_cmd(
         }
         "status" => {
             if objc >= 3 {
-                // All status queries return 0 for now
-                set_result_int(interp, 0);
+                let what = obj_to_string(*objv.offset(2));
+                if what == "sort" {
+                    // Return whether the most recent query performed a sort
+                    let did_sort = crate::vdbe::get_sort_flag();
+                    set_result_int(interp, if did_sort { 1 } else { 0 });
+                } else {
+                    // Other status queries return 0
+                    set_result_int(interp, 0);
+                }
             } else {
                 set_result_string(interp, "");
             }

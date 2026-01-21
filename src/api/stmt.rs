@@ -7,11 +7,14 @@ use std::sync::atomic::Ordering;
 use crate::error::{Error, ErrorCode, Result};
 use crate::executor::analyze::execute_analyze;
 use crate::executor::pragma::{execute_pragma, pragma_columns};
-use crate::executor::prepare::{compile_sql, compile_sql_with_schema, CompiledStmt, StmtType};
+use crate::executor::prepare::{
+    compile_sql, compile_sql_with_config, compile_sql_with_schema, CompiledStmt, StmtType,
+};
 use crate::parser::ast::{AttachStmt, Expr, Literal, QualifiedName, Variable};
 use crate::types::{ColumnType, StepResult, Value};
 use crate::vdbe::engine::Vdbe;
 use crate::vdbe::ops::VdbeOp;
+use crate::vdbe::reset_sort_flag;
 
 use super::connection::SqliteConnection;
 
@@ -319,9 +322,12 @@ pub fn sqlite3_prepare_v2<'a>(
     });
 
     // Compile the SQL to VDBE bytecode with schema access for name resolution
+    // Pass column naming PRAGMA settings for result column name formatting
+    let short_column_names = conn.db_config.short_column_names;
+    let full_column_names = conn.db_config.full_column_names;
     let compile_result = if let Some(ref schema_arc) = conn.main_db().schema {
         if let Ok(schema) = schema_arc.read() {
-            compile_sql_with_schema(sql, &schema)
+            compile_sql_with_config(sql, &schema, short_column_names, full_column_names)
         } else {
             compile_sql(sql)
         }
@@ -448,6 +454,9 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
             stmt.set_done();
             return Ok(StepResult::Done);
         }
+
+        // Reset the sort flag before executing a new query
+        reset_sort_flag();
 
         // Create VDBE from compiled bytecode
         let mut vdbe = Vdbe::from_ops(stmt.ops.clone());

@@ -33,7 +33,8 @@ pub use fkey::{
 };
 pub use insert::{compile_insert, compile_insert_with_schema, InsertCompiler};
 pub use prepare::{
-    compile_sql, compile_sql_with_schema, parse_sql, CompiledStmt, StatementCompiler, StmtType,
+    compile_sql, compile_sql_with_config, compile_sql_with_schema, parse_sql, CompiledStmt,
+    StatementCompiler, StmtType,
 };
 pub use trigger::{
     compile_create_trigger, compile_drop_trigger, find_matching_triggers, generate_trigger_code,

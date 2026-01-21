@@ -102,6 +102,10 @@ pub struct StatementCompiler<'s> {
     named_params: HashSet<String>,
     /// Schema for name resolution (optional)
     schema: Option<&'s crate::schema::Schema>,
+    /// PRAGMA short_column_names (default ON)
+    short_column_names: bool,
+    /// PRAGMA full_column_names (default OFF)
+    full_column_names: bool,
 }
 
 impl<'s> StatementCompiler<'s> {
@@ -112,6 +116,8 @@ impl<'s> StatementCompiler<'s> {
             param_names: Vec::new(),
             named_params: HashSet::new(),
             schema: None,
+            short_column_names: true,
+            full_column_names: false,
         }
     }
 
@@ -122,7 +128,15 @@ impl<'s> StatementCompiler<'s> {
             param_names: Vec::new(),
             named_params: HashSet::new(),
             schema: Some(schema),
+            short_column_names: true,
+            full_column_names: false,
         }
+    }
+
+    /// Set column naming flags from PRAGMA settings
+    pub fn set_column_name_flags(&mut self, short_column_names: bool, full_column_names: bool) {
+        self.short_column_names = short_column_names;
+        self.full_column_names = full_column_names;
     }
 
     /// Compile a SQL string to VDBE bytecode
@@ -167,6 +181,8 @@ impl<'s> StatementCompiler<'s> {
                 } else {
                     SelectCompiler::new()
                 };
+                // Pass column naming flags from PRAGMA settings
+                compiler.set_column_name_flags(self.short_column_names, self.full_column_names);
                 let ops = compiler.compile(select, &SelectDest::Output)?;
                 // Use column names from compiler (properly expanded for Star)
                 let names = if compiler.column_names().is_empty() {
@@ -2011,6 +2027,22 @@ pub fn compile_sql_with_schema<'a>(
     schema: &crate::schema::Schema,
 ) -> Result<(CompiledStmt, &'a str)> {
     let mut compiler = StatementCompiler::with_schema(schema);
+    compiler.compile(sql)
+}
+
+/// Compile SQL to VDBE bytecode with schema and column naming configuration
+///
+/// Returns the compiled statement and any remaining SQL (tail).
+/// The schema is used for name resolution (e.g., expanding SELECT *).
+/// The column naming flags control result column name formatting.
+pub fn compile_sql_with_config<'a>(
+    sql: &'a str,
+    schema: &crate::schema::Schema,
+    short_column_names: bool,
+    full_column_names: bool,
+) -> Result<(CompiledStmt, &'a str)> {
+    let mut compiler = StatementCompiler::with_schema(schema);
+    compiler.set_column_name_flags(short_column_names, full_column_names);
     compiler.compile(sql)
 }
 

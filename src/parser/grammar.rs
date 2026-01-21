@@ -399,8 +399,24 @@ impl<'a> Parser<'a> {
         let mut tables = vec![self.parse_table_ref()?];
 
         // Handle implicit cross joins (comma-separated)
+        // SQLite extension: comma-join can have ON clause, e.g., "t1, t2 ON t1.a=t2.b"
         while self.match_token(TokenKind::Comma) {
-            tables.push(self.parse_table_ref()?);
+            let right = self.parse_table_ref()?;
+
+            // Check for ON clause (undocumented SQLite extension for comma joins)
+            if self.match_token(TokenKind::On) {
+                let on_expr = self.parse_expr()?;
+                // Convert to an explicit JOIN with ON constraint
+                let left = tables.pop().unwrap();
+                tables.push(TableRef::Join {
+                    left: Box::new(left),
+                    join_type: JoinFlags::INNER,
+                    right: Box::new(right),
+                    constraint: Some(JoinConstraint::On(Box::new(on_expr))),
+                });
+            } else {
+                tables.push(right);
+            }
         }
 
         Ok(FromClause { tables })
@@ -471,9 +487,14 @@ impl<'a> Parser<'a> {
                     flags |= JoinFlags::OUTER;
                 }
                 return Some(flags);
+            } else if self.match_token(TokenKind::Cross) {
+                // NATURAL CROSS JOIN
+                return Some(JoinFlags::NATURAL | JoinFlags::INNER | JoinFlags::CROSS);
+            } else if self.match_token(TokenKind::Inner) {
+                // NATURAL INNER JOIN
+                return Some(JoinFlags::NATURAL | JoinFlags::INNER);
             } else {
-                // NATURAL [INNER] JOIN
-                self.match_token(TokenKind::Inner);
+                // NATURAL JOIN (bare)
                 return Some(JoinFlags::NATURAL | JoinFlags::INNER);
             }
         }

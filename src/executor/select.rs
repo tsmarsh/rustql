@@ -166,6 +166,9 @@ pub struct SelectCompiler<'s> {
     /// Join conditions collected from ON/USING/NATURAL in FROM clause
     /// These are merged with WHERE clause during compilation
     join_conditions: Vec<Expr>,
+    /// Columns to exclude from * expansion for each table (for NATURAL/USING coalescing)
+    /// Key: table index, Value: set of column names to exclude
+    coalesced_columns: HashMap<usize, std::collections::HashSet<String>>,
 }
 
 impl<'s> SelectCompiler<'s> {
@@ -200,6 +203,7 @@ impl<'s> SelectCompiler<'s> {
             next_subquery: 0,
             compound_aliases: HashMap::new(),
             join_conditions: Vec::new(),
+            coalesced_columns: HashMap::new(),
         }
     }
 
@@ -234,6 +238,7 @@ impl<'s> SelectCompiler<'s> {
             next_subquery: 0,
             compound_aliases: HashMap::new(),
             join_conditions: Vec::new(),
+            coalesced_columns: HashMap::new(),
         }
     }
 
@@ -901,10 +906,22 @@ impl<'s> SelectCompiler<'s> {
             match col {
                 ResultColumn::Star => {
                     // Expand * to all columns from all tables
+                    // Skip coalesced columns from NATURAL/USING joins
                     let tables_snapshot: Vec<_> = self.tables.clone();
-                    for table in &tables_snapshot {
+                    let coalesced_snapshot = self.coalesced_columns.clone();
+
+                    for (table_idx, table) in tables_snapshot.iter().enumerate() {
+                        let excluded_cols = coalesced_snapshot.get(&table_idx);
+
                         if let Some(schema_table) = &table.schema_table {
-                            for (col_idx, _) in schema_table.columns.iter().enumerate() {
+                            for (col_idx, col_def) in schema_table.columns.iter().enumerate() {
+                                // Skip coalesced columns
+                                if let Some(excluded) = excluded_cols {
+                                    if excluded.contains(&col_def.name.to_lowercase()) {
+                                        continue;
+                                    }
+                                }
+
                                 let reg = self.alloc_reg();
                                 self.emit(
                                     Opcode::Column,
@@ -1544,6 +1561,7 @@ impl<'s> SelectCompiler<'s> {
     /// - ON: use the expression directly
     fn process_joins(&mut self, src_list: &crate::parser::ast::SrcList) -> Result<()> {
         use crate::parser::ast::{BinaryOp, ColumnRef, Expr};
+        use std::collections::HashSet;
 
         for (i, item) in src_list.items.iter().enumerate() {
             if i == 0 {
@@ -1556,6 +1574,14 @@ impl<'s> SelectCompiler<'s> {
             // Handle NATURAL join - find common columns
             if item.join_type.is_natural() {
                 let common_cols = self.find_common_columns(i);
+
+                // Track common columns to exclude from * expansion for current (right) table
+                let excluded: HashSet<String> =
+                    common_cols.iter().map(|s| s.to_lowercase()).collect();
+                if !excluded.is_empty() {
+                    self.coalesced_columns.insert(i, excluded);
+                }
+
                 for col_name in common_cols {
                     // Generate: prev_table.col = current_table.col
                     let left_expr = Expr::Column(ColumnRef {
@@ -1580,6 +1606,13 @@ impl<'s> SelectCompiler<'s> {
             }
             // Handle USING clause
             else if let Some(using_cols) = &item.using_columns {
+                // Track USING columns to exclude from * expansion for current (right) table
+                let excluded: HashSet<String> =
+                    using_cols.iter().map(|s| s.to_lowercase()).collect();
+                if !excluded.is_empty() {
+                    self.coalesced_columns.insert(i, excluded);
+                }
+
                 for col_name in using_cols {
                     // Generate: prev_table.col = current_table.col
                     let left_expr = Expr::Column(ColumnRef {
@@ -1975,11 +2008,24 @@ impl<'s> SelectCompiler<'s> {
             match col {
                 ResultColumn::Star => {
                     // Expand * to all columns from all tables using schema
+                    // Skip coalesced columns from NATURAL/USING joins (they're shown from the left table)
                     let tables_snapshot: Vec<_> = self.tables.clone();
-                    for table in &tables_snapshot {
+                    let coalesced_snapshot = self.coalesced_columns.clone();
+
+                    for (table_idx, table) in tables_snapshot.iter().enumerate() {
+                        // Get the set of columns to exclude for this table (if any)
+                        let excluded_cols = coalesced_snapshot.get(&table_idx);
+
                         if let Some(schema_table) = &table.schema_table {
                             // Regular table - expand from schema
                             for (col_idx, col_def) in schema_table.columns.iter().enumerate() {
+                                // Skip coalesced columns (from NATURAL/USING on right table)
+                                if let Some(excluded) = excluded_cols {
+                                    if excluded.contains(&col_def.name.to_lowercase()) {
+                                        continue;
+                                    }
+                                }
+
                                 let reg = self.alloc_reg();
                                 self.emit(
                                     Opcode::Column,
@@ -2005,6 +2051,13 @@ impl<'s> SelectCompiler<'s> {
                         } else if let Some(subquery_cols) = &table.subquery_columns {
                             // Subquery - expand from captured column names
                             for (col_idx, subquery_col_name) in subquery_cols.iter().enumerate() {
+                                // Skip coalesced columns (from NATURAL/USING on right table)
+                                if let Some(excluded) = excluded_cols {
+                                    if excluded.contains(&subquery_col_name.to_lowercase()) {
+                                        continue;
+                                    }
+                                }
+
                                 let reg = self.alloc_reg();
                                 self.emit(
                                     Opcode::Column,
@@ -2776,16 +2829,28 @@ impl<'s> SelectCompiler<'s> {
                     // Must check for ambiguous column references
                     let mut found = None;
                     let mut match_count = 0;
-                    for tinfo in &self.tables {
+                    let col_lower = col_ref.column.to_lowercase();
+                    for (table_idx, tinfo) in self.tables.iter().enumerate() {
                         if let Some(st) = &tinfo.schema_table {
                             if let Some(idx) = st
                                 .columns
                                 .iter()
                                 .position(|c| c.name.eq_ignore_ascii_case(&col_ref.column))
                             {
-                                match_count += 1;
-                                if found.is_none() {
-                                    found = Some((tinfo.cursor, idx as i32));
+                                // Check if this column is coalesced for this table
+                                // (from NATURAL or USING join). If so, it's not
+                                // ambiguous - skip counting it.
+                                let is_coalesced = self
+                                    .coalesced_columns
+                                    .get(&table_idx)
+                                    .map(|cols| cols.contains(&col_lower))
+                                    .unwrap_or(false);
+
+                                if !is_coalesced {
+                                    match_count += 1;
+                                    if found.is_none() {
+                                        found = Some((tinfo.cursor, idx as i32));
+                                    }
                                 }
                             }
                         }

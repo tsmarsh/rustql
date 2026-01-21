@@ -729,7 +729,13 @@ impl<'s> SelectCompiler<'s> {
                 self.emit(Opcode::NullRow, cursor, 0, 0, P4::Unused);
 
                 // Re-evaluate result columns with null row
+                // Save column metadata since compile_result_columns adds to these vectors
+                let saved_result_column_names = self.result_column_names.len();
+                let saved_columns = self.columns.len();
                 let null_result_regs = self.compile_result_columns(&core.columns)?;
+                // Restore column metadata (don't double-count columns for null row output)
+                self.result_column_names.truncate(saved_result_column_names);
+                self.columns.truncate(saved_columns);
 
                 // Output the null row
                 self.output_row(dest, null_result_regs.0, null_result_regs.1)?;

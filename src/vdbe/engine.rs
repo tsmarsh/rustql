@@ -33,6 +33,31 @@ fn inc_search_count() {
     SEARCH_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
 }
 
+// ============================================================================
+// Global Sort Flag (for db status sort compatibility)
+// ============================================================================
+
+use std::sync::atomic::AtomicBool;
+
+/// Global flag for tracking whether a sort operation was performed.
+/// This is used by TCL's "db status sort" for test compatibility.
+static SORT_FLAG: AtomicBool = AtomicBool::new(false);
+
+/// Get whether a sort was performed in the most recent query
+pub fn get_sort_flag() -> bool {
+    SORT_FLAG.load(AtomicOrdering::Relaxed)
+}
+
+/// Reset the sort flag to false (call before executing a query)
+pub fn reset_sort_flag() {
+    SORT_FLAG.store(false, AtomicOrdering::Relaxed);
+}
+
+/// Set the sort flag to true (called when SorterSort executes)
+fn set_sort_flag() {
+    SORT_FLAG.store(true, AtomicOrdering::Relaxed);
+}
+
 use crate::api::{SqliteConnection, TransactionState};
 use crate::error::{Error, ErrorCode, Result};
 use crate::functions::aggregate::AggregateState;
@@ -1725,6 +1750,8 @@ impl Vdbe {
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     // Invalidate column cache on cursor movement
                     cursor.cached_columns = None;
+                    // Clear null row mode when rewinding
+                    cursor.null_row = false;
                     if cursor.is_sqlite_master {
                         // Virtual cursor for sqlite_master
                         cursor.virtual_index = 0;
@@ -3568,6 +3595,8 @@ impl Vdbe {
                         cursor.sorter_sorted = true;
                         cursor.sorter_index = 0;
                         cursor.state = CursorState::Valid;
+                        // Mark that a sort was performed for "db status sort"
+                        set_sort_flag();
                     }
                 } else {
                     self.pc = op.p2;

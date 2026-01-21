@@ -58,6 +58,8 @@ pub struct ColumnInfo {
     pub affinity: Affinity,
     /// Register holding the value
     pub reg: i32,
+    /// Explicit alias (for ORDER BY resolution)
+    pub alias: Option<String>,
 }
 
 // ============================================================================
@@ -1440,31 +1442,45 @@ impl<'s> SelectCompiler<'s> {
             TableSource::Subquery(query) => {
                 let cursor = self.alloc_cursor();
 
-                // Compile subquery to ephemeral table
-                let (subquery_ops, subquery_col_names) = {
-                    let mut sub_compiler = SelectCompiler::new();
-                    if let Some(schema) = self.schema {
-                        sub_compiler.schema = Some(schema);
-                    }
-                    sub_compiler.compile(query, &SelectDest::Output)?;
-                    (sub_compiler.ops, sub_compiler.result_column_names)
-                };
-
                 // Create ephemeral table for subquery results
-                self.emit(
-                    Opcode::OpenEphemeral,
-                    cursor,
-                    subquery_col_names.len() as i32,
-                    0,
-                    P4::Unused,
-                );
+                self.emit(Opcode::OpenEphemeral, cursor, 0, 0, P4::Unused);
 
-                // Execute subquery and populate ephemeral table
-                let sub_base_reg = self.alloc_reg();
-                for op in subquery_ops {
-                    self.ops.push(op);
+                // Compile subquery into ephemeral table
+                let subquery_dest = SelectDest::EphemTable { cursor };
+                let mut subcompiler = if let Some(schema) = self.schema {
+                    SelectCompiler::with_schema(schema)
+                } else {
+                    SelectCompiler::new()
+                };
+                subcompiler.next_reg = self.next_reg;
+                subcompiler.next_cursor = self.next_cursor;
+                // Pass column naming settings to subquery compiler
+                subcompiler.set_column_name_flags(self.short_column_names, self.full_column_names);
+                let subquery_ops = subcompiler.compile(query, &subquery_dest)?;
+
+                // Capture subquery result column names for * expansion
+                let subquery_col_names = subcompiler.result_column_names.clone();
+
+                // Inline the subquery ops (skip Halt)
+                // Adjust jump addresses by the current offset
+                // Mark inlined jump ops so resolve_labels doesn't reprocess them
+                let offset = self.ops.len() as i32;
+                for mut op in subquery_ops {
+                    if op.opcode != Opcode::Halt {
+                        // Adjust P2 for jump instructions
+                        // The subcompiler already resolved labels, so P2 contains actual addresses
+                        // We need to adjust by offset and mark as resolved
+                        if op.opcode.is_jump() {
+                            op.p2 += offset;
+                            // Use P5 = 0xFFFF to mark as already resolved so resolve_labels skips it
+                            op.p5 = 0xFFFF;
+                        }
+                        self.ops.push(op);
+                    }
                 }
-                self.emit(Opcode::Insert, cursor, sub_base_reg, 0, P4::Unused);
+
+                self.next_reg = subcompiler.next_reg;
+                self.next_cursor = subcompiler.next_cursor;
 
                 let subquery_name = item.alias.clone().unwrap_or_else(|| {
                     let name = format!("(subquery-{})", self.next_subquery);
@@ -2000,6 +2016,12 @@ impl<'s> SelectCompiler<'s> {
 
     /// Compile result columns
     fn compile_result_columns(&mut self, columns: &[ResultColumn]) -> Result<(i32, usize)> {
+        // Clear alias_expressions to avoid result column aliases interfering with
+        // column resolution within the result columns themselves.
+        // alias_expressions was populated by prescan_result_aliases for WHERE clause
+        // resolution, but should not affect result column compilation.
+        self.alias_expressions.clear();
+
         // Track result registers explicitly since they may not be contiguous
         // (function arguments allocate intermediate registers)
         let mut result_regs: Vec<i32> = Vec::new();
@@ -2136,17 +2158,25 @@ impl<'s> SelectCompiler<'s> {
                         .clone()
                         .unwrap_or_else(|| self.expr_to_name(expr, result_regs.len()));
                     self.result_column_names.push(name.clone());
-                    // Track explicit aliases for ORDER BY resolution
-                    if let Some(alias_name) = alias {
-                        self.result_aliases.insert(alias_name.to_lowercase(), reg);
-                    }
+                    // Collect aliases for later - don't populate result_aliases yet
+                    // to avoid subsequent columns incorrectly resolving to earlier aliases
                     self.columns.push(ColumnInfo {
                         name,
                         table: None,
                         affinity: Affinity::Blob,
                         reg,
+                        alias: alias.clone(),
                     });
                 }
+            }
+        }
+
+        // Now populate result_aliases for ORDER BY resolution
+        // This must happen AFTER all result columns are compiled
+        for col_info in &self.columns {
+            if let Some(alias_name) = &col_info.alias {
+                self.result_aliases
+                    .insert(alias_name.to_lowercase(), col_info.reg);
             }
         }
 
@@ -3472,6 +3502,7 @@ impl<'s> SelectCompiler<'s> {
             SelectDest::Table { cursor } | SelectDest::EphemTable { cursor } => {
                 // Insert into ephemeral/regular table
                 let record_reg = self.alloc_reg();
+                let rowid_reg = self.alloc_reg();
                 self.emit(
                     Opcode::MakeRecord,
                     result_base_reg,
@@ -3479,12 +3510,12 @@ impl<'s> SelectCompiler<'s> {
                     record_reg,
                     P4::Unused,
                 );
-                self.emit(Opcode::NewRowid, *cursor, result_base_reg, 0, P4::Unused);
+                self.emit(Opcode::NewRowid, *cursor, rowid_reg, 0, P4::Unused);
                 self.emit(
                     Opcode::Insert,
                     *cursor,
                     record_reg,
-                    result_base_reg,
+                    rowid_reg,
                     P4::Unused,
                 );
             }
@@ -3603,6 +3634,7 @@ impl<'s> SelectCompiler<'s> {
             }
             SelectDest::Table { cursor } | SelectDest::EphemTable { cursor } => {
                 let record_reg = self.alloc_reg();
+                let rowid_reg = self.alloc_reg();
                 self.emit(
                     Opcode::MakeRecord,
                     base_reg,
@@ -3610,8 +3642,8 @@ impl<'s> SelectCompiler<'s> {
                     record_reg,
                     P4::Unused,
                 );
-                self.emit(Opcode::NewRowid, *cursor, base_reg, 0, P4::Unused);
-                self.emit(Opcode::Insert, *cursor, record_reg, base_reg, P4::Unused);
+                self.emit(Opcode::NewRowid, *cursor, rowid_reg, 0, P4::Unused);
+                self.emit(Opcode::Insert, *cursor, record_reg, rowid_reg, P4::Unused);
             }
             SelectDest::Coroutine { reg } => {
                 for i in 0..count {
@@ -4950,6 +4982,12 @@ impl<'s> SelectCompiler<'s> {
         // Resolve all label references in jump instructions
         for op in &mut self.ops {
             if op.opcode.is_jump() {
+                // Skip ops that were already resolved (inlined from subqueries)
+                // These are marked with p5 = 0xFFFF
+                if op.p5 == 0xFFFF {
+                    op.p5 = 0; // Clear the marker
+                    continue;
+                }
                 if let Some(Some(addr)) = self.labels.get(&op.p2) {
                     op.p2 = *addr;
                 }

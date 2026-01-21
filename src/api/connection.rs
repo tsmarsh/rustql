@@ -750,6 +750,8 @@ pub struct DbConfigFlags {
     pub full_column_names: bool,
     /// Print VDBE bytecode during prepare (default OFF)
     pub vdbe_listing: bool,
+    /// Empty result callbacks - return column names for queries with zero rows (default OFF)
+    pub empty_result_callbacks: bool,
 }
 
 impl Default for SqliteConnection {
@@ -804,9 +806,10 @@ impl SqliteConnection {
                 legacy_file_format: false,
                 no_ckpt_on_close: false,
                 count_changes: false,
-                short_column_names: true, // Default ON
-                full_column_names: false, // Default OFF
-                vdbe_listing: false,      // Default OFF
+                short_column_names: true,      // Default ON
+                full_column_names: false,      // Default OFF
+                vdbe_listing: false,           // Default OFF
+                empty_result_callbacks: false, // Default OFF
             },
             schema_generation: AtomicU64::new(0),
             memory_used: AtomicI64::new(0),

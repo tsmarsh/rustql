@@ -516,9 +516,11 @@ unsafe fn db_eval(
                 continue;
             }
 
+            let mut got_row = false;
             loop {
                 match sqlite3_step(&mut stmt) {
                     Ok(StepResult::Row) => {
+                        got_row = true;
                         let col_count = sqlite3_column_count(&stmt);
 
                         if let (Some(ref arr_name), Some(ref scr)) = (&array_name, &script) {
@@ -586,7 +588,30 @@ unsafe fn db_eval(
                             }
                         }
                     }
-                    Ok(StepResult::Done) => break,
+                    Ok(StepResult::Done) => {
+                        // Handle empty_result_callbacks: set column names even for empty results
+                        if !got_row && conn.db_config.empty_result_callbacks && array_name.is_some()
+                        {
+                            let col_count = sqlite3_column_count(&stmt);
+                            if col_count > 0 {
+                                let arr_name = array_name.as_ref().unwrap();
+                                let arr_c = CString::new(arr_name.as_str())
+                                    .unwrap_or_else(|_| CString::new("").unwrap());
+
+                                // Set array(*) = list of column names
+                                let star = CString::new("*").unwrap();
+                                let names_list = Tcl_NewListObj(0, std::ptr::null());
+                                for i in 0..col_count {
+                                    let col_name =
+                                        sqlite3_column_name(&stmt, i).unwrap_or("").to_string();
+                                    let name_obj = string_to_obj(&col_name);
+                                    Tcl_ListObjAppendElement(interp, names_list, name_obj);
+                                }
+                                Tcl_SetVar2Ex(interp, arr_c.as_ptr(), star.as_ptr(), names_list, 0);
+                            }
+                        }
+                        break;
+                    }
                     Err(e) => {
                         let _ = sqlite3_finalize(stmt);
                         set_result_string(interp, &e.sqlite_errmsg());

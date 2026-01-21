@@ -120,6 +120,7 @@ pub fn execute_pragma(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Resul
         "count_changes" => pragma_count_changes(conn, pragma),
         "short_column_names" => pragma_short_column_names(conn, pragma),
         "full_column_names" => pragma_full_column_names(conn, pragma),
+        "empty_result_callbacks" => pragma_empty_result_callbacks(conn, pragma),
         "integrity_check" => pragma_integrity_check(conn, schema_name, pragma),
         "quick_check" => pragma_integrity_check(conn, schema_name, pragma),
         "vdbe_listing" => pragma_vdbe_listing(conn, pragma),
@@ -539,6 +540,23 @@ fn pragma_vdbe_listing(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Resu
     }
     if pragma.value.is_none() {
         return Ok(single_int_result(i64::from(conn.db_config.vdbe_listing)));
+    }
+    Ok(empty_result())
+}
+
+fn pragma_empty_result_callbacks(
+    conn: &mut SqliteConnection,
+    pragma: &PragmaStmt,
+) -> Result<PragmaResult> {
+    if let Some(value) = pragma_value_i64(pragma) {
+        conn.db_config.empty_result_callbacks = value != 0;
+    } else if let Some(value) = pragma_value_string(pragma) {
+        conn.db_config.empty_result_callbacks = parse_bool_value(&value);
+    }
+    if pragma.value.is_none() {
+        return Ok(single_int_result(i64::from(
+            conn.db_config.empty_result_callbacks,
+        )));
     }
     Ok(empty_result())
 }

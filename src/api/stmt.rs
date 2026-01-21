@@ -400,6 +400,7 @@ pub fn sqlite3_prepare16(
 /// Returns Row if a row is available, Done if finished, or an error.
 pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
     use crate::vdbe::engine::ExecResult;
+    use std::sync::atomic::Ordering;
 
     if stmt.done {
         return Ok(StepResult::Done);
@@ -465,6 +466,13 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
             if let Some(main_db) = conn.find_db("main") {
                 if let Some(ref btree) = main_db.btree {
                     vdbe.set_btree(btree.clone());
+
+                    // In autocommit mode, start a write transaction for write statements
+                    // This is necessary because individual statements don't include
+                    // Transaction opcodes in their bytecode
+                    if !stmt.read_only && conn.get_autocommit() {
+                        let _ = btree.begin_trans(true);
+                    }
                 }
                 if let Some(ref schema) = main_db.schema {
                     vdbe.set_schema(schema.clone());
@@ -500,6 +508,19 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
             Ok(StepResult::Row)
         }
         Ok(ExecResult::Done) => {
+            // In autocommit mode, commit the implicit write transaction
+            if !stmt.read_only {
+                if let Some(conn_ptr) = stmt.conn_ptr {
+                    let conn = unsafe { &*conn_ptr };
+                    if conn.get_autocommit() {
+                        if let Some(main_db) = conn.find_db("main") {
+                            if let Some(ref btree) = main_db.btree {
+                                let _ = btree.commit();
+                            }
+                        }
+                    }
+                }
+            }
             stmt.set_done();
             Ok(StepResult::Done)
         }
@@ -508,6 +529,19 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
             sqlite3_step(stmt)
         }
         Err(e) => {
+            // In autocommit mode, rollback on error
+            if !stmt.read_only {
+                if let Some(conn_ptr) = stmt.conn_ptr {
+                    let conn = unsafe { &*conn_ptr };
+                    if conn.get_autocommit() {
+                        if let Some(main_db) = conn.find_db("main") {
+                            if let Some(ref btree) = main_db.btree {
+                                let _ = btree.rollback(0, false);
+                            }
+                        }
+                    }
+                }
+            }
             stmt.set_done();
             Err(e)
         }

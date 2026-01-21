@@ -2646,6 +2646,11 @@ impl Vdbe {
                     if let Some(ref btree) = self.btree {
                         let _ = btree.rollback(0, false);
                     }
+                    // Reload schema from sqlite_master after rollback.
+                    // DDL operations (CREATE/DROP TABLE/INDEX) modify the schema cache
+                    // immediately, so after rollback we must re-read the actual state
+                    // from sqlite_master to restore the pre-transaction schema.
+                    let _ = conn.reload_schema();
                     if let Some(hook) = conn.rollback_hook.as_ref() {
                         hook();
                     }
@@ -4580,14 +4585,25 @@ impl Vdbe {
                 // ParseSchemaIndex P1 P2 P3 P4
                 // Parse a CREATE INDEX statement and add to schema
                 // P1 = 1 if UNIQUE index
+                // P2 = register containing root page number
                 // P4 = SQL text of the CREATE INDEX statement
                 if let P4::Text(sql) = &op.p4 {
+                    // Get root page from register P2
+                    let root_page = if op.p2 > 0 {
+                        self.mem(op.p2).to_int() as u32
+                    } else {
+                        0
+                    };
+
                     if let Some(ref schema) = self.schema {
                         if let Ok(mut schema_guard) = schema.write() {
                             // Parse CREATE INDEX SQL
-                            if let Some(index) =
+                            if let Some(mut index) =
                                 crate::schema::parse_create_index_sql(sql, op.p1 != 0)
                             {
+                                // Set the root page from the register
+                                index.root_page = root_page;
+
                                 let index_name_lower = index.name.to_lowercase();
                                 let table_name_lower = index.table.to_lowercase();
 

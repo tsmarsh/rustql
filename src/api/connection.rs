@@ -8,7 +8,9 @@ use std::sync::{Arc, RwLock};
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::functions::{get_aggregate_function, get_scalar_function, AggregateInfo, ScalarFunc};
-use crate::schema::{parse_create_sql, Encoding, Schema};
+use crate::schema::{
+    parse_create_sql, Encoding, Index, IndexColumn, Schema, SortOrder, DEFAULT_COLLATION,
+};
 use crate::storage::btree::{Btree, BtreeCursorFlags, BtreeOpenFlags, CursorState};
 use crate::storage::pager::{JournalMode, LockingMode, DEFAULT_PAGE_SIZE};
 use crate::types::{
@@ -868,6 +870,28 @@ impl SqliteConnection {
         self.schema_generation.fetch_add(1, Ordering::SeqCst) + 1
     }
 
+    /// Reload schema from sqlite_master after ROLLBACK
+    ///
+    /// This resets the in-memory schema cache by re-reading the sqlite_master
+    /// table from the btree. Called after ROLLBACK to ensure schema cache
+    /// reflects the actual on-disk state.
+    pub fn reload_schema(&mut self) -> Result<()> {
+        for db in &mut self.dbs {
+            if let (Some(btree), Some(schema_arc)) = (&db.btree, &db.schema) {
+                if let Ok(mut schema) = schema_arc.write() {
+                    // Clear existing schema cache
+                    schema.tables.clear();
+                    schema.indexes.clear();
+                    schema.triggers.clear();
+                    // Reload from sqlite_master
+                    load_schema_from_btree(btree, &mut schema)?;
+                }
+            }
+        }
+        self.increment_schema_generation();
+        Ok(())
+    }
+
     /// Get current memory usage for this connection
     pub fn memory_used(&self) -> i64 {
         self.memory_used.load(Ordering::SeqCst)
@@ -1260,12 +1284,30 @@ fn load_schema_from_btree(btree: &Arc<Btree>, schema: &mut Schema) -> Result<()>
     loop {
         let payload = cursor.info.payload.clone().unwrap_or_default();
         let values = decode_record_values(&payload, 5)?;
+        // sqlite_master columns: type(0), name(1), tbl_name(2), rootpage(3), sql(4)
+        let obj_type = values.get(0).map(Mem::to_str).unwrap_or_default();
         let sql = values.get(4).map(Mem::to_str).unwrap_or_default();
         let root_page = values.get(3).map(Mem::to_int).unwrap_or(0) as u32;
+        let tbl_name = values.get(2).map(Mem::to_str).unwrap_or_default();
 
-        if let Some(table) = parse_create_sql(&sql, root_page) {
-            let name = table.name.to_lowercase();
-            schema.tables.entry(name).or_insert_with(|| Arc::new(table));
+        match obj_type.as_str() {
+            "table" => {
+                if let Some(table) = parse_create_sql(&sql, root_page) {
+                    let name = table.name.to_lowercase();
+                    schema.tables.entry(name).or_insert_with(|| Arc::new(table));
+                }
+            }
+            "index" => {
+                if let Some(index) = parse_create_index_sql(&sql, &tbl_name, root_page, schema) {
+                    let name = index.name.to_lowercase();
+                    schema
+                        .indexes
+                        .entry(name)
+                        .or_insert_with(|| Arc::new(index));
+                }
+            }
+            // views and triggers not currently supported for schema reload
+            _ => {}
         }
 
         cursor.next(0)?;
@@ -1275,6 +1317,98 @@ fn load_schema_from_btree(btree: &Arc<Btree>, schema: &mut Schema) -> Result<()>
     }
 
     Ok(())
+}
+
+/// Parse CREATE INDEX SQL to build Index struct
+fn parse_create_index_sql(
+    sql: &str,
+    table_name: &str,
+    root_page: u32,
+    schema: &Schema,
+) -> Option<Index> {
+    let sql_upper = sql.to_uppercase();
+    if !sql_upper.starts_with("CREATE") {
+        return None;
+    }
+
+    // Parse: CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table(col1, col2, ...)
+    let mut after_create = sql["CREATE".len()..].trim();
+    let after_upper = after_create.to_uppercase();
+
+    let unique = if after_upper.starts_with("UNIQUE") {
+        after_create = after_create["UNIQUE".len()..].trim();
+        true
+    } else {
+        false
+    };
+
+    let after_upper = after_create.to_uppercase();
+    if !after_upper.starts_with("INDEX") {
+        return None;
+    }
+    after_create = after_create["INDEX".len()..].trim();
+
+    let after_upper = after_create.to_uppercase();
+    if after_upper.starts_with("IF NOT EXISTS") {
+        after_create = after_create["IF NOT EXISTS".len()..].trim();
+    }
+
+    // Find ON keyword
+    let on_pos = after_create.to_uppercase().find(" ON ")?;
+    let index_name = after_create[..on_pos].trim().to_string();
+    after_create = after_create[on_pos + 4..].trim();
+
+    // Find parentheses for column list
+    let paren_start = after_create.find('(')?;
+    let paren_end = after_create.rfind(')')?;
+    let col_list = &after_create[paren_start + 1..paren_end];
+
+    // Parse columns - look up column indices from table schema
+    let table = schema.tables.get(&table_name.to_lowercase())?;
+    let mut columns = Vec::new();
+
+    for col_str in col_list.split(',') {
+        let col_str = col_str.trim();
+        if col_str.is_empty() {
+            continue;
+        }
+
+        // Parse "colname [ASC|DESC]"
+        let parts: Vec<&str> = col_str.split_whitespace().collect();
+        let col_name = parts.first()?.to_lowercase();
+        let sort_order = if parts.len() > 1 && parts[1].eq_ignore_ascii_case("DESC") {
+            SortOrder::Desc
+        } else {
+            SortOrder::Asc
+        };
+
+        // Find column index in table
+        let column_idx = table
+            .columns
+            .iter()
+            .position(|c| c.name.to_lowercase() == col_name)
+            .map(|i| i as i32)
+            .unwrap_or(-1);
+
+        columns.push(IndexColumn {
+            column_idx,
+            expr: None,
+            sort_order,
+            collation: DEFAULT_COLLATION.to_string(),
+        });
+    }
+
+    Some(Index {
+        name: index_name,
+        table: table_name.to_string(),
+        columns,
+        root_page,
+        unique,
+        partial: None,
+        is_primary_key: false,
+        sql: Some(sql.to_string()),
+        stats: None,
+    })
 }
 
 fn decode_record_values(payload: &[u8], expected_cols: usize) -> Result<Vec<Mem>> {

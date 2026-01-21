@@ -1343,6 +1343,8 @@ impl<'s> StatementCompiler<'s> {
     }
 
     fn compile_create_index(&mut self, create: &CreateIndexStmt) -> Result<Vec<VdbeOp>> {
+        use crate::storage::btree::BTREE_BLOBKEY;
+
         let index_name = &create.name.name;
         let index_name_lower = index_name.to_lowercase();
         let table_name = &create.table;
@@ -1405,18 +1407,131 @@ impl<'s> StatementCompiler<'s> {
         );
 
         let mut ops = Vec::new();
+        let reg_root_page = 1;
+
+        // Init - jump to start of program
         ops.push(Self::make_op(Opcode::Init, 0, 2, 0, P4::Unused));
+        // Halt - end of program
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
-        // Use ParseSchemaIndex to register the index
+
+        // CreateBtree - create the index's btree page (BLOBKEY for index)
+        ops.push(Self::make_op(
+            Opcode::CreateBtree,
+            0,
+            reg_root_page,
+            BTREE_BLOBKEY as i32,
+            P4::Unused,
+        ));
+
+        // ParseSchemaIndex to register the index in schema cache
         ops.push(Self::make_op(
             Opcode::ParseSchemaIndex,
             if create.unique { 1 } else { 0 },
+            reg_root_page,
             0,
-            0,
-            P4::Text(sql),
+            P4::Text(sql.clone()),
         ));
+
+        // Insert into sqlite_master
+        let cursor_id = 0;
+        self.append_sqlite_master_open(&mut ops, cursor_id);
+        self.append_sqlite_master_insert_index(
+            &mut ops,
+            cursor_id,
+            index_name,
+            table_name,
+            reg_root_page,
+            &sql,
+        );
+        self.append_sqlite_master_close(&mut ops, cursor_id);
+
+        // Goto end
         ops.push(Self::make_op(Opcode::Goto, 0, 1, 0, P4::Unused));
         Ok(ops)
+    }
+
+    /// Insert an index entry into sqlite_master
+    fn append_sqlite_master_insert_index(
+        &self,
+        ops: &mut Vec<VdbeOp>,
+        cursor_id: i32,
+        index_name: &str,
+        table_name: &str,
+        reg_root_page: i32,
+        create_sql: &str,
+    ) {
+        let reg_type = 2;
+        let reg_name = 3;
+        let reg_tbl = 4;
+        let reg_root = 5;
+        let reg_sql = 6;
+        let reg_record = 7;
+        let reg_rowid = 8;
+
+        // type = 'index'
+        ops.push(Self::make_op(
+            Opcode::String8,
+            0,
+            reg_type,
+            0,
+            P4::Text("index".to_string()),
+        ));
+        // name = index_name
+        ops.push(Self::make_op(
+            Opcode::String8,
+            0,
+            reg_name,
+            0,
+            P4::Text(index_name.to_string()),
+        ));
+        // tbl_name = table_name (the table this index is on)
+        ops.push(Self::make_op(
+            Opcode::String8,
+            0,
+            reg_tbl,
+            0,
+            P4::Text(table_name.to_string()),
+        ));
+        // rootpage = from register
+        ops.push(Self::make_op(
+            Opcode::Copy,
+            reg_root_page,
+            reg_root,
+            0,
+            P4::Unused,
+        ));
+        // sql = CREATE INDEX statement
+        ops.push(Self::make_op(
+            Opcode::String8,
+            0,
+            reg_sql,
+            0,
+            P4::Text(create_sql.to_string()),
+        ));
+        // Make record from columns
+        ops.push(Self::make_op(
+            Opcode::MakeRecord,
+            reg_type,
+            5,
+            reg_record,
+            P4::Unused,
+        ));
+        // Get new rowid
+        ops.push(Self::make_op(
+            Opcode::NewRowid,
+            cursor_id,
+            reg_rowid,
+            0,
+            P4::Unused,
+        ));
+        // Insert into sqlite_master
+        ops.push(Self::make_op(
+            Opcode::Insert,
+            cursor_id,
+            reg_record,
+            reg_rowid,
+            P4::Text("sqlite_master".to_string()),
+        ));
     }
 
     fn compile_create_view(&mut self, create: &CreateViewStmt) -> Result<Vec<VdbeOp>> {

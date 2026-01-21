@@ -1195,9 +1195,10 @@ impl<'s> SelectCompiler<'s> {
 
         // New group - output previous group if not first
         // Skip output if prev_group is NULL (first group)
+        // Use IsNull instead of IfNot because 0 is a valid group key but IfNot treats 0 as falsy
         let first_group_label = self.alloc_label();
         self.emit(
-            Opcode::IfNot,
+            Opcode::IsNull,
             prev_group_regs,
             first_group_label,
             0,

@@ -41,6 +41,69 @@ jobs:
       - name: Run tests
         run: cargo test --features fts3,fts5,rtree,session,json
 
+  # TCL compatibility testing - non-blocking, reports SQLite test suite pass rates
+  tcl-compat:
+    name: TCL Compatibility
+    runs-on: ubuntu-latest
+    continue-on-error: true  # Don't fail the build on TCL test failures
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install TCL
+        run: sudo apt-get update && sudo apt-get install -y tcl tcl-dev
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-tcl-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-tcl-
+
+      - name: Build TCL extension
+        run: make tcl-extension
+
+      - name: Run TCL test suite (sequential)
+        run: |
+          rm -f test.db test.db-journal
+          make test-seq 2>&1 | tee test-output.log || true
+
+      - name: Generate pass rates report
+        run: |
+          echo "## TCL Test Suite Pass Rates" > tcl-report.md
+          echo "" >> tcl-report.md
+          echo "| Test | Passed | Total | Rate |" >> tcl-report.md
+          echo "|------|--------|-------|------|" >> tcl-report.md
+          make pass-rates 2>/dev/null | grep -E "^\w+:" | while read line; do
+            test_name=$(echo "$line" | cut -d: -f1)
+            stats=$(echo "$line" | cut -d: -f2 | xargs)
+            echo "| $test_name | $stats |" >> tcl-report.md
+          done
+          echo "" >> tcl-report.md
+          echo "### Summary" >> tcl-report.md
+          make pass-rates 2>/dev/null | tail -1 >> tcl-report.md
+          cat tcl-report.md
+
+      - name: Upload TCL test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: tcl-test-results
+          path: |
+            tcl-report.md
+            test-results/
+          retention-days: 30
+
+      - name: Add summary to job
+        run: cat tcl-report.md >> $GITHUB_STEP_SUMMARY
+
   # Optional: Run tests on multiple platforms
   test-matrix:
     name: Test (${{ matrix.os }})

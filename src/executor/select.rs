@@ -171,6 +171,10 @@ pub struct SelectCompiler<'s> {
     /// Columns to exclude from * expansion for each table (for NATURAL/USING coalescing)
     /// Key: table index, Value: set of column names to exclude
     coalesced_columns: HashMap<usize, std::collections::HashSet<String>>,
+    /// Index where outer (correlation context) tables end and local tables begin.
+    /// Tables at index < outer_tables_boundary are from outer queries and should not be looped over.
+    /// Tables at index >= outer_tables_boundary are local to this query and should be looped.
+    outer_tables_boundary: usize,
 }
 
 impl<'s> SelectCompiler<'s> {
@@ -206,6 +210,7 @@ impl<'s> SelectCompiler<'s> {
             compound_aliases: HashMap::new(),
             join_conditions: Vec::new(),
             coalesced_columns: HashMap::new(),
+            outer_tables_boundary: 0,
         }
     }
 
@@ -241,6 +246,7 @@ impl<'s> SelectCompiler<'s> {
             compound_aliases: HashMap::new(),
             join_conditions: Vec::new(),
             coalesced_columns: HashMap::new(),
+            outer_tables_boundary: 0,
         }
     }
 
@@ -530,8 +536,20 @@ impl<'s> SelectCompiler<'s> {
         };
 
         // Collect table cursors and join types to avoid borrow checker issues
-        let table_cursors: Vec<i32> = self.tables.iter().map(|t| t.cursor).collect();
-        let table_join_types: Vec<JoinType> = self.tables.iter().map(|t| t.join_type).collect();
+        // Only include local tables (index >= outer_tables_boundary) for loop generation.
+        // Outer tables are from enclosing queries and should not be looped over.
+        let table_cursors: Vec<i32> = self
+            .tables
+            .iter()
+            .skip(self.outer_tables_boundary)
+            .map(|t| t.cursor)
+            .collect();
+        let table_join_types: Vec<JoinType> = self
+            .tables
+            .iter()
+            .skip(self.outer_tables_boundary)
+            .map(|t| t.join_type)
+            .collect();
 
         // Generate proper nested loop structure for cross joins
         // For N tables, we need nested Rewind/Next pairs where inner tables
@@ -3163,32 +3181,42 @@ impl<'s> SelectCompiler<'s> {
             }
             Expr::Subquery(select) => {
                 // Compile scalar subquery inline
-                // Save outer query state
-                let saved_tables = std::mem::take(&mut self.tables);
+                // Keep outer tables for correlation - save count to restore later
+                let outer_tables_len = self.tables.len();
+                let saved_boundary = self.outer_tables_boundary;
                 let saved_has_agg = self.has_aggregates;
                 let saved_has_window = self.has_window_functions;
-                let saved_result_names = std::mem::take(&mut self.result_column_names);
+                let saved_result_names_len = self.result_column_names.len();
+
+                // Set boundary so subquery only loops over its own tables, not outer tables
+                self.outer_tables_boundary = outer_tables_len;
 
                 // Initialize result to NULL in case subquery returns no rows
                 self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
 
                 // Compile the subquery body with Set destination
+                // Outer tables remain available for correlated column references
                 let sub_dest = SelectDest::Set { reg: dest_reg };
                 self.compile_body(&select.body, &sub_dest)?;
 
-                // Restore outer query state
-                self.tables = saved_tables;
+                // Restore outer query state - remove subquery's tables and reset boundary
+                self.tables.truncate(outer_tables_len);
+                self.outer_tables_boundary = saved_boundary;
                 self.has_aggregates = saved_has_agg;
                 self.has_window_functions = saved_has_window;
-                self.result_column_names = saved_result_names;
+                self.result_column_names.truncate(saved_result_names_len);
             }
             Expr::Exists { subquery, negated } => {
                 // Compile EXISTS subquery
-                // Save outer query state
-                let saved_tables = std::mem::take(&mut self.tables);
+                // Keep outer tables for correlation - save count to restore later
+                let outer_tables_len = self.tables.len();
+                let saved_boundary = self.outer_tables_boundary;
                 let saved_has_agg = self.has_aggregates;
                 let saved_has_window = self.has_window_functions;
-                let saved_result_names = std::mem::take(&mut self.result_column_names);
+                let saved_result_names_len = self.result_column_names.len();
+
+                // Set boundary so subquery only loops over its own tables, not outer tables
+                self.outer_tables_boundary = outer_tables_len;
 
                 // Initialize result to 0 (false) - will be set to 1 if any row is found
                 self.emit(
@@ -3200,6 +3228,7 @@ impl<'s> SelectCompiler<'s> {
                 );
 
                 // Compile the subquery body with Exists destination
+                // Outer tables remain available for correlated column references
                 let sub_dest = SelectDest::Exists { reg: dest_reg };
                 self.compile_body(&subquery.body, &sub_dest)?;
 
@@ -3217,11 +3246,12 @@ impl<'s> SelectCompiler<'s> {
                     self.emit(Opcode::Not, dest_reg, dest_reg, 0, P4::Unused);
                 }
 
-                // Restore outer query state
-                self.tables = saved_tables;
+                // Restore outer query state - remove subquery's tables and reset boundary
+                self.tables.truncate(outer_tables_len);
+                self.outer_tables_boundary = saved_boundary;
                 self.has_aggregates = saved_has_agg;
                 self.has_window_functions = saved_has_window;
-                self.result_column_names = saved_result_names;
+                self.result_column_names.truncate(saved_result_names_len);
             }
             Expr::Like {
                 expr: text_expr,
@@ -3310,32 +3340,37 @@ impl<'s> SelectCompiler<'s> {
                         let subq_cursor = self.alloc_cursor();
                         self.emit(Opcode::OpenEphemeral, subq_cursor, 1, 0, P4::Unused);
 
-                        // Save outer query state (including result_column_names to avoid
-                        // subquery columns being added to outer result set)
-                        let saved_tables = std::mem::take(&mut self.tables);
+                        // Keep outer tables for correlation - save counts to restore later
+                        let outer_tables_len = self.tables.len();
+                        let saved_boundary = self.outer_tables_boundary;
                         let saved_has_agg = self.has_aggregates;
                         let saved_has_window = self.has_window_functions;
                         let saved_order_by = std::mem::take(&mut self.order_by_terms);
                         let saved_limit_reg = self.limit_counter_reg.take();
                         let saved_offset_reg = self.offset_counter_reg.take();
                         let saved_limit_done = self.limit_done_label.take();
-                        let saved_result_names = std::mem::take(&mut self.result_column_names);
+                        let saved_result_names_len = self.result_column_names.len();
+
+                        // Set boundary so subquery only loops over its own tables, not outer tables
+                        self.outer_tables_boundary = outer_tables_len;
 
                         // Compile full subquery (including ORDER BY/LIMIT) to fill ephemeral table
+                        // Outer tables remain available for correlated column references
                         let subq_dest = SelectDest::EphemTable {
                             cursor: subq_cursor,
                         };
                         self.compile_subselect(subquery, &subq_dest)?;
 
-                        // Restore outer query state
-                        self.tables = saved_tables;
+                        // Restore outer query state - remove subquery's tables and reset boundary
+                        self.tables.truncate(outer_tables_len);
+                        self.outer_tables_boundary = saved_boundary;
                         self.has_aggregates = saved_has_agg;
                         self.has_window_functions = saved_has_window;
                         self.order_by_terms = saved_order_by;
                         self.limit_counter_reg = saved_limit_reg;
                         self.offset_counter_reg = saved_offset_reg;
                         self.limit_done_label = saved_limit_done;
-                        self.result_column_names = saved_result_names;
+                        self.result_column_names.truncate(saved_result_names_len);
 
                         // Check if value exists in ephemeral table
                         // Make a record from the value

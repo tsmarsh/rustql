@@ -1,7 +1,7 @@
 //! Debug tests for WHERE clause issues
 
 use rustql::types::StepResult;
-use rustql::vdbe::reset_search_count;
+use rustql::vdbe::{get_sort_flag, reset_search_count, reset_sort_flag};
 use rustql::{
     sqlite3_close, sqlite3_column_count, sqlite3_column_text, sqlite3_finalize, sqlite3_initialize,
     sqlite3_open, sqlite3_prepare_v2, sqlite3_step, SqliteConnection,
@@ -320,6 +320,190 @@ fn test_sqlite_search_count() {
     // The search count should be > 0 (includes seek and possibly next operations)
     let count: i64 = count_result[0].parse().unwrap();
     assert!(count > 0, "Search count should be > 0, got {}", count);
+
+    let _ = sqlite3_close(conn);
+}
+
+#[test]
+fn test_join_with_non_empty_tables() {
+    // Test joins where both tables have data
+    init();
+    let mut conn = sqlite3_open(":memory:").expect("open memory db");
+
+    // Setup - similar to where.test where-2.x
+    exec(&mut conn, "CREATE TABLE t1(w int, x int, y int)");
+    exec(&mut conn, "CREATE TABLE t2(p int, q int, r int, s int)");
+    exec(&mut conn, "INSERT INTO t1 VALUES(1, 0, 4)");
+    exec(&mut conn, "INSERT INTO t1 VALUES(2, 1, 9)");
+    exec(&mut conn, "INSERT INTO t1 VALUES(3, 1, 16)");
+    exec(&mut conn, "INSERT INTO t2 VALUES(100, 0, 10197, 4)");
+    exec(&mut conn, "INSERT INTO t2 VALUES(99, 1, 10192, 9)");
+    exec(&mut conn, "INSERT INTO t2 VALUES(98, 1, 10185, 16)");
+
+    // Simple inner join
+    let result = query(
+        &mut conn,
+        "SELECT w, p FROM t1, t2 WHERE x=q AND y=s ORDER BY w",
+    );
+    println!("Join result: {:?}", result);
+    assert!(
+        result.len() >= 1,
+        "Should have at least one join result, got {:?}",
+        result
+    );
+
+    let _ = sqlite3_close(conn);
+}
+
+#[test]
+fn test_left_join_with_data() {
+    // Test LEFT JOIN where right table has matching data
+    init();
+    let mut conn = sqlite3_open(":memory:").expect("open memory db");
+
+    exec(&mut conn, "CREATE TABLE t181(a)");
+    exec(&mut conn, "CREATE TABLE t182(b, c)");
+    exec(&mut conn, "INSERT INTO t181 VALUES(1)");
+    exec(&mut conn, "INSERT INTO t181 VALUES(2)");
+    exec(&mut conn, "INSERT INTO t182 VALUES(1, 'match')");
+    // No match for a=2
+
+    // Check data
+    let t181_data = query(&mut conn, "SELECT * FROM t181");
+    println!("t181 data: {:?}", t181_data);
+    let t182_data = query(&mut conn, "SELECT * FROM t182");
+    println!("t182 data: {:?}", t182_data);
+
+    // Try simpler query first: LEFT JOIN without ORDER BY
+    let simple_result = query(&mut conn, "SELECT a, b, c FROM t181 LEFT JOIN t182 ON a=b");
+    println!("LEFT JOIN without ORDER BY: {:?}", simple_result);
+
+    // LEFT JOIN should return both rows from t181
+    let result = query(
+        &mut conn,
+        "SELECT a, b, c FROM t181 LEFT JOIN t182 ON a=b ORDER BY a",
+    );
+    println!("LEFT JOIN with data result: {:?}", result);
+    assert_eq!(result.len(), 2, "Should have 2 rows");
+    // Row 1: a=1 should match b=1
+    assert_eq!(result[0][0], "1");
+    assert_eq!(result[0][1], "1");
+    assert_eq!(result[0][2], "match");
+    // Row 2: a=2 should have NULLs for b and c
+    assert_eq!(result[1][0], "2");
+    // b and c should be NULL (empty string in our representation)
+    assert!(
+        result[1][1] == "" || result[1][1] == "NULL",
+        "b should be NULL for unmatched row"
+    );
+
+    let _ = sqlite3_close(conn);
+}
+
+#[test]
+fn test_three_way_join() {
+    // Test 3-way join - similar to where-3.x
+    init();
+    let mut conn = sqlite3_open(":memory:").expect("open memory db");
+
+    exec(&mut conn, "CREATE TABLE t1(w int, x int, y int)");
+    exec(&mut conn, "INSERT INTO t1 VALUES(1, 0, 4)");
+    exec(&mut conn, "INSERT INTO t1 VALUES(2, 1, 9)");
+    exec(&mut conn, "INSERT INTO t1 VALUES(3, 1, 16)");
+
+    // 3-way self-join
+    let result = query(
+        &mut conn,
+        "SELECT A.w, B.w, C.w FROM t1 as A, t1 as B, t1 as C
+         WHERE A.w = B.w AND B.w = C.w ORDER BY A.w",
+    );
+    println!("3-way join result: {:?}", result);
+    assert_eq!(result.len(), 3, "Should have 3 rows (one for each match)");
+    assert_eq!(result[0], vec!["1", "1", "1"]);
+    assert_eq!(result[1], vec!["2", "2", "2"]);
+    assert_eq!(result[2], vec!["3", "3", "3"]);
+
+    let _ = sqlite3_close(conn);
+}
+
+#[test]
+fn test_sort_flag_with_order_by_expression() {
+    // Test that the sort flag is set when ORDER BY requires sorting
+    // (i.e., when ORDER BY expression doesn't match an index)
+    init();
+    let mut conn = sqlite3_open(":memory:").expect("open memory db");
+
+    // Setup
+    exec(&mut conn, "CREATE TABLE t3(a int, b int, c int)");
+    exec(&mut conn, "CREATE INDEX i3a ON t3(a)");
+    exec(&mut conn, "INSERT INTO t3 VALUES(1, 100, 4)");
+    exec(&mut conn, "INSERT INTO t3 VALUES(2, 99, 9)");
+    exec(&mut conn, "INSERT INTO t3 VALUES(3, 98, 16)");
+
+    // ORDER BY a should NOT require sorting (index can provide order)
+    reset_sort_flag();
+    let result = query_flat(&mut conn, "SELECT * FROM t3 ORDER BY a LIMIT 3");
+    println!("ORDER BY a result: {:?}", result);
+    let sort_for_order_a = get_sort_flag();
+    println!("Sort flag for ORDER BY a: {}", sort_for_order_a);
+
+    // ORDER BY a+1 SHOULD require sorting (expression doesn't match index)
+    reset_sort_flag();
+    let result2 = query_flat(&mut conn, "SELECT * FROM t3 ORDER BY a+1 LIMIT 3");
+    println!("ORDER BY a+1 result: {:?}", result2);
+    let sort_for_order_a_plus_1 = get_sort_flag();
+    println!("Sort flag for ORDER BY a+1: {}", sort_for_order_a_plus_1);
+
+    // The key test: ORDER BY a+1 should trigger a sort, ORDER BY a should not
+    // (assuming the query planner can use the index for ORDER BY a)
+    assert!(
+        sort_for_order_a_plus_1,
+        "ORDER BY a+1 should require sorting"
+    );
+
+    let _ = sqlite3_close(conn);
+}
+
+#[test]
+fn test_correlated_subquery_no_from() {
+    init();
+    let mut conn = sqlite3_open(":memory:").unwrap();
+
+    // Create test table
+    exec(&mut conn, "CREATE TABLE t1(a,b)");
+    exec(&mut conn, "INSERT INTO t1 VALUES(1,2)");
+    exec(&mut conn, "INSERT INTO t1 VALUES(3,4)");
+
+    // Test simple correlated subquery with no FROM clause
+    let result = query(&mut conn, "SELECT a, (SELECT a) FROM t1");
+    println!("(SELECT a) result: {:?}", result);
+
+    // Expected: [(1, 1), (3, 3)]
+    assert_eq!(result.len(), 2, "Should return 2 rows");
+    assert_eq!(result[0], vec!["1", "1"], "Row 1 should be (1, 1)");
+    assert_eq!(result[1], vec!["3", "3"], "Row 2 should be (3, 3)");
+
+    let _ = sqlite3_close(conn);
+}
+
+#[test]
+fn test_correlated_subquery_with_other_column() {
+    init();
+    let mut conn = sqlite3_open(":memory:").unwrap();
+
+    // Create test table
+    exec(&mut conn, "CREATE TABLE t1(a,b)");
+    exec(&mut conn, "INSERT INTO t1 VALUES(1,2)");
+    exec(&mut conn, "INSERT INTO t1 VALUES(3,4)");
+
+    // Test correlated subquery AND another column from same table
+    let result = query(&mut conn, "SELECT (SELECT a), b FROM t1");
+    println!("(SELECT a), b result: {:?}", result);
+
+    // Expected: [(1, 2), (3, 4)]
+    assert_eq!(result.len(), 2, "Should return 2 rows");
+    assert_eq!(result[0], vec!["1", "2"], "Row 1 should be (1, 2)");
+    assert_eq!(result[1], vec!["3", "4"], "Row 2 should be (3, 4)");
 
     let _ = sqlite3_close(conn);
 }

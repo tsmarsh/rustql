@@ -510,3 +510,152 @@ fn test_correlated_subquery_with_other_column() {
 
     let _ = sqlite3_close(conn);
 }
+
+#[test]
+fn test_expr_transaction() {
+    init();
+    let mut conn = sqlite3_open(":memory:").unwrap();
+
+    // Setup like expr.test
+    exec(
+        &mut conn,
+        "CREATE TABLE test1(i1 int, i2 int, r1 real, r2 real, t1 text, t2 text)",
+    );
+    exec(
+        &mut conn,
+        "INSERT INTO test1 VALUES(1,2,1.1,2.2,'hello','world')",
+    );
+
+    // Test multi-statement with transaction
+    let result = query(
+        &mut conn,
+        "BEGIN; UPDATE test1 SET i1=10, i2=20; SELECT i1-i2 FROM test1; ROLLBACK;",
+    );
+    println!("Transaction test result: {:?}", result);
+
+    // Also test individual statements
+    exec(&mut conn, "BEGIN");
+    exec(&mut conn, "UPDATE test1 SET i1=10, i2=20");
+    let result2 = query(&mut conn, "SELECT i1-i2 FROM test1");
+    println!("After UPDATE result: {:?}", result2);
+    exec(&mut conn, "ROLLBACK");
+
+    let _ = sqlite3_close(conn);
+}
+
+#[test]
+fn test_expr_minus_vs_plus() {
+    init();
+    let mut conn = sqlite3_open(":memory:").unwrap();
+
+    exec(&mut conn, "CREATE TABLE test1(i1 int, i2 int)");
+    exec(&mut conn, "INSERT INTO test1 VALUES(1,2)");
+
+    // Test simple addition and subtraction
+    let plus = query(&mut conn, "SELECT i1+i2 FROM test1");
+    println!("i1+i2: {:?}", plus);
+
+    let minus = query(&mut conn, "SELECT i1-i2 FROM test1");
+    println!("i1-i2: {:?}", minus);
+
+    // Test after update
+    exec(&mut conn, "UPDATE test1 SET i1=10, i2=20");
+    let plus_after = query(&mut conn, "SELECT i1+i2 FROM test1");
+    println!("After update i1+i2: {:?}", plus_after);
+
+    let minus_after = query(&mut conn, "SELECT i1-i2 FROM test1");
+    println!("After update i1-i2: {:?}", minus_after);
+
+    let _ = sqlite3_close(conn);
+}
+
+#[test]
+fn test_expr_multi_statement_rollback() {
+    init();
+    let mut conn = sqlite3_open(":memory:").unwrap();
+
+    exec(&mut conn, "CREATE TABLE test1(i1 int, i2 int)");
+    exec(&mut conn, "INSERT INTO test1 VALUES(1,2)");
+
+    // Simulate what test_expr does
+    exec(&mut conn, "BEGIN");
+    exec(&mut conn, "UPDATE test1 SET i1=10, i2=20");
+    let r1 = query(&mut conn, "SELECT i1+i2 FROM test1");
+    println!("Test 1 (i1+i2): {:?}", r1);
+    exec(&mut conn, "ROLLBACK");
+
+    // Now try second "test"
+    exec(&mut conn, "BEGIN");
+    exec(&mut conn, "UPDATE test1 SET i1=10, i2=20");
+    let r2 = query(&mut conn, "SELECT i1-i2 FROM test1");
+    println!("Test 2 (i1-i2): {:?}", r2);
+    exec(&mut conn, "ROLLBACK");
+
+    // And third
+    exec(&mut conn, "BEGIN");
+    exec(&mut conn, "UPDATE test1 SET i1=10, i2=20");
+    let r3 = query(&mut conn, "SELECT i1*i2 FROM test1");
+    println!("Test 3 (i1*i2): {:?}", r3);
+    exec(&mut conn, "ROLLBACK");
+
+    // Check table still exists with original data
+    let check = query(&mut conn, "SELECT * FROM test1");
+    println!("Final table state: {:?}", check);
+
+    let _ = sqlite3_close(conn);
+}
+
+#[test]
+fn test_rollback_behavior() {
+    init();
+    let mut conn = sqlite3_open(":memory:").unwrap();
+
+    exec(&mut conn, "CREATE TABLE test1(i1 int, i2 int)");
+    exec(&mut conn, "INSERT INTO test1 VALUES(1,2)");
+
+    let before = query(&mut conn, "SELECT * FROM test1");
+    println!("Before BEGIN: {:?}", before);
+    assert_eq!(before, vec![vec!["1".to_string(), "2".to_string()]]);
+
+    exec(&mut conn, "BEGIN");
+    let in_txn = query(&mut conn, "SELECT * FROM test1");
+    println!("In transaction (no changes): {:?}", in_txn);
+    assert_eq!(in_txn, vec![vec!["1".to_string(), "2".to_string()]]);
+
+    exec(&mut conn, "UPDATE test1 SET i1=10, i2=20");
+    let after_update = query(&mut conn, "SELECT * FROM test1");
+    println!("After UPDATE: {:?}", after_update);
+    assert_eq!(after_update, vec![vec!["10".to_string(), "20".to_string()]]);
+
+    exec(&mut conn, "ROLLBACK");
+    let after_rollback = query(&mut conn, "SELECT * FROM test1");
+    println!("After ROLLBACK: {:?}", after_rollback);
+    // CRITICAL: After ROLLBACK, data should be restored to pre-BEGIN state
+    assert_eq!(
+        after_rollback,
+        vec![vec!["1".to_string(), "2".to_string()]],
+        "ROLLBACK should restore data to pre-transaction state"
+    );
+
+    let _ = sqlite3_close(conn);
+}
+
+#[test]
+fn test_simple_update_no_txn() {
+    init();
+    let mut conn = sqlite3_open(":memory:").unwrap();
+
+    exec(&mut conn, "CREATE TABLE test1(i1 int, i2 int)");
+    exec(&mut conn, "INSERT INTO test1 VALUES(1,2)");
+
+    let before = query(&mut conn, "SELECT * FROM test1");
+    println!("Before UPDATE: {:?}", before);
+
+    // Simple UPDATE without explicit transaction
+    exec(&mut conn, "UPDATE test1 SET i1=10, i2=20");
+
+    let after = query(&mut conn, "SELECT * FROM test1");
+    println!("After UPDATE: {:?}", after);
+
+    let _ = sqlite3_close(conn);
+}

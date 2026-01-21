@@ -1284,15 +1284,15 @@ impl Pager {
         if self.mem_db && !self.mem_journal.is_empty() {
             let page_size = self.page_size as usize;
 
-            // Process journal records in reverse order (LIFO) to restore original state
-            // We iterate in reverse because a page might be journaled multiple times
-            // and we want to restore the earliest (original) version
+            // Process journal records in forward order to restore original state
+            // The first occurrence of each page in the journal contains the original data
+            // (saved before any modifications in this transaction)
             let journal_records: Vec<_> = std::mem::take(&mut self.mem_journal);
 
             // Track which pages we've already restored to avoid double-restoring
             let mut restored_pages = std::collections::HashSet::new();
 
-            for (pgno, original_data) in journal_records.into_iter().rev() {
+            for (pgno, original_data) in journal_records.into_iter() {
                 if restored_pages.contains(&pgno) {
                     continue; // Already restored this page
                 }

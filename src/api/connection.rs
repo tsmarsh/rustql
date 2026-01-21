@@ -1321,7 +1321,12 @@ pub fn sqlite3_close(mut conn: Box<SqliteConnection>) -> Result<()> {
     for db in &mut conn.dbs {
         // Close btree connections
         if let Some(btree) = db.btree.take() {
-            let _ = btree.commit_shared();
+            // Only commit if there's an active write transaction
+            // After rollback or no transaction, commit_shared() would try to
+            // start a new transaction which can hang on file locks
+            if btree.is_in_write_trans() {
+                let _ = btree.commit_shared();
+            }
         }
         db.schema = None;
     }

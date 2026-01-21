@@ -3813,6 +3813,11 @@ impl Btree {
         self.begin_trans(write)
     }
 
+    /// Check if btree is in a write transaction
+    pub fn is_in_write_trans(&self) -> bool {
+        self.in_trans.load(Ordering::SeqCst) == TransState::Write as u8
+    }
+
     /// sqlite3BtreeCommitPhaseOne
     pub fn commit_phase_one(&self, super_journal: Option<&str>) -> Result<()> {
         let mut shared = self

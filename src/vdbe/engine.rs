@@ -2628,9 +2628,7 @@ impl Vdbe {
                     conn.is_transaction_savepoint = false;
                     self.deferred_fk_counter = 0;
                     // Allow subsequent Halt opcode to finish the statement.
-                }
-
-                if desired_autocommit {
+                } else if desired_autocommit {
                     if self.deferred_fk_counter > 0 {
                         return Err(Error::with_message(
                             ErrorCode::Constraint,

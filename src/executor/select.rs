@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use crate::error::{Error, ErrorCode, Result};
 use crate::executor::window::{select_has_window_functions, WindowCompiler};
 use crate::parser::ast::{
-    BinaryOp, ColumnRef, CompoundOp, Distinct, Expr, FromClause, JoinFlags, JoinType, LikeOp,
-    LimitClause, Literal, OrderingTerm, ResultColumn, SelectBody, SelectCore, SelectStmt,
-    SortOrder, TableRef, WithClause,
+    BinaryOp, ColumnRef, CommonTableExpr, CompoundOp, Distinct, Expr, FromClause, JoinFlags,
+    JoinType, LikeOp, LimitClause, Literal, OrderingTerm, ResultColumn, SelectBody, SelectCore,
+    SelectStmt, SortOrder, TableRef, WithClause,
 };
 use crate::schema::{Affinity, Table};
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
@@ -125,7 +125,7 @@ pub struct SelectCompiler<'s> {
     /// Pending labels (label -> address)
     labels: HashMap<i32, Option<i32>>,
     /// CTE definitions
-    ctes: HashMap<String, SelectStmt>,
+    ctes: HashMap<String, CommonTableExpr>,
     /// Is this a compound select?
     is_compound: bool,
     /// Has aggregates?
@@ -393,8 +393,14 @@ impl<'s> SelectCompiler<'s> {
 
     /// Process WITH clause
     fn process_with_clause(&mut self, with: &WithClause) -> Result<()> {
+        if with.recursive {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                "recursive CTEs are not supported",
+            ));
+        }
         for cte in &with.ctes {
-            self.ctes.insert(cte.name.clone(), (*cte.query).clone());
+            self.ctes.insert(cte.name.to_lowercase(), cte.clone());
         }
         Ok(())
     }
@@ -474,6 +480,59 @@ impl<'s> SelectCompiler<'s> {
         }
 
         Ok(())
+    }
+
+    fn compile_subquery_to_ephemeral(
+        &mut self,
+        query: &SelectStmt,
+        cursor: i32,
+        exclude_cte: Option<&str>,
+    ) -> Result<Vec<String>> {
+        // Create ephemeral table for subquery results
+        self.emit(Opcode::OpenEphemeral, cursor, 0, 0, P4::Unused);
+
+        // Compile subquery into ephemeral table
+        let subquery_dest = SelectDest::EphemTable { cursor };
+        let mut subcompiler = if let Some(schema) = self.schema {
+            SelectCompiler::with_schema(schema)
+        } else {
+            SelectCompiler::new()
+        };
+        subcompiler.next_reg = self.next_reg;
+        subcompiler.next_cursor = self.next_cursor;
+        subcompiler.ctes = self.ctes.clone();
+        if let Some(name) = exclude_cte {
+            subcompiler.ctes.remove(name);
+        }
+        // Pass column naming settings to subquery compiler
+        subcompiler.set_column_name_flags(self.short_column_names, self.full_column_names);
+        let subquery_ops = subcompiler.compile(query, &subquery_dest)?;
+
+        // Capture subquery result column names for * expansion
+        let subquery_col_names = subcompiler.result_column_names.clone();
+
+        // Inline the subquery ops (skip Halt)
+        // Adjust jump addresses by the current offset
+        // Mark inlined jump ops so resolve_labels doesn't reprocess them
+        let offset = self.ops.len() as i32;
+        for mut op in subquery_ops {
+            if op.opcode != Opcode::Halt {
+                // Adjust P2 for jump instructions
+                // The subcompiler already resolved labels, so P2 contains actual addresses
+                // We need to adjust by offset and mark as resolved
+                if op.opcode.is_jump() {
+                    op.p2 += offset;
+                    // Use P5 = 0xFFFF to mark as already resolved so resolve_labels skips it
+                    op.p5 = 0xFFFF;
+                }
+                self.ops.push(op);
+            }
+        }
+
+        self.next_reg = subcompiler.next_reg;
+        self.next_cursor = subcompiler.next_cursor;
+
+        Ok(subquery_col_names)
     }
 
     /// Compile a simple SELECT (not compound)
@@ -1455,16 +1514,46 @@ impl<'s> SelectCompiler<'s> {
                 let table_name = &name.name;
                 let table_name_lower = table_name.to_lowercase();
 
+                if let Some(cte) = self.ctes.get(&table_name_lower).cloned() {
+                    let subquery_cols = self.compile_subquery_to_ephemeral(
+                        &cte.query,
+                        cursor,
+                        Some(&table_name_lower),
+                    )?;
+                    let columns = if let Some(explicit) = &cte.columns {
+                        if explicit.len() != subquery_cols.len() {
+                            return Err(Error::with_message(
+                                ErrorCode::Error,
+                                format!(
+                                    "table {} has {} values for {} columns",
+                                    cte.name,
+                                    subquery_cols.len(),
+                                    explicit.len()
+                                ),
+                            ));
+                        }
+                        explicit.clone()
+                    } else {
+                        subquery_cols
+                    };
+                    let display_name = item.alias.clone().unwrap_or_else(|| table_name.clone());
+                    self.tables.push(TableInfo {
+                        name: display_name,
+                        table_name: table_name.clone(),
+                        cursor,
+                        schema_table: None,
+                        is_subquery: true,
+                        join_type: item.join_type,
+                        subquery_columns: Some(columns),
+                    });
+                    return Ok(());
+                }
+
                 // Look up table in schema if available
                 let schema_table = self.lookup_table_schema(&table_name_lower);
 
                 // Emit OpenRead for the table
-                if schema_table.is_some() {
-                    self.emit(Opcode::OpenRead, cursor, 0, 0, P4::Text(table_name.clone()));
-                } else {
-                    // CTE or unknown table - will be handled elsewhere
-                    self.emit(Opcode::OpenRead, cursor, 0, 0, P4::Text(table_name.clone()));
-                }
+                self.emit(Opcode::OpenRead, cursor, 0, 0, P4::Text(table_name.clone()));
 
                 let display_name = item.alias.clone().unwrap_or_else(|| table_name.clone());
                 self.tables.push(TableInfo {
@@ -1479,46 +1568,7 @@ impl<'s> SelectCompiler<'s> {
             }
             TableSource::Subquery(query) => {
                 let cursor = self.alloc_cursor();
-
-                // Create ephemeral table for subquery results
-                self.emit(Opcode::OpenEphemeral, cursor, 0, 0, P4::Unused);
-
-                // Compile subquery into ephemeral table
-                let subquery_dest = SelectDest::EphemTable { cursor };
-                let mut subcompiler = if let Some(schema) = self.schema {
-                    SelectCompiler::with_schema(schema)
-                } else {
-                    SelectCompiler::new()
-                };
-                subcompiler.next_reg = self.next_reg;
-                subcompiler.next_cursor = self.next_cursor;
-                // Pass column naming settings to subquery compiler
-                subcompiler.set_column_name_flags(self.short_column_names, self.full_column_names);
-                let subquery_ops = subcompiler.compile(query, &subquery_dest)?;
-
-                // Capture subquery result column names for * expansion
-                let subquery_col_names = subcompiler.result_column_names.clone();
-
-                // Inline the subquery ops (skip Halt)
-                // Adjust jump addresses by the current offset
-                // Mark inlined jump ops so resolve_labels doesn't reprocess them
-                let offset = self.ops.len() as i32;
-                for mut op in subquery_ops {
-                    if op.opcode != Opcode::Halt {
-                        // Adjust P2 for jump instructions
-                        // The subcompiler already resolved labels, so P2 contains actual addresses
-                        // We need to adjust by offset and mark as resolved
-                        if op.opcode.is_jump() {
-                            op.p2 += offset;
-                            // Use P5 = 0xFFFF to mark as already resolved so resolve_labels skips it
-                            op.p5 = 0xFFFF;
-                        }
-                        self.ops.push(op);
-                    }
-                }
-
-                self.next_reg = subcompiler.next_reg;
-                self.next_cursor = subcompiler.next_cursor;
+                let subquery_col_names = self.compile_subquery_to_ephemeral(query, cursor, None)?;
 
                 let subquery_name = item.alias.clone().unwrap_or_else(|| {
                     let name = format!("(subquery-{})", self.next_subquery);

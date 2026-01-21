@@ -1029,6 +1029,12 @@ impl Pager {
             self.playback_journal()?;
         }
 
+        // Clear the dirty list - all pages have been restored from journal
+        // This is critical: playback_journal removes the DIRTY flag but doesn't
+        // remove pages from the dirty list. We must clean the list here to prevent
+        // cycles when pages are re-dirtied in subsequent transactions.
+        self.pcache.clean_all();
+
         // Restore original database size
         self.db_size = self.db_orig_size;
 
@@ -1293,12 +1299,13 @@ impl Pager {
                 restored_pages.insert(pgno);
 
                 // Restore the page in the cache
+                // Note: We don't remove the DIRTY flag here - clean_all() in rollback()
+                // will handle removing pages from the dirty list and clearing the flag.
                 if let Some(mut cache_page) = self.pcache.fetch(pgno, false) {
                     unsafe {
                         let data_len = original_data.len().min(page_size);
                         cache_page.as_mut().data[..data_len]
                             .copy_from_slice(&original_data[..data_len]);
-                        cache_page.as_mut().flags.remove(PgFlags::DIRTY);
                         cache_page.as_mut().flags.remove(PgFlags::WRITEABLE);
                     }
                 }
@@ -1390,10 +1397,11 @@ impl Pager {
             }
 
             // Also update the cache if the page is there
+            // Note: We don't remove the DIRTY flag here - clean_all() in rollback()
+            // will handle removing pages from the dirty list and clearing the flag.
             if let Some(mut cache_page) = self.pcache.fetch(pgno, false) {
                 unsafe {
                     cache_page.as_mut().data[..page_size].copy_from_slice(&page_buf);
-                    cache_page.as_mut().flags.remove(PgFlags::DIRTY);
                 }
             }
         }

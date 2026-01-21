@@ -240,20 +240,30 @@ impl VfsFile for FileVfsFile {
 
     #[cfg(unix)]
     fn unlock(&mut self, level: LockLevel) -> Result<()> {
-        use libc::{flock, LOCK_UN};
+        use libc::{flock, LOCK_NB, LOCK_SH, LOCK_UN};
 
         if level >= self.lock_level {
             return Ok(());
         }
 
-        if level == LockLevel::None {
-            let fd = self.file.as_raw_fd();
-            let result = unsafe { flock(fd, LOCK_UN) };
-            if result != 0 {
-                return Err(Error::with_message(
-                    ErrorCode::IoErr,
-                    std::io::Error::last_os_error().to_string(),
-                ));
+        let fd = self.file.as_raw_fd();
+        let operation = match level {
+            LockLevel::None => LOCK_UN,
+            LockLevel::Shared => LOCK_SH | LOCK_NB, // Downgrade to shared lock
+            _ => {
+                // For Reserved/Pending/Exclusive, we can't downgrade to those
+                // Just update the tracking level
+                self.lock_level = level;
+                return Ok(());
+            }
+        };
+
+        let result = unsafe { flock(fd, operation) };
+        if result != 0 {
+            let errno = std::io::Error::last_os_error();
+            // EWOULDBLOCK can happen when downgrading, treat as success
+            if errno.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                return Err(Error::with_message(ErrorCode::IoErr, errno.to_string()));
             }
         }
 

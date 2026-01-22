@@ -476,11 +476,14 @@ unsafe extern "C" fn db_cmd(
             set_result_string(interp, "3.0.0");
             TCL_OK
         }
-        "function"
-        | "collate"
+        "function" | "func" => {
+            // Register a custom SQL function - stub for now
+            // Usage: db func name proc
+            TCL_OK
+        }
+        "collate"
         | "trace"
         | "profile"
-        | "nullvalue"
         | "progress"
         | "busy"
         | "timeout"
@@ -494,6 +497,43 @@ unsafe extern "C" fn db_cmd(
         | "preupdate" => {
             // Stub these methods - accept but ignore
             TCL_OK
+        }
+        "collation_needed" => {
+            // Register callback for when unknown collation is needed
+            // Usage: db collation_needed callback_proc
+            // For now, just accept and ignore (no-op)
+            TCL_OK
+        }
+        "config" => {
+            // Database configuration options
+            // Usage: db config ?option? ?value?
+            // Return empty for queries, accept values silently
+            if objc == 2 {
+                // No args - return empty list of options
+                set_result_string(interp, "");
+            }
+            // With args - silently accept
+            TCL_OK
+        }
+        "nullvalue" | "null" => {
+            // Set/get the null representation string
+            // Usage: db nullvalue ?string?
+            if objc >= 3 {
+                // Setting null value - store it (not implemented yet, just accept)
+                TCL_OK
+            } else {
+                // Getting null value - return empty string (default)
+                set_result_string(interp, "");
+                TCL_OK
+            }
+        }
+        "incrblob" => {
+            // Incremental BLOB I/O - open a blob for reading/writing
+            // Usage: db incrblob ?-readonly? table column rowid
+            // This is complex - requires TCL channel creation
+            // For now, return error explaining it's not implemented
+            set_result_string(interp, "incrblob not implemented");
+            TCL_ERROR
         }
         "transaction" => {
             // Simple transaction support - just execute the script

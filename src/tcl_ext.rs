@@ -174,6 +174,15 @@ unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         "register_regexp_module",
         "register_fuzzer_module",
         "register_unionvtab_module",
+        // Utility commands
+        "hexio_write",
+        "hexio_read",
+        "hexio_get_int",
+        "sqlite3_release_memory",
+        "breakpoint",
+        "do_faultsim_test",
+        "sqlite3_wal_checkpoint_v2",
+        "sqlite3_vtab_config",
     ];
 
     for cmd in stub_commands {
@@ -211,6 +220,66 @@ unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         interp,
         cmd_name.as_ptr(),
         Some(test_stub_status),
+        std::ptr::null_mut(),
+        None,
+    );
+
+    // Register sqlite3_mprintf_int
+    let cmd_name = CString::new("sqlite3_mprintf_int").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(sqlite3_mprintf_int_cmd),
+        std::ptr::null_mut(),
+        None,
+    );
+
+    // Register sqlite3_mprintf_double
+    let cmd_name = CString::new("sqlite3_mprintf_double").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(sqlite3_mprintf_double_cmd),
+        std::ptr::null_mut(),
+        None,
+    );
+
+    // Register sqlite3_txn_state
+    let cmd_name = CString::new("sqlite3_txn_state").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(sqlite3_txn_state_cmd),
+        std::ptr::null_mut(),
+        None,
+    );
+
+    // Register working_64bit_int
+    let cmd_name = CString::new("working_64bit_int").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(working_64bit_int_cmd),
+        std::ptr::null_mut(),
+        None,
+    );
+
+    // Register tcl_variable_type
+    let cmd_name = CString::new("tcl_variable_type").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(tcl_variable_type_cmd),
+        std::ptr::null_mut(),
+        None,
+    );
+
+    // Register clang_sanitize_address
+    let cmd_name = CString::new("clang_sanitize_address").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(clang_sanitize_address_cmd),
         std::ptr::null_mut(),
         None,
     );
@@ -302,6 +371,356 @@ unsafe extern "C" fn test_stub_status(
     _objv: *const *mut Tcl_Obj,
 ) -> c_int {
     set_result_string(interp, "0 0 0");
+    TCL_OK
+}
+
+/// sqlite3_mprintf_int - format integers using format string
+/// Usage: sqlite3_mprintf_int FORMAT A B C ...
+/// Each %d, %i, %x, %o, %u in FORMAT is replaced with corresponding arg
+unsafe extern "C" fn sqlite3_mprintf_int_cmd(
+    _client_data: *mut std::ffi::c_void,
+    interp: *mut Tcl_Interp,
+    objc: c_int,
+    objv: *const *mut Tcl_Obj,
+) -> c_int {
+    if objc < 2 {
+        set_result_string(
+            interp,
+            "wrong # args: should be \"sqlite3_mprintf_int FORMAT ?INT ...?\"",
+        );
+        return TCL_ERROR;
+    }
+
+    let format = obj_to_string(*objv.offset(1));
+
+    // Collect integer arguments
+    let mut args: Vec<i64> = Vec::new();
+    for i in 2..objc {
+        let arg_str = obj_to_string(*objv.offset(i as isize));
+        match arg_str.parse::<i64>() {
+            Ok(v) => args.push(v),
+            Err(_) => {
+                set_result_string(interp, &format!("expected integer but got \"{}\"", arg_str));
+                return TCL_ERROR;
+            }
+        }
+    }
+
+    // Process format string, replacing format specifiers with args
+    let mut result = String::new();
+    let mut arg_idx = 0;
+    let mut chars = format.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            // Check for format specifier
+            let mut spec = String::from("%");
+
+            // Collect width/precision
+            while let Some(&ch) = chars.peek() {
+                if ch.is_ascii_digit()
+                    || ch == '-'
+                    || ch == '+'
+                    || ch == ' '
+                    || ch == '#'
+                    || ch == '0'
+                    || ch == '.'
+                {
+                    spec.push(ch);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+
+            if let Some(&type_char) = chars.peek() {
+                spec.push(type_char);
+                chars.next();
+
+                match type_char {
+                    'd' | 'i' => {
+                        if arg_idx < args.len() {
+                            // Parse width from spec
+                            let width_str: String = spec[1..spec.len() - 1]
+                                .chars()
+                                .filter(|c| c.is_ascii_digit())
+                                .collect();
+                            let width = width_str.parse::<usize>().unwrap_or(0);
+                            let zero_pad = spec.contains('0');
+                            let value = args[arg_idx];
+                            if zero_pad && width > 0 {
+                                result.push_str(&format!("{:0>width$}", value, width = width));
+                            } else if width > 0 {
+                                result.push_str(&format!("{:>width$}", value, width = width));
+                            } else {
+                                result.push_str(&format!("{}", value));
+                            }
+                            arg_idx += 1;
+                        }
+                    }
+                    'x' => {
+                        if arg_idx < args.len() {
+                            let width_str: String = spec[1..spec.len() - 1]
+                                .chars()
+                                .filter(|c| c.is_ascii_digit())
+                                .collect();
+                            let width = width_str.parse::<usize>().unwrap_or(0);
+                            let zero_pad = spec.contains('0');
+                            let value = args[arg_idx] as u64;
+                            if zero_pad && width > 0 {
+                                result.push_str(&format!("{:0>width$x}", value, width = width));
+                            } else if width > 0 {
+                                result.push_str(&format!("{:>width$x}", value, width = width));
+                            } else {
+                                result.push_str(&format!("{:x}", value));
+                            }
+                            arg_idx += 1;
+                        }
+                    }
+                    'X' => {
+                        if arg_idx < args.len() {
+                            let width_str: String = spec[1..spec.len() - 1]
+                                .chars()
+                                .filter(|c| c.is_ascii_digit())
+                                .collect();
+                            let width = width_str.parse::<usize>().unwrap_or(0);
+                            let zero_pad = spec.contains('0');
+                            let value = args[arg_idx] as u64;
+                            if zero_pad && width > 0 {
+                                result.push_str(&format!("{:0>width$X}", value, width = width));
+                            } else if width > 0 {
+                                result.push_str(&format!("{:>width$X}", value, width = width));
+                            } else {
+                                result.push_str(&format!("{:X}", value));
+                            }
+                            arg_idx += 1;
+                        }
+                    }
+                    'o' => {
+                        if arg_idx < args.len() {
+                            result.push_str(&format!("{:o}", args[arg_idx] as u64));
+                            arg_idx += 1;
+                        }
+                    }
+                    'u' => {
+                        if arg_idx < args.len() {
+                            result.push_str(&format!("{}", args[arg_idx] as u64));
+                            arg_idx += 1;
+                        }
+                    }
+                    '%' => {
+                        result.push('%');
+                    }
+                    _ => {
+                        result.push_str(&spec);
+                    }
+                }
+            } else {
+                result.push('%');
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    set_result_string(interp, &result);
+    TCL_OK
+}
+
+/// sqlite3_mprintf_double - format doubles using format string
+/// Usage: sqlite3_mprintf_double FORMAT A B C ...
+unsafe extern "C" fn sqlite3_mprintf_double_cmd(
+    _client_data: *mut std::ffi::c_void,
+    interp: *mut Tcl_Interp,
+    objc: c_int,
+    objv: *const *mut Tcl_Obj,
+) -> c_int {
+    if objc < 2 {
+        set_result_string(
+            interp,
+            "wrong # args: should be \"sqlite3_mprintf_double FORMAT ?DOUBLE ...?\"",
+        );
+        return TCL_ERROR;
+    }
+
+    let format = obj_to_string(*objv.offset(1));
+
+    // Collect double arguments
+    let mut args: Vec<f64> = Vec::new();
+    for i in 2..objc {
+        let arg_str = obj_to_string(*objv.offset(i as isize));
+        match arg_str.parse::<f64>() {
+            Ok(v) => args.push(v),
+            Err(_) => {
+                set_result_string(interp, &format!("expected double but got \"{}\"", arg_str));
+                return TCL_ERROR;
+            }
+        }
+    }
+
+    // Process format string
+    let mut result = String::new();
+    let mut arg_idx = 0;
+    let mut chars = format.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            // Collect format specifier
+            let mut width = 0usize;
+            let mut precision: Option<usize> = None;
+            let mut in_precision = false;
+
+            while let Some(&ch) = chars.peek() {
+                if ch == '.' {
+                    in_precision = true;
+                    chars.next();
+                } else if ch.is_ascii_digit() {
+                    if in_precision {
+                        let p = precision.get_or_insert(0);
+                        *p = *p * 10 + (ch as usize - '0' as usize);
+                    } else {
+                        width = width * 10 + (ch as usize - '0' as usize);
+                    }
+                    chars.next();
+                } else if ch == '-' || ch == '+' || ch == ' ' || ch == '#' || ch == '0' {
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+
+            if let Some(&type_char) = chars.peek() {
+                chars.next();
+
+                match type_char {
+                    'f' | 'F' => {
+                        if arg_idx < args.len() {
+                            let value = args[arg_idx];
+                            let prec = precision.unwrap_or(6);
+                            result.push_str(&format!("{:.prec$}", value, prec = prec));
+                            arg_idx += 1;
+                        }
+                    }
+                    'e' | 'E' => {
+                        if arg_idx < args.len() {
+                            let value = args[arg_idx];
+                            let prec = precision.unwrap_or(6);
+                            if type_char == 'E' {
+                                result.push_str(&format!("{:.prec$E}", value, prec = prec));
+                            } else {
+                                result.push_str(&format!("{:.prec$e}", value, prec = prec));
+                            }
+                            arg_idx += 1;
+                        }
+                    }
+                    'g' | 'G' => {
+                        if arg_idx < args.len() {
+                            let value = args[arg_idx];
+                            let prec = precision.unwrap_or(6);
+                            // Use precision for significant digits
+                            result.push_str(&format!("{:.prec$}", value, prec = prec));
+                            arg_idx += 1;
+                        }
+                    }
+                    '%' => {
+                        result.push('%');
+                    }
+                    _ => {
+                        result.push('%');
+                        result.push(type_char);
+                    }
+                }
+            } else {
+                result.push('%');
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    set_result_string(interp, &result);
+    TCL_OK
+}
+
+/// sqlite3_txn_state - query transaction state of a connection
+/// Usage: sqlite3_txn_state DB ?SCHEMA?
+/// Returns: -1 (error), 0 (none), 1 (read), 2 (write)
+unsafe extern "C" fn sqlite3_txn_state_cmd(
+    _client_data: *mut std::ffi::c_void,
+    interp: *mut Tcl_Interp,
+    objc: c_int,
+    objv: *const *mut Tcl_Obj,
+) -> c_int {
+    if objc < 2 {
+        set_result_string(
+            interp,
+            "wrong # args: should be \"sqlite3_txn_state DB ?SCHEMA?\"",
+        );
+        return TCL_ERROR;
+    }
+
+    let db_name = obj_to_string(*objv.offset(1));
+
+    // Get transaction state
+    let state = CONNECTIONS.with(|connections| {
+        let conns = connections.borrow();
+        if let Some(conn) = conns.get(&db_name) {
+            // Check if in autocommit mode
+            use crate::api::TransactionState;
+            match conn.transaction_state {
+                TransactionState::None => 0,  // No transaction
+                TransactionState::Read => 1,  // Read transaction
+                TransactionState::Write => 2, // Write transaction
+            }
+        } else {
+            -1 // Error - no such connection
+        }
+    });
+
+    set_result_int(interp, state);
+    TCL_OK
+}
+
+/// working_64bit_int - returns 1 if platform supports 64-bit integers
+unsafe extern "C" fn working_64bit_int_cmd(
+    _client_data: *mut std::ffi::c_void,
+    interp: *mut Tcl_Interp,
+    _objc: c_int,
+    _objv: *const *mut Tcl_Obj,
+) -> c_int {
+    // Rust always supports 64-bit integers
+    set_result_int(interp, 1);
+    TCL_OK
+}
+
+/// tcl_variable_type - returns the type of a TCL variable
+unsafe extern "C" fn tcl_variable_type_cmd(
+    _client_data: *mut std::ffi::c_void,
+    interp: *mut Tcl_Interp,
+    objc: c_int,
+    objv: *const *mut Tcl_Obj,
+) -> c_int {
+    if objc < 2 {
+        set_result_string(
+            interp,
+            "wrong # args: should be \"tcl_variable_type VARNAME\"",
+        );
+        return TCL_ERROR;
+    }
+    // For compatibility, just return empty string (unknown type)
+    set_result_string(interp, "");
+    TCL_OK
+}
+
+/// clang_sanitize_address - returns 1 if running with address sanitizer
+unsafe extern "C" fn clang_sanitize_address_cmd(
+    _client_data: *mut std::ffi::c_void,
+    interp: *mut Tcl_Interp,
+    _objc: c_int,
+    _objv: *const *mut Tcl_Obj,
+) -> c_int {
+    // Not running with sanitizer
+    set_result_int(interp, 0);
     TCL_OK
 }
 

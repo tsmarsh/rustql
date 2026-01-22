@@ -585,11 +585,20 @@ impl Wal {
 
     /// Open WAL for a database (sqlite3WalOpen)
     pub fn open(db_path: &str, page_size: u32) -> Result<Self> {
+        Self::open_with_fd(db_path, page_size, None)
+    }
+
+    /// Open WAL with an existing file handle (sqlite3WalOpen + walIndexRecover)
+    pub fn open_with_fd(
+        db_path: &str,
+        page_size: u32,
+        wal_fd: Option<Box<dyn VfsFile>>,
+    ) -> Result<Self> {
         let wal_path = format!("{}-wal", db_path);
         let shm = shared_wal_shm(db_path);
 
-        Ok(Wal {
-            wal_fd: None,
+        let mut wal = Wal {
+            wal_fd,
             db_path: db_path.to_string(),
             wal_path,
             header: WalIndexHdr::new(page_size),
@@ -607,7 +616,13 @@ impl Wal {
             shm,
             n_written: 0,
             truncate_on_commit: false,
-        })
+        };
+
+        if wal.wal_fd.is_some() {
+            wal.recover()?;
+        }
+
+        Ok(wal)
     }
 
     fn with_shm<R>(&self, f: impl FnOnce(&mut WalShm) -> R) -> R {
@@ -779,7 +794,7 @@ impl Wal {
         }
 
         // Create WAL file if needed
-        if self.wal_fd.is_none() {
+        if self.wal_fd.is_none() || self.wal_header.is_none() {
             self.create_wal_file(page_size)?;
         }
 
@@ -1045,8 +1060,8 @@ impl Wal {
         self.read_lock = WAL_READ_LOCK_NONE;
         self.checksum = [0, 0];
 
-        // Reset shared memory read marks
-        {
+        // Reset shared memory read marks only if no other connections exist.
+        if Arc::strong_count(&self.shm) == 1 {
             let mut shm = self.shm.lock().unwrap();
             for mark in shm.read_marks.iter_mut() {
                 *mark = 0;
@@ -1158,6 +1173,10 @@ impl Wal {
         let hdr_bytes = hdr.to_bytes();
         let (c1, c2) = wal_checksum(self.big_endian_cksum, &hdr_bytes[0..24], 0, 0);
         self.checksum = [c1, c2];
+
+        if let Some(ref mut fd) = self.wal_fd {
+            fd.write(&hdr_bytes, 0)?;
+        }
 
         self.header = WalIndexHdr::new(page_size);
         self.header.salt = [hdr.salt1, hdr.salt2];

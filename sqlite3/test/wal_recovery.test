@@ -1,0 +1,40 @@
+# 2025 February 10
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# Tests for WAL recovery when reopening a database.
+#
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+source $testdir/wal_common.tcl
+
+set testprefix wal_recovery
+
+ifcapable !wal { finish_test ; return }
+
+forcedelete test.db test.db-wal test.db-shm
+
+sqlite3 db1 test.db
+execsql {
+  PRAGMA journal_mode = WAL;
+  CREATE TABLE t(x);
+  INSERT INTO t VALUES(1);
+} db1
+db1 close
+
+sqlite3 db2 test.db
+set rows [execsql { SELECT x FROM t; } db2]
+db2 close
+
+do_test wal_recovery-1.1 {
+  set rows
+} {1}
+
+finish_test

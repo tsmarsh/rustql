@@ -1499,8 +1499,21 @@ impl Pager {
             ));
         }
 
-        // Create WAL instance
-        let wal = Wal::open(&self.db_path, self.page_size)?;
+        // Open WAL file and recover index if present
+        let wal_fd = match self.vfs_open.as_ref() {
+            Some(open_fn) => {
+                let wal_path = format!("{}-wal", self.db_path);
+                let mut flags = if self.read_only {
+                    OpenFlags::READONLY
+                } else {
+                    OpenFlags::READWRITE | OpenFlags::CREATE
+                };
+                flags.insert(OpenFlags::WAL);
+                Some(open_fn(&wal_path, flags)?)
+            }
+            None => None,
+        };
+        let wal = Wal::open_with_fd(&self.db_path, self.page_size, wal_fd)?;
         self.wal = Some(wal);
         self.journal_mode = JournalMode::Wal;
 

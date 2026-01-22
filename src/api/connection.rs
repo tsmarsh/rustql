@@ -11,7 +11,7 @@ use crate::functions::{get_aggregate_function, get_scalar_function, AggregateInf
 use crate::schema::{
     parse_create_sql, Encoding, Index, IndexColumn, Schema, SortOrder, DEFAULT_COLLATION,
 };
-use crate::storage::btree::{Btree, BtreeCursorFlags, BtreeOpenFlags, CursorState};
+use crate::storage::btree::{Btree, BtreeCursorFlags, BtreeOpenFlags, CursorState, TransState};
 use crate::storage::pager::{JournalMode, LockingMode, DEFAULT_PAGE_SIZE};
 use crate::types::{
     AccessFlags, DbOffset, DeviceCharacteristics, LockLevel, OpenFlags, RowId, SyncFlags, Value,
@@ -1477,11 +1477,17 @@ pub fn sqlite3_close(mut conn: Box<SqliteConnection>) -> Result<()> {
     for db in &mut conn.dbs {
         // Close btree connections
         if let Some(btree) = db.btree.take() {
-            // Only commit if there's an active write transaction
-            // After rollback or no transaction, commit_shared() would try to
-            // start a new transaction which can hang on file locks
-            if btree.is_in_write_trans() {
-                let _ = btree.commit_shared();
+            // Roll back any open transaction to release locks safely.
+            if btree.txn_state() != TransState::None {
+                let _ = btree.rollback(0, false);
+            }
+            match Arc::try_unwrap(btree) {
+                Ok(mut btree) => {
+                    btree.close()?;
+                }
+                Err(_) => {
+                    return Err(Error::new(ErrorCode::Busy));
+                }
             }
         }
         db.schema = None;

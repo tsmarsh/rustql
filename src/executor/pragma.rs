@@ -89,6 +89,10 @@ pub fn pragma_columns(pragma: &PragmaStmt) -> Option<(Vec<String>, Vec<ColumnTyp
                 ColumnType::Integer,
             ],
         ),
+        "lock_status" => (
+            vec!["database", "status"],
+            vec![ColumnType::Text, ColumnType::Text],
+        ),
         _ => return None,
     };
 
@@ -124,6 +128,17 @@ pub fn execute_pragma(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Resul
         "integrity_check" => pragma_integrity_check(conn, schema_name, pragma),
         "quick_check" => pragma_integrity_check(conn, schema_name, pragma),
         "vdbe_listing" => pragma_vdbe_listing(conn, pragma),
+        // Legacy pragmas (aliases)
+        "default_cache_size" => pragma_cache_size(conn, schema_name, pragma),
+        "default_synchronous" => pragma_synchronous(conn, schema_name, pragma),
+        // Additional pragmas
+        "case_sensitive_like" => pragma_case_sensitive_like(conn, pragma),
+        "freelist_count" => pragma_freelist_count(conn),
+        "lock_status" => pragma_lock_status(conn),
+        "incremental_vacuum" => pragma_incremental_vacuum(),
+        "cache_spill" => pragma_cache_spill(conn, pragma),
+        "writable_schema" => pragma_writable_schema(conn, pragma),
+        "automatic_index" => pragma_automatic_index(conn, pragma),
         _ => Err(Error::with_message(
             ErrorCode::Error,
             format!("unknown pragma: {}", pragma.name),
@@ -693,6 +708,94 @@ fn pragma_encoding(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Result<P
             crate::schema::Encoding::Utf16be => "UTF-16BE",
         };
         return Ok(single_text_result(name.to_string()));
+    }
+    Ok(empty_result())
+}
+
+fn pragma_case_sensitive_like(
+    conn: &mut SqliteConnection,
+    pragma: &PragmaStmt,
+) -> Result<PragmaResult> {
+    if let Some(value) = pragma_value_i64(pragma) {
+        conn.db_config.case_sensitive_like = value != 0;
+    } else if let Some(value) = pragma_value_string(pragma) {
+        conn.db_config.case_sensitive_like = parse_bool_value(&value);
+    }
+    if pragma.value.is_none() {
+        return Ok(single_int_result(i64::from(
+            conn.db_config.case_sensitive_like,
+        )));
+    }
+    Ok(empty_result())
+}
+
+fn pragma_freelist_count(_conn: &SqliteConnection) -> Result<PragmaResult> {
+    // Return 0 - no free pages tracked currently
+    Ok(single_int_result(0))
+}
+
+fn pragma_lock_status(conn: &SqliteConnection) -> Result<PragmaResult> {
+    // Return lock status for each attached database
+    // Format: database, status (unlocked, shared, reserved, pending, exclusive)
+    let mut rows = Vec::new();
+    for db in &conn.dbs {
+        // Currently we don't track lock state, report as unlocked
+        rows.push(vec![
+            Value::Text(db.name.clone()),
+            Value::Text("unlocked".to_string()),
+        ]);
+    }
+    Ok(PragmaResult {
+        columns: vec!["database".into(), "status".into()],
+        types: vec![ColumnType::Text, ColumnType::Text],
+        rows,
+    })
+}
+
+fn pragma_incremental_vacuum() -> Result<PragmaResult> {
+    // No-op - incremental vacuum not implemented
+    // Just return success with empty result
+    Ok(empty_result())
+}
+
+fn pragma_cache_spill(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Result<PragmaResult> {
+    if let Some(value) = pragma_value_i64(pragma) {
+        conn.db_config.cache_spill = value != 0;
+    } else if let Some(value) = pragma_value_string(pragma) {
+        conn.db_config.cache_spill = parse_bool_value(&value);
+    }
+    if pragma.value.is_none() {
+        return Ok(single_int_result(i64::from(conn.db_config.cache_spill)));
+    }
+    Ok(empty_result())
+}
+
+fn pragma_writable_schema(
+    conn: &mut SqliteConnection,
+    pragma: &PragmaStmt,
+) -> Result<PragmaResult> {
+    if let Some(value) = pragma_value_i64(pragma) {
+        conn.db_config.writable_schema = value != 0;
+    } else if let Some(value) = pragma_value_string(pragma) {
+        conn.db_config.writable_schema = parse_bool_value(&value);
+    }
+    if pragma.value.is_none() {
+        return Ok(single_int_result(i64::from(conn.db_config.writable_schema)));
+    }
+    Ok(empty_result())
+}
+
+fn pragma_automatic_index(
+    conn: &mut SqliteConnection,
+    pragma: &PragmaStmt,
+) -> Result<PragmaResult> {
+    if let Some(value) = pragma_value_i64(pragma) {
+        conn.db_config.automatic_index = value != 0;
+    } else if let Some(value) = pragma_value_string(pragma) {
+        conn.db_config.automatic_index = parse_bool_value(&value);
+    }
+    if pragma.value.is_none() {
+        return Ok(single_int_result(i64::from(conn.db_config.automatic_index)));
     }
     Ok(empty_result())
 }

@@ -752,6 +752,12 @@ pub struct DbConfigFlags {
     pub vdbe_listing: bool,
     /// Empty result callbacks - return column names for queries with zero rows (default OFF)
     pub empty_result_callbacks: bool,
+    /// Case sensitive LIKE - when true, LIKE is case sensitive (default OFF)
+    pub case_sensitive_like: bool,
+    /// Automatic index creation - when true, optimizer can create automatic indexes (default ON)
+    pub automatic_index: bool,
+    /// Cache spill - when true, allow cache to spill to disk under memory pressure (default ON)
+    pub cache_spill: bool,
 }
 
 impl Default for SqliteConnection {
@@ -810,6 +816,9 @@ impl SqliteConnection {
                 full_column_names: false,      // Default OFF
                 vdbe_listing: false,           // Default OFF
                 empty_result_callbacks: false, // Default OFF
+                case_sensitive_like: false,    // Default OFF
+                automatic_index: true,         // Default ON
+                cache_spill: true,             // Default ON
             },
             schema_generation: AtomicU64::new(0),
             memory_used: AtomicI64::new(0),

@@ -52,6 +52,11 @@ pub fn get_scalar_function(name: &str) -> Option<ScalarFunc> {
         "IFNULL" => Some(func_ifnull),
         "IIF" => Some(func_iif),
 
+        // Query optimizer hint functions (no-ops that return first argument)
+        "LIKELY" => Some(func_likely),
+        "UNLIKELY" => Some(func_unlikely),
+        "LIKELIHOOD" => Some(func_likelihood),
+
         // Blob functions
         "HEX" => Some(func_hex),
         "UNHEX" => Some(func_unhex),
@@ -567,6 +572,48 @@ pub fn func_iif(args: &[Value]) -> Result<Value> {
     } else {
         Ok(args[2].clone())
     }
+}
+
+// ============================================================================
+// Query Optimizer Hint Functions
+// ============================================================================
+
+/// likely(X) - Hint that X is probably true (returns X unchanged)
+///
+/// This is a no-op function that provides a hint to the query optimizer
+/// that the argument is likely to be true. Since RustQL doesn't use the
+/// same optimizer as SQLite, this simply returns the argument unchanged.
+pub fn func_likely(args: &[Value]) -> Result<Value> {
+    if args.is_empty() {
+        return Ok(Value::Null);
+    }
+    Ok(args[0].clone())
+}
+
+/// unlikely(X) - Hint that X is probably false (returns X unchanged)
+///
+/// This is a no-op function that provides a hint to the query optimizer
+/// that the argument is unlikely to be true. Since RustQL doesn't use the
+/// same optimizer as SQLite, this simply returns the argument unchanged.
+pub fn func_unlikely(args: &[Value]) -> Result<Value> {
+    if args.is_empty() {
+        return Ok(Value::Null);
+    }
+    Ok(args[0].clone())
+}
+
+/// likelihood(X, P) - Hint that X has probability P of being true (returns X unchanged)
+///
+/// This is a no-op function that provides a hint to the query optimizer
+/// about the probability of the first argument being true. The probability P
+/// should be between 0.0 and 1.0. Since RustQL doesn't use the same optimizer
+/// as SQLite, this simply returns the first argument unchanged.
+pub fn func_likelihood(args: &[Value]) -> Result<Value> {
+    if args.is_empty() {
+        return Ok(Value::Null);
+    }
+    // Ignore the probability argument, just return the first argument
+    Ok(args[0].clone())
 }
 
 // ============================================================================

@@ -3,7 +3,7 @@
 //! This module generates VDBE opcodes for SELECT statements.
 //! Corresponds to SQLite's select.c.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::executor::window::{select_has_window_functions, WindowCompiler};
@@ -126,6 +126,10 @@ pub struct SelectCompiler<'s> {
     labels: HashMap<i32, Option<i32>>,
     /// CTE definitions
     ctes: HashMap<String, CommonTableExpr>,
+    /// Names of CTEs declared in WITH RECURSIVE
+    recursive_ctes: HashSet<String>,
+    /// CTEs mapped to existing cursors (used for recursive evaluation)
+    cte_cursors: HashMap<String, (i32, Vec<String>)>,
     /// Is this a compound select?
     is_compound: bool,
     /// Has aggregates?
@@ -189,6 +193,8 @@ impl<'s> SelectCompiler<'s> {
             next_label: 0,
             labels: HashMap::new(),
             ctes: HashMap::new(),
+            recursive_ctes: HashSet::new(),
+            cte_cursors: HashMap::new(),
             is_compound: false,
             has_aggregates: false,
             has_window_functions: false,
@@ -225,6 +231,8 @@ impl<'s> SelectCompiler<'s> {
             next_label: 0,
             labels: HashMap::new(),
             ctes: HashMap::new(),
+            recursive_ctes: HashSet::new(),
+            cte_cursors: HashMap::new(),
             is_compound: false,
             has_aggregates: false,
             has_window_functions: false,
@@ -393,14 +401,12 @@ impl<'s> SelectCompiler<'s> {
 
     /// Process WITH clause
     fn process_with_clause(&mut self, with: &WithClause) -> Result<()> {
-        if with.recursive {
-            return Err(Error::with_message(
-                ErrorCode::Error,
-                "recursive CTEs are not supported",
-            ));
-        }
         for cte in &with.ctes {
-            self.ctes.insert(cte.name.to_lowercase(), cte.clone());
+            let name_lower = cte.name.to_lowercase();
+            if with.recursive {
+                self.recursive_ctes.insert(name_lower.clone());
+            }
+            self.ctes.insert(name_lower, cte.clone());
         }
         Ok(())
     }
@@ -501,8 +507,12 @@ impl<'s> SelectCompiler<'s> {
         subcompiler.next_reg = self.next_reg;
         subcompiler.next_cursor = self.next_cursor;
         subcompiler.ctes = self.ctes.clone();
+        subcompiler.recursive_ctes = self.recursive_ctes.clone();
+        subcompiler.cte_cursors = self.cte_cursors.clone();
         if let Some(name) = exclude_cte {
             subcompiler.ctes.remove(name);
+            subcompiler.recursive_ctes.remove(name);
+            subcompiler.cte_cursors.remove(name);
         }
         // Pass column naming settings to subquery compiler
         subcompiler.set_column_name_flags(self.short_column_names, self.full_column_names);
@@ -533,6 +543,276 @@ impl<'s> SelectCompiler<'s> {
         self.next_cursor = subcompiler.next_cursor;
 
         Ok(subquery_col_names)
+    }
+
+    fn compile_recursive_cte(
+        &mut self,
+        cte: &CommonTableExpr,
+        cte_cursor: i32,
+        name_lower: &str,
+    ) -> Result<Vec<String>> {
+        let SelectBody::Compound { op, left, right } = &cte.query.body else {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                "recursive CTE requires a compound SELECT",
+            ));
+        };
+
+        let distinct = match op {
+            CompoundOp::Union => true,
+            CompoundOp::UnionAll => false,
+            _ => {
+                return Err(Error::with_message(
+                    ErrorCode::Error,
+                    "recursive CTE requires UNION or UNION ALL",
+                ));
+            }
+        };
+
+        let seed_select = SelectStmt {
+            with: None,
+            body: (*left.clone()).clone(),
+            order_by: None,
+            limit: None,
+        };
+
+        let recursive_select = SelectStmt {
+            with: None,
+            body: (*right.clone()).clone(),
+            order_by: cte.query.order_by.clone(),
+            limit: cte.query.limit.clone(),
+        };
+
+        let work_cursor = self.alloc_cursor();
+        let queue_cursor = self.alloc_cursor();
+        let next_cursor = self.alloc_cursor();
+
+        self.emit(Opcode::OpenEphemeral, cte_cursor, 0, 0, P4::Unused);
+        self.emit(Opcode::OpenEphemeral, work_cursor, 0, 0, P4::Unused);
+        self.emit(Opcode::OpenEphemeral, queue_cursor, 0, 0, P4::Unused);
+
+        let limit_reg = if let Some(limit) = &cte.query.limit {
+            let reg = self.alloc_reg();
+            self.compile_expr(&limit.limit, reg)?;
+            Some(reg)
+        } else {
+            None
+        };
+
+        let offset_reg = if let Some(limit) = &cte.query.limit {
+            if let Some(offset) = &limit.offset {
+                let reg = self.alloc_reg();
+                self.compile_expr(offset, reg)?;
+                Some(reg)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let done_label = self.alloc_label();
+
+        let seed_columns =
+            self.compile_subquery_to_ephemeral(&seed_select, next_cursor, Some(name_lower))?;
+        let column_names = if let Some(explicit) = &cte.columns {
+            if explicit.len() != seed_columns.len() {
+                return Err(Error::with_message(
+                    ErrorCode::Error,
+                    format!(
+                        "table {} has {} values for {} columns",
+                        cte.name,
+                        seed_columns.len(),
+                        explicit.len()
+                    ),
+                ));
+            }
+            explicit.clone()
+        } else {
+            seed_columns
+        };
+
+        let column_count = column_names.len();
+
+        self.emit_recursive_cte_process_cursor(
+            next_cursor,
+            work_cursor,
+            queue_cursor,
+            cte_cursor,
+            column_count,
+            distinct,
+            limit_reg,
+            offset_reg,
+            done_label,
+        )?;
+
+        let loop_start_label = self.alloc_label();
+        self.resolve_label(loop_start_label, self.current_addr());
+        self.emit(Opcode::Rewind, queue_cursor, done_label, 0, P4::Unused);
+
+        let mut subcompiler = if let Some(schema) = self.schema {
+            SelectCompiler::with_schema(schema)
+        } else {
+            SelectCompiler::new()
+        };
+        subcompiler.next_reg = self.next_reg;
+        subcompiler.next_cursor = self.next_cursor;
+        subcompiler.ctes = self.ctes.clone();
+        subcompiler.recursive_ctes = self.recursive_ctes.clone();
+        subcompiler.cte_cursors = HashMap::new();
+        subcompiler
+            .cte_cursors
+            .insert(name_lower.to_string(), (queue_cursor, column_names.clone()));
+        subcompiler.set_column_name_flags(self.short_column_names, self.full_column_names);
+        let recursive_ops = subcompiler.compile(
+            &recursive_select,
+            &SelectDest::EphemTable {
+                cursor: next_cursor,
+            },
+        )?;
+
+        let recursive_cols = subcompiler.result_column_names.clone();
+        if recursive_cols.len() != column_count {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                format!(
+                    "table {} has {} values for {} columns",
+                    cte.name,
+                    recursive_cols.len(),
+                    column_count
+                ),
+            ));
+        }
+
+        let offset = self.ops.len() as i32;
+        for mut op in recursive_ops {
+            if op.opcode != Opcode::Halt {
+                if op.opcode.is_jump() {
+                    op.p2 += offset;
+                    op.p5 = 0xFFFF;
+                }
+                self.ops.push(op);
+            }
+        }
+        self.next_reg = subcompiler.next_reg;
+        self.next_cursor = subcompiler.next_cursor;
+
+        self.emit(Opcode::OpenEphemeral, queue_cursor, 0, 0, P4::Unused);
+        self.emit_recursive_cte_process_cursor(
+            next_cursor,
+            work_cursor,
+            queue_cursor,
+            cte_cursor,
+            column_count,
+            distinct,
+            limit_reg,
+            offset_reg,
+            done_label,
+        )?;
+        self.emit(Opcode::Goto, 0, loop_start_label, 0, P4::Unused);
+
+        self.resolve_label(done_label, self.current_addr());
+
+        Ok(column_names)
+    }
+
+    fn emit_recursive_cte_process_cursor(
+        &mut self,
+        src_cursor: i32,
+        work_cursor: i32,
+        queue_cursor: i32,
+        output_cursor: i32,
+        column_count: usize,
+        distinct: bool,
+        limit_reg: Option<i32>,
+        offset_reg: Option<i32>,
+        done_label: i32,
+    ) -> Result<()> {
+        let done = self.alloc_label();
+        self.emit(Opcode::Rewind, src_cursor, done, 0, P4::Unused);
+
+        let loop_label = self.alloc_label();
+        self.resolve_label(loop_label, self.current_addr());
+
+        let base_reg = self.next_reg;
+        for _ in 0..column_count {
+            let reg = self.alloc_reg();
+            self.emit(Opcode::Column, src_cursor, reg - base_reg, reg, P4::Unused);
+        }
+
+        let record_reg = self.alloc_reg();
+        self.emit(
+            Opcode::MakeRecord,
+            base_reg,
+            column_count as i32,
+            record_reg,
+            P4::Unused,
+        );
+
+        let skip_label = self.alloc_label();
+        if distinct {
+            self.emit(
+                Opcode::Found,
+                work_cursor,
+                skip_label,
+                record_reg,
+                P4::Unused,
+            );
+        }
+
+        let work_rowid = self.alloc_reg();
+        self.emit(Opcode::NewRowid, work_cursor, work_rowid, 0, P4::Unused);
+        self.emit(
+            Opcode::Insert,
+            work_cursor,
+            record_reg,
+            work_rowid,
+            P4::Unused,
+        );
+
+        let queue_rowid = self.alloc_reg();
+        self.emit(Opcode::NewRowid, queue_cursor, queue_rowid, 0, P4::Unused);
+        self.emit(
+            Opcode::Insert,
+            queue_cursor,
+            record_reg,
+            queue_rowid,
+            P4::Unused,
+        );
+
+        let after_output = self.alloc_label();
+        if let Some(offset_reg) = offset_reg {
+            let after_offset = self.alloc_label();
+            self.emit(Opcode::IfNot, offset_reg, after_offset, 0, P4::Unused);
+            self.emit(Opcode::AddImm, offset_reg, -1, 0, P4::Unused);
+            self.emit(Opcode::Goto, 0, after_output, 0, P4::Unused);
+            self.resolve_label(after_offset, self.current_addr());
+        }
+
+        if let Some(limit_reg) = limit_reg {
+            self.emit(Opcode::IfNot, limit_reg, done_label, 0, P4::Unused);
+        }
+
+        let out_rowid = self.alloc_reg();
+        self.emit(Opcode::NewRowid, output_cursor, out_rowid, 0, P4::Unused);
+        self.emit(
+            Opcode::Insert,
+            output_cursor,
+            record_reg,
+            out_rowid,
+            P4::Unused,
+        );
+
+        if let Some(limit_reg) = limit_reg {
+            self.emit(Opcode::AddImm, limit_reg, -1, 0, P4::Unused);
+        }
+
+        self.resolve_label(after_output, self.current_addr());
+        self.resolve_label(skip_label, self.current_addr());
+        self.emit(Opcode::Next, src_cursor, loop_label, 0, P4::Unused);
+        self.resolve_label(done, self.current_addr());
+
+        Ok(())
     }
 
     /// Compile a simple SELECT (not compound)
@@ -1510,31 +1790,50 @@ impl<'s> SelectCompiler<'s> {
 
         match &item.source {
             TableSource::Table(name) => {
-                let cursor = self.alloc_cursor();
                 let table_name = &name.name;
                 let table_name_lower = table_name.to_lowercase();
 
+                if let Some((cursor, columns)) = self.cte_cursors.get(&table_name_lower) {
+                    let display_name = item.alias.clone().unwrap_or_else(|| table_name.clone());
+                    self.tables.push(TableInfo {
+                        name: display_name,
+                        table_name: table_name.clone(),
+                        cursor: *cursor,
+                        schema_table: None,
+                        is_subquery: true,
+                        join_type: item.join_type,
+                        subquery_columns: Some(columns.clone()),
+                    });
+                    return Ok(());
+                }
+
+                let cursor = self.alloc_cursor();
+
                 if let Some(cte) = self.ctes.get(&table_name_lower).cloned() {
-                    let subquery_cols = self.compile_subquery_to_ephemeral(
-                        &cte.query,
-                        cursor,
-                        Some(&table_name_lower),
-                    )?;
-                    let columns = if let Some(explicit) = &cte.columns {
-                        if explicit.len() != subquery_cols.len() {
-                            return Err(Error::with_message(
-                                ErrorCode::Error,
-                                format!(
-                                    "table {} has {} values for {} columns",
-                                    cte.name,
-                                    subquery_cols.len(),
-                                    explicit.len()
-                                ),
-                            ));
-                        }
-                        explicit.clone()
+                    let columns = if self.recursive_ctes.contains(&table_name_lower) {
+                        self.compile_recursive_cte(&cte, cursor, &table_name_lower)?
                     } else {
-                        subquery_cols
+                        let subquery_cols = self.compile_subquery_to_ephemeral(
+                            &cte.query,
+                            cursor,
+                            Some(&table_name_lower),
+                        )?;
+                        if let Some(explicit) = &cte.columns {
+                            if explicit.len() != subquery_cols.len() {
+                                return Err(Error::with_message(
+                                    ErrorCode::Error,
+                                    format!(
+                                        "table {} has {} values for {} columns",
+                                        cte.name,
+                                        subquery_cols.len(),
+                                        explicit.len()
+                                    ),
+                                ));
+                            }
+                            explicit.clone()
+                        } else {
+                            subquery_cols
+                        }
                     };
                     let display_name = item.alias.clone().unwrap_or_else(|| table_name.clone());
                     self.tables.push(TableInfo {

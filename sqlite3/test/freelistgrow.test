@@ -1,0 +1,47 @@
+# 2025 February 16
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# This file implements regression tests for freelist stability.
+#
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix freelistgrow
+
+reset_db
+execsql {
+  PRAGMA page_size=1024;
+  PRAGMA auto_vacuum=0;
+  CREATE TABLE t(x);
+}
+
+do_test freelistgrow-1.0 {
+  execsql {BEGIN;}
+  for {set i 0} {$i < 400} {incr i} {
+    execsql {INSERT INTO t VALUES(zeroblob(900));}
+  }
+  execsql {COMMIT;}
+  execsql {DELETE FROM t;}
+  set pc1 [lindex [execsql {PRAGMA page_count;}] 0]
+  set fc1 [lindex [execsql {PRAGMA freelist_count;}] 0]
+
+  execsql {BEGIN;}
+  for {set i 0} {$i < 400} {incr i} {
+    execsql {INSERT INTO t VALUES(zeroblob(900));}
+  }
+  execsql {COMMIT;}
+  execsql {DELETE FROM t;}
+  set pc2 [lindex [execsql {PRAGMA page_count;}] 0]
+  set fc2 [lindex [execsql {PRAGMA freelist_count;}] 0]
+
+  expr {$pc2 == $pc1 && $fc2 > 0 && $fc1 > 0}
+} 1
+
+finish_test

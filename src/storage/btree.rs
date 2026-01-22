@@ -1358,6 +1358,9 @@ fn load_freelist(shared: &mut BtShared) -> Result<()> {
         // Read next trunk page pointer
         let next_trunk = read_u32(&trunk_page.data, 0).unwrap_or(0);
 
+        // Trunk pages are free pages too.
+        shared.free_pages.push(trunk_pgno);
+
         // Read leaf count
         let leaf_count = read_u32(&trunk_page.data, 4).unwrap_or(0) as usize;
         if leaf_count > max_leaves_per_trunk {
@@ -1379,10 +1382,6 @@ fn load_freelist(shared: &mut BtShared) -> Result<()> {
                 }
             }
         }
-
-        // The trunk page itself is also free (it's part of the freelist)
-        // But we don't add it to free_pages because it's being used to store the list
-        // We'll add trunk pages when we save/rebuild the freelist
 
         trunk_pgno = next_trunk;
     }
@@ -1407,26 +1406,38 @@ fn save_freelist(shared: &mut BtShared) -> Result<()> {
     let usable_size = shared.usable_size as usize;
     let max_leaves_per_trunk = (usable_size - 8) / 4;
 
-    // Sort free pages for better locality
+    // Sort and dedupe free pages for stable freelist output.
     shared.free_pages.sort();
+    shared.free_pages.dedup();
 
-    // Calculate how many trunk pages we need
     let total_free = shared.free_pages.len();
-    let num_trunks = (total_free + max_leaves_per_trunk - 1) / max_leaves_per_trunk;
+    let num_trunks = (total_free + max_leaves_per_trunk) / (max_leaves_per_trunk + 1);
+    let num_trunks = std::cmp::max(1, num_trunks);
 
-    // We need trunk pages to store the freelist. For simplicity, we allocate
-    // new pages at the end of the database for trunk pages.
-    // A more sophisticated implementation would reuse existing trunk pages.
-    let mut trunk_pages: Vec<Pgno> = Vec::with_capacity(num_trunks);
-    for _ in 0..num_trunks {
-        // Allocate a new page for the trunk
-        let trunk_pgno = shared.pager.db_size + 1;
+    let mut trunk_pages = Vec::with_capacity(num_trunks);
+    let mut leaf_pages = shared.free_pages.clone();
+
+    // Prefer higher-numbered pages for trunks (typically existing trunk pages).
+    leaf_pages.sort();
+    while trunk_pages.len() < num_trunks && !leaf_pages.is_empty() {
+        trunk_pages.push(leaf_pages.pop().unwrap());
+    }
+
+    while trunk_pages.len() < num_trunks {
+        let mut trunk_pgno = shared.pager.db_size + 1;
+        if shared.auto_vacuum != BTREE_AUTOVACUUM_NONE {
+            while is_ptrmap_page(shared.usable_size, trunk_pgno) {
+                trunk_pgno += 1;
+            }
+        }
         shared.pager.db_size = trunk_pgno;
+        shared.n_page = trunk_pgno;
         trunk_pages.push(trunk_pgno);
     }
 
     // Build trunk pages
     let mut leaf_idx = 0;
+    let leaf_total = leaf_pages.len();
     for (trunk_idx, &trunk_pgno) in trunk_pages.iter().enumerate() {
         let mut trunk_page = shared.pager.get(trunk_pgno, PagerGetFlags::empty())?;
         shared.pager.write(&mut trunk_page)?;
@@ -1441,13 +1452,14 @@ fn save_freelist(shared: &mut BtShared) -> Result<()> {
         write_u32(&mut trunk_page.data, 0, next_trunk)?;
 
         // Count leaves for this trunk
-        let leaves_this_trunk = std::cmp::min(max_leaves_per_trunk, total_free - leaf_idx);
+        let remaining = leaf_total.saturating_sub(leaf_idx);
+        let leaves_this_trunk = std::cmp::min(max_leaves_per_trunk, remaining);
         write_u32(&mut trunk_page.data, 4, leaves_this_trunk as u32)?;
 
         // Write leaf page numbers
         for i in 0..leaves_this_trunk {
             let offset = 8 + i * 4;
-            write_u32(&mut trunk_page.data, offset, shared.free_pages[leaf_idx])?;
+            write_u32(&mut trunk_page.data, offset, leaf_pages[leaf_idx])?;
             leaf_idx += 1;
         }
     }
@@ -1465,7 +1477,7 @@ fn save_freelist(shared: &mut BtShared) -> Result<()> {
     write_u32(&mut page1.data, 32, first_trunk)?;
 
     // Total free page count at offset 36 (includes trunk pages + leaf pages)
-    let total_freelist_pages = total_free + num_trunks;
+    let total_freelist_pages = total_free;
     write_u32(&mut page1.data, 36, total_freelist_pages as u32)?;
 
     Ok(())

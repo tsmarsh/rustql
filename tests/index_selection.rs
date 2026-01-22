@@ -77,7 +77,8 @@ fn test_no_index_when_no_match() {
     exec(&mut conn, "CREATE INDEX i1 ON t1(a)");
 
     let details = explain_details(&mut conn, "EXPLAIN QUERY PLAN SELECT * FROM t1 WHERE b = 5");
-    assert!(details.iter().any(|d| d.contains("SCAN TABLE t1")));
+    // Changed from "SCAN TABLE t1" to "SCAN t1" to match SQLite format
+    assert!(details.iter().any(|d| d.contains("SCAN t1")));
 
     sqlite3_close(conn).unwrap();
 }

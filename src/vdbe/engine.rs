@@ -4624,9 +4624,10 @@ impl Vdbe {
                                 // Also add to the parent table's index list
                                 if let Some(table) = schema_guard.tables.get_mut(&table_name_lower)
                                 {
-                                    if let Some(table_mut) = std::sync::Arc::get_mut(table) {
-                                        table_mut.indexes.push(std::sync::Arc::new(index));
-                                    }
+                                    // Use Arc::make_mut to get mutable access even if there are
+                                    // other Arc references (will clone if needed)
+                                    let table_mut = std::sync::Arc::make_mut(table);
+                                    table_mut.indexes.push(std::sync::Arc::new(index));
                                 }
                             }
                         }
@@ -4657,11 +4658,12 @@ impl Vdbe {
                                     schema_guard.indexes.remove(&name_lower);
                                     // Also remove from parent table's index list
                                     for table in schema_guard.tables.values_mut() {
-                                        if let Some(table_mut) = std::sync::Arc::get_mut(table) {
-                                            table_mut.indexes.retain(|idx| {
-                                                idx.name.to_lowercase() != name_lower
-                                            });
-                                        }
+                                        // Use Arc::make_mut to get mutable access even if there are
+                                        // other Arc references (will clone if needed)
+                                        let table_mut = std::sync::Arc::make_mut(table);
+                                        table_mut
+                                            .indexes
+                                            .retain(|idx| idx.name.to_lowercase() != name_lower);
                                     }
                                 }
                                 2 => {

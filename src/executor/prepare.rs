@@ -2164,15 +2164,29 @@ impl<'s> StatementCompiler<'s> {
         }
 
         if planner.analyze_where(core.where_clause.as_deref()).is_err() {
-            return vec!["SCAN TABLE".to_string()];
+            // Return SCAN for each table when WHERE analysis fails
+            return table_infos
+                .iter()
+                .map(|t| format!("SCAN {}", t.display_name))
+                .collect();
         }
         let plan = match planner.find_best_plan() {
             Ok(plan) => plan,
-            Err(_) => return vec!["SCAN TABLE".to_string()],
+            Err(_) => {
+                // Return SCAN for each table when planning fails
+                return table_infos
+                    .iter()
+                    .map(|t| format!("SCAN {}", t.display_name))
+                    .collect();
+            }
         };
 
         if plan.levels.is_empty() {
-            return vec!["SCAN TABLE".to_string()];
+            // Return SCAN for each table when plan has no levels
+            return table_infos
+                .iter()
+                .map(|t| format!("SCAN {}", t.display_name))
+                .collect();
         }
 
         plan.levels
@@ -2193,7 +2207,7 @@ impl<'s> StatementCompiler<'s> {
             .map(|t| t.display_name.as_str())
             .unwrap_or("table");
         match &level.plan {
-            WherePlan::FullScan => format!("SCAN TABLE {}", display_name),
+            WherePlan::FullScan => format!("SCAN {}", display_name),
             WherePlan::IndexScan {
                 index_name,
                 covering,

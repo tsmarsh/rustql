@@ -429,6 +429,9 @@ pub struct TableInfo {
 
     /// Has rowid?
     pub has_rowid: bool,
+
+    /// Table column names (for column index resolution)
+    pub columns: Vec<String>,
 }
 
 /// Index information for planning
@@ -487,7 +490,20 @@ impl QueryPlanner {
             estimated_rows,
             indexes: Vec::new(),
             has_rowid: true,
+            columns: Vec::new(),
         });
+    }
+
+    pub fn set_table_columns(&mut self, table_idx: usize, columns: Vec<String>) {
+        if let Some(table) = self.tables.get_mut(table_idx) {
+            table.columns = columns;
+        }
+    }
+
+    pub fn set_table_rowid(&mut self, table_idx: usize, has_rowid: bool) {
+        if let Some(table) = self.tables.get_mut(table_idx) {
+            table.has_rowid = has_rowid;
+        }
     }
 
     /// Add an index to a table
@@ -574,14 +590,19 @@ impl QueryPlanner {
     /// Analyze all terms to extract table references and operator types
     fn analyze_terms(&mut self) -> Result<()> {
         // Collect table info needed for analysis
-        let table_info: Vec<_> = self
+        let table_usage_info: Vec<_> = self
             .tables
             .iter()
             .map(|t| (t.name.clone(), t.alias.clone(), t.mask))
             .collect();
+        let table_info: Vec<_> = self
+            .tables
+            .iter()
+            .map(|t| (t.name.clone(), t.alias.clone(), t.mask, t.columns.clone()))
+            .collect();
 
         for term in self.where_clause.iter_mut() {
-            term.mask = where_expr::expr_usage(term.expr.as_ref(), &table_info);
+            term.mask = where_expr::expr_usage(term.expr.as_ref(), &table_usage_info);
             term.prereq = term.mask;
             // Determine operator type and selectivity
             Self::analyze_term_expr_static(&table_info, term)?;
@@ -591,7 +612,7 @@ impl QueryPlanner {
 
     /// Analyze a single term's expression (static version for borrow checker)
     fn analyze_term_expr_static(
-        table_info: &[(String, Option<String>, u64)],
+        table_info: &[(String, Option<String>, u64, Vec<String>)],
         term: &mut WhereTerm,
     ) -> Result<()> {
         let needs_commute = match term.expr.as_ref() {
@@ -718,13 +739,13 @@ impl QueryPlanner {
 
     /// Analyze a potential column reference in an expression (static version)
     fn analyze_column_ref_static(
-        table_info: &[(String, Option<String>, u64)],
+        table_info: &[(String, Option<String>, u64, Vec<String>)],
         term: &mut WhereTerm,
         expr: &Expr,
     ) -> Result<()> {
         if let Expr::Column(col_ref) = expr {
             // Try to find which table this column belongs to
-            for (i, (name, alias, mask)) in table_info.iter().enumerate() {
+            for (i, (name, alias, mask, columns)) in table_info.iter().enumerate() {
                 let table_matches = match (&col_ref.table, alias) {
                     (Some(t), Some(a)) => t == a || t == name,
                     (Some(t), None) => t == name,
@@ -732,9 +753,22 @@ impl QueryPlanner {
                 };
 
                 if table_matches {
+                    let column_idx = if Self::is_rowid_alias(&col_ref.column) {
+                        Some(-1)
+                    } else if let Some(idx) = col_ref.column_index {
+                        Some(idx)
+                    } else {
+                        columns
+                            .iter()
+                            .position(|c| c.eq_ignore_ascii_case(&col_ref.column))
+                            .map(|idx| idx as i32)
+                    };
+
                     term.mask |= mask;
-                    term.left_col = Some((i as i32, 0)); // Column idx would need schema lookup
-                    term.flags |= WhereTermFlags::LEFT_COLUMN;
+                    if let Some(idx) = column_idx {
+                        term.left_col = Some((i as i32, idx));
+                        term.flags |= WhereTermFlags::LEFT_COLUMN;
+                    }
                     break;
                 }
             }
@@ -758,6 +792,12 @@ impl QueryPlanner {
             LikeOp::Like | LikeOp::Regexp | LikeOp::Match => first != '%' && first != '_',
             LikeOp::Glob => first != '*' && first != '?',
         }
+    }
+
+    fn is_rowid_alias(name: &str) -> bool {
+        name.eq_ignore_ascii_case("rowid")
+            || name.eq_ignore_ascii_case("_rowid_")
+            || name.eq_ignore_ascii_case("oid")
     }
 
     /// Find the optimal query plan
@@ -933,9 +973,15 @@ impl QueryPlanner {
         // Check indexes
         for index in &table.indexes {
             let eq_match_count = self.count_index_eq_matches(index, &usable_eq_terms, table_idx);
+            let has_range =
+                self.index_has_range_match(index, &usable_range_terms, table_idx, eq_match_count);
 
-            if eq_match_count > 0 {
-                let rows = self.estimate_index_rows(table, index, eq_match_count);
+            if eq_match_count > 0 || has_range {
+                let rows = if eq_match_count > 0 {
+                    self.estimate_index_rows(table, index, eq_match_count)
+                } else {
+                    (table.estimated_rows as f64 * 0.33).max(1.0)
+                };
                 let cost = INDEX_SEEK_COST + rows * ROW_READ_COST;
 
                 if cost < best_cost {
@@ -1047,6 +1093,24 @@ impl QueryPlanner {
             }
         }
         count
+    }
+
+    fn index_has_range_match(
+        &self,
+        index: &IndexInfo,
+        range_terms: &[&WhereTerm],
+        table_idx: usize,
+        eq_match_count: i32,
+    ) -> bool {
+        let next_idx = eq_match_count as usize;
+        if next_idx >= index.columns.len() {
+            return false;
+        }
+        let col_idx = index.columns[next_idx];
+        range_terms.iter().any(|t| {
+            t.left_col
+                .is_some_and(|(ti, ci)| ti == table_idx as i32 && ci == col_idx)
+        })
     }
 }
 

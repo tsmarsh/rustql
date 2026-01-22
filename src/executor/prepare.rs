@@ -16,6 +16,7 @@ use super::delete::{compile_delete, compile_delete_with_schema};
 use super::insert::{compile_insert, compile_insert_with_schema};
 use super::select::{SelectCompiler, SelectDest};
 use super::update::{compile_update, compile_update_with_schema};
+use super::where_clause::{IndexInfo, QueryPlanner, WherePlan, WhereTerm};
 
 // ============================================================================
 // Compiled Statement Info
@@ -86,6 +87,18 @@ impl StmtType {
                 | StmtType::Pragma
         )
     }
+}
+
+#[derive(Debug, Clone)]
+struct ExplainTableInfo {
+    name: String,
+    alias: Option<String>,
+    display_name: String,
+    columns: Vec<String>,
+    estimated_rows: i64,
+    has_rowid: bool,
+    indexed_by: Option<IndexedBy>,
+    indexes: Vec<IndexInfo>,
 }
 
 // ============================================================================
@@ -347,7 +360,7 @@ impl<'s> StatementCompiler<'s> {
 
             Stmt::ExplainQueryPlan(inner) => {
                 let (_inner_ops, _, _, _) = self.compile_stmt(inner)?;
-                let ops = self.compile_explain_query_plan()?;
+                let ops = self.compile_explain_query_plan(inner)?;
                 let names = vec![
                     "id".to_string(),
                     "parent".to_string(),
@@ -1936,37 +1949,534 @@ impl<'s> StatementCompiler<'s> {
         Ok(ops)
     }
 
-    fn compile_explain_query_plan(&mut self) -> Result<Vec<VdbeOp>> {
+    fn compile_explain_query_plan(&mut self, stmt: &Stmt) -> Result<Vec<VdbeOp>> {
+        let details = self.explain_query_plan_details(stmt);
         let mut ops = Vec::new();
         ops.push(Self::make_op(Opcode::Init, 0, 1, 0, P4::Unused));
 
         let base_reg = 1;
-        ops.push(Self::make_op(Opcode::Integer, 0, base_reg, 0, P4::Unused));
-        ops.push(Self::make_op(
-            Opcode::Integer,
-            0,
-            base_reg + 1,
-            0,
-            P4::Unused,
-        ));
-        ops.push(Self::make_op(
-            Opcode::Integer,
-            0,
-            base_reg + 2,
-            0,
-            P4::Unused,
-        ));
-        ops.push(Self::make_op(
-            Opcode::String8,
-            0,
-            base_reg + 3,
-            0,
-            P4::Text("SCAN TABLE".to_string()),
-        ));
-        ops.push(Self::make_op(Opcode::ResultRow, base_reg, 4, 0, P4::Unused));
+        for (i, detail) in details.iter().enumerate() {
+            ops.push(Self::make_op(
+                Opcode::Integer,
+                i as i32,
+                base_reg,
+                0,
+                P4::Unused,
+            ));
+            ops.push(Self::make_op(
+                Opcode::Integer,
+                0,
+                base_reg + 1,
+                0,
+                P4::Unused,
+            ));
+            ops.push(Self::make_op(
+                Opcode::Integer,
+                0,
+                base_reg + 2,
+                0,
+                P4::Unused,
+            ));
+            ops.push(Self::make_op(
+                Opcode::String8,
+                0,
+                base_reg + 3,
+                0,
+                P4::Text(detail.clone()),
+            ));
+            ops.push(Self::make_op(Opcode::ResultRow, base_reg, 4, 0, P4::Unused));
+        }
+
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
 
         Ok(ops)
+    }
+
+    fn explain_query_plan_details(&self, stmt: &Stmt) -> Vec<String> {
+        match stmt {
+            Stmt::Select(select) => self.explain_select_query_plan(select),
+            _ => vec!["SCAN TABLE".to_string()],
+        }
+    }
+
+    fn explain_select_query_plan(&self, select: &SelectStmt) -> Vec<String> {
+        let schema = match self.schema {
+            Some(schema) => schema,
+            None => return vec!["SCAN TABLE".to_string()],
+        };
+
+        let core = match &select.body {
+            SelectBody::Select(core) => core,
+            _ => return vec!["SCAN TABLE".to_string()],
+        };
+
+        let from = match &core.from {
+            Some(from) => from,
+            None => return vec!["SCAN CONSTANT ROW".to_string()],
+        };
+
+        let src_list = from.to_src_list();
+        let mut table_infos = Vec::new();
+
+        for item in &src_list.items {
+            match &item.source {
+                TableSource::Table(name) => {
+                    let table_name = name.name.clone();
+                    let display_name = item.alias.clone().unwrap_or_else(|| table_name.clone());
+                    let schema_table = schema.table(&table_name);
+                    let (columns, estimated_rows, has_rowid) = match schema_table.as_ref() {
+                        Some(table) => (
+                            table.columns.iter().map(|c| c.name.clone()).collect(),
+                            if table.row_estimate > 0 {
+                                table.row_estimate
+                            } else {
+                                1000
+                            },
+                            !table.without_rowid,
+                        ),
+                        None => (Vec::new(), 1000, true),
+                    };
+
+                    table_infos.push(ExplainTableInfo {
+                        name: table_name,
+                        alias: item.alias.clone(),
+                        display_name,
+                        columns,
+                        estimated_rows,
+                        has_rowid,
+                        indexed_by: item.indexed_by.clone(),
+                        indexes: Vec::new(),
+                    });
+                }
+                TableSource::Subquery(_) => {
+                    let display_name = item
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| "(subquery)".to_string());
+                    table_infos.push(ExplainTableInfo {
+                        name: display_name.clone(),
+                        alias: item.alias.clone(),
+                        display_name,
+                        columns: Vec::new(),
+                        estimated_rows: 1000,
+                        has_rowid: true,
+                        indexed_by: item.indexed_by.clone(),
+                        indexes: Vec::new(),
+                    });
+                }
+                TableSource::TableFunction { name, .. } => {
+                    table_infos.push(ExplainTableInfo {
+                        name: name.clone(),
+                        alias: item.alias.clone(),
+                        display_name: name.clone(),
+                        columns: Vec::new(),
+                        estimated_rows: 1000,
+                        has_rowid: true,
+                        indexed_by: item.indexed_by.clone(),
+                        indexes: Vec::new(),
+                    });
+                }
+            }
+        }
+
+        let (required_columns, requires_all_cols) =
+            self.collect_required_columns(core, &table_infos);
+
+        for (idx, table_info) in table_infos.iter_mut().enumerate() {
+            let schema_table = schema.table(&table_info.name);
+            let Some(table) = schema_table.as_ref() else {
+                continue;
+            };
+
+            let index_filter = table_info.indexed_by.as_ref();
+            let mut indexes: Vec<IndexInfo> = Vec::new();
+
+            for index in &table.indexes {
+                if let Some(IndexedBy::NotIndexed) = index_filter {
+                    break;
+                }
+                if let Some(IndexedBy::Index(forced)) = index_filter {
+                    if !index.name.eq_ignore_ascii_case(forced) {
+                        continue;
+                    }
+                }
+
+                let mut columns = Vec::new();
+                for col in &index.columns {
+                    let col_idx = if col.column_idx >= 0 {
+                        Some(col.column_idx)
+                    } else {
+                        match col.expr.as_ref() {
+                            Some(crate::schema::Expr::Column { column, .. }) => table
+                                .columns
+                                .iter()
+                                .position(|c| c.name.eq_ignore_ascii_case(column))
+                                .map(|idx| idx as i32),
+                            _ => None,
+                        }
+                    };
+                    if let Some(idx) = col_idx {
+                        columns.push(idx);
+                    }
+                }
+                if columns.is_empty() {
+                    continue;
+                }
+
+                let is_covering = !requires_all_cols[idx]
+                    && required_columns[idx].iter().all(|col| {
+                        columns.iter().any(|cidx| {
+                            table
+                                .columns
+                                .get(*cidx as usize)
+                                .map(|c| c.name.eq_ignore_ascii_case(col))
+                                .unwrap_or(false)
+                        })
+                    });
+
+                indexes.push(IndexInfo {
+                    name: index.name.clone(),
+                    columns,
+                    is_primary: index.is_primary_key,
+                    is_unique: index.unique,
+                    is_covering,
+                    stats: index.stats.clone(),
+                });
+            }
+
+            table_info.indexes = indexes;
+        }
+
+        let mut planner = QueryPlanner::new();
+        for table in &table_infos {
+            planner.add_table(
+                table.name.clone(),
+                table.alias.clone(),
+                table.estimated_rows,
+            );
+        }
+        for (idx, table) in table_infos.iter().enumerate() {
+            planner.set_table_columns(idx, table.columns.clone());
+            planner.set_table_rowid(idx, table.has_rowid);
+            for index in &table.indexes {
+                planner.add_index(idx, index.clone());
+            }
+        }
+
+        if planner.analyze_where(core.where_clause.as_deref()).is_err() {
+            return vec!["SCAN TABLE".to_string()];
+        }
+        let plan = match planner.find_best_plan() {
+            Ok(plan) => plan,
+            Err(_) => return vec!["SCAN TABLE".to_string()],
+        };
+
+        if plan.levels.is_empty() {
+            return vec!["SCAN TABLE".to_string()];
+        }
+
+        plan.levels
+            .iter()
+            .map(|level| self.format_plan_detail(level, &plan.terms, &table_infos))
+            .collect()
+    }
+
+    fn format_plan_detail(
+        &self,
+        level: &super::where_clause::WhereLevel,
+        terms: &[WhereTerm],
+        table_infos: &[ExplainTableInfo],
+    ) -> String {
+        let table_idx = level.from_idx as usize;
+        let table_info = table_infos.get(table_idx);
+        let display_name = table_info
+            .map(|t| t.display_name.as_str())
+            .unwrap_or("table");
+        match &level.plan {
+            WherePlan::FullScan => format!("SCAN TABLE {}", display_name),
+            WherePlan::IndexScan {
+                index_name,
+                covering,
+                ..
+            } => {
+                let index_info = table_info.and_then(|t| {
+                    t.indexes
+                        .iter()
+                        .find(|idx| idx.name.eq_ignore_ascii_case(index_name))
+                });
+                let constraints = match (table_info, index_info) {
+                    (Some(table), Some(index)) => {
+                        self.index_constraints(index, table_idx, &table.columns, terms)
+                    }
+                    _ => Vec::new(),
+                };
+                if constraints.is_empty() {
+                    if *covering {
+                        format!(
+                            "SEARCH {} USING COVERING INDEX {}",
+                            display_name, index_name
+                        )
+                    } else {
+                        format!("SEARCH {} USING INDEX {}", display_name, index_name)
+                    }
+                } else {
+                    if *covering {
+                        format!(
+                            "SEARCH {} USING COVERING INDEX {} ({})",
+                            display_name,
+                            index_name,
+                            constraints.join(" AND ")
+                        )
+                    } else {
+                        format!(
+                            "SEARCH {} USING INDEX {} ({})",
+                            display_name,
+                            index_name,
+                            constraints.join(" AND ")
+                        )
+                    }
+                }
+            }
+            WherePlan::RowidEq => {
+                format!(
+                    "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
+                    display_name
+                )
+            }
+            WherePlan::RowidRange { has_start, has_end } => {
+                let mut parts = Vec::new();
+                if *has_start {
+                    parts.push("rowid>?");
+                }
+                if *has_end {
+                    parts.push("rowid<?");
+                }
+                if parts.is_empty() {
+                    format!("SEARCH {} USING INTEGER PRIMARY KEY", display_name)
+                } else {
+                    format!(
+                        "SEARCH {} USING INTEGER PRIMARY KEY ({})",
+                        display_name,
+                        parts.join(" AND ")
+                    )
+                }
+            }
+            WherePlan::PrimaryKey { .. } => {
+                format!("SEARCH {} USING INTEGER PRIMARY KEY", display_name)
+            }
+        }
+    }
+
+    fn index_constraints(
+        &self,
+        index: &IndexInfo,
+        table_idx: usize,
+        columns: &[String],
+        terms: &[WhereTerm],
+    ) -> Vec<String> {
+        let mut constraints = Vec::new();
+        for col_idx in &index.columns {
+            let eq_term = terms.iter().find(|term| {
+                term.left_col
+                    .is_some_and(|(ti, ci)| ti == table_idx as i32 && ci == *col_idx)
+                    && term.is_equality()
+            });
+            if eq_term.is_some() {
+                constraints.push(format!("{}=?", self.column_name(columns, *col_idx)));
+                continue;
+            }
+
+            let range_terms: Vec<&WhereTerm> = terms
+                .iter()
+                .filter(|term| {
+                    term.left_col
+                        .is_some_and(|(ti, ci)| ti == table_idx as i32 && ci == *col_idx)
+                        && term.is_range()
+                })
+                .collect();
+            if range_terms.is_empty() {
+                break;
+            }
+
+            for term in range_terms {
+                if let Some(op) = term.op {
+                    constraints.push(format!(
+                        "{}{}?",
+                        self.column_name(columns, *col_idx),
+                        self.term_op_string(op)
+                    ));
+                }
+            }
+            break;
+        }
+        constraints
+    }
+
+    fn column_name(&self, columns: &[String], col_idx: i32) -> String {
+        if col_idx < 0 {
+            return "rowid".to_string();
+        }
+        columns
+            .get(col_idx as usize)
+            .cloned()
+            .unwrap_or_else(|| format!("column{}", col_idx))
+    }
+
+    fn term_op_string(&self, op: super::where_clause::TermOp) -> &'static str {
+        match op {
+            super::where_clause::TermOp::Eq | super::where_clause::TermOp::Is => "=",
+            super::where_clause::TermOp::Lt => "<",
+            super::where_clause::TermOp::Le => "<=",
+            super::where_clause::TermOp::Gt => ">",
+            super::where_clause::TermOp::Ge => ">=",
+            super::where_clause::TermOp::In => " IN ",
+            _ => "",
+        }
+    }
+
+    fn collect_required_columns(
+        &self,
+        core: &SelectCore,
+        table_infos: &[ExplainTableInfo],
+    ) -> (Vec<std::collections::HashSet<String>>, Vec<bool>) {
+        let mut required = vec![std::collections::HashSet::new(); table_infos.len()];
+        let mut requires_all_cols = vec![false; table_infos.len()];
+
+        for col in &core.columns {
+            match col {
+                ResultColumn::Star => {
+                    for flag in &mut requires_all_cols {
+                        *flag = true;
+                    }
+                }
+                ResultColumn::TableStar(name) => {
+                    for (idx, table) in table_infos.iter().enumerate() {
+                        if table.name.eq_ignore_ascii_case(name)
+                            || table
+                                .alias
+                                .as_ref()
+                                .is_some_and(|alias| alias.eq_ignore_ascii_case(name))
+                        {
+                            requires_all_cols[idx] = true;
+                        }
+                    }
+                }
+                ResultColumn::Expr { expr, .. } => {
+                    let mut refs = Vec::new();
+                    self.collect_expr_columns(expr, &mut refs);
+                    for col_ref in refs {
+                        if let Some(idx) = self.table_index_for_column(&col_ref, table_infos) {
+                            required[idx].insert(col_ref.column);
+                        }
+                    }
+                }
+            }
+        }
+
+        (required, requires_all_cols)
+    }
+
+    fn table_index_for_column(
+        &self,
+        col_ref: &ColumnRef,
+        table_infos: &[ExplainTableInfo],
+    ) -> Option<usize> {
+        if let Some(table) = &col_ref.table {
+            for (idx, info) in table_infos.iter().enumerate() {
+                if table.eq_ignore_ascii_case(&info.name)
+                    || info
+                        .alias
+                        .as_ref()
+                        .is_some_and(|alias| table.eq_ignore_ascii_case(alias))
+                {
+                    return Some(idx);
+                }
+            }
+            return None;
+        }
+
+        if table_infos.len() == 1 {
+            return Some(0);
+        }
+
+        None
+    }
+
+    fn collect_expr_columns(&self, expr: &Expr, refs: &mut Vec<ColumnRef>) {
+        match expr {
+            Expr::Column(col) => refs.push(col.clone()),
+            Expr::Unary { expr, .. } => self.collect_expr_columns(expr, refs),
+            Expr::Binary { left, right, .. } => {
+                self.collect_expr_columns(left, refs);
+                self.collect_expr_columns(right, refs);
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.collect_expr_columns(expr, refs);
+                self.collect_expr_columns(low, refs);
+                self.collect_expr_columns(high, refs);
+            }
+            Expr::In { expr, list, .. } => {
+                self.collect_expr_columns(expr, refs);
+                match list {
+                    InList::Values(values) => {
+                        for value in values {
+                            self.collect_expr_columns(value, refs);
+                        }
+                    }
+                    InList::Subquery(_) | InList::Table(_) => {}
+                }
+            }
+            Expr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => {
+                self.collect_expr_columns(expr, refs);
+                self.collect_expr_columns(pattern, refs);
+                if let Some(escape) = escape {
+                    self.collect_expr_columns(escape, refs);
+                }
+            }
+            Expr::IsNull { expr, .. } => self.collect_expr_columns(expr, refs),
+            Expr::IsDistinct { left, right, .. } => {
+                self.collect_expr_columns(left, refs);
+                self.collect_expr_columns(right, refs);
+            }
+            Expr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => {
+                if let Some(operand) = operand {
+                    self.collect_expr_columns(operand, refs);
+                }
+                for clause in when_clauses {
+                    self.collect_expr_columns(&clause.when, refs);
+                    self.collect_expr_columns(&clause.then, refs);
+                }
+                if let Some(else_clause) = else_clause {
+                    self.collect_expr_columns(else_clause, refs);
+                }
+            }
+            Expr::Cast { expr, .. } | Expr::Collate { expr, .. } | Expr::Parens(expr) => {
+                self.collect_expr_columns(expr, refs);
+            }
+            Expr::Function(call) => {
+                if let FunctionArgs::Exprs(exprs) = &call.args {
+                    for expr in exprs {
+                        self.collect_expr_columns(expr, refs);
+                    }
+                }
+                if let Some(filter) = &call.filter {
+                    self.collect_expr_columns(filter, refs);
+                }
+            }
+            Expr::Exists { .. } | Expr::Subquery(_) => {}
+            Expr::Literal(_) | Expr::Variable(_) | Expr::Raise { .. } => {}
+        }
     }
 }
 

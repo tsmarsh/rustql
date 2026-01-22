@@ -183,6 +183,12 @@ unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         "do_faultsim_test",
         "sqlite3_wal_checkpoint_v2",
         "sqlite3_vtab_config",
+        // Printf test commands
+        "sqlite3_mprintf_hexdouble",
+        "sqlite3_mprintf_str",
+        "sqlite3_mprintf_n_test",
+        "sqlite3_mprintf_z_test",
+        "vfs_unlink_test",
     ];
 
     for cmd in stub_commands {
@@ -326,6 +332,8 @@ unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         ("or_opt", "1"),
         ("update_delete_limit", "0"),
         ("between_opt", "1"),
+        ("schema_version", "1"),
+        ("default_cache_size", "1"),
     ];
 
     let arr_name = CString::new("::sqlite_options").unwrap();
@@ -348,6 +356,16 @@ unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         interp,
         bitmask_size_name.as_ptr(),
         bitmask_size_val.as_ptr(),
+        TCL_GLOBAL_ONLY,
+    );
+
+    // Set SQLITE_MAX_LENGTH used by printf.test and other tests
+    let max_length_name = CString::new("SQLITE_MAX_LENGTH").unwrap();
+    let max_length_val = CString::new("1000000000").unwrap();
+    Tcl_SetVar(
+        interp,
+        max_length_name.as_ptr(),
+        max_length_val.as_ptr(),
         TCL_GLOBAL_ONLY,
     );
 }
@@ -374,6 +392,70 @@ unsafe extern "C" fn test_stub_status(
     TCL_OK
 }
 
+/// Helper to format an integer with printf-style flags
+fn format_int(
+    value: i64,
+    width: usize,
+    zero_pad: bool,
+    left_align: bool,
+    show_sign: bool,
+    space_sign: bool,
+    alt_form: bool,
+    conv: char,
+) -> String {
+    let formatted = match conv {
+        'd' | 'i' => {
+            let sign = if value < 0 {
+                "-"
+            } else if show_sign {
+                "+"
+            } else if space_sign {
+                " "
+            } else {
+                ""
+            };
+            let abs_val = value.unsigned_abs();
+            format!("{}{}", sign, abs_val)
+        }
+        'u' => format!("{}", value as u64),
+        'x' => {
+            let prefix = if alt_form && value != 0 { "0x" } else { "" };
+            format!("{}{:x}", prefix, value as u64)
+        }
+        'X' => {
+            let prefix = if alt_form && value != 0 { "0X" } else { "" };
+            format!("{}{:X}", prefix, value as u64)
+        }
+        'o' => {
+            let prefix = if alt_form && value != 0 { "0" } else { "" };
+            format!("{}{:o}", prefix, value as u64)
+        }
+        _ => format!("{}", value),
+    };
+
+    if width == 0 || formatted.len() >= width {
+        return formatted;
+    }
+
+    let pad_len = width - formatted.len();
+    if left_align {
+        format!("{}{}", formatted, " ".repeat(pad_len))
+    } else if zero_pad && !left_align {
+        // For zero padding, need to handle sign specially
+        if formatted.starts_with('-') || formatted.starts_with('+') || formatted.starts_with(' ') {
+            let (sign, rest) = formatted.split_at(1);
+            format!("{}{}{}", sign, "0".repeat(pad_len), rest)
+        } else if formatted.starts_with("0x") || formatted.starts_with("0X") {
+            let (prefix, rest) = formatted.split_at(2);
+            format!("{}{}{}", prefix, "0".repeat(pad_len), rest)
+        } else {
+            format!("{}{}", "0".repeat(pad_len), formatted)
+        }
+    } else {
+        format!("{}{}", " ".repeat(pad_len), formatted)
+    }
+}
+
 /// sqlite3_mprintf_int - format integers using format string
 /// Usage: sqlite3_mprintf_int FORMAT A B C ...
 /// Each %d, %i, %x, %o, %u in FORMAT is replaced with corresponding arg
@@ -393,11 +475,24 @@ unsafe extern "C" fn sqlite3_mprintf_int_cmd(
 
     let format = obj_to_string(*objv.offset(1));
 
-    // Collect integer arguments
+    // Collect integer arguments (supports decimal, hex 0x, octal 0)
     let mut args: Vec<i64> = Vec::new();
     for i in 2..objc {
         let arg_str = obj_to_string(*objv.offset(i as isize));
-        match arg_str.parse::<i64>() {
+        let trimmed = arg_str.trim();
+        let parsed = if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
+            // Hex
+            i64::from_str_radix(&trimmed[2..], 16)
+        } else if trimmed.starts_with("-0x") || trimmed.starts_with("-0X") {
+            // Negative hex
+            i64::from_str_radix(&trimmed[3..], 16).map(|v| -v)
+        } else if trimmed.starts_with('0') && trimmed.len() > 1 && !trimmed.contains('.') {
+            // Octal (but not "0" itself or floats like "0.5")
+            i64::from_str_radix(&trimmed[1..], 8).or_else(|_| trimmed.parse::<i64>())
+        } else {
+            trimmed.parse::<i64>()
+        };
+        match parsed {
             Ok(v) => args.push(v),
             Err(_) => {
                 set_result_string(interp, &format!("expected integer but got \"{}\"", arg_str));
@@ -413,98 +508,92 @@ unsafe extern "C" fn sqlite3_mprintf_int_cmd(
 
     while let Some(c) = chars.next() {
         if c == '%' {
-            // Check for format specifier
-            let mut spec = String::from("%");
+            // Parse flags
+            let mut left_align = false;
+            let mut show_sign = false;
+            let mut space_sign = false;
+            let mut alt_form = false;
+            let mut zero_pad = false;
 
-            // Collect width/precision
             while let Some(&ch) = chars.peek() {
-                if ch.is_ascii_digit()
-                    || ch == '-'
-                    || ch == '+'
-                    || ch == ' '
-                    || ch == '#'
-                    || ch == '0'
-                    || ch == '.'
-                {
-                    spec.push(ch);
+                match ch {
+                    '-' => {
+                        left_align = true;
+                        chars.next();
+                    }
+                    '+' => {
+                        show_sign = true;
+                        chars.next();
+                    }
+                    ' ' => {
+                        space_sign = true;
+                        chars.next();
+                    }
+                    '#' => {
+                        alt_form = true;
+                        chars.next();
+                    }
+                    '0' => {
+                        zero_pad = true;
+                        chars.next();
+                    }
+                    _ => break,
+                }
+            }
+
+            // Parse width (cap at 10000 to prevent memory exhaustion)
+            let mut width = 0usize;
+            let mut width_overflow = false;
+            while let Some(&ch) = chars.peek() {
+                if ch.is_ascii_digit() {
+                    let new_width = width
+                        .saturating_mul(10)
+                        .saturating_add(ch as usize - '0' as usize);
+                    if new_width > 100000 {
+                        width_overflow = true;
+                    }
+                    width = new_width;
                     chars.next();
                 } else {
                     break;
                 }
             }
+            // For extremely large widths, SQLite returns empty string for entire result
+            if width_overflow {
+                set_result_string(interp, "");
+                return TCL_OK;
+            }
 
-            if let Some(&type_char) = chars.peek() {
-                spec.push(type_char);
+            // Skip precision (not used for integers, but parse it)
+            if chars.peek() == Some(&'.') {
+                chars.next();
+                while let Some(&ch) = chars.peek() {
+                    if ch.is_ascii_digit() {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            // Get conversion specifier
+            if let Some(&conv) = chars.peek() {
                 chars.next();
 
-                match type_char {
-                    'd' | 'i' => {
+                match conv {
+                    'd' | 'i' | 'u' | 'x' | 'X' | 'o' => {
                         if arg_idx < args.len() {
-                            // Parse width from spec
-                            let width_str: String = spec[1..spec.len() - 1]
-                                .chars()
-                                .filter(|c| c.is_ascii_digit())
-                                .collect();
-                            let width = width_str.parse::<usize>().unwrap_or(0);
-                            let zero_pad = spec.contains('0');
-                            let value = args[arg_idx];
-                            if zero_pad && width > 0 {
-                                result.push_str(&format!("{:0>width$}", value, width = width));
-                            } else if width > 0 {
-                                result.push_str(&format!("{:>width$}", value, width = width));
-                            } else {
-                                result.push_str(&format!("{}", value));
-                            }
-                            arg_idx += 1;
-                        }
-                    }
-                    'x' => {
-                        if arg_idx < args.len() {
-                            let width_str: String = spec[1..spec.len() - 1]
-                                .chars()
-                                .filter(|c| c.is_ascii_digit())
-                                .collect();
-                            let width = width_str.parse::<usize>().unwrap_or(0);
-                            let zero_pad = spec.contains('0');
-                            let value = args[arg_idx] as u64;
-                            if zero_pad && width > 0 {
-                                result.push_str(&format!("{:0>width$x}", value, width = width));
-                            } else if width > 0 {
-                                result.push_str(&format!("{:>width$x}", value, width = width));
-                            } else {
-                                result.push_str(&format!("{:x}", value));
-                            }
-                            arg_idx += 1;
-                        }
-                    }
-                    'X' => {
-                        if arg_idx < args.len() {
-                            let width_str: String = spec[1..spec.len() - 1]
-                                .chars()
-                                .filter(|c| c.is_ascii_digit())
-                                .collect();
-                            let width = width_str.parse::<usize>().unwrap_or(0);
-                            let zero_pad = spec.contains('0');
-                            let value = args[arg_idx] as u64;
-                            if zero_pad && width > 0 {
-                                result.push_str(&format!("{:0>width$X}", value, width = width));
-                            } else if width > 0 {
-                                result.push_str(&format!("{:>width$X}", value, width = width));
-                            } else {
-                                result.push_str(&format!("{:X}", value));
-                            }
-                            arg_idx += 1;
-                        }
-                    }
-                    'o' => {
-                        if arg_idx < args.len() {
-                            result.push_str(&format!("{:o}", args[arg_idx] as u64));
-                            arg_idx += 1;
-                        }
-                    }
-                    'u' => {
-                        if arg_idx < args.len() {
-                            result.push_str(&format!("{}", args[arg_idx] as u64));
+                            let formatted = format_int(
+                                args[arg_idx],
+                                width,
+                                zero_pad,
+                                left_align,
+                                show_sign,
+                                space_sign,
+                                alt_form,
+                                conv,
+                            );
+                            result.push_str(&formatted);
                             arg_idx += 1;
                         }
                     }
@@ -512,7 +601,8 @@ unsafe extern "C" fn sqlite3_mprintf_int_cmd(
                         result.push('%');
                     }
                     _ => {
-                        result.push_str(&spec);
+                        result.push('%');
+                        result.push(conv);
                     }
                 }
             } else {
@@ -529,6 +619,7 @@ unsafe extern "C" fn sqlite3_mprintf_int_cmd(
 
 /// sqlite3_mprintf_double - format doubles using format string
 /// Usage: sqlite3_mprintf_double FORMAT A B C ...
+/// Also handles %d, %i, %x, %o, %u by converting double to int
 unsafe extern "C" fn sqlite3_mprintf_double_cmd(
     _client_data: *mut std::ffi::c_void,
     interp: *mut Tcl_Interp,
@@ -565,39 +656,113 @@ unsafe extern "C" fn sqlite3_mprintf_double_cmd(
 
     while let Some(c) = chars.next() {
         if c == '%' {
-            // Collect format specifier
-            let mut width = 0usize;
-            let mut precision: Option<usize> = None;
-            let mut in_precision = false;
+            // Parse flags
+            let mut left_align = false;
+            let mut show_sign = false;
+            let mut space_sign = false;
+            let mut alt_form = false;
+            let mut zero_pad = false;
 
             while let Some(&ch) = chars.peek() {
-                if ch == '.' {
-                    in_precision = true;
-                    chars.next();
-                } else if ch.is_ascii_digit() {
-                    if in_precision {
-                        let p = precision.get_or_insert(0);
-                        *p = *p * 10 + (ch as usize - '0' as usize);
-                    } else {
-                        width = width * 10 + (ch as usize - '0' as usize);
+                match ch {
+                    '-' => {
+                        left_align = true;
+                        chars.next();
                     }
-                    chars.next();
-                } else if ch == '-' || ch == '+' || ch == ' ' || ch == '#' || ch == '0' {
+                    '+' => {
+                        show_sign = true;
+                        chars.next();
+                    }
+                    ' ' => {
+                        space_sign = true;
+                        chars.next();
+                    }
+                    '#' => {
+                        alt_form = true;
+                        chars.next();
+                    }
+                    '0' => {
+                        zero_pad = true;
+                        chars.next();
+                    }
+                    _ => break,
+                }
+            }
+
+            // Parse width
+            let mut width = 0usize;
+            let mut width_overflow = false;
+            while let Some(&ch) = chars.peek() {
+                if ch.is_ascii_digit() {
+                    let new_width = width
+                        .saturating_mul(10)
+                        .saturating_add(ch as usize - '0' as usize);
+                    if new_width > 100000 {
+                        width_overflow = true;
+                    }
+                    width = new_width;
                     chars.next();
                 } else {
                     break;
                 }
             }
 
+            if width_overflow {
+                set_result_string(interp, "");
+                return TCL_OK;
+            }
+
+            // Parse precision
+            let mut precision: Option<usize> = None;
+            if chars.peek() == Some(&'.') {
+                chars.next();
+                let mut prec = 0usize;
+                while let Some(&ch) = chars.peek() {
+                    if ch.is_ascii_digit() {
+                        prec = prec
+                            .saturating_mul(10)
+                            .saturating_add(ch as usize - '0' as usize);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                precision = Some(prec);
+            }
+
             if let Some(&type_char) = chars.peek() {
                 chars.next();
 
                 match type_char {
+                    'd' | 'i' | 'u' | 'x' | 'X' | 'o' => {
+                        // Integer format - convert double to int
+                        if arg_idx < args.len() {
+                            let int_val = args[arg_idx] as i64;
+                            let formatted = format_int(
+                                int_val, width, zero_pad, left_align, show_sign, space_sign,
+                                alt_form, type_char,
+                            );
+                            result.push_str(&formatted);
+                            arg_idx += 1;
+                        }
+                    }
                     'f' | 'F' => {
                         if arg_idx < args.len() {
                             let value = args[arg_idx];
                             let prec = precision.unwrap_or(6);
-                            result.push_str(&format!("{:.prec$}", value, prec = prec));
+                            let formatted = format!("{:.prec$}", value, prec = prec);
+                            if width > formatted.len() {
+                                let pad = width - formatted.len();
+                                if left_align {
+                                    result.push_str(&formatted);
+                                    result.push_str(&" ".repeat(pad));
+                                } else {
+                                    result.push_str(&" ".repeat(pad));
+                                    result.push_str(&formatted);
+                                }
+                            } else {
+                                result.push_str(&formatted);
+                            }
                             arg_idx += 1;
                         }
                     }
@@ -605,10 +770,22 @@ unsafe extern "C" fn sqlite3_mprintf_double_cmd(
                         if arg_idx < args.len() {
                             let value = args[arg_idx];
                             let prec = precision.unwrap_or(6);
-                            if type_char == 'E' {
-                                result.push_str(&format!("{:.prec$E}", value, prec = prec));
+                            let formatted = if type_char == 'E' {
+                                format!("{:.prec$E}", value, prec = prec)
                             } else {
-                                result.push_str(&format!("{:.prec$e}", value, prec = prec));
+                                format!("{:.prec$e}", value, prec = prec)
+                            };
+                            if width > formatted.len() {
+                                let pad = width - formatted.len();
+                                if left_align {
+                                    result.push_str(&formatted);
+                                    result.push_str(&" ".repeat(pad));
+                                } else {
+                                    result.push_str(&" ".repeat(pad));
+                                    result.push_str(&formatted);
+                                }
+                            } else {
+                                result.push_str(&formatted);
                             }
                             arg_idx += 1;
                         }
@@ -617,8 +794,19 @@ unsafe extern "C" fn sqlite3_mprintf_double_cmd(
                         if arg_idx < args.len() {
                             let value = args[arg_idx];
                             let prec = precision.unwrap_or(6);
-                            // Use precision for significant digits
-                            result.push_str(&format!("{:.prec$}", value, prec = prec));
+                            let formatted = format!("{:.prec$}", value, prec = prec);
+                            if width > formatted.len() {
+                                let pad = width - formatted.len();
+                                if left_align {
+                                    result.push_str(&formatted);
+                                    result.push_str(&" ".repeat(pad));
+                                } else {
+                                    result.push_str(&" ".repeat(pad));
+                                    result.push_str(&formatted);
+                                }
+                            } else {
+                                result.push_str(&formatted);
+                            }
                             arg_idx += 1;
                         }
                     }

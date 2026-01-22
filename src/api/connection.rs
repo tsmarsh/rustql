@@ -1271,6 +1271,19 @@ pub fn sqlite3_open_v2(
                 if let (Some(ref btree), Some(ref schema)) =
                     (main_db.btree.as_ref(), main_db.schema.as_ref())
                 {
+                    if btree.sharable {
+                        if let Ok(mut shared) = btree.shared.write() {
+                            if let Some(shared_schema) = shared.schema_cache.clone() {
+                                main_db.schema = Some(shared_schema);
+                            } else {
+                                shared.schema_cache = Some(Arc::clone(schema));
+                            }
+                        }
+                    }
+                }
+                if let (Some(ref btree), Some(ref schema)) =
+                    (main_db.btree.as_ref(), main_db.schema.as_ref())
+                {
                     if let Ok(mut schema_guard) = schema.write() {
                         load_schema_from_btree(btree, &mut schema_guard)?;
                     }

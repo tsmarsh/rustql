@@ -7,6 +7,7 @@ use std::sync::RwLock;
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::os::mutex;
+use crate::shared_cache;
 
 // ============================================================================
 // Threading Mode
@@ -289,6 +290,12 @@ pub fn sqlite3_shutdown() -> Result<()> {
 
     config.is_init.store(false, Ordering::SeqCst);
 
+    Ok(())
+}
+
+/// sqlite3_enable_shared_cache - Enable or disable shared-cache mode
+pub fn sqlite3_enable_shared_cache(enable: i32) -> Result<()> {
+    shared_cache::set_shared_cache_enabled(enable != 0);
     Ok(())
 }
 

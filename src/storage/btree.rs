@@ -1,5 +1,7 @@
 //! B-tree implementation
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock, Weak};
@@ -7,6 +9,8 @@ use std::sync::{Arc, RwLock, Weak};
 use bitflags::bitflags;
 
 use crate::error::{Error, ErrorCode, Result};
+use crate::schema::Schema;
+use crate::shared_cache;
 use crate::storage::pager::{
     JournalMode, Pager, PagerFlags, PagerGetFlags, PagerOpenFlags, SavepointOp,
 };
@@ -154,6 +158,43 @@ bitflags! {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BtTableLockEntry {
+    table: i32,
+    btree_id: usize,
+    lock_type: BtLock,
+}
+
+thread_local! {
+    static SHARED_CACHE_REGISTRY: RefCell<HashMap<String, Weak<RwLock<BtShared>>>> =
+        RefCell::new(HashMap::new());
+}
+
+fn shared_cache_key(filename: &str) -> Option<String> {
+    if filename.is_empty() || filename == ":memory:" {
+        None
+    } else {
+        Some(filename.to_string())
+    }
+}
+
+fn shared_cache_lookup(key: &str) -> Option<Arc<RwLock<BtShared>>> {
+    SHARED_CACHE_REGISTRY.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        if let Some(shared) = registry.get(key).and_then(|entry| entry.upgrade()) {
+            return Some(shared);
+        }
+        registry.remove(key);
+        None
+    })
+}
+
+fn shared_cache_insert(key: String, shared: &Arc<RwLock<BtShared>>) {
+    SHARED_CACHE_REGISTRY.with(|registry| {
+        registry.borrow_mut().insert(key, Arc::downgrade(shared));
+    });
+}
+
 pub struct Btree {
     pub db: Option<Arc<dyn Connection>>,
     pub shared: Arc<RwLock<BtShared>>,
@@ -190,12 +231,14 @@ pub struct BtShared {
     pub n_transaction: i32,
     pub n_page: u32,
     pub schema: Option<Arc<dyn std::any::Any>>,
+    pub schema_cache: Option<Arc<RwLock<Schema>>>,
     pub has_content: Option<Vec<u8>>,
     pub temp_space: Vec<u8>,
     pub preformat_size: i32,
     pub schema_cookie: u32,
     pub file_format: u8,
     pub free_pages: Vec<Pgno>,
+    pub table_locks: Vec<BtTableLockEntry>,
 }
 
 impl BtShared {
@@ -3506,6 +3549,35 @@ impl Btree {
     where
         V::File: 'static,
     {
+        let mut use_shared_cache =
+            shared_cache::shared_cache_enabled() || vfs_flags.contains(OpenFlags::SHAREDCACHE);
+        if vfs_flags.contains(OpenFlags::PRIVATECACHE) {
+            use_shared_cache = false;
+        }
+        let shared_key = if use_shared_cache {
+            shared_cache_key(filename)
+        } else {
+            None
+        };
+        let sharable = use_shared_cache && shared_key.is_some();
+        if let Some(ref key) = shared_key {
+            if let Some(shared) = shared_cache_lookup(key) {
+                return Ok(Arc::new(Btree {
+                    db,
+                    shared,
+                    in_trans: AtomicU8::new(TransState::None as u8),
+                    sharable,
+                    locked: false,
+                    has_incrblob_cur: false,
+                    want_to_lock: 0,
+                    n_backup: AtomicI32::new(0),
+                    data_version: 0,
+                    next: None,
+                    prev: None,
+                }));
+            }
+        }
+
         let pager_flags = pager_open_flags_from_btree(flags);
         let pager = Pager::open(vfs, filename, pager_flags, vfs_flags)?;
         let page_size = pager.page_size;
@@ -3533,12 +3605,14 @@ impl Btree {
             n_transaction: 0,
             n_page: 0,
             schema: None,
+            schema_cache: None,
             has_content: None,
             temp_space: vec![0u8; page_size as usize],
             preformat_size: 0,
             schema_cookie: 0,
             file_format: 0,
             free_pages: Vec::new(),
+            table_locks: Vec::new(),
         };
 
         // Try to read existing database header from page 1
@@ -3619,11 +3693,16 @@ impl Btree {
             }
         }
 
+        let shared = Arc::new(RwLock::new(shared));
+        if let Some(key) = shared_key {
+            shared_cache_insert(key, &shared);
+        }
+
         Ok(Arc::new(Btree {
             db,
-            shared: Arc::new(RwLock::new(shared)),
+            shared,
             in_trans: AtomicU8::new(TransState::None as u8),
-            sharable: false,
+            sharable,
             locked: false,
             has_incrblob_cur: false,
             want_to_lock: 0,
@@ -3690,11 +3769,15 @@ impl Btree {
 
     /// sqlite3BtreeClose
     pub fn close(&mut self) -> Result<()> {
-        let mut shared = self
-            .shared
-            .write()
-            .map_err(|_| Error::new(ErrorCode::Internal))?;
-        shared.pager.close()?;
+        self.clear_table_locks();
+        let should_close = !self.sharable || Arc::strong_count(&self.shared) == 1;
+        if should_close {
+            let mut shared = self
+                .shared
+                .write()
+                .map_err(|_| Error::new(ErrorCode::Internal))?;
+            shared.pager.close()?;
+        }
         Ok(())
     }
 
@@ -3854,6 +3937,8 @@ impl Btree {
         shared.in_transaction = TransState::None;
         self.in_trans
             .store(TransState::None as u8, Ordering::SeqCst);
+        drop(shared);
+        self.clear_table_locks();
         Ok(())
     }
 
@@ -3890,6 +3975,8 @@ impl Btree {
         shared.in_transaction = TransState::None;
         self.in_trans
             .store(TransState::None as u8, Ordering::SeqCst);
+        drop(shared);
+        self.clear_table_locks();
         Ok(())
     }
 
@@ -4479,8 +4566,55 @@ impl Btree {
     }
 
     /// sqlite3BtreeLockTable
-    pub fn lock_table(&mut self, _table: i32, _write: bool) -> Result<()> {
+    pub fn lock_table(&self, table: i32, write: bool) -> Result<()> {
+        if !self.sharable {
+            return Ok(());
+        }
+        let lock_type = if write { BtLock::Write } else { BtLock::Read };
+        let btree_id = self as *const Btree as usize;
+        let mut shared = self
+            .shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
+
+        let mut has_own_lock = false;
+        for lock in &shared.table_locks {
+            if lock.table != table {
+                continue;
+            }
+            if lock.btree_id == btree_id {
+                has_own_lock = true;
+                if lock.lock_type == lock_type {
+                    return Ok(());
+                }
+                continue;
+            }
+            if lock.lock_type == BtLock::Write || lock_type == BtLock::Write {
+                return Err(Error::new(ErrorCode::Locked));
+            }
+        }
+
+        if has_own_lock {
+            shared
+                .table_locks
+                .retain(|lock| !(lock.btree_id == btree_id && lock.table == table));
+        }
+        shared.table_locks.push(BtTableLockEntry {
+            table,
+            btree_id,
+            lock_type,
+        });
         Ok(())
+    }
+
+    fn clear_table_locks(&self) {
+        if !self.sharable {
+            return;
+        }
+        if let Ok(mut shared) = self.shared.write() {
+            let btree_id = self as *const Btree as usize;
+            shared.table_locks.retain(|lock| lock.btree_id != btree_id);
+        }
     }
 
     /// sqlite3BtreeSavepoint

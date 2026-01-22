@@ -1591,6 +1591,9 @@ impl Vdbe {
                 } else {
                     // Clone btree Arc to avoid borrow issues
                     let btree = self.btree.clone();
+                    if let Some(ref btree) = btree {
+                        btree.lock_table(root_page as i32, true)?;
+                    }
                     self.open_cursor(op.p1, root_page, true)?;
                     if let Some(cursor) = self.cursor_mut(op.p1) {
                         cursor.n_field = op.p3;

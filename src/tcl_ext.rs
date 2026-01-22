@@ -334,6 +334,11 @@ unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         ("between_opt", "1"),
         ("schema_version", "1"),
         ("default_cache_size", "1"),
+        ("memorymanage", "0"),
+        ("shared_cache", "0"),
+        ("threadsafe", "0"),
+        ("threadsafe1", "0"),
+        ("threadsafe2", "0"),
     ];
 
     let arr_name = CString::new("::sqlite_options").unwrap();

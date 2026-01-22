@@ -6,6 +6,9 @@
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::types::{Pgno, SyncFlags, VfsFile};
+use lazy_static::lazy_static;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Weak};
 
 // ============================================================================
 // Constants
@@ -381,6 +384,8 @@ pub struct WalShm {
     pub regions: Vec<WalShmRegion>,
     /// Read marks for each reader slot
     pub read_marks: [u32; WAL_NREADER],
+    /// Read slot occupancy
+    pub read_held: [bool; WAL_NREADER],
 }
 
 impl WalShm {
@@ -389,6 +394,7 @@ impl WalShm {
         WalShm {
             regions: Vec::new(),
             read_marks: [0; WAL_NREADER],
+            read_held: [false; WAL_NREADER],
         }
     }
 
@@ -413,6 +419,23 @@ impl Default for WalShm {
     fn default() -> Self {
         Self::new()
     }
+}
+
+lazy_static! {
+    static ref WAL_SHM_REGISTRY: Mutex<HashMap<String, Weak<Mutex<WalShm>>>> =
+        Mutex::new(HashMap::new());
+}
+
+fn shared_wal_shm(db_path: &str) -> Arc<Mutex<WalShm>> {
+    let mut registry = WAL_SHM_REGISTRY.lock().unwrap();
+    if let Some(weak) = registry.get(db_path) {
+        if let Some(shared) = weak.upgrade() {
+            return shared;
+        }
+    }
+    let shared = Arc::new(Mutex::new(WalShm::new()));
+    registry.insert(db_path.to_string(), Arc::downgrade(&shared));
+    shared
 }
 
 // ============================================================================
@@ -546,7 +569,7 @@ pub struct Wal {
 
     // Shared memory
     /// WAL-index shared memory
-    pub shm: WalShm,
+    pub shm: Arc<Mutex<WalShm>>,
 
     // Callback state
     /// Number of pages written in current transaction
@@ -563,6 +586,7 @@ impl Wal {
     /// Open WAL for a database (sqlite3WalOpen)
     pub fn open(db_path: &str, page_size: u32) -> Result<Self> {
         let wal_path = format!("{}-wal", db_path);
+        let shm = shared_wal_shm(db_path);
 
         Ok(Wal {
             wal_fd: None,
@@ -580,10 +604,15 @@ impl Wal {
             hash_tables: vec![WalHashTable::new()],
             big_endian_cksum: false,
             checksum: [0, 0],
-            shm: WalShm::new(),
+            shm,
             n_written: 0,
             truncate_on_commit: false,
         })
+    }
+
+    fn with_shm<R>(&self, f: impl FnOnce(&mut WalShm) -> R) -> R {
+        let mut shm = self.shm.lock().unwrap();
+        f(&mut shm)
     }
 
     /// Close WAL connection (sqlite3WalClose)
@@ -599,6 +628,11 @@ impl Wal {
         // Close file handle
         self.wal_fd = None;
 
+        if Arc::strong_count(&self.shm) == 1 {
+            let mut registry = WAL_SHM_REGISTRY.lock().unwrap();
+            registry.remove(&self.db_path);
+        }
+
         Ok(())
     }
 
@@ -613,12 +647,22 @@ impl Wal {
             return Ok(false);
         }
 
-        // Acquire read lock on first slot
-        // In a real implementation, this would use shared memory locks
-        // and try multiple slots if one is busy
-        let slot = 0;
+        // Acquire a read lock slot for this connection.
+        let mut shm = self.shm.lock().unwrap();
+        let mut slot = None;
+        for i in 0..WAL_NREADER {
+            if !shm.read_held[i] {
+                slot = Some(i as i16);
+                break;
+            }
+        }
+        let slot = match slot {
+            Some(slot) => slot,
+            None => return Ok(false),
+        };
         self.read_lock = slot;
-        self.shm.read_marks[slot as usize] = self.max_frame;
+        shm.read_held[slot as usize] = true;
+        shm.read_marks[slot as usize] = self.max_frame;
         Ok(true)
     }
 
@@ -631,7 +675,9 @@ impl Wal {
         // Release the read lock
         let slot = self.read_lock as usize;
         if slot < WAL_NREADER {
-            self.shm.read_marks[slot] = 0;
+            let mut shm = self.shm.lock().unwrap();
+            shm.read_held[slot] = false;
+            shm.read_marks[slot] = 0;
         }
         self.read_lock = WAL_READ_LOCK_NONE;
 
@@ -649,7 +695,10 @@ impl Wal {
             if let Some(frame) = table.lookup(pgno) {
                 // Check if frame is within our read snapshot
                 if self.read_lock != WAL_READ_LOCK_NONE {
-                    let read_mark = self.shm.read_marks[self.read_lock as usize];
+                    let read_mark = {
+                        let shm = self.shm.lock().unwrap();
+                        shm.read_marks[self.read_lock as usize]
+                    };
                     if frame <= read_mark {
                         return Ok(frame);
                     }
@@ -876,16 +925,23 @@ impl Wal {
         // Find the frame up to which we can checkpoint
         // This depends on active readers
         let mut safe_frame = self.max_frame;
-        for &read_mark in &self.shm.read_marks {
-            if read_mark > 0 && read_mark < safe_frame {
+        let (read_marks, read_held) = {
+            let shm = self.shm.lock().unwrap();
+            (shm.read_marks, shm.read_held)
+        };
+        for (read_mark, held) in read_marks.iter().zip(read_held.iter()) {
+            if !*held {
+                continue;
+            }
+            if *read_mark > 0 && *read_mark < safe_frame {
                 if mode == CheckpointMode::Passive {
-                    safe_frame = read_mark - 1;
+                    safe_frame = *read_mark - 1;
                 } else {
                     // Wait for readers to finish
                     if let Some(handler) = busy_handler {
-                        while read_mark < safe_frame {
+                        while *read_mark < safe_frame {
                             if !handler() {
-                                safe_frame = read_mark - 1;
+                                safe_frame = *read_mark - 1;
                                 break;
                             }
                         }
@@ -990,8 +1046,14 @@ impl Wal {
         self.checksum = [0, 0];
 
         // Reset shared memory read marks
-        for mark in self.shm.read_marks.iter_mut() {
-            *mark = 0;
+        {
+            let mut shm = self.shm.lock().unwrap();
+            for mark in shm.read_marks.iter_mut() {
+                *mark = 0;
+            }
+            for held in shm.read_held.iter_mut() {
+                *held = false;
+            }
         }
 
         // Read and validate WAL header
@@ -1196,17 +1258,21 @@ fn wal_checksum(big_endian: bool, data: &[u8], init1: u32, init2: u32) -> (u32, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     /// Get a platform-appropriate temporary database path for testing
     fn get_test_db_path() -> String {
+        let id = TEST_DB_COUNTER.fetch_add(1, Ordering::SeqCst);
         #[cfg(unix)]
-        return "/tmp/test.db".to_string();
+        return format!("/tmp/test-{}.db", id);
 
         #[cfg(windows)]
-        return "C:\\Temp\\test.db".to_string();
+        return format!("C:\\Temp\\test-{}.db", id);
 
         #[cfg(target_os = "macos")]
-        return "/tmp/test.db".to_string();
+        return format!("/tmp/test-{}.db", id);
     }
 
     #[test]
@@ -1517,17 +1583,19 @@ mod tests {
         let mut wal = Wal::open(&get_test_db_path(), 4096).unwrap();
 
         // Test getting header region - it's pre-allocated with 32768 bytes
-        let header_region = wal.shm.get_header_region();
-        assert_eq!(header_region.data.len(), 32768);
-        assert!(header_region.data.iter().all(|&b| b == 0)); // Zero-filled
+        let header_len = wal.with_shm(|shm| shm.get_header_region().data.len());
+        let header_zeroed =
+            wal.with_shm(|shm| shm.get_header_region().data.iter().all(|&b| b == 0));
+        assert_eq!(header_len, 32768);
+        assert!(header_zeroed); // Zero-filled
 
         // Test getting same region returns same size (already created at index 0)
-        let region = wal.shm.get_region(0, 1024);
-        assert_eq!(region.data.len(), 32768); // Same region, not recreated
+        let region_len = wal.with_shm(|shm| shm.get_region(0, 1024).data.len());
+        assert_eq!(region_len, 32768); // Same region, not recreated
 
         // Test getting a new region at different index
-        let region1 = wal.shm.get_region(1, 1024);
-        assert_eq!(region1.data.len(), 1024);
+        let region1_len = wal.with_shm(|shm| shm.get_region(1, 1024).data.len());
+        assert_eq!(region1_len, 1024);
     }
 
     #[test]
@@ -1662,7 +1730,9 @@ mod tests {
         // shm.regions always exists
 
         // Test shared memory initialization
-        let _header_region = wal.shm.get_header_region();
+        wal.with_shm(|shm| {
+            let _ = shm.get_header_region();
+        });
         assert_eq!(WALINDEX_HDR_SIZE, WALINDEX_HDR_SIZE);
     }
 
@@ -1792,16 +1862,16 @@ mod tests {
         let mut wal = Wal::open(&get_test_db_path(), 4096).unwrap();
 
         // First call to get_header_region creates region 0 with 32768 bytes
-        let header_region = wal.shm.get_header_region();
-        assert_eq!(header_region.data.len(), 32768);
+        let header_len = wal.with_shm(|shm| shm.get_header_region().data.len());
+        assert_eq!(header_len, 32768);
 
         // Now region 0 exists, get_region(0, x) returns existing region
-        let region = wal.shm.get_region(0, 0);
-        assert_eq!(region.data.len(), 32768); // Already created size
+        let region_len = wal.with_shm(|shm| shm.get_region(0, 0).data.len());
+        assert_eq!(region_len, 32768); // Already created size
 
         // Creating region at new index with specified size
-        let region = wal.shm.get_region(5, 1024 * 1024); // 1MB at index 5
-        assert_eq!(region.data.len(), 1024 * 1024);
+        let region_len = wal.with_shm(|shm| shm.get_region(5, 1024 * 1024).data.len());
+        assert_eq!(region_len, 1024 * 1024);
     }
 
     #[test]
@@ -1890,9 +1960,12 @@ mod tests {
         assert_eq!(result, None); // Should handle gracefully
 
         // Test that shared memory regions are properly sized
-        let region = wal.shm.get_region(0, 100);
-        assert_eq!(region.data.len(), 100);
-        assert!(region.index < wal.shm.regions.len());
+        let (region_len, region_index, regions_len) = wal.with_shm(|shm| {
+            let region = shm.get_region(0, 100);
+            (region.data.len(), region.index, shm.regions.len())
+        });
+        assert_eq!(region_len, 100);
+        assert!(region_index < regions_len);
     }
 
     #[test]
@@ -1909,6 +1982,26 @@ mod tests {
         // End read transaction
         wal.end_read_transaction().unwrap();
         assert_eq!(wal.read_lock, WAL_READ_LOCK_NONE);
+    }
+
+    #[test]
+    fn test_wal_multi_reader_slots() {
+        let db_path = get_test_db_path();
+        let mut wal1 = Wal::open(&db_path, 4096).unwrap();
+        let mut wal2 = Wal::open(&db_path, 4096).unwrap();
+
+        assert!(wal1.begin_read_transaction().unwrap());
+        assert!(wal2.begin_read_transaction().unwrap());
+        assert_ne!(wal1.read_lock, wal2.read_lock);
+
+        let marks = wal1.with_shm(|shm| shm.read_marks);
+        assert_eq!(marks[wal1.read_lock as usize], wal1.max_frame);
+        assert_eq!(marks[wal2.read_lock as usize], wal2.max_frame);
+
+        wal1.end_read_transaction().unwrap();
+        wal2.end_read_transaction().unwrap();
+        let marks = wal1.with_shm(|shm| shm.read_marks);
+        assert!(marks.iter().all(|mark| *mark == 0));
     }
 
     #[test]
@@ -2072,13 +2165,25 @@ mod tests {
         let mut wal = Wal::open(&get_test_db_path(), 4096).unwrap();
 
         // Test shared memory region management
-        let region1 = wal.shm.get_region(0, 1024);
-        let region1_len = region1.data.len();
-        let region1_idx = region1.index;
+        let (region1_len, region1_idx, region2_len, region2_idx, header_len) =
+            wal.with_shm(|shm| {
+                let region1 = shm.get_region(0, 1024);
+                let region1_len = region1.data.len();
+                let region1_idx = region1.index;
 
-        let region2 = wal.shm.get_region(1, 2048);
-        let region2_len = region2.data.len();
-        let region2_idx = region2.index;
+                let region2 = shm.get_region(1, 2048);
+                let region2_len = region2.data.len();
+                let region2_idx = region2.index;
+
+                let header_len = shm.get_header_region().data.len();
+                (
+                    region1_len,
+                    region1_idx,
+                    region2_len,
+                    region2_idx,
+                    header_len,
+                )
+            });
 
         assert_eq!(region1_len, 1024);
         assert_eq!(region2_len, 2048);
@@ -2086,8 +2191,7 @@ mod tests {
 
         // Test header region - note: region 0 already exists with 1024 bytes
         // get_header_region returns existing region, doesn't resize
-        let header_region = wal.shm.get_header_region();
-        assert_eq!(header_region.data.len(), 1024); // Same as region1
+        assert_eq!(header_len, 1024); // Same as region1
     }
 
     #[test]
@@ -2180,7 +2284,7 @@ mod tests {
 
         // Test shared memory
         // shm.regions always exists
-        assert!(wal.shm.read_marks.len() == WAL_NREADER);
+        assert_eq!(wal.with_shm(|shm| shm.read_marks.len()), WAL_NREADER);
     }
 
     #[test]
@@ -2282,11 +2386,12 @@ mod tests {
         let wal = Wal::open(&get_test_db_path(), 4096).unwrap();
 
         // Test shared memory properties
-        assert!(wal.shm.read_marks.len() == WAL_NREADER);
+        let read_marks = wal.with_shm(|shm| shm.read_marks);
+        assert_eq!(read_marks.len(), WAL_NREADER);
         // shm.regions always exists
 
         // Test that read marks are initialized
-        for mark in &wal.shm.read_marks {
+        for mark in &read_marks {
             assert_eq!(*mark, 0);
         }
     }
@@ -2382,9 +2487,12 @@ mod tests {
         assert_eq!(result, None);
 
         // Test shared memory bounds
-        let region = wal.shm.get_region(0, 100);
-        assert_eq!(region.data.len(), 100);
-        assert!(region.index < wal.shm.regions.len() + 1); // Allow for new regions
+        let (region_len, region_index, regions_len) = wal.with_shm(|shm| {
+            let region = shm.get_region(0, 100);
+            (region.data.len(), region.index, shm.regions.len())
+        });
+        assert_eq!(region_len, 100);
+        assert!(region_index < regions_len + 1); // Allow for new regions
     }
 
     #[test]
@@ -2587,17 +2695,29 @@ mod tests {
         // Test shared memory operations
 
         // Test getting multiple regions
-        let region1 = wal.shm.get_region(0, 1024);
-        let region1_len = region1.data.len();
-        let region1_idx = region1.index;
+        let (region1_len, region1_idx, region2_len, region2_idx, region3_len, region3_idx) = wal
+            .with_shm(|shm| {
+                let region1 = shm.get_region(0, 1024);
+                let region1_len = region1.data.len();
+                let region1_idx = region1.index;
 
-        let region2 = wal.shm.get_region(1, 2048);
-        let region2_len = region2.data.len();
-        let region2_idx = region2.index;
+                let region2 = shm.get_region(1, 2048);
+                let region2_len = region2.data.len();
+                let region2_idx = region2.index;
 
-        let region3 = wal.shm.get_region(2, 4096);
-        let region3_len = region3.data.len();
-        let region3_idx = region3.index;
+                let region3 = shm.get_region(2, 4096);
+                let region3_len = region3.data.len();
+                let region3_idx = region3.index;
+
+                (
+                    region1_len,
+                    region1_idx,
+                    region2_len,
+                    region2_idx,
+                    region3_len,
+                    region3_idx,
+                )
+            });
 
         // Test that regions have different indices
         assert_eq!(region1_len, 1024);
@@ -2705,7 +2825,7 @@ mod tests {
         assert!(wal.hash_tables[0].slots.len() == HASHTABLE_NSLOT);
         assert!(wal.hash_tables[0].pages.len() == HASHTABLE_NPAGE);
         // shm.regions always exists
-        assert!(wal.shm.read_marks.len() == WAL_NREADER);
+        assert_eq!(wal.with_shm(|shm| shm.read_marks.len()), WAL_NREADER);
     }
 
     #[test]
@@ -2822,11 +2942,12 @@ mod tests {
         let wal = Wal::open(&get_test_db_path(), 4096).unwrap();
 
         // Test shared memory properties
-        assert!(wal.shm.read_marks.len() == WAL_NREADER);
+        let read_marks = wal.with_shm(|shm| shm.read_marks);
+        assert_eq!(read_marks.len(), WAL_NREADER);
         // shm.regions always exists
 
         // Test read marks initialization
-        for mark in &wal.shm.read_marks {
+        for mark in &read_marks {
             assert_eq!(*mark, 0);
         }
     }
@@ -2925,9 +3046,12 @@ mod tests {
         assert_eq!(result, None);
 
         // Test shared memory safety
-        let region = wal.shm.get_region(0, 100);
-        assert_eq!(region.data.len(), 100);
-        assert!(region.index <= wal.shm.regions.len());
+        let (region_len, region_index, regions_len) = wal.with_shm(|shm| {
+            let region = shm.get_region(0, 100);
+            (region.data.len(), region.index, shm.regions.len())
+        });
+        assert_eq!(region_len, 100);
+        assert!(region_index <= regions_len);
     }
 
     #[test]
@@ -3125,8 +3249,8 @@ mod tests {
         let sizes = [0, 1, 10, 100, 1000, 10000, 100000];
 
         for (i, size) in sizes.iter().enumerate() {
-            let region = wal.shm.get_region(i as usize, *size);
-            assert_eq!(region.data.len(), *size);
+            let region_len = wal.with_shm(|shm| shm.get_region(i as usize, *size).data.len());
+            assert_eq!(region_len, *size);
         }
     }
 
@@ -3220,7 +3344,7 @@ mod tests {
         assert!(wal.hash_tables[0].slots.len() == HASHTABLE_NSLOT);
         assert!(wal.hash_tables[0].pages.len() == HASHTABLE_NPAGE);
         // shm.regions always exists
-        assert!(wal.shm.read_marks.len() == WAL_NREADER);
+        assert_eq!(wal.with_shm(|shm| shm.read_marks.len()), WAL_NREADER);
     }
 
     #[test]
@@ -3310,7 +3434,7 @@ mod tests {
         let wal = Wal::open(&get_test_db_path(), 4096).unwrap();
 
         // Test shared memory properties
-        assert!(wal.shm.read_marks.len() == WAL_NREADER);
+        assert_eq!(wal.with_shm(|shm| shm.read_marks.len()), WAL_NREADER);
         // shm.regions always exists
     }
 
@@ -3510,8 +3634,8 @@ mod tests {
         // Final final comprehensive shared memory operations test
 
         // Test shared memory operations
-        let region = wal.shm.get_region(0, 1024);
-        assert_eq!(region.data.len(), 1024);
+        let region_len = wal.with_shm(|shm| shm.get_region(0, 1024).data.len());
+        assert_eq!(region_len, 1024);
     }
 
     #[test]
@@ -3626,7 +3750,7 @@ mod tests {
 
         // Test shared memory validation
         let wal = Wal::open(&get_test_db_path(), 4096).unwrap();
-        assert!(wal.shm.read_marks.len() == WAL_NREADER);
+        assert_eq!(wal.with_shm(|shm| shm.read_marks.len()), WAL_NREADER);
     }
 
     #[test]
@@ -3795,7 +3919,7 @@ mod tests {
         // Final final final comprehensive shared memory operations test
 
         // Test shared memory operations
-        let region = wal.shm.get_region(0, 512);
-        assert_eq!(region.data.len(), 512);
+        let region_len = wal.with_shm(|shm| shm.get_region(0, 512).data.len());
+        assert_eq!(region_len, 512);
     }
 }

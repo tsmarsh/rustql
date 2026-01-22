@@ -100,7 +100,6 @@ fn test_scalar_subquery_in_expression() {
 }
 
 #[test]
-#[ignore] // TODO: "ambiguous column name: y" error - needs investigation
 fn test_insert_select_with_scalar_subquery() {
     init();
     let mut conn = sqlite3_open(":memory:").expect("open memory db");
@@ -216,7 +215,31 @@ fn test_insert_select_arithmetic_simple() {
 }
 
 #[test]
-#[ignore] // TODO: "ambiguous column name: y" error - needs investigation
+fn test_ambiguous_column_resolution() {
+    init();
+    let mut conn = sqlite3_open(":memory:").expect("open memory db");
+
+    exec(&mut conn, "CREATE TABLE t1(x int)");
+    exec(&mut conn, "CREATE TABLE t2(x int)");
+    exec(&mut conn, "INSERT INTO t1 VALUES(1)");
+    exec(&mut conn, "INSERT INTO t2 VALUES(2)");
+
+    let err = sqlite3_prepare_v2(&mut conn, "SELECT x FROM t1, t2")
+        .err()
+        .expect("expected prepare to fail for ambiguous column");
+    assert!(
+        err.to_string().contains("ambiguous"),
+        "expected ambiguous column error, got: {}",
+        err
+    );
+
+    let results = query(&mut conn, "SELECT t1.x, t2.x FROM t1, t2");
+    assert_eq!(results, vec![vec!["1".to_string(), "2".to_string()]]);
+
+    let _ = sqlite3_close(conn);
+}
+
+#[test]
 fn test_where_test_setup() {
     // This test mimics the where.test setup from SQLite
     init();

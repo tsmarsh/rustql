@@ -1157,7 +1157,12 @@ impl<'s> SelectCompiler<'s> {
         self.emit(Opcode::OpenEphemeral, eph_cursor, 0, 0, P4::Unused);
 
         // Step 2: Collect table cursors
-        let table_cursors: Vec<i32> = self.tables.iter().map(|t| t.cursor).collect();
+        let table_cursors: Vec<i32> = self
+            .tables
+            .iter()
+            .skip(self.outer_tables_boundary)
+            .map(|t| t.cursor)
+            .collect();
 
         // Generate Rewind for each table cursor
         let mut rewind_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
@@ -1355,7 +1360,12 @@ impl<'s> SelectCompiler<'s> {
         let agg_regs = self.init_aggregates(&core.columns)?;
 
         // Collect table cursors to avoid borrow checker issues
-        let table_cursors: Vec<i32> = self.tables.iter().map(|t| t.cursor).collect();
+        let table_cursors: Vec<i32> = self
+            .tables
+            .iter()
+            .skip(self.outer_tables_boundary)
+            .map(|t| t.cursor)
+            .collect();
 
         // Generate Rewind for each table cursor
         let mut rewind_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
@@ -1954,6 +1964,44 @@ impl<'s> SelectCompiler<'s> {
         } else {
             None
         }
+    }
+
+    fn table_name_matches(table: &TableInfo, name: &str) -> bool {
+        table.name.eq_ignore_ascii_case(name) || table.table_name.eq_ignore_ascii_case(name)
+    }
+
+    fn column_index_in_table(&self, table: &TableInfo, column: &str) -> Option<i32> {
+        if is_rowid_alias(column) {
+            if let Some(schema_table) = &table.schema_table {
+                if !schema_table.without_rowid {
+                    return Some(-1);
+                }
+            }
+        }
+
+        if let Some(schema_table) = &table.schema_table {
+            return schema_table
+                .columns
+                .iter()
+                .position(|col| col.name.eq_ignore_ascii_case(column))
+                .map(|idx| idx as i32);
+        }
+
+        if let Some(cols) = &table.subquery_columns {
+            return cols
+                .iter()
+                .position(|col| col.eq_ignore_ascii_case(column))
+                .map(|idx| idx as i32);
+        }
+
+        None
+    }
+
+    fn is_column_coalesced(&self, table_idx: usize, column_lower: &str) -> bool {
+        self.coalesced_columns
+            .get(&table_idx)
+            .map(|cols| cols.contains(column_lower))
+            .unwrap_or(false)
     }
 
     /// Process join constraints (NATURAL, USING, ON) and generate WHERE conditions
@@ -3185,35 +3233,37 @@ impl<'s> SelectCompiler<'s> {
                     }
                 }
 
-                if is_rowid_alias(&col_ref.column) {
-                    let cursor = if let Some(table) = &col_ref.table {
-                        self.tables
-                            .iter()
-                            .find(|t| {
-                                t.name.eq_ignore_ascii_case(table)
-                                    || t.table_name.eq_ignore_ascii_case(table)
-                            })
-                            .map(|t| t.cursor)
-                    } else if self.tables.len() == 1 {
-                        self.tables.first().map(|t| t.cursor)
-                    } else {
-                        None
-                    };
-
-                    if let Some(cursor) = cursor {
-                        self.emit(Opcode::Rowid, cursor, dest_reg, 0, P4::Unused);
-                        return Ok(());
-                    }
-                }
-
                 // Find the table and column index
                 let (cursor, col_idx) = if let Some(table) = &col_ref.table {
-                    // Check for multiple tables with the same name/alias (ambiguous)
-                    let matching_tables: Vec<_> = self
+                    // Resolve table name with scoping (local first, then outer)
+                    let mut local_matches = Vec::new();
+                    for (idx, tinfo) in self
                         .tables
                         .iter()
-                        .filter(|t| t.name.eq_ignore_ascii_case(table))
-                        .collect();
+                        .enumerate()
+                        .skip(self.outer_tables_boundary)
+                    {
+                        if Self::table_name_matches(tinfo, table) {
+                            local_matches.push(idx);
+                        }
+                    }
+
+                    let mut matching_tables = if local_matches.is_empty() {
+                        let mut outer_matches = Vec::new();
+                        for (idx, tinfo) in self
+                            .tables
+                            .iter()
+                            .enumerate()
+                            .take(self.outer_tables_boundary)
+                        {
+                            if Self::table_name_matches(tinfo, table) {
+                                outer_matches.push(idx);
+                            }
+                        }
+                        outer_matches
+                    } else {
+                        local_matches
+                    };
 
                     if matching_tables.len() > 1 {
                         return Err(Error::with_message(
@@ -3222,67 +3272,86 @@ impl<'s> SelectCompiler<'s> {
                         ));
                     }
 
-                    if let Some(tinfo) = matching_tables.first() {
-                        // Use column_index if set, otherwise look up from schema
-                        let idx = col_ref.column_index.unwrap_or_else(|| {
-                            tinfo
-                                .schema_table
-                                .as_ref()
-                                .and_then(|st| {
-                                    st.columns
-                                        .iter()
-                                        .position(|c| c.name.eq_ignore_ascii_case(&col_ref.column))
-                                })
-                                .map(|i| i as i32)
-                                .unwrap_or(0)
-                        });
+                    if let Some(table_idx) = matching_tables.pop() {
+                        let tinfo = &self.tables[table_idx];
+                        let idx = col_ref
+                            .column_index
+                            .or_else(|| self.column_index_in_table(tinfo, &col_ref.column))
+                            .ok_or_else(|| {
+                                Error::with_message(
+                                    ErrorCode::Error,
+                                    format!("no such column: {}.{}", table, col_ref.column),
+                                )
+                            })?;
                         (tinfo.cursor, idx)
+                    } else if self.schema.is_none() {
+                        let cursor = self.tables.first().map(|t| t.cursor).unwrap_or(0);
+                        (cursor, col_ref.column_index.unwrap_or(0))
                     } else {
-                        // Table not found, use defaults
-                        (0, col_ref.column_index.unwrap_or(0))
+                        return Err(Error::with_message(
+                            ErrorCode::Error,
+                            format!("no such column: {}.{}", table, col_ref.column),
+                        ));
                     }
                 } else {
-                    // No table specified - search all tables for column
-                    // Must check for ambiguous column references
-                    let mut found = None;
-                    let mut match_count = 0;
+                    // No table specified - search local tables first, then outer
                     let col_lower = col_ref.column.to_lowercase();
-                    for (table_idx, tinfo) in self.tables.iter().enumerate() {
-                        if let Some(st) = &tinfo.schema_table {
-                            if let Some(idx) = st
-                                .columns
-                                .iter()
-                                .position(|c| c.name.eq_ignore_ascii_case(&col_ref.column))
-                            {
-                                // Check if this column is coalesced for this table
-                                // (from NATURAL or USING join). If so, it's not
-                                // ambiguous - skip counting it.
-                                let is_coalesced = self
-                                    .coalesced_columns
-                                    .get(&table_idx)
-                                    .map(|cols| cols.contains(&col_lower))
-                                    .unwrap_or(false);
-
-                                if !is_coalesced {
-                                    match_count += 1;
-                                    if found.is_none() {
-                                        found = Some((tinfo.cursor, idx as i32));
-                                    }
-                                }
-                            }
+                    let mut matches = Vec::new();
+                    for (table_idx, tinfo) in self
+                        .tables
+                        .iter()
+                        .enumerate()
+                        .skip(self.outer_tables_boundary)
+                    {
+                        if self.is_column_coalesced(table_idx, &col_lower) {
+                            continue;
+                        }
+                        if let Some(idx) = self.column_index_in_table(tinfo, &col_ref.column) {
+                            matches.push((tinfo.cursor, idx));
                         }
                     }
-                    if match_count > 1 {
+
+                    if matches.len() > 1 {
                         return Err(Error::with_message(
                             ErrorCode::Error,
                             format!("ambiguous column name: {}", col_ref.column),
                         ));
                     }
-                    found.unwrap_or_else(|| {
-                        // Fallback to first table with col_idx=0
+
+                    if matches.is_empty() {
+                        for (table_idx, tinfo) in self
+                            .tables
+                            .iter()
+                            .enumerate()
+                            .take(self.outer_tables_boundary)
+                        {
+                            if self.is_column_coalesced(table_idx, &col_lower) {
+                                continue;
+                            }
+                            if let Some(idx) = self.column_index_in_table(tinfo, &col_ref.column) {
+                                matches.push((tinfo.cursor, idx));
+                            }
+                        }
+
+                        if matches.len() > 1 {
+                            return Err(Error::with_message(
+                                ErrorCode::Error,
+                                format!("ambiguous column name: {}", col_ref.column),
+                            ));
+                        }
+                    }
+
+                    if let Some((cursor, idx)) = matches.pop() {
+                        (cursor, idx)
+                    } else if self.schema.is_none() {
                         let cursor = self.tables.first().map(|t| t.cursor).unwrap_or(0);
                         (cursor, col_ref.column_index.unwrap_or(0))
-                    })
+                    } else {
+                        return Err(Error::with_message(
+                            ErrorCode::Error,
+                            format!("no such column: {}", col_ref.column),
+                        ));
+                    }
                 };
 
                 if col_idx < 0 {

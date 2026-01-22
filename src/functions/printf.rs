@@ -315,8 +315,9 @@ fn format_unsigned(spec: &PrintfSpec, value: u64, base: u32, upper: bool) -> Res
 }
 
 fn format_float(spec: &PrintfSpec, value: f64, mode: char) -> Result<String> {
+    // Cap precision to prevent memory exhaustion (SQLite caps at around 350)
     let precision = if spec.precision >= 0 {
-        spec.precision as usize
+        (spec.precision as usize).min(350)
     } else {
         6
     };
@@ -330,21 +331,125 @@ fn format_float(spec: &PrintfSpec, value: f64, mode: char) -> Result<String> {
         }
     }
 
+    let alt_form = spec.flags.contains(FormatFlags::ALT_FORM);
+
     let mut body = match mode {
-        'e' => format!("{:.*e}", precision, value),
-        'E' => format!("{:.*E}", precision, value),
+        'e' => fix_exponent(&format!("{:.*e}", precision, value)),
+        'E' => fix_exponent(&format!("{:.*E}", precision, value)),
         'f' | 'F' => format!("{:.*}", precision, value),
-        'g' => format!("{:.*}", precision, value),
-        'G' => format!("{:.*}", precision, value).to_uppercase(),
+        'g' | 'G' => format_g_style(value, precision, alt_form),
         _ => format!("{:.*}", precision, value),
     };
 
-    if mode == 'F' {
+    if mode == 'F' || mode == 'G' {
         body = body.to_uppercase();
     }
 
     let combined = format!("{}{}", sign, body);
     Ok(apply_width(spec, &combined, sign.len()))
+}
+
+/// Ensure exponent has at least 2 digits (SQLite uses e+03 not e+3)
+fn fix_exponent(s: &str) -> String {
+    if let Some(e_pos) = s.find(|c| c == 'e' || c == 'E') {
+        let (mantissa, exp_part) = s.split_at(e_pos);
+        let exp_char = exp_part.chars().next().unwrap();
+        let rest = &exp_part[1..];
+
+        let (sign, digits) = if rest.starts_with('-') {
+            ("-", &rest[1..])
+        } else if rest.starts_with('+') {
+            ("+", &rest[1..])
+        } else {
+            ("+", rest)
+        };
+
+        if digits.len() == 1 {
+            format!("{}{}{}0{}", mantissa, exp_char, sign, digits)
+        } else {
+            format!("{}{}{}{}", mantissa, exp_char, sign, digits)
+        }
+    } else {
+        s.to_string()
+    }
+}
+
+/// Format using %g style (shortest representation, removes trailing zeros)
+fn format_g_style(value: f64, precision: usize, alt_form: bool) -> String {
+    if !value.is_finite() {
+        return if value.is_nan() {
+            "NaN".to_string()
+        } else if value > 0.0 {
+            "Inf".to_string()
+        } else {
+            "-Inf".to_string()
+        };
+    }
+
+    if value == 0.0 {
+        return if alt_form && precision > 0 {
+            format!("{:.prec$}", 0.0, prec = precision.saturating_sub(1))
+        } else {
+            "0".to_string()
+        };
+    }
+
+    let prec = if precision == 0 { 1 } else { precision };
+    let abs_val = value.abs();
+    let log10 = if abs_val > 0.0 {
+        abs_val.log10().floor() as i32
+    } else {
+        0
+    };
+
+    // Use %e if exponent < -4 or exponent >= precision
+    let use_exp = log10 < -4 || log10 >= prec as i32;
+
+    if use_exp {
+        let formatted = format!("{:.*e}", prec.saturating_sub(1), value);
+        let fixed = fix_exponent(&formatted);
+        if alt_form {
+            fixed
+        } else {
+            remove_trailing_zeros_exp(&fixed)
+        }
+    } else {
+        let decimal_places = (prec as i32 - 1 - log10).max(0) as usize;
+        let formatted = format!("{:.*}", decimal_places, value);
+        if alt_form {
+            formatted
+        } else {
+            remove_trailing_zeros_fixed(&formatted)
+        }
+    }
+}
+
+fn remove_trailing_zeros_exp(s: &str) -> String {
+    if let Some(e_pos) = s.find(|c| c == 'e' || c == 'E') {
+        let (mantissa, exp) = s.split_at(e_pos);
+        let trimmed = mantissa.trim_end_matches('0');
+        let trimmed = if trimmed.ends_with('.') {
+            &trimmed[..trimmed.len() - 1]
+        } else {
+            trimmed
+        };
+        format!("{}{}", trimmed, exp)
+    } else {
+        s.to_string()
+    }
+}
+
+fn remove_trailing_zeros_fixed(s: &str) -> String {
+    if s.contains('.') {
+        let trimmed = s.trim_end_matches('0');
+        if trimmed.ends_with('.') {
+            trimmed[..trimmed.len() - 1].to_string()
+        } else {
+            trimmed.to_string()
+        }
+    } else {
+        s.to_string()
+    }
 }
 
 fn format_string(spec: &PrintfSpec, value: &str) -> Result<String> {

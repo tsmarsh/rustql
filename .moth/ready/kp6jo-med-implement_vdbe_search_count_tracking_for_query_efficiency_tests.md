@@ -94,3 +94,117 @@ make test-where
 Tests like `where-1.1.1` should return correct search counts:
 - With index: low count (3-10)
 - Full scan: high count (~100 for 100 rows)
+
+## Regression Tests (Required)
+
+Add these Rust unit tests to prevent regression:
+
+### 1. `src/vdbe/tests/search_count_tests.rs`
+```rust
+#[cfg(test)]
+mod search_count_tests {
+    use super::*;
+
+    #[test]
+    fn test_search_count_reset() {
+        reset_search_count();
+        assert_eq!(get_search_count(), 0);
+
+        increment_search_count();
+        increment_search_count();
+        assert_eq!(get_search_count(), 2);
+
+        reset_search_count();
+        assert_eq!(get_search_count(), 0);
+    }
+
+    #[test]
+    fn test_table_scan_increments_count() {
+        let db = setup_test_db();
+        db.execute("CREATE TABLE t1(a INT)").unwrap();
+        for i in 0..100 {
+            db.execute(&format!("INSERT INTO t1 VALUES({})", i)).unwrap();
+        }
+
+        reset_search_count();
+        let _: Vec<i32> = db.query("SELECT * FROM t1").unwrap();
+
+        // Full scan of 100 rows should have ~100 Next operations
+        let count = get_search_count();
+        assert!(count >= 100, "Expected >= 100, got {}", count);
+    }
+
+    #[test]
+    fn test_index_seek_low_count() {
+        let db = setup_test_db();
+        db.execute("CREATE TABLE t1(a INT)").unwrap();
+        db.execute("CREATE INDEX i1 ON t1(a)").unwrap();
+        for i in 0..100 {
+            db.execute(&format!("INSERT INTO t1 VALUES({})", i)).unwrap();
+        }
+
+        reset_search_count();
+        let _: Vec<i32> = db.query("SELECT * FROM t1 WHERE a = 50").unwrap();
+
+        // Index seek should have very few operations (seek + maybe 1-2 next)
+        let count = get_search_count();
+        assert!(count <= 10, "Expected <= 10, got {}", count);
+    }
+
+    #[test]
+    fn test_range_query_partial_scan() {
+        let db = setup_test_db();
+        db.execute("CREATE TABLE t1(a INT)").unwrap();
+        db.execute("CREATE INDEX i1 ON t1(a)").unwrap();
+        for i in 0..100 {
+            db.execute(&format!("INSERT INTO t1 VALUES({})", i)).unwrap();
+        }
+
+        reset_search_count();
+        let _: Vec<i32> = db.query("SELECT * FROM t1 WHERE a > 90").unwrap();
+
+        // Range returning ~10 rows should have ~10 operations
+        let count = get_search_count();
+        assert!(count >= 9 && count <= 15, "Expected 9-15, got {}", count);
+    }
+
+    #[test]
+    fn test_count_increments_on_seek_ops() {
+        let db = setup_test_db();
+        db.execute("CREATE TABLE t1(a INT PRIMARY KEY)").unwrap();
+        db.execute("INSERT INTO t1 VALUES(1)").unwrap();
+
+        reset_search_count();
+        let _: Vec<i32> = db.query("SELECT * FROM t1 WHERE a = 1").unwrap();
+
+        // Primary key lookup should have exactly 1 seek
+        let count = get_search_count();
+        assert!(count >= 1, "Expected >= 1, got {}", count);
+    }
+}
+```
+
+### 2. Integration with TCL
+```rust
+// In src/tcl_ext.rs - test the variable is exposed
+#[test]
+fn test_sqlite_search_count_tcl_variable() {
+    // Verify the variable can be read via Tcl
+    let script = r#"
+        sqlite3 db :memory:
+        db eval {CREATE TABLE t1(a INT)}
+        db eval {INSERT INTO t1 VALUES(1)}
+        set ::sqlite_search_count 0
+        db eval {SELECT * FROM t1}
+        set ::sqlite_search_count
+    "#;
+    // Result should be > 0 after query
+}
+```
+
+### Acceptance Criteria
+- [ ] All tests in `search_count_tests.rs` pass
+- [ ] `sqlite_search_count` variable accessible in TCL
+- [ ] `count{}` tests in where.test return non-zero counts
+- [ ] Index queries show lower counts than full scans
+- [ ] No regression in other test suites

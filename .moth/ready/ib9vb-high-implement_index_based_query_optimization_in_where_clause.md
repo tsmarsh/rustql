@@ -114,3 +114,100 @@ Must output: `SEARCH table USING INDEX index_name (column=?)`
 ```bash
 make test-where
 ```
+
+## Regression Tests (Required)
+
+Add these Rust unit tests to prevent regression:
+
+### 1. `src/executor/tests/index_selection_tests.rs`
+```rust
+#[cfg(test)]
+mod index_selection_tests {
+    use super::*;
+
+    #[test]
+    fn test_single_column_equality_uses_index() {
+        let db = setup_test_db();
+        db.execute("CREATE TABLE t1(a INT, b INT)").unwrap();
+        db.execute("CREATE INDEX i1 ON t1(a)").unwrap();
+
+        let plan = db.explain_query_plan("SELECT * FROM t1 WHERE a = 5").unwrap();
+        assert!(plan.contains("SEARCH") && plan.contains("USING INDEX i1"));
+    }
+
+    #[test]
+    fn test_multi_column_index_partial_match() {
+        let db = setup_test_db();
+        db.execute("CREATE TABLE t1(a INT, b INT, c INT)").unwrap();
+        db.execute("CREATE INDEX i1 ON t1(a, b)").unwrap();
+
+        // Only first column matched - should still use index
+        let plan = db.explain_query_plan("SELECT * FROM t1 WHERE a = 5").unwrap();
+        assert!(plan.contains("USING INDEX i1"));
+    }
+
+    #[test]
+    fn test_no_index_when_no_match() {
+        let db = setup_test_db();
+        db.execute("CREATE TABLE t1(a INT, b INT)").unwrap();
+        db.execute("CREATE INDEX i1 ON t1(a)").unwrap();
+
+        // Index on 'a' but WHERE uses 'b' - should scan
+        let plan = db.explain_query_plan("SELECT * FROM t1 WHERE b = 5").unwrap();
+        assert!(plan.contains("SCAN"));
+    }
+
+    #[test]
+    fn test_covering_index_preferred() {
+        let db = setup_test_db();
+        db.execute("CREATE TABLE t1(a INT, b INT, c INT)").unwrap();
+        db.execute("CREATE INDEX i1 ON t1(a, b)").unwrap();
+
+        let plan = db.explain_query_plan("SELECT a, b FROM t1 WHERE a = 5").unwrap();
+        assert!(plan.contains("COVERING INDEX"));
+    }
+
+    #[test]
+    fn test_range_query_uses_index() {
+        let db = setup_test_db();
+        db.execute("CREATE TABLE t1(a INT)").unwrap();
+        db.execute("CREATE INDEX i1 ON t1(a)").unwrap();
+
+        let plan = db.explain_query_plan("SELECT * FROM t1 WHERE a > 5").unwrap();
+        assert!(plan.contains("USING INDEX i1"));
+    }
+
+    #[test]
+    fn test_index_with_multiple_conditions() {
+        let db = setup_test_db();
+        db.execute("CREATE TABLE t1(a INT, b INT)").unwrap();
+        db.execute("CREATE INDEX i1 ON t1(a, b)").unwrap();
+
+        let plan = db.explain_query_plan("SELECT * FROM t1 WHERE a = 5 AND b = 10").unwrap();
+        assert!(plan.contains("USING INDEX i1") && plan.contains("a=? AND b=?"));
+    }
+}
+```
+
+### 2. `src/executor/tests/query_results_tests.rs`
+```rust
+#[test]
+fn test_index_query_returns_correct_results() {
+    let db = setup_test_db();
+    db.execute("CREATE TABLE t1(w INT, x INT, y INT)").unwrap();
+    db.execute("CREATE INDEX i1w ON t1(w)").unwrap();
+
+    for i in 1..=100 {
+        db.execute(&format!("INSERT INTO t1 VALUES({}, {}, {})",
+            i, (i as f64).log2() as i32, i*i + 2*i + 1)).unwrap();
+    }
+
+    let rows: Vec<_> = db.query("SELECT x, y, w FROM t1 WHERE w = 10").unwrap();
+    assert_eq!(rows, vec![(3, 121, 10)]);
+}
+```
+
+### Acceptance Criteria
+- [ ] All tests in `index_selection_tests.rs` pass
+- [ ] `make test-where` shows improvement from 29% baseline
+- [ ] No regression in other test suites

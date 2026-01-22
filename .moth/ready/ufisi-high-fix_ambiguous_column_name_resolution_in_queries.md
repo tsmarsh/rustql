@@ -95,3 +95,130 @@ make test-where
 ## Success Criteria
 - where-1.0 should pass without "ambiguous column name" error
 - Legitimate ambiguous references should still error correctly
+
+## Regression Tests (Required)
+
+Add these Rust unit tests to prevent regression:
+
+### 1. `src/executor/tests/column_resolution_tests.rs`
+```rust
+#[cfg(test)]
+mod column_resolution_tests {
+    use super::*;
+
+    #[test]
+    fn test_unambiguous_single_table() {
+        let db = setup_test_db();
+        db.execute("CREATE TABLE t1(a INT, b INT, c INT)").unwrap();
+        db.execute("INSERT INTO t1 VALUES(1, 2, 3)").unwrap();
+
+        // Unqualified column in single table - should work
+        let result: (i32,) = db.query_row("SELECT b FROM t1").unwrap();
+        assert_eq!(result, (2,));
+    }
+
+    #[test]
+    fn test_unambiguous_different_columns() {
+        let db = setup_test_db();
+        db.execute("CREATE TABLE t1(a INT, b INT)").unwrap();
+        db.execute("CREATE TABLE t2(c INT, d INT)").unwrap();
+        db.execute("INSERT INTO t1 VALUES(1, 2)").unwrap();
+        db.execute("INSERT INTO t2 VALUES(3, 4)").unwrap();
+
+        // Different column names - no ambiguity
+        let result: (i32, i32) = db.query_row(
+            "SELECT a, c FROM t1, t2"
+        ).unwrap();
+        assert_eq!(result, (1, 3));
+    }
+
+    #[test]
+    fn test_ambiguous_same_column_name_errors() {
+        let db = setup_test_db();
+        db.execute("CREATE TABLE t1(x INT)").unwrap();
+        db.execute("CREATE TABLE t2(x INT)").unwrap();
+
+        // Same column name in both tables without qualifier - should error
+        let result = db.execute("SELECT x FROM t1, t2");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn test_qualified_column_not_ambiguous() {
+        let db = setup_test_db();
+        db.execute("CREATE TABLE t1(x INT)").unwrap();
+        db.execute("CREATE TABLE t2(x INT)").unwrap();
+        db.execute("INSERT INTO t1 VALUES(1)").unwrap();
+        db.execute("INSERT INTO t2 VALUES(2)").unwrap();
+
+        // Qualified column names - no ambiguity
+        let result: (i32, i32) = db.query_row(
+            "SELECT t1.x, t2.x FROM t1, t2"
+        ).unwrap();
+        assert_eq!(result, (1, 2));
+    }
+
+    #[test]
+    fn test_alias_resolves_ambiguity() {
+        let db = setup_test_db();
+        db.execute("CREATE TABLE t1(x INT)").unwrap();
+        db.execute("INSERT INTO t1 VALUES(1)").unwrap();
+
+        // Self-join with aliases
+        let result: (i32, i32) = db.query_row(
+            "SELECT a.x, b.x FROM t1 AS a, t1 AS b"
+        ).unwrap();
+        assert_eq!(result, (1, 1));
+    }
+
+    #[test]
+    fn test_subquery_column_shadowing() {
+        let db = setup_test_db();
+        db.execute("CREATE TABLE t1(x INT)").unwrap();
+        db.execute("INSERT INTO t1 VALUES(1)").unwrap();
+
+        // Inner x shadows outer x
+        let result: (i32,) = db.query_row(
+            "SELECT (SELECT x FROM t1 LIMIT 1) FROM t1"
+        ).unwrap();
+        assert_eq!(result, (1,));
+    }
+
+    #[test]
+    fn test_natural_join_not_ambiguous() {
+        let db = setup_test_db();
+        db.execute("CREATE TABLE t1(id INT, a INT)").unwrap();
+        db.execute("CREATE TABLE t2(id INT, b INT)").unwrap();
+        db.execute("INSERT INTO t1 VALUES(1, 10)").unwrap();
+        db.execute("INSERT INTO t2 VALUES(1, 20)").unwrap();
+
+        // NATURAL JOIN - 'id' is joined column, not ambiguous
+        let result: (i32, i32, i32) = db.query_row(
+            "SELECT id, a, b FROM t1 NATURAL JOIN t2"
+        ).unwrap();
+        assert_eq!(result, (1, 10, 20));
+    }
+
+    #[test]
+    fn test_join_using_not_ambiguous() {
+        let db = setup_test_db();
+        db.execute("CREATE TABLE t1(id INT, a INT)").unwrap();
+        db.execute("CREATE TABLE t2(id INT, b INT)").unwrap();
+        db.execute("INSERT INTO t1 VALUES(1, 10)").unwrap();
+        db.execute("INSERT INTO t2 VALUES(1, 20)").unwrap();
+
+        // JOIN USING - 'id' is joined column, not ambiguous
+        let result: (i32,) = db.query_row(
+            "SELECT id FROM t1 JOIN t2 USING(id)"
+        ).unwrap();
+        assert_eq!(result, (1,));
+    }
+}
+```
+
+### Acceptance Criteria
+- [ ] All tests in `column_resolution_tests.rs` pass
+- [ ] where-1.0 passes without "ambiguous column name" error
+- [ ] Legitimate ambiguous column errors still occur
+- [ ] No regression in other test suites

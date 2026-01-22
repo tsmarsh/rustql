@@ -103,3 +103,138 @@ make test-where
 
 ## Success Criteria
 `do_eqp_test` assertions should pass with correct index/scan descriptions.
+
+## Regression Tests (Required)
+
+Add these Rust unit tests to prevent regression:
+
+### 1. `src/executor/tests/explain_query_plan_tests.rs`
+```rust
+#[cfg(test)]
+mod explain_query_plan_tests {
+    use super::*;
+
+    #[test]
+    fn test_eqp_table_scan_format() {
+        let db = setup_test_db();
+        db.execute("CREATE TABLE t1(a INT, b INT)").unwrap();
+
+        let rows = db.query("EXPLAIN QUERY PLAN SELECT * FROM t1").unwrap();
+        assert_eq!(rows.len(), 1);
+
+        // Check column structure: selectid, order, from, detail
+        let row = &rows[0];
+        assert_eq!(row[0], Value::Integer(0)); // selectid
+        assert_eq!(row[1], Value::Integer(0)); // order
+        assert_eq!(row[2], Value::Integer(0)); // from
+
+        // Detail should be "SCAN t1"
+        let detail = row[3].as_text().unwrap();
+        assert!(detail.contains("SCAN") && detail.contains("t1"));
+    }
+
+    #[test]
+    fn test_eqp_index_seek_format() {
+        let db = setup_test_db();
+        db.execute("CREATE TABLE t1(a INT, b INT)").unwrap();
+        db.execute("CREATE INDEX i1 ON t1(a)").unwrap();
+
+        let rows = db.query("EXPLAIN QUERY PLAN SELECT * FROM t1 WHERE a = 5").unwrap();
+        let detail = rows[0][3].as_text().unwrap();
+
+        // Should be "SEARCH t1 USING INDEX i1 (a=?)"
+        assert!(detail.contains("SEARCH"), "Expected SEARCH, got: {}", detail);
+        assert!(detail.contains("t1"), "Expected t1, got: {}", detail);
+        assert!(detail.contains("USING INDEX"), "Expected USING INDEX, got: {}", detail);
+        assert!(detail.contains("i1"), "Expected i1, got: {}", detail);
+        assert!(detail.contains("a=?"), "Expected a=?, got: {}", detail);
+    }
+
+    #[test]
+    fn test_eqp_covering_index_format() {
+        let db = setup_test_db();
+        db.execute("CREATE TABLE t1(a INT, b INT)").unwrap();
+        db.execute("CREATE INDEX i1 ON t1(a, b)").unwrap();
+
+        // Query only uses columns in the index
+        let rows = db.query("EXPLAIN QUERY PLAN SELECT a, b FROM t1 WHERE a = 5").unwrap();
+        let detail = rows[0][3].as_text().unwrap();
+
+        // Should include "COVERING INDEX"
+        assert!(detail.contains("COVERING INDEX"), "Expected COVERING INDEX, got: {}", detail);
+    }
+
+    #[test]
+    fn test_eqp_rowid_lookup_format() {
+        let db = setup_test_db();
+        db.execute("CREATE TABLE t1(a INT PRIMARY KEY, b INT)").unwrap();
+
+        let rows = db.query("EXPLAIN QUERY PLAN SELECT * FROM t1 WHERE a = 5").unwrap();
+        let detail = rows[0][3].as_text().unwrap();
+
+        // Should be "SEARCH t1 USING INTEGER PRIMARY KEY (rowid=?)"
+        assert!(detail.contains("INTEGER PRIMARY KEY") || detail.contains("USING INDEX"),
+            "Expected primary key lookup, got: {}", detail);
+    }
+
+    #[test]
+    fn test_eqp_range_query_format() {
+        let db = setup_test_db();
+        db.execute("CREATE TABLE t1(a INT)").unwrap();
+        db.execute("CREATE INDEX i1 ON t1(a)").unwrap();
+
+        let rows = db.query("EXPLAIN QUERY PLAN SELECT * FROM t1 WHERE a > 5 AND a < 10").unwrap();
+        let detail = rows[0][3].as_text().unwrap();
+
+        // Should show range: "SEARCH t1 USING INDEX i1 (a>? AND a<?)"
+        assert!(detail.contains("SEARCH"), "Expected SEARCH, got: {}", detail);
+        assert!(detail.contains("i1"), "Expected i1, got: {}", detail);
+    }
+
+    #[test]
+    fn test_eqp_multi_column_index_format() {
+        let db = setup_test_db();
+        db.execute("CREATE TABLE t1(a INT, b INT, c INT)").unwrap();
+        db.execute("CREATE INDEX i1 ON t1(a, b)").unwrap();
+
+        let rows = db.query("EXPLAIN QUERY PLAN SELECT * FROM t1 WHERE a = 1 AND b = 2").unwrap();
+        let detail = rows[0][3].as_text().unwrap();
+
+        // Should show both columns: "(a=? AND b=?)"
+        assert!(detail.contains("a=?"), "Expected a=?, got: {}", detail);
+        assert!(detail.contains("b=?"), "Expected b=?, got: {}", detail);
+    }
+
+    #[test]
+    fn test_eqp_order_by_temp_btree() {
+        let db = setup_test_db();
+        db.execute("CREATE TABLE t1(a INT, b INT)").unwrap();
+
+        let rows = db.query("EXPLAIN QUERY PLAN SELECT * FROM t1 ORDER BY b").unwrap();
+
+        // Should include "USE TEMP B-TREE FOR ORDER BY" for non-indexed sort
+        let has_temp_btree = rows.iter().any(|r| {
+            r[3].as_text().map(|s| s.contains("TEMP B-TREE")).unwrap_or(false)
+        });
+        assert!(has_temp_btree || rows.len() == 1, "Expected temp b-tree or simple scan");
+    }
+
+    #[test]
+    fn test_eqp_multiple_tables() {
+        let db = setup_test_db();
+        db.execute("CREATE TABLE t1(a INT)").unwrap();
+        db.execute("CREATE TABLE t2(b INT)").unwrap();
+
+        let rows = db.query("EXPLAIN QUERY PLAN SELECT * FROM t1, t2").unwrap();
+
+        // Should have entries for both tables
+        assert!(rows.len() >= 2, "Expected at least 2 plan entries for 2 tables");
+    }
+}
+```
+
+### Acceptance Criteria
+- [ ] All tests in `explain_query_plan_tests.rs` pass
+- [ ] `do_eqp_test` assertions in where.test pass
+- [ ] EQP output matches SQLite format exactly
+- [ ] No regression in other test suites

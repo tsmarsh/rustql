@@ -92,3 +92,118 @@ make test-index
 ## Success Criteria
 After `db close`, a new `sqlite3 db test.db` should succeed without locking errors.
 All index.test tests should run without cascading "invalid command name db" errors.
+
+## Regression Tests (Required)
+
+Add these Rust unit tests to prevent regression:
+
+### 1. `src/api/tests/connection_lifecycle_tests.rs`
+```rust
+#[cfg(test)]
+mod connection_lifecycle_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_close_releases_lock_for_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        // Open, write, close
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute("CREATE TABLE t1(a INT)").unwrap();
+            db.execute("INSERT INTO t1 VALUES(1)").unwrap();
+            db.close().unwrap();
+        }
+
+        // Reopen should succeed without "database is locked"
+        {
+            let db = Connection::open(&path).unwrap();
+            let rows: Vec<i32> = db.query("SELECT a FROM t1").unwrap();
+            assert_eq!(rows, vec![1]);
+        }
+    }
+
+    #[test]
+    fn test_close_with_pending_transaction_rollback() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute("CREATE TABLE t1(a INT)").unwrap();
+            db.execute("BEGIN").unwrap();
+            db.execute("INSERT INTO t1 VALUES(1)").unwrap();
+            // Don't commit - close should rollback
+            db.close().unwrap();
+        }
+
+        // Reopen and verify rollback happened
+        {
+            let db = Connection::open(&path).unwrap();
+            let count: i32 = db.query_row("SELECT COUNT(*) FROM t1").unwrap();
+            assert_eq!(count, 0); // Insert was rolled back
+        }
+    }
+
+    #[test]
+    fn test_multiple_close_reopen_cycles() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        for i in 0..10 {
+            let db = Connection::open(&path).unwrap();
+            if i == 0 {
+                db.execute("CREATE TABLE t1(a INT)").unwrap();
+            }
+            db.execute(&format!("INSERT INTO t1 VALUES({})", i)).unwrap();
+            db.close().unwrap();
+        }
+
+        let db = Connection::open(&path).unwrap();
+        let count: i32 = db.query_row("SELECT COUNT(*) FROM t1").unwrap();
+        assert_eq!(count, 10);
+    }
+
+    #[test]
+    fn test_drop_releases_lock() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        // Use drop instead of explicit close
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute("CREATE TABLE t1(a INT)").unwrap();
+            // db dropped here
+        }
+
+        // Should be able to reopen
+        let db = Connection::open(&path).unwrap();
+        assert!(db.execute("SELECT * FROM t1").is_ok());
+    }
+}
+```
+
+### 2. `src/pager/tests/lock_release_tests.rs`
+```rust
+#[test]
+fn test_pager_close_releases_file_lock() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test.db");
+
+    let pager = Pager::open(&path).unwrap();
+    pager.close().unwrap();
+
+    // File should be unlocked - another open should work
+    let pager2 = Pager::open(&path).unwrap();
+    assert!(pager2.is_ok());
+}
+```
+
+### Acceptance Criteria
+- [ ] All tests in `connection_lifecycle_tests.rs` pass
+- [ ] All tests in `lock_release_tests.rs` pass
+- [ ] `make test-index` runs without cascading lock errors
+- [ ] No regression in other test suites

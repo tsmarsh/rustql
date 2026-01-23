@@ -48,6 +48,14 @@ pub trait PcacheImpl {
     fn truncate(&mut self, pgno: Pgno);
     fn destroy(&mut self);
     fn shrink(&mut self);
+    /// Check if cache is at or near capacity (may need spilling)
+    fn needs_spill(&self) -> bool {
+        false
+    }
+    /// Get the maximum cache size
+    fn max_size(&self) -> i32 {
+        0
+    }
 }
 
 /// Page cache wrapper for a pager.
@@ -170,6 +178,29 @@ impl PCache {
     /// Get the total reference count sum across all pages
     pub fn ref_count(&self) -> i64 {
         self.n_ref_sum
+    }
+
+    /// Get the number of pages in the cache
+    pub fn page_count(&self) -> i32 {
+        self.cache.page_count()
+    }
+
+    /// Check if cache needs spilling (at or near capacity)
+    pub fn needs_spill(&self) -> bool {
+        self.cache.needs_spill()
+    }
+
+    /// Get the dirty page count
+    pub fn dirty_count(&self) -> i32 {
+        let mut count = 0;
+        let mut current = self.dirty_head;
+        while let Some(page) = current {
+            count += 1;
+            unsafe {
+                current = page.as_ref().dirty_next;
+            }
+        }
+        count
     }
 
     fn manage_dirty_list(&mut self, page: NonNull<PgHdr>, op: DirtyListOp) {
@@ -326,8 +357,13 @@ impl PcacheImpl for PCache1 {
             return None;
         }
 
+        // Enforce cache size limits: if cache is full, try to evict
         if self.purgeable && self.n_page >= self.n_max {
-            self.evict_lru();
+            if self.evict_lru().is_none() {
+                // Eviction failed (all pages pinned) - respect cache limit
+                // Return None to signal cache is full
+                return None;
+            }
         }
 
         Some(self.allocate_page(pgno))
@@ -378,5 +414,142 @@ impl PcacheImpl for PCache1 {
                 break;
             }
         }
+    }
+
+    fn needs_spill(&self) -> bool {
+        // Cache needs spilling when we're at 90% capacity or more
+        self.purgeable && self.n_page >= self.n90pct
+    }
+
+    fn max_size(&self) -> i32 {
+        self.n_max as i32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cache_size_limit_enforced() {
+        let mut cache = PCache::open(1024, 0, true);
+        cache.set_cache_size(2);
+
+        // Fetch first page - should succeed
+        let p1 = cache.fetch(1, true);
+        assert!(p1.is_some(), "First page should be allocated");
+
+        // Fetch second page - should succeed (cache size is 2)
+        let p2 = cache.fetch(2, true);
+        assert!(p2.is_some(), "Second page should be allocated");
+
+        // Both pages are pinned (n_ref > 0), so third page should fail
+        // when cache is full and no eviction possible
+        let p3 = cache.fetch(3, true);
+        assert!(
+            p3.is_none(),
+            "pcache should not grow beyond cache_size when all pages pinned"
+        );
+
+        // Release first page
+        if let Some(page) = p1 {
+            cache.release(page);
+        }
+
+        // Now third page should succeed (p1 can be evicted)
+        let p3 = cache.fetch(3, true);
+        assert!(
+            p3.is_some(),
+            "Third page should succeed after releasing first"
+        );
+
+        // Cleanup
+        if let Some(page) = p2 {
+            cache.release(page);
+        }
+        if let Some(page) = p3 {
+            cache.release(page);
+        }
+    }
+
+    #[test]
+    fn test_cache_eviction_with_unpinned_pages() {
+        let mut cache = PCache::open(1024, 0, true);
+        cache.set_cache_size(2);
+
+        // Fetch and immediately release a page (so it's unpinned)
+        let p1 = cache.fetch(1, true).unwrap();
+        cache.release(p1);
+
+        // Fetch second page
+        let p2 = cache.fetch(2, true).unwrap();
+        cache.release(p2);
+
+        // Cache is full but both pages are unpinned
+        // Third page should succeed via eviction
+        let p3 = cache.fetch(3, true);
+        assert!(p3.is_some(), "Third page should succeed via LRU eviction");
+
+        if let Some(page) = p3 {
+            cache.release(page);
+        }
+    }
+
+    #[test]
+    fn test_needs_spill_at_90_percent() {
+        let mut cache = PCache::open(1024, 0, true);
+        cache.set_cache_size(10);
+
+        // Fill cache to 90% (9 pages)
+        for i in 1..=8 {
+            let page = cache.fetch(i, true).unwrap();
+            cache.release(page);
+        }
+        assert!(!cache.needs_spill(), "Should not need spill at 80%");
+
+        let page = cache.fetch(9, true).unwrap();
+        cache.release(page);
+        assert!(cache.needs_spill(), "Should need spill at 90%");
+    }
+
+    #[test]
+    fn test_page_count() {
+        let mut cache = PCache::open(1024, 0, true);
+        cache.set_cache_size(10);
+
+        assert_eq!(cache.page_count(), 0);
+
+        let p1 = cache.fetch(1, true).unwrap();
+        assert_eq!(cache.page_count(), 1);
+
+        let p2 = cache.fetch(2, true).unwrap();
+        assert_eq!(cache.page_count(), 2);
+
+        cache.release(p1);
+        cache.release(p2);
+        // Pages still in cache (unpinned), count should be same
+        assert_eq!(cache.page_count(), 2);
+    }
+
+    #[test]
+    fn test_dirty_count() {
+        let mut cache = PCache::open(1024, 0, true);
+        cache.set_cache_size(10);
+
+        assert_eq!(cache.dirty_count(), 0);
+
+        let p1 = cache.fetch(1, true).unwrap();
+        cache.make_dirty(p1);
+        assert_eq!(cache.dirty_count(), 1);
+
+        let p2 = cache.fetch(2, true).unwrap();
+        cache.make_dirty(p2);
+        assert_eq!(cache.dirty_count(), 2);
+
+        cache.make_clean(p1);
+        assert_eq!(cache.dirty_count(), 1);
+
+        cache.release(p1);
+        cache.release(p2);
     }
 }

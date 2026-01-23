@@ -340,14 +340,11 @@ impl JournalHeader {
     }
 }
 
-/// Generate a random nonce for journal checksum
+/// Generate a random nonce for journal checksum using strong randomness
 fn rand_nonce() -> u32 {
-    // Simple PRNG for now - in production use proper randomness
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    (duration.as_nanos() & 0xFFFFFFFF) as u32
+    let mut buf = [0u8; 4];
+    crate::sqlite3_randomness(&mut buf);
+    u32::from_le_bytes(buf)
 }
 
 // ============================================================================
@@ -1177,10 +1174,12 @@ impl Pager {
             self.jfd = Some(jfd);
 
             // Write journal header
+            // Use VFS sector size from database file, defaulting to 4096
+            let sector_size = self.fd.as_ref().map(|f| f.sector_size()).unwrap_or(4096) as u32;
             let header = JournalHeader::new(
                 0, // page count will be updated as we write
                 self.db_orig_size,
-                4096, // sector size
+                sector_size,
                 self.page_size,
             );
             self.checksum_nonce = header.nonce;
@@ -1638,5 +1637,29 @@ mod tests {
         assert_eq!(page.data.len(), 4096);
         assert!(!page.is_dirty());
         assert!(!page.is_writeable());
+    }
+
+    #[test]
+    fn test_rand_nonce_is_random() {
+        // Generate multiple nonces and verify they're not all the same
+        // (very unlikely with strong randomness)
+        let nonce1 = rand_nonce();
+        let nonce2 = rand_nonce();
+        let nonce3 = rand_nonce();
+
+        // At least some should be different (with overwhelming probability)
+        let all_same = nonce1 == nonce2 && nonce2 == nonce3;
+        assert!(!all_same, "nonces should be random, not all same");
+    }
+
+    #[test]
+    fn test_journal_header_with_different_sector_sizes() {
+        // Test with various sector sizes to ensure they're preserved
+        for sector_size in [512, 1024, 2048, 4096, 8192] {
+            let header = JournalHeader::new(100, 50, sector_size, 4096);
+            let bytes = header.to_bytes();
+            let parsed = JournalHeader::from_bytes(&bytes).unwrap();
+            assert_eq!(parsed.sector_size, sector_size);
+        }
     }
 }

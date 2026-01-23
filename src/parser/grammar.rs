@@ -2473,6 +2473,8 @@ impl<'a> Parser<'a> {
             || self.check(TokenKind::String)
             || self.check(TokenKind::Blob)
             || self.check(TokenKind::Null)
+            || self.check(TokenKind::True)
+            || self.check(TokenKind::False)
             || self.check(TokenKind::CurrentTime)
             || self.check(TokenKind::CurrentDate)
             || self.check(TokenKind::CurrentTimestamp)
@@ -2545,8 +2547,9 @@ impl<'a> Parser<'a> {
             return Ok(Expr::Parens(Box::new(expr)));
         }
 
-        // Identifier (column reference or function call)
-        if self.check(TokenKind::Identifier) {
+        // Identifier or keyword (column reference or function call)
+        // Keywords like GLOB, LIKE, REPLACE can be used as function names
+        if self.check(TokenKind::Identifier) || self.current().kind.is_keyword() {
             return self.parse_identifier_or_function();
         }
 
@@ -2559,6 +2562,8 @@ impl<'a> Parser<'a> {
 
         match token.kind {
             TokenKind::Null => Ok(Literal::Null),
+            TokenKind::True => Ok(Literal::Integer(1)),
+            TokenKind::False => Ok(Literal::Integer(0)),
             TokenKind::Integer => {
                 let text = token.text(self.source);
                 let value = if text.starts_with("0x") || text.starts_with("0X") {

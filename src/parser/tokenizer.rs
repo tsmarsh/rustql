@@ -75,6 +75,7 @@ pub enum TokenKind {
     Exists,
     Explain,
     Fail,
+    False,
     Filter,
     First,
     Following,
@@ -157,6 +158,7 @@ pub enum TokenKind {
     To,
     Transaction,
     Trigger,
+    True,
     Unbounded,
     Union,
     Unique,
@@ -270,6 +272,7 @@ impl TokenKind {
                 | TokenKind::Exists
                 | TokenKind::Explain
                 | TokenKind::Fail
+                | TokenKind::False
                 | TokenKind::Filter
                 | TokenKind::First
                 | TokenKind::Following
@@ -352,6 +355,7 @@ impl TokenKind {
                 | TokenKind::To
                 | TokenKind::Transaction
                 | TokenKind::Trigger
+                | TokenKind::True
                 | TokenKind::Unbounded
                 | TokenKind::Union
                 | TokenKind::Unique
@@ -961,6 +965,7 @@ fn keyword_or_identifier(text: &str) -> TokenKind {
         "EXISTS" => TokenKind::Exists,
         "EXPLAIN" => TokenKind::Explain,
         "FAIL" => TokenKind::Fail,
+        "FALSE" => TokenKind::False,
         "FILTER" => TokenKind::Filter,
         "FIRST" => TokenKind::First,
         "FOLLOWING" => TokenKind::Following,
@@ -1043,6 +1048,7 @@ fn keyword_or_identifier(text: &str) -> TokenKind {
         "TO" => TokenKind::To,
         "TRANSACTION" => TokenKind::Transaction,
         "TRIGGER" => TokenKind::Trigger,
+        "TRUE" => TokenKind::True,
         "UNBOUNDED" => TokenKind::Unbounded,
         "UNION" => TokenKind::Union,
         "UNIQUE" => TokenKind::Unique,

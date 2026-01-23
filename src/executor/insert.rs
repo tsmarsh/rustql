@@ -164,7 +164,7 @@ impl<'a> InsertCompiler<'a> {
         conflict_action: ConflictAction,
     ) -> Result<()> {
         // Build column index map if columns specified
-        let col_targets = self.build_column_map(&insert.columns)?;
+        let col_targets = self.build_column_map(&insert.table.name, &insert.columns)?;
 
         // Validate column count for each row
         let expected_cols = col_targets.len();
@@ -263,14 +263,7 @@ impl<'a> InsertCompiler<'a> {
     }
 
     fn infer_num_columns(&self, insert: &InsertStmt) -> usize {
-        // If column list is specified, use that count
-        if let Some(cols) = &insert.columns {
-            if !cols.is_empty() {
-                return cols.iter().filter(|col| !is_rowid_alias(col)).count();
-            }
-        }
-
-        // If schema is available, use actual table column count
+        // Always try to get actual table column count from schema
         if let Some(schema) = self.schema {
             let table_name_lower = insert.table.name.to_lowercase();
             if let Some(table) = schema.tables.get(&table_name_lower) {
@@ -278,7 +271,14 @@ impl<'a> InsertCompiler<'a> {
             }
         }
 
-        // Fallback: infer from source (less accurate)
+        // Fallback: if column list is specified, use that count
+        if let Some(cols) = &insert.columns {
+            if !cols.is_empty() {
+                return cols.iter().filter(|col| !is_rowid_alias(col)).count();
+            }
+        }
+
+        // Final fallback: infer from source (less accurate)
         match &insert.source {
             InsertSource::Values(rows) => rows.first().map(|row| row.len()).unwrap_or(0),
             InsertSource::Select(select) => self.count_select_columns(select),
@@ -327,7 +327,7 @@ impl<'a> InsertCompiler<'a> {
         conflict_action: ConflictAction,
     ) -> Result<()> {
         // Build column index map
-        let col_targets = self.build_column_map(&insert.columns)?;
+        let col_targets = self.build_column_map(&insert.table.name, &insert.columns)?;
 
         // Extract SELECT expressions to check for complexity
         let select_exprs = self.get_select_expressions(select);
@@ -1122,18 +1122,49 @@ impl<'a> InsertCompiler<'a> {
     }
 
     /// Build column index map from column list
-    fn build_column_map(&self, columns: &Option<Vec<String>>) -> Result<Vec<InsertColumnTarget>> {
+    fn build_column_map(
+        &self,
+        table_name: &str,
+        columns: &Option<Vec<String>>,
+    ) -> Result<Vec<InsertColumnTarget>> {
         match columns {
             Some(cols) => {
-                // Map specified columns to indices
+                // Map specified columns to their actual table indices
                 let mut targets = Vec::with_capacity(cols.len());
-                let mut next_idx = 0usize;
+
+                // Get the table schema for column validation and mapping
+                let table_lower = table_name.to_lowercase();
+                let table_opt = self.schema.and_then(|s| s.tables.get(&table_lower));
+
+                // Validate each column name and map to actual index
                 for col in cols {
                     if is_rowid_alias(col) {
                         targets.push(InsertColumnTarget::Rowid);
                     } else {
-                        targets.push(InsertColumnTarget::Column(next_idx));
-                        next_idx += 1;
+                        // Try to find the column in the schema
+                        if let Some(table) = table_opt {
+                            let col_lower = col.to_lowercase();
+                            let col_index = table
+                                .columns
+                                .iter()
+                                .position(|c| c.name.to_lowercase() == col_lower);
+
+                            match col_index {
+                                Some(idx) => {
+                                    targets.push(InsertColumnTarget::Column(idx));
+                                }
+                                None => {
+                                    // Column doesn't exist in table
+                                    return Err(crate::error::Error::with_message(
+                                        crate::error::ErrorCode::Error,
+                                        format!("table {} has no column named {}", table_name, col),
+                                    ));
+                                }
+                            }
+                        } else {
+                            // No schema available - we'll accept the column names and validate at runtime
+                            targets.push(InsertColumnTarget::Column(0));
+                        }
                     }
                 }
                 Ok(targets)

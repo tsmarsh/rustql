@@ -1432,8 +1432,28 @@ impl<'a> Parser<'a> {
             return Ok(DefaultValue::CurrentTimestamp);
         }
 
+        // Handle unary operators for literals (+ or -)
+        let is_negative = if self.match_token(TokenKind::Minus) {
+            true
+        } else {
+            self.match_token(TokenKind::Plus);
+            false
+        };
+
         // Literal value
-        let literal = self.parse_literal()?;
+        let mut literal = self.parse_literal()?;
+
+        // Apply unary minus if needed
+        if is_negative {
+            match literal {
+                Literal::Integer(n) => literal = Literal::Integer(-n),
+                Literal::Float(f) => literal = Literal::Float(-f),
+                _ => {
+                    return Err(self.error("unary minus only allowed on numeric literals"));
+                }
+            }
+        }
+
         Ok(DefaultValue::Literal(literal))
     }
 

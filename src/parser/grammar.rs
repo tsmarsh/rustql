@@ -2455,7 +2455,9 @@ impl<'a> Parser<'a> {
     fn parse_collate_expr(&mut self) -> Result<Expr> {
         let mut expr = self.parse_primary_expr()?;
 
-        if self.match_token(TokenKind::Collate) {
+        // Handle multiple chained COLLATE clauses (e.g., ORDER BY 1 COLLATE nocase COLLATE binary)
+        // The last COLLATE takes precedence
+        while self.match_token(TokenKind::Collate) {
             let collation = self.expect_identifier()?;
             expr = Expr::Collate {
                 expr: Box::new(expr),

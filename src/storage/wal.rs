@@ -427,7 +427,9 @@ lazy_static! {
 }
 
 fn shared_wal_shm(db_path: &str) -> Arc<Mutex<WalShm>> {
-    let mut registry = WAL_SHM_REGISTRY.lock().unwrap();
+    let mut registry = WAL_SHM_REGISTRY
+        .lock()
+        .expect("WAL SHM registry mutex poisoned");
     if let Some(weak) = registry.get(db_path) {
         if let Some(shared) = weak.upgrade() {
             return shared;
@@ -626,7 +628,7 @@ impl Wal {
     }
 
     fn with_shm<R>(&self, f: impl FnOnce(&mut WalShm) -> R) -> R {
-        let mut shm = self.shm.lock().unwrap();
+        let mut shm = self.shm.lock().expect("WAL shared memory mutex poisoned");
         f(&mut shm)
     }
 
@@ -644,7 +646,9 @@ impl Wal {
         self.wal_fd = None;
 
         if Arc::strong_count(&self.shm) == 1 {
-            let mut registry = WAL_SHM_REGISTRY.lock().unwrap();
+            let mut registry = WAL_SHM_REGISTRY
+                .lock()
+                .expect("WAL SHM registry mutex poisoned");
             registry.remove(&self.db_path);
         }
 
@@ -663,7 +667,7 @@ impl Wal {
         }
 
         // Acquire a read lock slot for this connection.
-        let mut shm = self.shm.lock().unwrap();
+        let mut shm = self.shm.lock().expect("WAL shared memory mutex poisoned");
         let mut slot = None;
         for i in 0..WAL_NREADER {
             if !shm.read_held[i] {
@@ -690,7 +694,7 @@ impl Wal {
         // Release the read lock
         let slot = self.read_lock as usize;
         if slot < WAL_NREADER {
-            let mut shm = self.shm.lock().unwrap();
+            let mut shm = self.shm.lock().expect("WAL shared memory mutex poisoned");
             shm.read_held[slot] = false;
             shm.read_marks[slot] = 0;
         }
@@ -711,7 +715,7 @@ impl Wal {
                 // Check if frame is within our read snapshot
                 if self.read_lock != WAL_READ_LOCK_NONE {
                     let read_mark = {
-                        let shm = self.shm.lock().unwrap();
+                        let shm = self.shm.lock().expect("WAL shared memory mutex poisoned");
                         shm.read_marks[self.read_lock as usize]
                     };
                     if frame <= read_mark {
@@ -941,7 +945,7 @@ impl Wal {
         // This depends on active readers
         let mut safe_frame = self.max_frame;
         let (read_marks, read_held) = {
-            let shm = self.shm.lock().unwrap();
+            let shm = self.shm.lock().expect("WAL shared memory mutex poisoned");
             (shm.read_marks, shm.read_held)
         };
         for (read_mark, held) in read_marks.iter().zip(read_held.iter()) {
@@ -1062,7 +1066,7 @@ impl Wal {
 
         // Reset shared memory read marks only if no other connections exist.
         if Arc::strong_count(&self.shm) == 1 {
-            let mut shm = self.shm.lock().unwrap();
+            let mut shm = self.shm.lock().expect("WAL shared memory mutex poisoned");
             for mark in shm.read_marks.iter_mut() {
                 *mark = 0;
             }

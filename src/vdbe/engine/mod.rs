@@ -4,59 +4,13 @@
 //! executes all SQL statements. This module implements the main execution
 //! loop and manages the virtual machine state.
 
+mod state;
+
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
-
-// ============================================================================
-// Global Search Counter (for sqlite_search_count compatibility)
-// ============================================================================
-
-/// Global counter for tracking VDBE search operations (SeekGE, SeekGT, etc.)
-/// This is used by sqlite_search_count() for test compatibility.
-static SEARCH_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Get the current search count (for sqlite_search_count() function)
-pub fn get_search_count() -> u64 {
-    SEARCH_COUNT.load(AtomicOrdering::Relaxed)
-}
-
-/// Reset the search count to zero
-pub fn reset_search_count() {
-    SEARCH_COUNT.store(0, AtomicOrdering::Relaxed);
-}
-
-/// Increment the search count
-fn inc_search_count() {
-    SEARCH_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
-}
-
-// ============================================================================
-// Global Sort Flag (for db status sort compatibility)
-// ============================================================================
-
-use std::sync::atomic::AtomicBool;
-
-/// Global flag for tracking whether a sort operation was performed.
-/// This is used by TCL's "db status sort" for test compatibility.
-static SORT_FLAG: AtomicBool = AtomicBool::new(false);
-
-/// Get whether a sort was performed in the most recent query
-pub fn get_sort_flag() -> bool {
-    SORT_FLAG.load(AtomicOrdering::Relaxed)
-}
-
-/// Reset the sort flag to false (call before executing a query)
-pub fn reset_sort_flag() {
-    SORT_FLAG.store(false, AtomicOrdering::Relaxed);
-}
-
-/// Set the sort flag to true (called when SorterSort executes)
-fn set_sort_flag() {
-    SORT_FLAG.store(true, AtomicOrdering::Relaxed);
-}
 
 use crate::api::{SqliteConnection, TransactionState};
 use crate::error::{Error, ErrorCode, Result};
@@ -71,39 +25,16 @@ use crate::types::{ColumnType, OpenFlags, Pgno, Value};
 use crate::vdbe::mem::Mem;
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
-// ============================================================================
-// Constants
-// ============================================================================
+// Re-export from state module
+pub use state::{get_search_count, get_sort_flag, reset_search_count, reset_sort_flag};
 
-/// Magic number for valid VDBE state
-const VDBE_MAGIC_INIT: u32 = 0x26bceaa5;
-const VDBE_MAGIC_RUN: u32 = 0xbdf20da3;
-const VDBE_MAGIC_HALT: u32 = 0x519c2973;
-const VDBE_MAGIC_DEAD: u32 = 0xb606c3c8;
-
-/// Default number of memory cells
-const DEFAULT_MEM_SIZE: usize = 128;
-
-/// Default number of cursor slots
-const DEFAULT_CURSOR_SLOTS: usize = 16;
-
-// OPFLAG constants (from SQLite's vdbe.h)
-const OPFLAG_NCHANGE: u16 = 0x01;
-const OPFLAG_LASTROWID: u16 = 0x20;
-const OPFLAG_ISUPDATE: u16 = 0x04;
-const OPFLAG_APPEND: u16 = 0x08;
-
-// Conflict resolution modes (from SQLite's sqlite.h - OE_* constants)
-// These are encoded in bits 0-4 of P5 for Insert/Update/Delete
-const OE_NONE: u8 = 0;
-const OE_ROLLBACK: u8 = 1;
-const OE_ABORT: u8 = 2; // Default
-const OE_FAIL: u8 = 3;
-const OE_IGNORE: u8 = 4;
-const OE_REPLACE: u8 = 5;
-
-// Mask to extract conflict resolution from P5
-const OE_MASK: u8 = 0x1F;
+// Use state module items locally
+use state::{
+    inc_search_count, set_sort_flag, DEFAULT_CURSOR_SLOTS, DEFAULT_MEM_SIZE, OE_ABORT, OE_FAIL,
+    OE_IGNORE, OE_MASK, OE_NONE, OE_REPLACE, OE_ROLLBACK, OPFLAG_APPEND, OPFLAG_ISUPDATE,
+    OPFLAG_LASTROWID, OPFLAG_NCHANGE, VDBE_MAGIC_DEAD, VDBE_MAGIC_HALT, VDBE_MAGIC_INIT,
+    VDBE_MAGIC_RUN,
+};
 
 // ============================================================================
 // Execution Result

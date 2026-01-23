@@ -1,12 +1,13 @@
 //! B-tree implementation
 
+mod encoding;
+mod types;
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock, Weak};
-
-use bitflags::bitflags;
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::schema::Schema;
@@ -17,153 +18,28 @@ use crate::storage::pager::{
 use crate::types::{Connection, OpenFlags, Pgno, RowId, Value, Vfs};
 use crate::util::bitvec::BitVec;
 
-const BTREE_PAGEFLAG_INTKEY: u8 = 0x01;
-const BTREE_PAGEFLAG_ZERODATA: u8 = 0x02;
-const BTREE_PAGEFLAG_LEAFDATA: u8 = 0x04;
-const BTREE_PAGEFLAG_LEAF: u8 = 0x08;
+// Re-export types from submodules
+pub use encoding::{
+    get_varint, get_varint32, put_varint, read_u16, read_u32, read_varint, read_varint32,
+    read_varint_at, varint_len, write_u16, write_u32, write_varint,
+};
+pub use types::{
+    BtCursorFlags, BtLock, BtreeCursorFlags, BtreeInsertFlags, BtreeOpenFlags, BtsFlags, CollSeq,
+    CursorHints, CursorState, DbHeader, PageLimits, RecordField, TransState, BTCURSOR_MAX_DEPTH,
+    BTREE_APPLICATION_ID, BTREE_AUTOVACUUM_FULL, BTREE_AUTOVACUUM_INCR, BTREE_AUTOVACUUM_NONE,
+    BTREE_BLOBKEY, BTREE_DATA_VERSION, BTREE_DEFAULT_CACHE_SIZE, BTREE_FILE_FORMAT,
+    BTREE_FREE_PAGE_COUNT, BTREE_HINT_RANGE, BTREE_INCR_VACUUM, BTREE_INTKEY,
+    BTREE_LARGEST_ROOT_PAGE, BTREE_PAGEFLAG_INTKEY, BTREE_PAGEFLAG_LEAF, BTREE_PAGEFLAG_LEAFDATA,
+    BTREE_PAGEFLAG_ZERODATA, BTREE_SCHEMA_VERSION, BTREE_TEXT_ENCODING, BTREE_USER_VERSION,
+    BT_MAX_LOCAL, CELL_PTR_SIZE, DEFAULT_PAGE_SIZE, KEYINFO_ORDER_DESC, KEYINFO_ORDER_NULLS_FIRST,
+    MAX_EMBEDDED, MAX_PAGE_SIZE, MIN_EMBEDDED, MIN_PAGE_SIZE, PAGE_HEADER_SIZE_INTERIOR,
+    PAGE_HEADER_SIZE_LEAF, PTF_INDEX_INTERIOR, PTF_INDEX_LEAF, PTF_INTKEY, PTF_LEAF, PTF_LEAFDATA,
+    PTF_TABLE_INTERIOR, PTF_TABLE_LEAF, PTF_ZERODATA, PTRMAP_BTREE, PTRMAP_FREEPAGE,
+    PTRMAP_OVERFLOW1, PTRMAP_OVERFLOW2, PTRMAP_ROOTPAGE, SQLITE_FILE_HEADER, SQLITE_N_BTREE_META,
+};
 
-pub const PTF_INTKEY: u8 = BTREE_PAGEFLAG_INTKEY;
-pub const PTF_ZERODATA: u8 = BTREE_PAGEFLAG_ZERODATA;
-pub const PTF_LEAFDATA: u8 = BTREE_PAGEFLAG_LEAFDATA;
-pub const PTF_LEAF: u8 = BTREE_PAGEFLAG_LEAF;
-pub const PTF_TABLE_LEAF: u8 = PTF_INTKEY | PTF_LEAFDATA | PTF_LEAF;
-pub const PTF_TABLE_INTERIOR: u8 = PTF_INTKEY | PTF_LEAFDATA;
-pub const PTF_INDEX_LEAF: u8 = PTF_LEAF | PTF_ZERODATA;
-pub const PTF_INDEX_INTERIOR: u8 = PTF_ZERODATA;
-
-pub const PAGE_HEADER_SIZE_LEAF: usize = 8;
-pub const PAGE_HEADER_SIZE_INTERIOR: usize = 12;
-pub const MAX_EMBEDDED: u8 = 64;
-pub const MIN_EMBEDDED: u8 = 32;
-pub const CELL_PTR_SIZE: usize = 2;
-pub const MAX_PAGE_SIZE: u32 = 65536;
-pub const MIN_PAGE_SIZE: u32 = 512;
-pub const DEFAULT_PAGE_SIZE: u32 = 4096;
-
-pub const BTREE_AUTOVACUUM_NONE: u8 = 0;
-pub const BTREE_AUTOVACUUM_FULL: u8 = 1;
-pub const BTREE_AUTOVACUUM_INCR: u8 = 2;
-
-pub const BTREE_INTKEY: u8 = 1;
-pub const BTREE_BLOBKEY: u8 = 2;
-pub const BTREE_HINT_RANGE: u8 = 0;
-
-pub const BTREE_FREE_PAGE_COUNT: usize = 0;
-pub const BTREE_SCHEMA_VERSION: usize = 1;
-pub const BTREE_FILE_FORMAT: usize = 2;
-pub const BTREE_DEFAULT_CACHE_SIZE: usize = 3;
-pub const BTREE_LARGEST_ROOT_PAGE: usize = 4;
-pub const BTREE_TEXT_ENCODING: usize = 5;
-pub const BTREE_USER_VERSION: usize = 6;
-pub const BTREE_INCR_VACUUM: usize = 7;
-pub const BTREE_APPLICATION_ID: usize = 8;
-pub const BTREE_DATA_VERSION: usize = 15;
-pub const SQLITE_N_BTREE_META: usize = 16;
-pub const BTCURSOR_MAX_DEPTH: usize = 20;
-pub const BT_MAX_LOCAL: u16 = 65501;
-
-pub const PTRMAP_ROOTPAGE: u8 = 1;
-pub const PTRMAP_FREEPAGE: u8 = 2;
-pub const PTRMAP_OVERFLOW1: u8 = 3;
-pub const PTRMAP_OVERFLOW2: u8 = 4;
-pub const PTRMAP_BTREE: u8 = 5;
-pub const SQLITE_FILE_HEADER: &[u8; 16] = b"SQLite format 3\0";
-
-bitflags! {
-    #[derive(Clone, Copy)]
-    pub struct BtreeOpenFlags: u8 {
-        const OMIT_JOURNAL = 0x01;
-        const MEMORY = 0x02;
-        const SINGLE = 0x04;
-        const UNORDERED = 0x08;
-    }
-}
-
-bitflags! {
-    pub struct BtsFlags: u16 {
-        const READ_ONLY = 0x0001;
-        const PAGESIZE_FIXED = 0x0002;
-        const SECURE_DELETE = 0x0004;
-        const OVERWRITE = 0x0008;
-        const FAST_SECURE = 0x000c;
-        const INITIALLY_EMPTY = 0x0010;
-        const NO_WAL = 0x0020;
-        const EXCLUSIVE = 0x0040;
-        const PENDING = 0x0080;
-    }
-}
-
-bitflags! {
-    pub struct BtreeCursorFlags: u32 {
-        const BULKLOAD = 0x0000_0001;
-        const SEEK_EQ = 0x0000_0002;
-        const WRCSR = 0x0000_0004;
-        const FORDELETE = 0x0000_0008;
-    }
-}
-
-bitflags! {
-    pub struct BtreeInsertFlags: u8 {
-        const SAVEPOSITION = 0x02;
-        const AUXDELETE = 0x04;
-        const APPEND = 0x08;
-        /// Use seek_result parameter to skip internal seek - cursor is already positioned
-        const USESEEKRESULT = 0x10;
-        const PREFORMAT = 0x80;
-    }
-}
-
-bitflags! {
-    pub struct BtCursorFlags: u8 {
-        const WRITE = 0x01;
-        const VALID_NKEY = 0x02;
-        const VALID_OVFL = 0x04;
-        const AT_LAST = 0x08;
-        const INCRBLOB = 0x10;
-        const MULTIPLE = 0x20;
-        const PINNED = 0x40;
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum TransState {
-    None = 0,
-    Read = 1,
-    Write = 2,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum BtLock {
-    Read = 1,
-    Write = 2,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum CursorState {
-    Valid = 0,
-    Invalid = 1,
-    SkipNext = 2,
-    RequireSeek = 3,
-    Fault = 4,
-}
-
-bitflags! {
-    pub struct CursorHints: u8 {
-        const NONE = 0;
-        const BULKLOAD = 0x01;
-        const SEEK_EQ = 0x02;
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct BtTableLockEntry {
-    table: i32,
-    btree_id: usize,
-    lock_type: BtLock,
-}
+// Use types from submodules locally
+use types::BtTableLockEntry;
 
 thread_local! {
     static SHARED_CACHE_REGISTRY: RefCell<HashMap<String, Weak<RwLock<BtShared>>>> =
@@ -365,60 +241,6 @@ pub struct CellInfo {
     pub overflow_pgno: Option<Pgno>,
 }
 
-/// Sort order flags for KeyInfo columns
-pub const KEYINFO_ORDER_DESC: u8 = 0x01;
-pub const KEYINFO_ORDER_NULLS_FIRST: u8 = 0x02;
-
-/// Collation sequence type for string comparison
-#[derive(Clone)]
-pub enum CollSeq {
-    /// Binary comparison (memcmp, default)
-    Binary,
-    /// Case-insensitive comparison for ASCII
-    NoCase,
-    /// Ignore trailing spaces
-    RTrim,
-    /// Custom collation with name and comparison function
-    Custom {
-        name: String,
-        cmp: Arc<dyn Fn(&str, &str) -> std::cmp::Ordering + Send + Sync>,
-    },
-}
-
-impl CollSeq {
-    /// Compare two strings using this collation
-    pub fn compare(&self, a: &str, b: &str) -> std::cmp::Ordering {
-        match self {
-            CollSeq::Binary => a.cmp(b),
-            CollSeq::NoCase => a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()),
-            CollSeq::RTrim => a.trim_end().cmp(b.trim_end()),
-            CollSeq::Custom { cmp, .. } => cmp(a, b),
-        }
-    }
-
-    /// Get the name of this collation
-    pub fn name(&self) -> &str {
-        match self {
-            CollSeq::Binary => "BINARY",
-            CollSeq::NoCase => "NOCASE",
-            CollSeq::RTrim => "RTRIM",
-            CollSeq::Custom { name, .. } => name,
-        }
-    }
-}
-
-impl std::fmt::Debug for CollSeq {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CollSeq({})", self.name())
-    }
-}
-
-impl Default for CollSeq {
-    fn default() -> Self {
-        CollSeq::Binary
-    }
-}
-
 /// Key comparison information for indexes.
 /// Based on SQLite's KeyInfo structure (sqliteInt.h ~2400)
 #[derive(Clone)]
@@ -502,16 +324,6 @@ impl KeyInfo {
     }
 }
 
-/// Represents a parsed field value from a SQLite record
-#[derive(Clone, Debug)]
-pub enum RecordField {
-    Null,
-    Int(i64),
-    Float(f64),
-    Blob(Vec<u8>),
-    Text(String),
-}
-
 /// Unpacked record for index operations
 pub struct UnpackedRecord {
     /// Raw serialized key bytes
@@ -576,36 +388,6 @@ fn parse_record_fields(data: &[u8]) -> Vec<RecordField> {
     }
 
     fields
-}
-
-/// Read a varint at the given offset, returns (value, bytes_consumed)
-fn read_varint_at(data: &[u8], start: usize) -> (u64, usize) {
-    if start >= data.len() {
-        return (0, 0);
-    }
-
-    let mut value: u64 = 0;
-    let mut bytes = 0;
-
-    for i in 0..9 {
-        if start + i >= data.len() {
-            break;
-        }
-        let b = data[start + i];
-        if i < 8 {
-            value = (value << 7) | (b & 0x7f) as u64;
-            bytes += 1;
-            if b & 0x80 == 0 {
-                break;
-            }
-        } else {
-            // 9th byte uses all 8 bits
-            value = (value << 8) | b as u64;
-            bytes += 1;
-        }
-    }
-
-    (value, bytes)
 }
 
 /// Deserialize a field value from data given the serial type
@@ -763,59 +545,6 @@ pub struct IntegrityCk {
     pub max_err: i32,
     pub n_err: i32,
     pub errors: Vec<String>,
-}
-
-pub struct DbHeader {
-    pub page_size: u32,
-    pub reserve: u8,
-    pub file_format: u8,
-    pub schema_cookie: u32,
-    pub auto_vacuum: u8,
-    pub incr_vacuum: u8,
-    pub first_trunk_page: Pgno,
-    pub free_page_count: u32,
-}
-
-impl DbHeader {
-    pub fn parse(data: &[u8]) -> Result<Self> {
-        if data.len() < 100 {
-            return Err(Error::new(ErrorCode::Corrupt));
-        }
-        let mut page_size = read_u16(data, 16).ok_or(Error::new(ErrorCode::Corrupt))? as u32;
-        if page_size == 1 {
-            page_size = 65536;
-        }
-        if !(512..=65536).contains(&page_size) || !page_size.is_power_of_two() {
-            return Err(Error::new(ErrorCode::Corrupt));
-        }
-        let reserve = data[20];
-        let file_format = data[18];
-        // Offset 32-35: First freelist trunk page
-        let first_trunk_page = read_u32(data, 32).unwrap_or(0);
-        // Offset 36-39: Total number of freelist pages
-        let free_page_count = read_u32(data, 36).unwrap_or(0);
-        let schema_cookie = read_u32(data, 40).ok_or(Error::new(ErrorCode::Corrupt))?;
-        let auto_vacuum = if read_u32(data, 52).unwrap_or(0) != 0 {
-            1
-        } else {
-            0
-        };
-        let incr_vacuum = if read_u32(data, 64).unwrap_or(0) != 0 {
-            1
-        } else {
-            0
-        };
-        Ok(Self {
-            page_size,
-            reserve,
-            file_format,
-            schema_cookie,
-            auto_vacuum,
-            incr_vacuum,
-            first_trunk_page,
-            free_page_count,
-        })
-    }
 }
 
 pub fn integrity_check(
@@ -1140,98 +869,6 @@ pub fn fake_valid_cursor(btree: Arc<Btree>) -> BtCursor {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct PageLimits {
-    pub page_size: u32,
-    pub usable_size: u32,
-    pub header_offset: usize,
-}
-
-impl PageLimits {
-    pub fn new(page_size: u32, usable_size: u32) -> Self {
-        Self {
-            page_size,
-            usable_size,
-            header_offset: 0,
-        }
-    }
-
-    pub fn for_page1(page_size: u32, usable_size: u32) -> Self {
-        Self {
-            page_size,
-            usable_size,
-            header_offset: 100,
-        }
-    }
-
-    fn header_start(&self) -> usize {
-        self.header_offset
-    }
-
-    fn usable_end(&self) -> usize {
-        self.usable_size as usize
-    }
-}
-
-fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
-    data.get(offset..offset + 2)
-        .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
-}
-
-fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
-    data.get(offset..offset + 4)
-        .map(|bytes| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-}
-
-fn write_u32(data: &mut [u8], offset: usize, value: u32) -> Result<()> {
-    let bytes = value.to_be_bytes();
-    let target = data
-        .get_mut(offset..offset + 4)
-        .ok_or(Error::new(ErrorCode::Corrupt))?;
-    target.copy_from_slice(&bytes);
-    Ok(())
-}
-
-fn write_u16(data: &mut [u8], offset: usize, value: u16) -> Result<()> {
-    let bytes = value.to_be_bytes();
-    let target = data
-        .get_mut(offset..offset + 2)
-        .ok_or(Error::new(ErrorCode::Corrupt))?;
-    target.copy_from_slice(&bytes);
-    Ok(())
-}
-
-fn write_varint(value: u64, out: &mut Vec<u8>) {
-    if value <= 0x7f {
-        out.push(value as u8);
-    } else if value <= 0x3fff {
-        out.push(((value >> 7) | 0x80) as u8);
-        out.push((value & 0x7f) as u8);
-    } else if value <= 0x1fffff {
-        out.push(((value >> 14) | 0x80) as u8);
-        out.push(((value >> 7) | 0x80) as u8);
-        out.push((value & 0x7f) as u8);
-    } else if value <= 0x0fffffff {
-        out.push(((value >> 21) | 0x80) as u8);
-        out.push(((value >> 14) | 0x80) as u8);
-        out.push(((value >> 7) | 0x80) as u8);
-        out.push((value & 0x7f) as u8);
-    } else {
-        let len = 9;
-        let mut buf = [0u8; 9];
-        let mut v = value;
-        for i in (0..len).rev() {
-            if i == len - 1 {
-                buf[i] = (v & 0x7f) as u8;
-            } else {
-                buf[i] = ((v & 0x7f) | 0x80) as u8;
-            }
-            v >>= 7;
-        }
-        out.extend_from_slice(&buf);
-    }
-}
-
 struct OverflowChain {
     first: Option<Pgno>,
     pages: Vec<Vec<u8>>,
@@ -1463,7 +1100,8 @@ fn save_freelist(shared: &mut BtShared) -> Result<()> {
     // Prefer higher-numbered pages for trunks (typically existing trunk pages).
     leaf_pages.sort();
     while trunk_pages.len() < num_trunks && !leaf_pages.is_empty() {
-        trunk_pages.push(leaf_pages.pop().unwrap());
+        // SAFETY: loop condition guarantees leaf_pages is non-empty
+        trunk_pages.push(leaf_pages.pop().expect("loop ensures non-empty"));
     }
 
     while trunk_pages.len() < num_trunks {
@@ -2821,89 +2459,6 @@ fn split_leaf_with_parent(
         }
         Err(_) => split_internal_root(shared, parent.pgno, parent, parent_limits),
     }
-}
-
-fn read_varint(data: &[u8], offset: usize) -> Result<(u64, usize)> {
-    let mut value = 0u64;
-    for i in 0..9 {
-        let byte = *data.get(offset + i).ok_or(Error::new(ErrorCode::Corrupt))?;
-        if i == 8 {
-            value = (value << 8) | byte as u64;
-            return Ok((value, 9));
-        }
-        value = (value << 7) | (u64::from(byte & 0x7f));
-        if byte & 0x80 == 0 {
-            return Ok((value, i + 1));
-        }
-    }
-    Err(Error::new(ErrorCode::Corrupt))
-}
-
-fn read_varint32(data: &[u8], offset: usize) -> Result<(u32, usize)> {
-    let (value, size) = read_varint(data, offset)?;
-    if value > u32::MAX as u64 {
-        return Err(Error::new(ErrorCode::Corrupt));
-    }
-    Ok((value as u32, size))
-}
-
-pub fn get_varint(data: &[u8]) -> Result<(u64, usize)> {
-    read_varint(data, 0)
-}
-
-pub fn get_varint32(data: &[u8]) -> Result<(u32, usize)> {
-    read_varint32(data, 0)
-}
-
-pub fn put_varint(buf: &mut [u8], value: u64) -> usize {
-    let len = varint_len(value);
-    if buf.len() < len {
-        return 0;
-    }
-    put_varint_at(buf, value)
-}
-
-pub fn varint_len(value: u64) -> usize {
-    if value <= 0x7F {
-        1
-    } else if value <= 0x3FFF {
-        2
-    } else if value <= 0x1FFFFF {
-        3
-    } else if value <= 0x0FFFFFFF {
-        4
-    } else if value <= 0x07FFFFFFFF {
-        5
-    } else if value <= 0x03FFFFFFFFFF {
-        6
-    } else if value <= 0x01FFFFFFFFFFFF {
-        7
-    } else if value <= 0x00FFFFFFFFFFFFFF {
-        8
-    } else {
-        9
-    }
-}
-
-fn put_varint_at(buf: &mut [u8], value: u64) -> usize {
-    let len = varint_len(value);
-    if len == 9 {
-        buf[0] = 0xFF;
-        for i in 1..9 {
-            buf[i] = ((value >> ((8 - i) * 8)) & 0xFF) as u8;
-        }
-    } else {
-        let mut v = value;
-        for i in (0..len).rev() {
-            if i == len - 1 {
-                buf[i] = (v & 0x7F) as u8;
-            } else {
-                buf[i] = ((v & 0x7F) | 0x80) as u8;
-            }
-            v >>= 7;
-        }
-    }
-    len
 }
 
 impl MemPage {
@@ -5807,6 +5362,71 @@ impl BtCursor {
     /// sqlite3BtreeCursorHint
     pub fn hint(&mut self, _hint: i32) -> Result<()> {
         Ok(())
+    }
+
+    /// Create an iterator over all rows in the cursor's table.
+    ///
+    /// This provides an idiomatic Rust way to iterate over B-tree rows:
+    /// ```ignore
+    /// for result in cursor.iter() {
+    ///     match result {
+    ///         Ok((rowid, payload)) => { /* process row */ },
+    ///         Err(e) => { /* handle error */ },
+    ///     }
+    /// }
+    /// ```
+    pub fn iter(&mut self) -> BtCursorIter<'_> {
+        BtCursorIter {
+            cursor: self,
+            started: false,
+        }
+    }
+}
+
+/// Iterator over B-tree cursor rows.
+///
+/// Created by calling `BtCursor::iter()`. Yields `(RowId, Vec<u8>)` tuples
+/// for each row in the table, where the Vec contains the payload data.
+pub struct BtCursorIter<'a> {
+    cursor: &'a mut BtCursor,
+    started: bool,
+}
+
+impl<'a> Iterator for BtCursorIter<'a> {
+    type Item = Result<(RowId, Vec<u8>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // First call: position at the first row
+        if !self.started {
+            self.started = true;
+            match self.cursor.first() {
+                Ok(true) => return None, // Table is empty
+                Ok(false) => {}          // Successfully positioned
+                Err(e) => return Some(Err(e)),
+            }
+        } else {
+            // Subsequent calls: advance to next row
+            match self.cursor.next(0) {
+                Ok(()) if self.cursor.eof() => return None,
+                Ok(()) => {}
+                Err(e) => return Some(Err(e)),
+            }
+        }
+
+        // Return current row data
+        let rowid = self.cursor.integer_key();
+        let payload_size = self.cursor.payload_size();
+
+        // Handle empty payload
+        if payload_size == 0 {
+            return Some(Ok((rowid, Vec::new())));
+        }
+
+        // Get the full payload
+        match self.cursor.payload(0, payload_size) {
+            Ok(payload) => Some(Ok((rowid, payload))),
+            Err(e) => Some(Err(e)),
+        }
     }
 }
 

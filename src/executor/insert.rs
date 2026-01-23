@@ -93,6 +93,19 @@ impl<'a> InsertCompiler<'a> {
 
     /// Compile an INSERT statement
     pub fn compile(&mut self, insert: &InsertStmt) -> Result<Vec<VdbeOp>> {
+        // Check for system tables that cannot be modified
+        let table_name_lower = insert.table.name.to_lowercase();
+        if table_name_lower == "sqlite_master"
+            || table_name_lower == "sqlite_schema"
+            || table_name_lower == "sqlite_temp_master"
+            || table_name_lower == "sqlite_temp_schema"
+        {
+            return Err(crate::error::Error::with_message(
+                crate::error::ErrorCode::Error,
+                format!("table {} may not be modified", insert.table.name),
+            ));
+        }
+
         // Initialize
         self.emit(Opcode::Init, 0, 0, 0, P4::Unused);
 

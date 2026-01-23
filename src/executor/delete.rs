@@ -82,6 +82,19 @@ impl<'s> DeleteCompiler<'s> {
 
     /// Compile a DELETE statement
     pub fn compile(&mut self, delete: &DeleteStmt) -> Result<Vec<VdbeOp>> {
+        // Check for system tables that cannot be modified
+        let table_name_lower = delete.table.name.to_lowercase();
+        if table_name_lower == "sqlite_master"
+            || table_name_lower == "sqlite_schema"
+            || table_name_lower == "sqlite_temp_master"
+            || table_name_lower == "sqlite_temp_schema"
+        {
+            return Err(crate::error::Error::with_message(
+                crate::error::ErrorCode::Error,
+                format!("table {} may not be modified", delete.table.name),
+            ));
+        }
+
         // Initialize
         self.emit(Opcode::Init, 0, 0, 0, P4::Unused);
 

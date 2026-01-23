@@ -2611,25 +2611,48 @@ fn parse_cell_from_bytes(page: &MemPage, limits: PageLimits, cell: &[u8]) -> Res
     let mut info = CellInfo::default();
     info.n_key = n_key as i64;
     info.n_payload = payload_size;
+
+    // Determine local payload size (may be less than full payload for overflow cells)
+    let local_payload = if page.max_local != 0 && payload_size as u16 > page.max_local {
+        page.payload_to_local(payload_size as i64, limits)?
+    } else {
+        payload_size as u16
+    };
+
     if !page.is_intkey || page.is_leaf {
-        let end = cursor
-            .checked_add(payload_size as usize)
+        let payload_end = cursor
+            .checked_add(local_payload as usize)
             .ok_or(Error::new(ErrorCode::Corrupt))?;
-        if end > cell.len() {
+
+        // For overflow cells, need to account for the 4-byte overflow page pointer
+        let cell_end = if local_payload as u32 != payload_size {
+            payload_end + 4 // overflow page pointer
+        } else {
+            payload_end
+        };
+
+        if cell_end > cell.len() {
             return Err(Error::new(ErrorCode::Corrupt));
         }
-        if payload_size > 0 {
-            info.payload = Some(cell[cursor..end].to_vec());
+        if local_payload > 0 {
+            info.payload = Some(cell[cursor..payload_end].to_vec());
         }
     }
+
     if payload_size as u16 > page.max_local && page.max_local != 0 {
         info.overflow_pgno = None;
-        info.n_local = page.payload_to_local(payload_size as i64, limits)?;
-        info.n_size = (cursor + info.n_local as usize) as u16 + 4;
+        info.n_local = local_payload;
+        info.n_size = (cursor + local_payload as usize) as u16 + 4;
     } else {
         info.n_local = payload_size as u16;
         info.n_size = (cursor + payload_size as usize) as u16;
     }
+
+    // Enforce minimum cell size of 4 bytes (SQLite requirement)
+    if info.n_size < 4 {
+        info.n_size = 4;
+    }
+
     Ok(info)
 }
 
@@ -2913,6 +2936,14 @@ impl MemPage {
         let first_freeblock =
             read_u16(&data, header_start + 1).ok_or(Error::new(ErrorCode::Corrupt))?;
         let n_cell = read_u16(&data, header_start + 3).ok_or(Error::new(ErrorCode::Corrupt))?;
+
+        // Validate cell count doesn't exceed maximum possible for this page size
+        // MX_CELL = (pageSize - 8) / 6 (from SQLite btreeInt.h)
+        let max_cells = (limits.page_size.saturating_sub(8)) / 6;
+        if n_cell as u32 > max_cells {
+            return Err(Error::new(ErrorCode::Corrupt));
+        }
+
         let cell_offset =
             read_u16(&data, header_start + 5).ok_or(Error::new(ErrorCode::Corrupt))?;
         let free_bytes = data[header_start + 7] as u16;
@@ -2976,7 +3007,19 @@ impl MemPage {
             return Err(Error::new(ErrorCode::Range));
         }
         let offset = limits.header_start() + self.header_size() + (index as usize * 2);
-        read_u16(&self.data, offset).ok_or(Error::new(ErrorCode::Corrupt))
+        let ptr = read_u16(&self.data, offset).ok_or(Error::new(ErrorCode::Corrupt))?;
+
+        // Validate cell pointer is within valid cell content area
+        // Cell pointers must be >= first cell area (after header + cell pointer array)
+        // and <= last valid cell position (usable_end - 4 for minimum cell)
+        let cell_first =
+            (limits.header_start() + self.header_size() + (self.n_cell as usize * 2)) as u16;
+        let cell_last = limits.usable_end() as u16 - 4;
+        if ptr < cell_first || ptr > cell_last {
+            return Err(Error::new(ErrorCode::Corrupt));
+        }
+
+        Ok(ptr)
     }
 
     pub fn child_pgno(&self, cell_offset: u16) -> Result<Pgno> {
@@ -3176,6 +3219,11 @@ impl MemPage {
             info.payload = Some(self.data[cursor..payload_end].to_vec());
             let overflow_offset = payload_end;
             info.overflow_pgno = read_u32(&self.data, overflow_offset);
+        }
+
+        // Enforce minimum cell size of 4 bytes (SQLite requirement)
+        if info.n_size < 4 {
+            info.n_size = 4;
         }
 
         Ok(info)

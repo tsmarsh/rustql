@@ -118,11 +118,15 @@ array set sqlite_options {
 }
 
 # Source the test infrastructure
+# Set guard flag to prevent double reset_db when test file re-sources tester.tcl
+set ::TESTER_SOURCED 1
+puts "DEBUG: About to source tester.tcl, pwd=[pwd]"
 if {[catch {source tester.tcl} err]} {
     puts stderr "Error loading tester.tcl: $err"
     puts stderr $::errorInfo
     exit 1
 }
+puts "DEBUG: tester.tcl sourced, db=[info commands db]"
 
 # Run the test
 puts "Running ${test_name}.test..."
@@ -132,6 +136,8 @@ set start_time [clock seconds]
 # Set argv0 to the test file so that [file dirname $argv0] in the test
 # file returns the test directory (many SQLite tests use this pattern)
 set argv0 $test_file
+puts "DEBUG: argv0=$argv0, test_file=$test_file"
+puts "DEBUG: testdir=$testdir"
 
 if {[catch {source $test_file} err]} {
     puts stderr ""

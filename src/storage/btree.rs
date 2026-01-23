@@ -3727,6 +3727,11 @@ impl Btree {
                 // Fragmented free bytes = 0
                 page.data[header_offset + 7] = 0;
             }
+
+            // Commit the initial database header so it won't be rolled back
+            // by subsequent failed operations
+            let _ = shared.pager.commit_phase_one(None);
+            let _ = shared.pager.commit_phase_two();
         }
 
         shared.update_payload_params();

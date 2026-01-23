@@ -714,42 +714,35 @@ impl DateTime {
         if self.is_local {
             return Ok(());
         }
-        #[cfg(unix)]
-        {
-            use libc::{localtime_r, time_t, tm};
-            let mut tm_out: tm = unsafe { std::mem::zeroed() };
-            let secs = self.i_jd / 1000 - 21086676_i64 * 10000;
-            let t = secs as time_t;
-            let res = unsafe { localtime_r(&t, &mut tm_out) };
-            if res.is_null() {
+        use chrono::{Local, TimeZone, Utc};
+        let secs = self.i_jd / 1000 - 21086676_i64 * 10000;
+        let subsec_ms = self.i_jd % 1000;
+        let utc_dt = match Utc.timestamp_opt(secs, 0) {
+            chrono::LocalResult::Single(dt) => dt,
+            _ => {
                 return Err(Error::with_message(
                     ErrorCode::Error,
                     "local time unavailable",
                 ));
             }
-            self.year = tm_out.tm_year + 1900;
-            self.month = tm_out.tm_mon + 1;
-            self.day = tm_out.tm_mday;
-            self.hour = tm_out.tm_hour;
-            self.minute = tm_out.tm_min;
-            self.second = tm_out.tm_sec as f64 + (self.i_jd % 1000) as f64 * 0.001;
-            self.valid_ymd = true;
-            self.valid_hms = true;
-            self.valid_jd = false;
-            self.raw_s = false;
-            self.tz = 0;
-            self.is_error = false;
-            self.is_local = true;
-            self.is_utc = false;
-            Ok(())
-        }
-        #[cfg(not(unix))]
-        {
-            Err(Error::with_message(
-                ErrorCode::Error,
-                "localtime conversion not supported",
-            ))
-        }
+        };
+        let local_dt = utc_dt.with_timezone(&Local);
+        self.year = local_dt.format("%Y").to_string().parse().unwrap_or(2000);
+        self.month = local_dt.format("%m").to_string().parse().unwrap_or(1);
+        self.day = local_dt.format("%d").to_string().parse().unwrap_or(1);
+        self.hour = local_dt.format("%H").to_string().parse().unwrap_or(0);
+        self.minute = local_dt.format("%M").to_string().parse().unwrap_or(0);
+        let sec_int: i32 = local_dt.format("%S").to_string().parse().unwrap_or(0);
+        self.second = sec_int as f64 + subsec_ms as f64 * 0.001;
+        self.valid_ymd = true;
+        self.valid_hms = true;
+        self.valid_jd = false;
+        self.raw_s = false;
+        self.tz = 0;
+        self.is_error = false;
+        self.is_local = true;
+        self.is_utc = false;
+        Ok(())
     }
 
     fn to_utc(&mut self) -> Result<()> {
@@ -757,38 +750,45 @@ impl DateTime {
         if self.is_utc {
             return Ok(());
         }
-        #[cfg(unix)]
-        {
-            use libc::{mktime, tm};
-            let mut tm_in: tm = unsafe { std::mem::zeroed() };
-            tm_in.tm_year = self.year - 1900;
-            tm_in.tm_mon = self.month - 1;
-            tm_in.tm_mday = self.day;
-            tm_in.tm_hour = self.hour;
-            tm_in.tm_min = self.minute;
-            tm_in.tm_sec = self.second as i32;
-            let t = unsafe { mktime(&mut tm_in) };
-            if t == -1 {
+        use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
+        let date = match NaiveDate::from_ymd_opt(self.year, self.month as u32, self.day as u32) {
+            Some(d) => d,
+            None => {
                 return Err(Error::with_message(
                     ErrorCode::Error,
                     "utc conversion failed",
                 ));
             }
-            let secs = t as i64;
-            self.i_jd = secs * 1000 + JD_UNIX_EPOCH_MS;
-            self.valid_jd = true;
-            self.clear_ymd_hms_tz();
-            self.is_utc = true;
-            self.is_local = false;
-            Ok(())
-        }
-        #[cfg(not(unix))]
-        {
-            Err(Error::with_message(
-                ErrorCode::Error,
-                "utc conversion not supported",
-            ))
-        }
+        };
+        let time =
+            match NaiveTime::from_hms_opt(self.hour as u32, self.minute as u32, self.second as u32)
+            {
+                Some(t) => t,
+                None => {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        "utc conversion failed",
+                    ));
+                }
+            };
+        let naive_dt = NaiveDateTime::new(date, time);
+        let local_dt = match Local.from_local_datetime(&naive_dt) {
+            chrono::LocalResult::Single(dt) => dt,
+            chrono::LocalResult::Ambiguous(dt, _) => dt, // Use earlier time for ambiguous
+            chrono::LocalResult::None => {
+                return Err(Error::with_message(
+                    ErrorCode::Error,
+                    "utc conversion failed",
+                ));
+            }
+        };
+        let secs = local_dt.timestamp();
+        self.i_jd = secs * 1000 + JD_UNIX_EPOCH_MS;
+        self.valid_jd = true;
+        self.clear_ymd_hms_tz();
+        self.is_utc = true;
+        self.is_local = false;
+        Ok(())
     }
 }
 

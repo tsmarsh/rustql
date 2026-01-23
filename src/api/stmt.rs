@@ -538,16 +538,24 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
             sqlite3_step(stmt)
         }
         Err(e) => {
-            // In autocommit mode, rollback on error
-            if !stmt.read_only {
-                if let Some(conn_ptr) = stmt.conn_ptr {
-                    let conn = unsafe { &*conn_ptr };
-                    if conn.get_autocommit() {
-                        if let Some(main_db) = conn.find_db("main") {
-                            if let Some(ref btree) = main_db.btree {
-                                let _ = btree.rollback(0, false);
-                            }
-                        }
+            // Rollback on error - both in autocommit mode and explicit transactions
+            // This matches SQLite behavior where errors within a transaction cause
+            // automatic rollback to maintain database consistency
+            if let Some(conn_ptr) = stmt.conn_ptr {
+                let conn = unsafe { &*conn_ptr };
+                if let Some(main_db) = conn.find_db("main") {
+                    if let Some(ref btree) = main_db.btree {
+                        let _ = btree.rollback(0, false);
+                    }
+                }
+                // If we were in an explicit transaction, reset to autocommit mode
+                // so subsequent BEGIN statements will work
+                if !conn.get_autocommit() {
+                    conn.autocommit
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    // Call rollback hook if configured
+                    if let Some(hook) = conn.rollback_hook.as_ref() {
+                        hook();
                     }
                 }
             }

@@ -627,6 +627,50 @@ impl Table {
 // SQL Parsing Helpers
 // ============================================================================
 
+/// Extract DEFAULT value from a column definition
+fn extract_default_value(col_def_upper: &str, col_def: &str) -> Option<DefaultValue> {
+    if let Some(default_pos) = col_def_upper.find(" DEFAULT ") {
+        let after_default = col_def[default_pos + 9..].trim();
+
+        // Try to parse the default value
+        if after_default.starts_with('\'') {
+            // String literal
+            if let Some(end_quote) = after_default[1..].find('\'') {
+                let value = after_default[1..end_quote + 1].to_string();
+                return Some(DefaultValue::String(value));
+            }
+        } else if after_default.to_uppercase().starts_with("CURRENT_TIME") {
+            return Some(DefaultValue::CurrentTime);
+        } else if after_default.to_uppercase().starts_with("CURRENT_DATE") {
+            return Some(DefaultValue::CurrentDate);
+        } else if after_default
+            .to_uppercase()
+            .starts_with("CURRENT_TIMESTAMP")
+        {
+            return Some(DefaultValue::CurrentTimestamp);
+        } else {
+            // Try to parse as a number
+            let value_str = after_default
+                .split(|c: char| c.is_whitespace() || c == ',' || c == ')' || c == '\'' || c == '"')
+                .next()
+                .unwrap_or("");
+
+            if !value_str.is_empty() {
+                // Try integer first
+                if let Ok(n) = value_str.parse::<i64>() {
+                    return Some(DefaultValue::Integer(n));
+                }
+                // Try float
+                if let Ok(f) = value_str.parse::<f64>() {
+                    return Some(DefaultValue::Float(f));
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Parse a CREATE TABLE/CREATE VIRTUAL TABLE SQL string into a Table struct.
 pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
     // Simple parser for CREATE TABLE name (col1 type, col2 type, ...)
@@ -865,6 +909,9 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
             col_def_upper.contains(" PRIMARY KEY") || col_def_upper.contains(" PRIMARY");
         let is_not_null = col_def_upper.contains(" NOT NULL");
 
+        // Extract DEFAULT value if present
+        let default_value = extract_default_value(&col_def_upper, &col_def);
+
         // Determine type name - it's the second word if it's not a constraint keyword
         let type_name = parts.get(1).and_then(|s| {
             let upper = s.to_uppercase();
@@ -894,7 +941,7 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
             affinity,
             not_null: is_not_null,
             not_null_conflict: None,
-            default_value: None,
+            default_value,
             collation: DEFAULT_COLLATION.to_string(),
             is_primary_key,
             is_unique,

@@ -1004,7 +1004,51 @@ impl<'s> StatementCompiler<'s> {
                             }
                             ColumnConstraintKind::Default(val) => {
                                 col_sql.push_str(" DEFAULT ");
-                                col_sql.push_str(&format!("{:?}", val));
+                                match val {
+                                    crate::parser::ast::DefaultValue::Literal(lit) => match lit {
+                                        crate::parser::ast::Literal::Null => {
+                                            col_sql.push_str("NULL");
+                                        }
+                                        crate::parser::ast::Literal::Integer(n) => {
+                                            col_sql.push_str(&n.to_string());
+                                        }
+                                        crate::parser::ast::Literal::Float(f) => {
+                                            col_sql.push_str(&f.to_string());
+                                        }
+                                        crate::parser::ast::Literal::String(s) => {
+                                            col_sql.push('\'');
+                                            col_sql.push_str(&s.replace("'", "''"));
+                                            col_sql.push('\'');
+                                        }
+                                        crate::parser::ast::Literal::Blob(_) => {
+                                            col_sql.push_str("X''");
+                                        }
+                                        crate::parser::ast::Literal::Bool(b) => {
+                                            col_sql.push_str(if *b { "1" } else { "0" });
+                                        }
+                                        crate::parser::ast::Literal::CurrentTime => {
+                                            col_sql.push_str("current_time");
+                                        }
+                                        crate::parser::ast::Literal::CurrentDate => {
+                                            col_sql.push_str("current_date");
+                                        }
+                                        crate::parser::ast::Literal::CurrentTimestamp => {
+                                            col_sql.push_str("current_timestamp");
+                                        }
+                                    },
+                                    crate::parser::ast::DefaultValue::Expr(_) => {
+                                        col_sql.push_str("(expression)");
+                                    }
+                                    crate::parser::ast::DefaultValue::CurrentTime => {
+                                        col_sql.push_str("current_time");
+                                    }
+                                    crate::parser::ast::DefaultValue::CurrentDate => {
+                                        col_sql.push_str("current_date");
+                                    }
+                                    crate::parser::ast::DefaultValue::CurrentTimestamp => {
+                                        col_sql.push_str("current_timestamp");
+                                    }
+                                }
                             }
                             ColumnConstraintKind::Collate(name) => {
                                 col_sql.push_str(" COLLATE ");

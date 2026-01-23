@@ -99,12 +99,20 @@ impl DateTime {
     fn parse_yyyy_mm_dd(&mut self, input: &str) -> Result<bool> {
         let bytes = input.as_bytes();
         let mut idx = 0;
+
+        // Check for leading + which is invalid
+        if bytes.first() == Some(&b'+') {
+            return Ok(false);
+        }
+
         let neg = if bytes.first() == Some(&b'-') {
             idx += 1;
             true
         } else {
             false
         };
+
+        // Year must be exactly 4 digits
         let year = match parse_fixed_digits(bytes, idx, 4) {
             Some(v) => v,
             None => return Ok(false),
@@ -114,24 +122,32 @@ impl DateTime {
             return Ok(false);
         }
         idx += 1;
+
+        // Month must be exactly 2 digits
         let month = match parse_fixed_digits(bytes, idx, 2) {
             Some(v) => v,
             None => return Ok(false),
         };
         if !(1..=12).contains(&month) {
-            return Err(Error::with_message(ErrorCode::Error, "invalid month"));
+            return Ok(false); // Invalid month - return false to signal parse failure
         }
         idx += 2;
         if bytes.get(idx) != Some(&b'-') {
             return Ok(false);
         }
         idx += 1;
+
+        // Day must be exactly 2 digits
         let day = match parse_fixed_digits(bytes, idx, 2) {
             Some(v) => v,
             None => return Ok(false),
         };
-        if !(1..=31).contains(&day) {
-            return Err(Error::with_message(ErrorCode::Error, "invalid day"));
+
+        // Validate day against the actual month
+        let year_val = if neg { -year } else { year };
+        let max_day = days_in_month(year_val, month);
+        if day < 1 || day > max_day {
+            return Ok(false); // Invalid day for this month
         }
         idx += 2;
         let mut rest = &input[idx..];

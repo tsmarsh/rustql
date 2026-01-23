@@ -3507,17 +3507,21 @@ impl<'s> SelectCompiler<'s> {
                     }
 
                     // Compile as scalar function
-                    let arg_base = self.next_reg;
+                    // Pre-allocate contiguous registers for all arguments first,
+                    // so nested function calls don't break the contiguity
                     let argc = match &func_call.args {
-                        crate::parser::ast::FunctionArgs::Exprs(exprs) => {
-                            for arg in exprs {
-                                let reg = self.alloc_reg();
-                                self.compile_expr(arg, reg)?;
-                            }
-                            exprs.len()
-                        }
+                        crate::parser::ast::FunctionArgs::Exprs(exprs) => exprs.len(),
                         crate::parser::ast::FunctionArgs::Star => 0,
                     };
+                    let arg_base = self.next_reg;
+                    let arg_regs: Vec<i32> = (0..argc).map(|_| self.alloc_reg()).collect();
+
+                    // Now compile each argument into its pre-allocated register
+                    if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
+                        for (arg, &reg) in exprs.iter().zip(arg_regs.iter()) {
+                            self.compile_expr(arg, reg)?;
+                        }
+                    }
 
                     self.emit(
                         Opcode::Function,

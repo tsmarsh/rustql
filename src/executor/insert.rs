@@ -227,11 +227,36 @@ impl<'a> InsertCompiler<'a> {
                 }
             }
 
-            // Fill in NULL for unspecified columns
-            for (i, seen) in present.iter().enumerate() {
+            // Fill in defaults or NULL for unspecified columns
+            let table_lower = insert.table.name.to_lowercase();
+            let table_opt = self.schema.and_then(|s| s.tables.get(&table_lower));
+
+            for (col_idx, seen) in present.iter().enumerate() {
                 if !*seen {
-                    let reg = data_base + i as i32;
-                    self.emit(Opcode::Null, 0, reg, 0, P4::Unused);
+                    let reg = data_base + col_idx as i32;
+
+                    // Try to get default value from schema
+                    let has_default = if let Some(table) = table_opt {
+                        if col_idx < table.columns.len() {
+                            let column = &table.columns[col_idx];
+                            if let Some(default) = &column.default_value {
+                                // Emit code to apply the default value
+                                self.emit_default_value(default, reg)?;
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    // If no default found, use NULL
+                    if !has_default {
+                        self.emit(Opcode::Null, 0, reg, 0, P4::Unused);
+                    }
                 }
             }
 
@@ -1214,6 +1239,66 @@ impl<'a> InsertCompiler<'a> {
             ConflictAction::Ignore => 3,
             ConflictAction::Replace => 4,
         }
+    }
+
+    /// Emit code for a DEFAULT value
+    fn emit_default_value(
+        &mut self,
+        default: &crate::schema::DefaultValue,
+        dest_reg: i32,
+    ) -> Result<()> {
+        use crate::schema::DefaultValue;
+
+        match default {
+            DefaultValue::Null => {
+                self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+            }
+            DefaultValue::Integer(n) => {
+                self.emit(Opcode::Integer, *n as i32, dest_reg, 0, P4::Unused);
+            }
+            DefaultValue::Float(f) => {
+                self.emit(Opcode::Real, 0, dest_reg, 0, P4::Real(*f));
+            }
+            DefaultValue::String(s) => {
+                self.emit(Opcode::String8, 0, dest_reg, 0, P4::Text(s.clone()));
+            }
+            DefaultValue::Blob(b) => {
+                self.emit(Opcode::Blob, 0, dest_reg, 0, P4::Blob(b.clone()));
+            }
+            DefaultValue::Expr(_expr) => {
+                // For expression defaults, emit NULL as fallback for now
+                // Full expression evaluation would require more infrastructure
+                self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+            }
+            DefaultValue::CurrentTime => {
+                self.emit(
+                    Opcode::String8,
+                    0,
+                    dest_reg,
+                    0,
+                    P4::Text("current_time".to_string()),
+                );
+            }
+            DefaultValue::CurrentDate => {
+                self.emit(
+                    Opcode::String8,
+                    0,
+                    dest_reg,
+                    0,
+                    P4::Text("current_date".to_string()),
+                );
+            }
+            DefaultValue::CurrentTimestamp => {
+                self.emit(
+                    Opcode::String8,
+                    0,
+                    dest_reg,
+                    0,
+                    P4::Text("current_timestamp".to_string()),
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Compile an expression

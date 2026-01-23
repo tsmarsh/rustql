@@ -14,6 +14,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::types::{ColumnType, StepResult};
+use crate::vdbe::{get_search_count, reset_search_count};
 use crate::{
     sqlite3_changes, sqlite3_close, sqlite3_column_count, sqlite3_column_name, sqlite3_column_text,
     sqlite3_column_type, sqlite3_finalize, sqlite3_initialize, sqlite3_last_insert_rowid,
@@ -458,6 +459,16 @@ unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         interp,
         max_length_name.as_ptr(),
         max_length_val.as_ptr(),
+        TCL_GLOBAL_ONLY,
+    );
+
+    // Initialize sqlite_search_count variable for query efficiency tests
+    let search_count_name = CString::new("::sqlite_search_count").unwrap();
+    let search_count_val = CString::new("0").unwrap();
+    Tcl_SetVar(
+        interp,
+        search_count_name.as_ptr(),
+        search_count_val.as_ptr(),
         TCL_GLOBAL_ONLY,
     );
 }
@@ -2497,6 +2508,9 @@ unsafe fn db_eval(
         return TCL_ERROR;
     }
 
+    // Reset search count at the start of each eval
+    reset_search_count();
+
     let sql = obj_to_string(*objv.offset(2));
 
     // Check if we have array-name and script arguments
@@ -2616,17 +2630,21 @@ unsafe fn db_eval(
                     let eval_result = Tcl_Eval(interp, script_c.as_ptr());
 
                     if eval_result == TCL_BREAK {
+                        update_search_count_var(interp);
                         return TCL_OK;
                     } else if eval_result == TCL_ERROR {
+                        update_search_count_var(interp);
                         return TCL_ERROR;
                     }
                     // TCL_CONTINUE and TCL_OK: continue to next row
                 }
 
+                update_search_count_var(interp);
                 TCL_OK
             }
             Err(msg) => {
                 set_result_string(interp, &msg);
+                update_search_count_var(interp);
                 TCL_ERROR
             }
         }
@@ -2634,7 +2652,7 @@ unsafe fn db_eval(
         // Simple form: execute SQL and collect results as a flat list
         let result_list = Tcl_NewListObj(0, std::ptr::null());
 
-        CONNECTIONS.with(|connections| {
+        let result = CONNECTIONS.with(|connections| {
             let mut conns = connections.borrow_mut();
             let conn = match conns.get_mut(db_name) {
                 Some(c) => c.as_mut(),
@@ -2699,8 +2717,25 @@ unsafe fn db_eval(
 
             Tcl_SetObjResult(interp, result_list);
             TCL_OK
-        })
+        });
+
+        // Update ::sqlite_search_count variable with current search count
+        update_search_count_var(interp);
+
+        result
     }
+}
+
+/// Update the ::sqlite_search_count TCL variable with current search count
+unsafe fn update_search_count_var(interp: *mut Tcl_Interp) {
+    let var_name = CString::new("::sqlite_search_count").unwrap();
+    let count_str = CString::new(get_search_count().to_string()).unwrap();
+    Tcl_SetVar(
+        interp,
+        var_name.as_ptr(),
+        count_str.as_ptr(),
+        TCL_GLOBAL_ONLY,
+    );
 }
 
 /// Check if query returns any rows

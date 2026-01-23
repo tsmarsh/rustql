@@ -9,6 +9,8 @@ use crate::error::Result;
 use crate::parser::ast::{DeleteStmt, Expr, ResultColumn};
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
+const OPFLAG_NCHANGE: u16 = 0x01;
+
 fn is_rowid_alias(name: &str) -> bool {
     name.eq_ignore_ascii_case("rowid")
         || name.eq_ignore_ascii_case("_rowid_")
@@ -184,14 +186,28 @@ impl<'s> DeleteCompiler<'s> {
             let skip_label = self.alloc_label();
             self.compile_where_check(where_expr, skip_label)?;
 
-            // Delete the row
-            self.emit(Opcode::Delete, self.table_cursor, 0, 0, P4::Unused);
+            // Delete the row - set OPFLAG_NCHANGE to track deleted rows
+            self.emit_with_p5(
+                Opcode::Delete,
+                self.table_cursor,
+                0,
+                0,
+                P4::Unused,
+                OPFLAG_NCHANGE,
+            );
 
             // Skip label (for rows that don't match WHERE)
             self.resolve_label(skip_label, self.current_addr() as i32);
         } else {
             // No WHERE - delete every row
-            self.emit(Opcode::Delete, self.table_cursor, 0, 0, P4::Unused);
+            self.emit_with_p5(
+                Opcode::Delete,
+                self.table_cursor,
+                0,
+                0,
+                P4::Unused,
+                OPFLAG_NCHANGE,
+            );
         }
 
         // Move to next row
@@ -328,7 +344,14 @@ impl<'s> DeleteCompiler<'s> {
             rowid_reg,
             P4::Unused,
         );
-        self.emit(Opcode::Delete, self.table_cursor, 0, 0, P4::Unused);
+        self.emit_with_p5(
+            Opcode::Delete,
+            self.table_cursor,
+            0,
+            0,
+            P4::Unused,
+            OPFLAG_NCHANGE,
+        );
 
         // Increment counter
         let one_reg = self.alloc_reg();
@@ -352,6 +375,11 @@ impl<'s> DeleteCompiler<'s> {
 
     /// Compile code to check WHERE clause condition
     fn compile_where_check(&mut self, where_expr: &Expr, skip_label: i32) -> Result<()> {
+        // Validate columns in WHERE clause first (only if we have schema info)
+        if self.schema.is_some() {
+            self.validate_expr_columns(where_expr)?;
+        }
+
         let cond_reg = self.alloc_reg();
         self.compile_expr(where_expr, cond_reg)?;
 
@@ -359,6 +387,93 @@ impl<'s> DeleteCompiler<'s> {
         self.emit(Opcode::IfNot, cond_reg, skip_label, 1, P4::Unused);
 
         Ok(())
+    }
+
+    /// Validate that all column references in an expression exist in the table
+    fn validate_expr_columns(&self, expr: &Expr) -> Result<()> {
+        match expr {
+            Expr::Column(col_ref) => {
+                // Skip rowid aliases
+                if is_rowid_alias(&col_ref.column) {
+                    return Ok(());
+                }
+
+                // Check if column exists
+                if !self.column_exists(&col_ref.column) {
+                    return Err(crate::error::Error::with_message(
+                        crate::error::ErrorCode::Error,
+                        format!("no such column: {}", col_ref.column),
+                    ));
+                }
+                Ok(())
+            }
+            Expr::Binary { left, right, .. } => {
+                self.validate_expr_columns(left)?;
+                self.validate_expr_columns(right)
+            }
+            Expr::Unary { expr: inner, .. } => self.validate_expr_columns(inner),
+            Expr::Function(func_call) => {
+                match &func_call.args {
+                    crate::parser::ast::FunctionArgs::Exprs(exprs) => {
+                        for arg in exprs {
+                            self.validate_expr_columns(arg)?;
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+            Expr::IsNull { expr: inner, .. } => self.validate_expr_columns(inner),
+            Expr::Between {
+                expr: e, low, high, ..
+            } => {
+                self.validate_expr_columns(e)?;
+                self.validate_expr_columns(low)?;
+                self.validate_expr_columns(high)
+            }
+            Expr::In { expr: e, list, .. } => {
+                self.validate_expr_columns(e)?;
+                match list {
+                    crate::parser::ast::InList::Values(exprs) => {
+                        for val_expr in exprs {
+                            self.validate_expr_columns(val_expr)?;
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+            Expr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => {
+                if let Some(op) = operand {
+                    self.validate_expr_columns(op)?;
+                }
+                for when_clause in when_clauses {
+                    self.validate_expr_columns(&when_clause.when)?;
+                    self.validate_expr_columns(&when_clause.then)?;
+                }
+                if let Some(else_e) = else_clause {
+                    self.validate_expr_columns(else_e)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Check if a column exists in the table
+    fn column_exists(&self, col_name: &str) -> bool {
+        // Check rowid aliases
+        if is_rowid_alias(col_name) {
+            return true;
+        }
+
+        // Check in column_map (case-insensitive)
+        let col_lower = col_name.to_lowercase();
+        self.column_map.contains_key(&col_lower)
     }
 
     /// Build column index map
@@ -656,6 +771,11 @@ impl<'s> DeleteCompiler<'s> {
 
     fn emit(&mut self, opcode: Opcode, p1: i32, p2: i32, p3: i32, p4: P4) {
         self.ops.push(VdbeOp::with_p4(opcode, p1, p2, p3, p4));
+    }
+
+    fn emit_with_p5(&mut self, opcode: Opcode, p1: i32, p2: i32, p3: i32, p4: P4, p5: u16) {
+        self.ops
+            .push(VdbeOp::with_p4(opcode, p1, p2, p3, p4).with_p5(p5));
     }
 
     fn resolve_labels(&mut self) -> Result<()> {

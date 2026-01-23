@@ -649,7 +649,7 @@ fn extract_default_value(col_def_upper: &str, col_def: &str) -> Option<DefaultVa
         {
             return Some(DefaultValue::CurrentTimestamp);
         } else {
-            // Try to parse as a number
+            // Try to parse as a number or unquoted identifier
             let value_str = after_default
                 .split(|c: char| c.is_whitespace() || c == ',' || c == ')' || c == '\'' || c == '"')
                 .next()
@@ -664,6 +664,8 @@ fn extract_default_value(col_def_upper: &str, col_def: &str) -> Option<DefaultVa
                 if let Ok(f) = value_str.parse::<f64>() {
                     return Some(DefaultValue::Float(f));
                 }
+                // Treat as unquoted string (identifier used as default - valid for text columns)
+                return Some(DefaultValue::String(value_str.to_string()));
             }
         }
     }

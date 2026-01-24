@@ -540,13 +540,61 @@ impl Mem {
             // Both blob
             (ColumnType::Blob, ColumnType::Blob) => self.data.cmp(&other.data),
 
-            // Mixed types - use SQLite type ordering
-            (ColumnType::Integer | ColumnType::Float, ColumnType::Text | ColumnType::Blob) => {
-                Ordering::Less
+            // Mixed numeric-text: try numeric coercion (SQLite behavior)
+            (ColumnType::Integer | ColumnType::Float, ColumnType::Text) => {
+                // Try to parse text as number for comparison
+                let text_trimmed = other.to_str().trim().to_string();
+                if let Ok(other_int) = text_trimmed.parse::<i64>() {
+                    match self.column_type() {
+                        ColumnType::Integer => self.i.cmp(&other_int),
+                        ColumnType::Float => (self.r)
+                            .partial_cmp(&(other_int as f64))
+                            .unwrap_or(Ordering::Equal),
+                        _ => Ordering::Less,
+                    }
+                } else if let Ok(other_real) = text_trimmed.parse::<f64>() {
+                    match self.column_type() {
+                        ColumnType::Integer => (self.i as f64)
+                            .partial_cmp(&other_real)
+                            .unwrap_or(Ordering::Equal),
+                        ColumnType::Float => {
+                            self.r.partial_cmp(&other_real).unwrap_or(Ordering::Equal)
+                        }
+                        _ => Ordering::Less,
+                    }
+                } else {
+                    // Text is not numeric - use type ordering
+                    Ordering::Less
+                }
             }
-            (ColumnType::Text | ColumnType::Blob, ColumnType::Integer | ColumnType::Float) => {
-                Ordering::Greater
+            (ColumnType::Text, ColumnType::Integer | ColumnType::Float) => {
+                // Try to parse text as number for comparison
+                let text_trimmed = self.to_str().trim().to_string();
+                if let Ok(self_int) = text_trimmed.parse::<i64>() {
+                    match other.column_type() {
+                        ColumnType::Integer => self_int.cmp(&other.i),
+                        ColumnType::Float => (self_int as f64)
+                            .partial_cmp(&other.r)
+                            .unwrap_or(Ordering::Equal),
+                        _ => Ordering::Greater,
+                    }
+                } else if let Ok(self_real) = text_trimmed.parse::<f64>() {
+                    match other.column_type() {
+                        ColumnType::Integer => self_real
+                            .partial_cmp(&(other.i as f64))
+                            .unwrap_or(Ordering::Equal),
+                        ColumnType::Float => {
+                            self_real.partial_cmp(&other.r).unwrap_or(Ordering::Equal)
+                        }
+                        _ => Ordering::Greater,
+                    }
+                } else {
+                    // Text is not numeric - use type ordering
+                    Ordering::Greater
+                }
             }
+
+            // Blob comparisons with non-blob
             (ColumnType::Text, ColumnType::Blob) => Ordering::Less,
             (ColumnType::Blob, ColumnType::Text) => Ordering::Greater,
 

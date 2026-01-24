@@ -1440,8 +1440,14 @@ impl<'a> Parser<'a> {
             false
         };
 
-        // Literal value
-        let mut literal = self.parse_literal()?;
+        // Literal value or identifier
+        let mut literal = if self.current().kind == TokenKind::Identifier {
+            // Unquoted identifier - treat as string literal (common for text defaults)
+            let id = self.expect_identifier()?;
+            Literal::String(id)
+        } else {
+            self.parse_literal()?
+        };
 
         // Apply unary minus if needed
         if is_negative {

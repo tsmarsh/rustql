@@ -21,6 +21,9 @@ fn is_rowid_alias(name: &str) -> bool {
         || name.eq_ignore_ascii_case("oid")
 }
 
+/// Flag to indicate that this operation should update the change counter
+const OPFLAG_NCHANGE: u16 = 0x01;
+
 #[derive(Debug, Clone, Copy)]
 enum InsertColumnTarget {
     Rowid,
@@ -276,12 +279,13 @@ impl<'a> InsertCompiler<'a> {
 
             // Insert the record
             let flags = self.conflict_flags(conflict_action);
-            self.emit(
+            self.emit_with_p5(
                 Opcode::Insert,
                 self.table_cursor,
                 record_reg,
                 rowid_reg,
                 P4::Int64(flags),
+                OPFLAG_NCHANGE,
             );
         }
 
@@ -534,12 +538,13 @@ impl<'a> InsertCompiler<'a> {
         );
 
         let flags = self.conflict_flags(conflict_action);
-        self.emit(
+        self.emit_with_p5(
             Opcode::Insert,
             self.table_cursor,
             record_reg,
             rowid_reg,
             P4::Int64(flags),
+            OPFLAG_NCHANGE,
         );
 
         // Next row in ephemeral table
@@ -732,12 +737,13 @@ impl<'a> InsertCompiler<'a> {
         );
 
         let flags = self.conflict_flags(conflict_action);
-        self.emit(
+        self.emit_with_p5(
             Opcode::Insert,
             self.table_cursor,
             record_reg,
             rowid_reg,
             P4::Int64(flags),
+            OPFLAG_NCHANGE,
         );
 
         // Next row in ephemeral table
@@ -1187,12 +1193,13 @@ impl<'a> InsertCompiler<'a> {
         );
 
         let flags = self.conflict_flags(conflict_action);
-        self.emit(
+        self.emit_with_p5(
             Opcode::Insert,
             self.table_cursor,
             record_reg,
             rowid_reg,
             P4::Int64(flags),
+            OPFLAG_NCHANGE,
         );
 
         Ok(())
@@ -1531,6 +1538,11 @@ impl<'a> InsertCompiler<'a> {
 
     fn emit(&mut self, opcode: Opcode, p1: i32, p2: i32, p3: i32, p4: P4) {
         self.ops.push(VdbeOp::with_p4(opcode, p1, p2, p3, p4));
+    }
+
+    fn emit_with_p5(&mut self, opcode: Opcode, p1: i32, p2: i32, p3: i32, p4: P4, p5: u16) {
+        self.ops
+            .push(VdbeOp::with_p4(opcode, p1, p2, p3, p4).with_p5(p5));
     }
 
     fn resolve_labels(&mut self) -> Result<()> {

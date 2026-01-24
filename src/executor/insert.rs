@@ -358,9 +358,9 @@ impl<'a> InsertCompiler<'a> {
         let select_exprs = self.get_select_expressions(select);
         let select_col_count = select_exprs.len();
 
-        // Check if any expressions contain subqueries
-        // If so, use SelectCompiler for the entire SELECT
-        if Self::has_subquery(&select_exprs) {
+        // Check if SELECT is complex and needs the full SelectCompiler
+        // Complex cases include: UNION, ORDER BY, GROUP BY, multiple tables, etc.
+        if Self::has_subquery(&select_exprs) || self.is_complex_select(select) {
             return self.compile_select_with_subqueries(
                 insert,
                 select,
@@ -369,7 +369,7 @@ impl<'a> InsertCompiler<'a> {
             );
         }
 
-        // Simple path: no subqueries, use direct expression compilation
+        // Simple path: single table SELECT with no complex clauses
 
         // Extract source table from SELECT
         // For now, we support simple "SELECT * FROM table" or "SELECT cols FROM table"
@@ -873,6 +873,49 @@ impl<'a> InsertCompiler<'a> {
             Expr::Exists { .. } => true,
             _ => false,
         }
+    }
+
+    /// Check if a SELECT statement requires the full SelectCompiler
+    /// (i.e., it's not a simple "SELECT cols FROM table" query)
+    fn is_complex_select(&self, select: &SelectStmt) -> bool {
+        // Check for UNION, EXCEPT, INTERSECT (compound selects)
+        if !matches!(select.body, SelectBody::Select(_)) {
+            return true;
+        }
+
+        if let SelectBody::Select(core) = &select.body {
+            // Has ORDER BY or LIMIT
+            if select.order_by.is_some() || select.limit.is_some() {
+                return true;
+            }
+
+            // Has GROUP BY or HAVING
+            if core.group_by.is_some() || core.having.is_some() {
+                return true;
+            }
+
+            // Check for multiple tables (JOINs) - more complex than simple table
+            if let Some(from) = &core.from {
+                if from.tables.len() > 1 {
+                    return true;
+                }
+                // Check if table is a JOIN
+                if let Some(table_ref) = from.tables.first() {
+                    if matches!(table_ref, crate::parser::ast::TableRef::Join { .. }) {
+                        return true;
+                    }
+                }
+            }
+
+            // For now, treat any WHERE clause as potentially complex
+            // (The simple path doesn't handle complex WHERE conditions well)
+            // This is conservative but safe - simpler queries without WHERE will still use fast path
+            if core.where_clause.is_some() {
+                return true;
+            }
+        }
+
+        false
     }
 
     /// Compile a SELECT expression with proper column resolution

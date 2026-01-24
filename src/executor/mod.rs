@@ -1,6 +1,7 @@
 //! Query execution: SELECT, INSERT, UPDATE, DELETE
 
 pub mod analyze;
+pub mod column_mapping;
 pub mod delete;
 pub mod fkey;
 pub mod insert;
@@ -15,6 +16,7 @@ pub mod where_expr;
 pub mod wherecode;
 pub mod window;
 
+pub use column_mapping::{ColumnMapper, ColumnSource};
 pub use where_clause::{
     analyze_where, estimate_simple_cost, IndexInfo, QueryPlanner, TableInfo, TermOp, WhereClause,
     WhereInfo, WhereLevel, WherePlan, WhereTerm,

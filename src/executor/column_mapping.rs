@@ -13,7 +13,10 @@
 use std::collections::HashMap;
 
 use crate::error::Result;
-use crate::schema::{Column, DefaultValue, Schema};
+use crate::schema::{Column, Schema};
+
+#[cfg(test)]
+use crate::schema::DefaultValue;
 
 /// How a target column should be filled
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

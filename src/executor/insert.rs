@@ -12,6 +12,7 @@ use crate::parser::ast::{
 use crate::schema::Schema;
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
+use super::column_mapping::{ColumnMapper, ColumnSource};
 use super::select::{SelectCompiler, SelectDest};
 
 fn is_rowid_alias(name: &str) -> bool {
@@ -468,34 +469,54 @@ impl<'a> InsertCompiler<'a> {
             P4::Unused,
         );
 
+        // Use ColumnMapper to build proper column mapping including DEFAULTs
+        let explicit_cols = insert
+            .columns
+            .as_ref()
+            .map(|cols| cols.iter().map(|c| c.clone()).collect::<Vec<_>>());
+        let mapper = ColumnMapper::new(
+            &insert.table.name,
+            explicit_cols.as_deref(),
+            select_col_count,
+            self.schema,
+        )?;
+
         // Read columns from ephemeral row and map to target columns
         let data_base = self.next_reg;
         let _data_regs = self.alloc_regs(self.num_columns);
 
-        let mut present = vec![false; self.num_columns];
-        for (i, target) in col_targets.iter().enumerate() {
-            if i >= select_col_count {
-                break;
-            }
-            match *target {
-                InsertColumnTarget::Rowid => {
-                    self.emit(Opcode::Column, eph_cursor, i as i32, rowid_reg, P4::Unused);
+        for (target_idx, column_source) in mapper.mapping().iter().enumerate() {
+            let dest_reg = data_base + target_idx as i32;
+
+            match column_source {
+                ColumnSource::SourceIndex(src_idx) => {
+                    // Read from SELECT result
+                    self.emit(
+                        Opcode::Column,
+                        eph_cursor,
+                        *src_idx as i32,
+                        dest_reg,
+                        P4::Unused,
+                    );
                 }
-                InsertColumnTarget::Column(col_idx) => {
-                    let dest_reg = data_base + col_idx as i32;
-                    self.emit(Opcode::Column, eph_cursor, i as i32, dest_reg, P4::Unused);
-                    if col_idx < present.len() {
-                        present[col_idx] = true;
+                ColumnSource::DefaultValue => {
+                    // Use column's DEFAULT value
+                    if let Some(col) = mapper.get_column(target_idx) {
+                        if let Some(default) = &col.default_value {
+                            self.emit_default_value(default, dest_reg)?;
+                        } else {
+                            // Shouldn't happen (DEFAULT would be mapped by ColumnMapper),
+                            // but be safe
+                            self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                        }
+                    } else {
+                        self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
                     }
                 }
-            }
-        }
-
-        // Fill NULLs for unspecified columns
-        for (i, seen) in present.iter().enumerate() {
-            if !*seen {
-                let reg = data_base + i as i32;
-                self.emit(Opcode::Null, 0, reg, 0, P4::Unused);
+                ColumnSource::Null => {
+                    // Use NULL
+                    self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                }
             }
         }
 
@@ -646,34 +667,54 @@ impl<'a> InsertCompiler<'a> {
             P4::Unused,
         );
 
+        // Use ColumnMapper to build proper column mapping including DEFAULTs
+        let explicit_cols = insert
+            .columns
+            .as_ref()
+            .map(|cols| cols.iter().map(|c| c.clone()).collect::<Vec<_>>());
+        let mapper = ColumnMapper::new(
+            &insert.table.name,
+            explicit_cols.as_deref(),
+            select_col_count,
+            self.schema,
+        )?;
+
         // Read columns from ephemeral row and map to target columns
         let data_base = self.next_reg;
         let _data_regs = self.alloc_regs(self.num_columns);
 
-        let mut present = vec![false; self.num_columns];
-        for (i, target) in col_targets.iter().enumerate() {
-            if i >= select_col_count {
-                break;
-            }
-            match *target {
-                InsertColumnTarget::Rowid => {
-                    self.emit(Opcode::Column, eph_cursor, i as i32, rowid_reg, P4::Unused);
+        for (target_idx, column_source) in mapper.mapping().iter().enumerate() {
+            let dest_reg = data_base + target_idx as i32;
+
+            match column_source {
+                ColumnSource::SourceIndex(src_idx) => {
+                    // Read from SELECT result
+                    self.emit(
+                        Opcode::Column,
+                        eph_cursor,
+                        *src_idx as i32,
+                        dest_reg,
+                        P4::Unused,
+                    );
                 }
-                InsertColumnTarget::Column(col_idx) => {
-                    let dest_reg = data_base + col_idx as i32;
-                    self.emit(Opcode::Column, eph_cursor, i as i32, dest_reg, P4::Unused);
-                    if col_idx < present.len() {
-                        present[col_idx] = true;
+                ColumnSource::DefaultValue => {
+                    // Use column's DEFAULT value
+                    if let Some(col) = mapper.get_column(target_idx) {
+                        if let Some(default) = &col.default_value {
+                            self.emit_default_value(default, dest_reg)?;
+                        } else {
+                            // Shouldn't happen (DEFAULT would be mapped by ColumnMapper),
+                            // but be safe
+                            self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                        }
+                    } else {
+                        self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
                     }
                 }
-            }
-        }
-
-        // Fill NULLs for unspecified columns
-        for (i, seen) in present.iter().enumerate() {
-            if !*seen {
-                let reg = data_base + i as i32;
-                self.emit(Opcode::Null, 0, reg, 0, P4::Unused);
+                ColumnSource::Null => {
+                    // Use NULL
+                    self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                }
             }
         }
 

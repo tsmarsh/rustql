@@ -13,7 +13,10 @@ use std::collections::HashMap;
 
 use crate::error::Result;
 use crate::parser::ast::{ConflictAction, Expr, ResultColumn, UpdateStmt};
+use crate::schema::Schema;
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
+
+use super::column_mapping::ColumnMapper;
 
 /// Flag to indicate that this operation should update the change counter
 const OPFLAG_NCHANGE: u16 = 0x01;
@@ -54,6 +57,9 @@ pub struct UpdateCompiler<'s> {
     /// Column name to index mapping (lowercase name -> index)
     column_map: HashMap<String, usize>,
 
+    /// Unified column mapper (replaces column_map over time)
+    mapper: Option<ColumnMapper>,
+
     /// Schema for name resolution (optional)
     schema: Option<&'s crate::schema::Schema>,
 
@@ -80,6 +86,7 @@ impl<'s> UpdateCompiler<'s> {
             table_cursor: 0,
             num_columns: 0,
             column_map: HashMap::new(),
+            mapper: None,
             schema: None,
             table_name: String::new(),
             table_alias: None,
@@ -98,6 +105,7 @@ impl<'s> UpdateCompiler<'s> {
             table_cursor: 0,
             num_columns: 0,
             column_map: HashMap::new(),
+            mapper: None,
             schema: Some(schema),
             table_name: String::new(),
             table_alias: None,
@@ -130,6 +138,16 @@ impl<'s> UpdateCompiler<'s> {
 
         // Build column map from schema
         self.build_column_map_from_schema(&update.table.name);
+
+        // Initialize ColumnMapper for validation
+        if let Some(schema) = self.schema {
+            self.mapper = Some(ColumnMapper::new(
+                &update.table.name,
+                None, // UPDATE doesn't use explicit column list like INSERT
+                0,    // source_count not used for UPDATE validation
+                Some(schema),
+            )?);
+        }
 
         // Validate all column names in assignments exist
         if self.schema.is_some() {
@@ -491,6 +509,13 @@ impl<'s> UpdateCompiler<'s> {
 
     /// Get column index by name
     fn get_column_index(&self, name: &str) -> Option<usize> {
+        // Try mapper first if available
+        if let Some(mapper) = &self.mapper {
+            if let Ok(idx) = mapper.validate_column(name) {
+                return Some(idx);
+            }
+        }
+        // Fall back to column_map
         let name_lower = name.to_lowercase();
         self.column_map.get(&name_lower).copied()
     }

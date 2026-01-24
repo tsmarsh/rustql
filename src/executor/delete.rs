@@ -7,7 +7,10 @@ use std::collections::HashMap;
 
 use crate::error::Result;
 use crate::parser::ast::{DeleteStmt, Expr, ResultColumn};
+use crate::schema::Schema;
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
+
+use super::column_mapping::ColumnMapper;
 
 const OPFLAG_NCHANGE: u16 = 0x01;
 
@@ -47,6 +50,9 @@ pub struct DeleteCompiler<'s> {
     /// Column name to index mapping
     column_map: HashMap<String, usize>,
 
+    /// Unified column mapper (replaces column_map over time)
+    mapper: Option<ColumnMapper>,
+
     /// Schema for column resolution
     schema: Option<&'s crate::schema::Schema>,
 }
@@ -63,6 +69,7 @@ impl<'s> DeleteCompiler<'s> {
             table_cursor: 0,
             num_columns: 0,
             column_map: HashMap::new(),
+            mapper: None,
             schema: None,
         }
     }
@@ -78,6 +85,7 @@ impl<'s> DeleteCompiler<'s> {
             table_cursor: 0,
             num_columns: 0,
             column_map: HashMap::new(),
+            mapper: None,
             schema: Some(schema),
         }
     }
@@ -135,6 +143,16 @@ impl<'s> DeleteCompiler<'s> {
             // No schema - use placeholder
             self.num_columns = 5;
             self.build_column_map();
+        }
+
+        // Initialize ColumnMapper for validation
+        if let Some(schema) = self.schema {
+            self.mapper = Some(ColumnMapper::new(
+                &delete.table.name,
+                None, // DELETE doesn't use explicit column list
+                0,    // source_count not used for DELETE validation
+                Some(schema),
+            )?);
         }
 
         // Compile the DELETE body
@@ -471,6 +489,13 @@ impl<'s> DeleteCompiler<'s> {
             return true;
         }
 
+        // Try mapper first if available
+        if let Some(mapper) = &self.mapper {
+            if mapper.validate_column(col_name).is_ok() {
+                return true;
+            }
+        }
+
         // Check in column_map (case-insensitive)
         let col_lower = col_name.to_lowercase();
         self.column_map.contains_key(&col_lower)
@@ -486,7 +511,13 @@ impl<'s> DeleteCompiler<'s> {
 
     /// Get column index by name
     fn get_column_index(&self, name: &str) -> Option<usize> {
-        // Try exact match first
+        // Try mapper first if available
+        if let Some(mapper) = &self.mapper {
+            if let Ok(idx) = mapper.validate_column(name) {
+                return Some(idx);
+            }
+        }
+        // Try exact match in column_map
         if let Some(&idx) = self.column_map.get(name) {
             return Some(idx);
         }

@@ -3938,7 +3938,22 @@ impl Btree {
             .map_err(|_| Error::new(ErrorCode::Internal))?;
         let mut shared_guard = shared;
         let root_pgno = _cursor.root_page;
-        let (mut mem_page, limits) = _cursor.load_page(&mut shared_guard, root_pgno)?;
+
+        // Use cursor's current page if available (cursor is already positioned at a leaf).
+        // This is critical for multi-level btrees where root_page is an internal node.
+        let (mut mem_page, limits) = if let Some(ref cursor_page) = _cursor.page {
+            let page_pgno = cursor_page.pgno;
+            let limits = if page_pgno == 1 {
+                PageLimits::for_page1(shared_guard.page_size, shared_guard.usable_size)
+            } else {
+                PageLimits::new(shared_guard.page_size, shared_guard.usable_size)
+            };
+            (cursor_page.clone(), limits)
+        } else {
+            // Fallback: load from root (only works for single-level btrees)
+            _cursor.load_page(&mut shared_guard, root_pgno)?
+        };
+
         if !mem_page.is_leaf {
             return Err(Error::new(ErrorCode::Internal));
         }
@@ -3972,8 +3987,11 @@ impl Btree {
         // Account for the 2 bytes freed from the cell pointer array
         mem_page.n_free += 2;
 
-        // Write mem_page changes to pager
-        let mut page = shared_guard.pager.get(root_pgno, PagerGetFlags::empty())?;
+        // Write mem_page changes to pager using the actual page number
+        let actual_pgno = mem_page.pgno;
+        let mut page = shared_guard
+            .pager
+            .get(actual_pgno, PagerGetFlags::empty())?;
         shared_guard.pager.write(&mut page)?;
         page.data.copy_from_slice(&mem_page.data);
 

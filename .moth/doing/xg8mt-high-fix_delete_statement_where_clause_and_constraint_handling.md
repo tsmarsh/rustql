@@ -31,9 +31,16 @@ DELETE statements fail to properly handle WHERE clauses, constraints, and transa
   - However, still need to verify actual DELETE counts are correct
 
 ### Current Issues Being Investigated
-1. **delete-3.1.4 syntax error**: Parser rejects `DELETE FROM 'table1'` - single quotes not valid for identifiers
-2. **delete-5.3 returning 0**: DELETE WHERE f1==$i loop should delete 50 rows, leaving 150, but table ends up empty
-3. **Row count accuracy**: Some DELETE tests expect specific counts but are getting incorrect values
+1. **Database corruption on bulk operations** (Critical):
+   - delete-5.2.3 (and 6.1, 6.8): Fails with "database disk image is malformed"
+   - Pattern: Works once with 200 INSERT/COMMIT/SELECT (delete-5.2.1 passes)
+   - Fails on second attempt after DELETE FROM table (delete-5.2.3 fails after delete-5.2.2)
+   - Root cause: Appears to be issue with reusing table space after bulk DELETE
+   - Impact: Breaks all subsequent tests in the sequence (delete-5.3 returns empty table)
+
+2. **delete-3.1.4 syntax error**: Parser rejects `DELETE FROM 'table1'` - single quotes not valid for identifiers
+
+3. **Row count accuracy**: Some DELETE tests expect specific counts but are getting incorrect values due to earlier corruption
 
 ## Root Causes
 1. **WHERE clause evaluation**: Rows not being correctly identified for deletion

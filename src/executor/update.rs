@@ -1485,6 +1485,10 @@ impl<'s> UpdateCompiler<'s> {
                     }
                 }
             }
+            Expr::Parens(inner) => {
+                // Parentheses just wrap an expression - compile the inner expression
+                self.compile_expr(inner, dest_reg)?;
+            }
             _ => {
                 // Default to NULL for unsupported expressions
                 self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);

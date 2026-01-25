@@ -205,12 +205,13 @@ impl<'s> DeleteCompiler<'s> {
             self.compile_where_check(where_expr, skip_label)?;
 
             // Delete the row - set OPFLAG_NCHANGE to track deleted rows
+            // Pass table name in P4 for trigger dispatch
             self.emit_with_p5(
                 Opcode::Delete,
                 self.table_cursor,
                 0,
                 0,
-                P4::Unused,
+                P4::Table(delete.table.name.clone()),
                 OPFLAG_NCHANGE,
             );
 
@@ -218,12 +219,13 @@ impl<'s> DeleteCompiler<'s> {
             self.resolve_label(skip_label, self.current_addr() as i32);
         } else {
             // No WHERE - delete every row
+            // Pass table name in P4 for trigger dispatch
             self.emit_with_p5(
                 Opcode::Delete,
                 self.table_cursor,
                 0,
                 0,
-                P4::Unused,
+                P4::Table(delete.table.name.clone()),
                 OPFLAG_NCHANGE,
             );
         }
@@ -362,12 +364,13 @@ impl<'s> DeleteCompiler<'s> {
             rowid_reg,
             P4::Unused,
         );
+        // Pass table name in P4 for trigger dispatch
         self.emit_with_p5(
             Opcode::Delete,
             self.table_cursor,
             0,
             0,
-            P4::Unused,
+            P4::Table(delete.table.name.clone()),
             OPFLAG_NCHANGE,
         );
 

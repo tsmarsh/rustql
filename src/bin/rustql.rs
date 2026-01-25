@@ -287,11 +287,17 @@ impl Shell {
             // Step through results
             let mut row_count = 0;
             const MAX_ROWS: usize = 100000;
+            let mut dynamic_col_count = col_count;
 
             loop {
                 match sqlite3_step(&mut stmt) {
                     Ok(StepResult::Row) => {
-                        self.print_row(&stmt, col_count, &col_names);
+                        // Re-check column count after step (may change for count_changes)
+                        let new_col_count = sqlite3_column_count(&stmt);
+                        if new_col_count > dynamic_col_count {
+                            dynamic_col_count = new_col_count;
+                        }
+                        self.print_row(&stmt, dynamic_col_count, &col_names);
                         row_count += 1;
                         if row_count >= MAX_ROWS {
                             eprintln!("Warning: result limit reached");

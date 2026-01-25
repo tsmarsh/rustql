@@ -14,8 +14,9 @@ use std::time::Instant;
 
 use crate::api::{SqliteConnection, TransactionState};
 use crate::error::{Error, ErrorCode, Result};
+use crate::executor::trigger::{find_matching_triggers, TriggerMask};
 use crate::functions::aggregate::AggregateState;
-use crate::schema::Schema;
+use crate::schema::{Schema, TriggerEvent, TriggerTiming};
 use crate::storage::btree::{
     BtCursor, Btree, BtreeCursorFlags, BtreeInsertFlags, BtreePayload, UnpackedRecord,
     BTREE_FILE_FORMAT, BTREE_SCHEMA_VERSION,
@@ -931,8 +932,6 @@ impl Vdbe {
                                 self.set_mem(count_reg, Mem::from_int(self.n_change));
                                 self.result_start = count_reg;
                                 self.result_count = 1;
-                                // Don't increment PC so we come back here after returning Row
-                                self.pc -= 1;
                                 return Ok(ExecResult::Row);
                             }
                         }
@@ -1379,6 +1378,16 @@ impl Vdbe {
                                     index.table.clone(),
                                     index.root_page,
                                     index.sql.clone(),
+                                ));
+                            }
+                            // Add triggers
+                            for (_, trigger) in schema_guard.triggers.iter() {
+                                entries.push((
+                                    "trigger".to_string(),
+                                    trigger.name.clone(),
+                                    trigger.table.clone(),
+                                    0, // triggers don't have a root page
+                                    trigger.sql.clone(),
                                 ));
                             }
                         }
@@ -3289,6 +3298,16 @@ impl Vdbe {
                         conn.total_changes.fetch_add(1, AtomicOrdering::SeqCst);
                     }
                 }
+
+                // Fire AFTER DELETE triggers if a row was successfully deleted
+                if deleted {
+                    // Get table name from P4
+                    if let P4::Text(ref table_name) = op.p4 {
+                        self.fire_after_delete_triggers(table_name)?;
+                    } else if let P4::Table(ref table_name) = op.p4 {
+                        self.fire_after_delete_triggers(table_name)?;
+                    }
+                }
             }
 
             Opcode::Last => {
@@ -4465,15 +4484,98 @@ impl Vdbe {
 
             Opcode::ParseSchema => {
                 // ParseSchema P1 P2 P3 P4
-                // Parse a CREATE TABLE/INDEX statement and add to schema
-                // P2 = register containing root page number
+                // Parse a CREATE TABLE/INDEX/TRIGGER statement and add to schema
+                // P2 = register containing root page number (0 for triggers)
                 // P4 = SQL text of the CREATE statement
                 let root_page = self.mem(op.p2).to_int() as u32;
                 if let P4::Text(sql) = &op.p4 {
-                    if let Some(ref schema) = self.schema {
+                    let sql_upper = sql.to_uppercase();
+
+                    // Handle CREATE TRIGGER
+                    if sql_upper.contains("CREATE TRIGGER")
+                        || sql_upper.contains("CREATE TEMPORARY TRIGGER")
+                    {
+                        if let Some(ref schema) = self.schema {
+                            if let Ok(mut schema_guard) = schema.write() {
+                                // Parse the trigger SQL
+                                if let Ok(stmt) = crate::parser::grammar::parse(sql) {
+                                    if let crate::parser::ast::Stmt::CreateTrigger(create) = stmt {
+                                        let if_not_exists = create.if_not_exists;
+
+                                        // Validate table exists
+                                        let table_name_lower = create.table.to_lowercase();
+                                        if !schema_guard.tables.contains_key(&table_name_lower) {
+                                            return Err(Error::with_message(
+                                                ErrorCode::Error,
+                                                format!("no such table: {}", create.table),
+                                            ));
+                                        }
+
+                                        // Convert timing/event
+                                        let timing = match create.time {
+                                            crate::parser::ast::TriggerTime::Before => {
+                                                TriggerTiming::Before
+                                            }
+                                            crate::parser::ast::TriggerTime::After => {
+                                                TriggerTiming::After
+                                            }
+                                            crate::parser::ast::TriggerTime::InsteadOf => {
+                                                TriggerTiming::InsteadOf
+                                            }
+                                        };
+
+                                        let (event, update_columns) = match &create.event {
+                                            crate::parser::ast::TriggerEvent::Delete => {
+                                                (TriggerEvent::Delete, None)
+                                            }
+                                            crate::parser::ast::TriggerEvent::Insert => {
+                                                (TriggerEvent::Insert, None)
+                                            }
+                                            crate::parser::ast::TriggerEvent::Update(cols) => {
+                                                (TriggerEvent::Update, cols.clone())
+                                            }
+                                        };
+
+                                        // Create trigger definition
+                                        let trigger = crate::schema::Trigger {
+                                            name: create.name.name.clone(),
+                                            table: create.table.clone(),
+                                            timing,
+                                            event,
+                                            for_each_row: create.for_each_row,
+                                            update_columns,
+                                            when_clause: None,
+                                            body: Vec::new(),
+                                            sql: Some(sql.to_string()),
+                                        };
+
+                                        // Check for duplicate trigger
+                                        let trigger_name_lower = trigger.name.to_lowercase();
+                                        if schema_guard.triggers.contains_key(&trigger_name_lower) {
+                                            if !if_not_exists {
+                                                return Err(Error::with_message(
+                                                    ErrorCode::Error,
+                                                    format!(
+                                                        "trigger {} already exists",
+                                                        trigger.name
+                                                    ),
+                                                ));
+                                            }
+                                        } else {
+                                            schema_guard.triggers.insert(
+                                                trigger_name_lower,
+                                                std::sync::Arc::new(trigger),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Continue to next opcode (trigger handled)
+                    } else if let Some(ref schema) = self.schema {
                         if let Ok(mut schema_guard) = schema.write() {
                             // Check if IF NOT EXISTS was specified
-                            let if_not_exists = sql.to_uppercase().contains("IF NOT EXISTS");
+                            let if_not_exists = sql_upper.contains("IF NOT EXISTS");
 
                             // Parse CREATE TABLE SQL and register the table
                             if let Some(table) = crate::schema::parse_create_sql(sql, root_page) {
@@ -5069,6 +5171,163 @@ impl Vdbe {
             data_offset = data_offset.saturating_add(size);
         }
         mems
+    }
+
+    /// Fire AFTER DELETE triggers for a table
+    ///
+    /// This is called after a successful row deletion to execute any
+    /// AFTER DELETE triggers defined on the table.
+    fn fire_after_delete_triggers(&mut self, table_name: &str) -> Result<()> {
+        // Check recursion depth
+        if self.trigger_depth >= self.max_trigger_depth {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                format!(
+                    "too many levels of trigger recursion (max {})",
+                    self.max_trigger_depth
+                ),
+            ));
+        }
+
+        // Get the schema to find triggers
+        let schema = match &self.schema {
+            Some(s) => s.clone(),
+            None => return Ok(()),
+        };
+
+        let schema_guard = match schema.read() {
+            Ok(g) => g,
+            Err(_) => return Ok(()),
+        };
+
+        // Find matching AFTER DELETE triggers
+        let triggers = find_matching_triggers(
+            &schema_guard,
+            table_name,
+            TriggerTiming::After,
+            TriggerEvent::Delete,
+            None,
+        );
+
+        if triggers.is_empty() {
+            return Ok(());
+        }
+
+        // Drop the schema guard before we potentially need to compile/execute SQL
+        drop(schema_guard);
+
+        // Execute each trigger's body
+        for trigger in triggers {
+            // Get the trigger's SQL
+            let sql = match &trigger.sql {
+                Some(s) => s.clone(),
+                None => continue, // No SQL stored, skip
+            };
+
+            // Parse the CREATE TRIGGER statement to get the body
+            let stmt = match crate::parser::grammar::parse(&sql) {
+                Ok(s) => s,
+                Err(_) => continue, // Parse error, skip this trigger
+            };
+
+            // Extract the body from CreateTriggerStmt
+            let body_stmts = match stmt {
+                crate::parser::ast::Stmt::CreateTrigger(create) => create.body,
+                _ => continue, // Not a CREATE TRIGGER, skip
+            };
+
+            // Compile and execute each body statement
+            for body_stmt in body_stmts {
+                let schema_guard = match schema.read() {
+                    Ok(g) => g,
+                    Err(_) => continue,
+                };
+
+                // Create a compiler and compile the statement
+                let compiled = match compile_trigger_body_stmt(&body_stmt, &schema_guard) {
+                    Ok(ops) => ops,
+                    Err(_) => continue,
+                };
+
+                drop(schema_guard);
+
+                // Execute the compiled ops
+                self.trigger_depth += 1;
+                let result = self.execute_trigger_subprogram(compiled);
+                self.trigger_depth = self.trigger_depth.saturating_sub(1);
+
+                // If trigger execution failed, propagate the error
+                result?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Execute a trigger subprogram
+    fn execute_trigger_subprogram(&mut self, ops: Vec<VdbeOp>) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+
+        // Save current execution state
+        let saved_ops = std::mem::replace(&mut self.ops, ops);
+        let saved_pc = self.pc;
+        let saved_is_done = self.is_done;
+        let saved_has_result = self.has_result;
+
+        // Reset state for subprogram execution
+        self.pc = 0;
+        self.is_done = false;
+        self.has_result = false;
+
+        // Execute until done or error
+        let result = loop {
+            match self.step() {
+                Ok(ExecResult::Done) => break Ok(()),
+                Ok(ExecResult::Row) => continue, // Ignore result rows from trigger
+                Ok(ExecResult::Continue) => continue,
+                Err(e) => break Err(e),
+            }
+        };
+
+        // Restore execution state
+        self.ops = saved_ops;
+        self.pc = saved_pc;
+        self.is_done = saved_is_done;
+        self.has_result = saved_has_result;
+
+        result
+    }
+}
+
+/// Compile a trigger body statement to VDBE opcodes
+fn compile_trigger_body_stmt(
+    stmt: &crate::parser::ast::Stmt,
+    schema: &Schema,
+) -> Result<Vec<VdbeOp>> {
+    use crate::executor::delete::compile_delete_with_schema;
+    use crate::executor::insert::compile_insert_with_schema;
+    use crate::executor::update::compile_update_with_schema;
+    use crate::parser::ast::Stmt;
+
+    match stmt {
+        Stmt::Update(update) => compile_update_with_schema(update, schema),
+        Stmt::Insert(insert) => compile_insert_with_schema(insert, schema),
+        Stmt::Delete(delete) => compile_delete_with_schema(delete, schema),
+        Stmt::Select(select) => {
+            // For SELECT in triggers, compile as a basic select
+            use crate::executor::select::{SelectCompiler, SelectDest};
+            let mut compiler = SelectCompiler::with_schema(schema);
+            compiler.compile(select, &SelectDest::Discard)
+        }
+        _ => {
+            // Unsupported statement type in trigger body
+            Err(Error::with_message(
+                ErrorCode::Error,
+                format!("unsupported statement type in trigger body"),
+            ))
+        }
     }
 }
 

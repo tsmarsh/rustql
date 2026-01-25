@@ -1622,17 +1622,354 @@ impl<'s> StatementCompiler<'s> {
     }
 
     fn compile_create_trigger(&mut self, create: &CreateTriggerStmt) -> Result<Vec<VdbeOp>> {
+        // Reconstruct the CREATE TRIGGER SQL for storage
+        // This preserves the original SQL text for later parsing
+        let sql = self.reconstruct_create_trigger_sql(create);
+
         let mut ops = Vec::new();
-        ops.push(Self::make_op(Opcode::Init, 0, 1, 0, P4::Unused));
-        ops.push(Self::make_op(
-            Opcode::Noop,
-            0,
-            0,
-            0,
-            P4::Text(format!("CREATE TRIGGER {}", create.name)),
-        ));
+        ops.push(Self::make_op(Opcode::Init, 0, 2, 0, P4::Unused));
+        ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
+        // Use ParseSchema to register the trigger in the schema at runtime
+        // P2=0 (triggers don't need a root page), P4=SQL text
+        ops.push(Self::make_op(Opcode::ParseSchema, 0, 0, 0, P4::Text(sql)));
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
         Ok(ops)
+    }
+
+    /// Reconstruct CREATE TRIGGER SQL from the AST
+    fn reconstruct_create_trigger_sql(&self, create: &CreateTriggerStmt) -> String {
+        let mut sql = String::from("CREATE ");
+        if create.temporary {
+            sql.push_str("TEMPORARY ");
+        }
+        sql.push_str("TRIGGER ");
+        if create.if_not_exists {
+            sql.push_str("IF NOT EXISTS ");
+        }
+        sql.push_str(&create.name.to_string());
+        sql.push(' ');
+
+        // Timing
+        match create.time {
+            TriggerTime::Before => sql.push_str("BEFORE "),
+            TriggerTime::After => sql.push_str("AFTER "),
+            TriggerTime::InsteadOf => sql.push_str("INSTEAD OF "),
+        }
+
+        // Event
+        match &create.event {
+            TriggerEvent::Delete => sql.push_str("DELETE "),
+            TriggerEvent::Insert => sql.push_str("INSERT "),
+            TriggerEvent::Update(cols) => {
+                sql.push_str("UPDATE ");
+                if let Some(cols) = cols {
+                    sql.push_str("OF ");
+                    sql.push_str(&cols.join(", "));
+                    sql.push(' ');
+                }
+            }
+        }
+
+        sql.push_str("ON ");
+        sql.push_str(&create.table);
+        sql.push(' ');
+
+        if create.for_each_row {
+            sql.push_str("FOR EACH ROW ");
+        }
+
+        // WHEN clause
+        if let Some(ref when) = create.when {
+            sql.push_str("WHEN ");
+            sql.push_str(&self.expr_to_sql(when));
+            sql.push(' ');
+        }
+
+        sql.push_str("BEGIN ");
+        for stmt in &create.body {
+            sql.push_str(&self.stmt_to_sql(stmt));
+            sql.push_str("; ");
+        }
+        sql.push_str("END");
+
+        sql
+    }
+
+    /// Convert expression to SQL (for trigger reconstruction)
+    fn expr_to_sql(&self, expr: &Expr) -> String {
+        match expr {
+            Expr::Literal(lit) => match lit {
+                Literal::Null => "NULL".to_string(),
+                Literal::Integer(n) => n.to_string(),
+                Literal::Float(n) => n.to_string(),
+                Literal::String(s) => format!("'{}'", s.replace('\'', "''")),
+                Literal::Blob(b) => format!("X'{}'", hex::encode(b)),
+                Literal::Bool(b) => if *b { "1" } else { "0" }.to_string(),
+                Literal::CurrentTime => "CURRENT_TIME".to_string(),
+                Literal::CurrentDate => "CURRENT_DATE".to_string(),
+                Literal::CurrentTimestamp => "CURRENT_TIMESTAMP".to_string(),
+            },
+            Expr::Column(col) => {
+                if let Some(ref table) = col.table {
+                    format!("{}.{}", table, col.column)
+                } else {
+                    col.column.clone()
+                }
+            }
+            Expr::Binary { op, left, right } => {
+                let op_str = match op {
+                    BinaryOp::Add => "+",
+                    BinaryOp::Sub => "-",
+                    BinaryOp::Mul => "*",
+                    BinaryOp::Div => "/",
+                    BinaryOp::Mod => "%",
+                    BinaryOp::Eq => "=",
+                    BinaryOp::Ne => "!=",
+                    BinaryOp::Lt => "<",
+                    BinaryOp::Le => "<=",
+                    BinaryOp::Gt => ">",
+                    BinaryOp::Ge => ">=",
+                    BinaryOp::And => "AND",
+                    BinaryOp::Or => "OR",
+                    BinaryOp::Concat => "||",
+                    BinaryOp::BitAnd => "&",
+                    BinaryOp::BitOr => "|",
+                    BinaryOp::ShiftLeft => "<<",
+                    BinaryOp::ShiftRight => ">>",
+                    BinaryOp::Is => "IS",
+                    BinaryOp::IsNot => "IS NOT",
+                };
+                format!(
+                    "({} {} {})",
+                    self.expr_to_sql(left),
+                    op_str,
+                    self.expr_to_sql(right)
+                )
+            }
+            Expr::Unary { op, expr: inner } => {
+                let op_str = match op {
+                    UnaryOp::Not => "NOT ",
+                    UnaryOp::Neg => "-",
+                    UnaryOp::Pos => "+",
+                    UnaryOp::BitNot => "~",
+                };
+                format!("{}{}", op_str, self.expr_to_sql(inner))
+            }
+            Expr::Function(func) => {
+                let args_str = match &func.args {
+                    FunctionArgs::Star => "*".to_string(),
+                    FunctionArgs::Exprs(args) => args
+                        .iter()
+                        .map(|a| self.expr_to_sql(a))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                };
+                format!("{}({})", func.name, args_str)
+            }
+            Expr::Variable(var) => match var {
+                Variable::Named { prefix, name } => format!("{}{}", prefix, name),
+                Variable::Numbered(Some(idx)) => format!("?{}", idx),
+                Variable::Numbered(None) => "?".to_string(),
+            },
+            Expr::Parens(inner) => format!("({})", self.expr_to_sql(inner)),
+            _ => "?".to_string(), // Fallback for complex expressions
+        }
+    }
+
+    /// Convert statement to SQL (for trigger body reconstruction)
+    fn stmt_to_sql(&self, stmt: &Stmt) -> String {
+        match stmt {
+            Stmt::Update(update) => {
+                let mut sql = format!("UPDATE {} SET ", update.table.name);
+                let assignments: Vec<String> = update
+                    .assignments
+                    .iter()
+                    .map(|a| {
+                        let cols = a.columns.join(", ");
+                        format!("{} = {}", cols, self.expr_to_sql(&a.expr))
+                    })
+                    .collect();
+                sql.push_str(&assignments.join(", "));
+                if let Some(ref where_clause) = update.where_clause {
+                    sql.push_str(" WHERE ");
+                    sql.push_str(&self.expr_to_sql(where_clause));
+                }
+                sql
+            }
+            Stmt::Insert(insert) => {
+                let mut sql = format!("INSERT INTO {}", insert.table.name);
+                if let Some(ref cols) = insert.columns {
+                    sql.push_str(" (");
+                    sql.push_str(&cols.join(", "));
+                    sql.push(')');
+                }
+                match &insert.source {
+                    InsertSource::Values(rows) => {
+                        sql.push_str(" VALUES ");
+                        let value_lists: Vec<String> = rows
+                            .iter()
+                            .map(|row| {
+                                let exprs: Vec<String> =
+                                    row.iter().map(|e| self.expr_to_sql(e)).collect();
+                                format!("({})", exprs.join(", "))
+                            })
+                            .collect();
+                        sql.push_str(&value_lists.join(", "));
+                    }
+                    InsertSource::Select(select) => {
+                        sql.push(' ');
+                        sql.push_str(&self.select_to_sql(select));
+                    }
+                    InsertSource::DefaultValues => {
+                        sql.push_str(" DEFAULT VALUES");
+                    }
+                }
+                sql
+            }
+            Stmt::Delete(delete) => {
+                let mut sql = format!("DELETE FROM {}", delete.table.name);
+                if let Some(ref where_clause) = delete.where_clause {
+                    sql.push_str(" WHERE ");
+                    sql.push_str(&self.expr_to_sql(where_clause));
+                }
+                sql
+            }
+            Stmt::Select(select) => self.select_to_sql(select),
+            _ => String::new(),
+        }
+    }
+
+    /// Convert SELECT to SQL (simplified - handles SelectCore from SelectBody)
+    fn select_to_sql(&self, select: &SelectStmt) -> String {
+        self.select_body_to_sql(&select.body)
+    }
+
+    /// Convert SelectBody to SQL
+    fn select_body_to_sql(&self, body: &SelectBody) -> String {
+        match body {
+            SelectBody::Select(core) => self.select_core_to_sql(core),
+            SelectBody::Compound { op, left, right } => {
+                let left_sql = self.select_body_to_sql(left);
+                let right_sql = self.select_body_to_sql(right);
+                let op_str = match op {
+                    CompoundOp::Union => "UNION",
+                    CompoundOp::UnionAll => "UNION ALL",
+                    CompoundOp::Intersect => "INTERSECT",
+                    CompoundOp::Except => "EXCEPT",
+                };
+                format!("{} {} {}", left_sql, op_str, right_sql)
+            }
+        }
+    }
+
+    /// Convert SelectCore to SQL
+    fn select_core_to_sql(&self, core: &SelectCore) -> String {
+        let mut sql = String::from("SELECT ");
+        let cols: Vec<String> = core
+            .columns
+            .iter()
+            .map(|col| match col {
+                ResultColumn::Star => "*".to_string(),
+                ResultColumn::TableStar(t) => format!("{}.*", t),
+                ResultColumn::Expr { expr, alias } => {
+                    let e = self.expr_to_sql(expr);
+                    if let Some(a) = alias {
+                        format!("{} AS {}", e, a)
+                    } else {
+                        e
+                    }
+                }
+            })
+            .collect();
+        sql.push_str(&cols.join(", "));
+
+        if let Some(ref from) = core.from {
+            sql.push_str(" FROM ");
+            sql.push_str(&self.from_clause_to_sql(from));
+        }
+
+        if let Some(ref where_clause) = core.where_clause {
+            sql.push_str(" WHERE ");
+            sql.push_str(&self.expr_to_sql(where_clause));
+        }
+
+        sql
+    }
+
+    /// Convert FROM clause to SQL
+    fn from_clause_to_sql(&self, from: &FromClause) -> String {
+        let parts: Vec<String> = from
+            .tables
+            .iter()
+            .map(|t| self.table_ref_to_sql(t))
+            .collect();
+        parts.join(", ")
+    }
+
+    /// Convert TableRef to SQL
+    fn table_ref_to_sql(&self, table_ref: &TableRef) -> String {
+        match table_ref {
+            TableRef::Table { name, alias, .. } => {
+                if let Some(a) = alias {
+                    format!("{} AS {}", name.name, a)
+                } else {
+                    name.name.clone()
+                }
+            }
+            TableRef::Join {
+                left,
+                join_type,
+                right,
+                constraint,
+            } => {
+                let left_sql = self.table_ref_to_sql(left);
+                let right_sql = self.table_ref_to_sql(right);
+                let join_str = if join_type.contains(JoinFlags::LEFT) {
+                    "LEFT JOIN"
+                } else if join_type.contains(JoinFlags::RIGHT) {
+                    "RIGHT JOIN"
+                } else if join_type.contains(JoinFlags::CROSS) {
+                    "CROSS JOIN"
+                } else {
+                    "JOIN"
+                };
+                let mut sql = format!("{} {} {}", left_sql, join_str, right_sql);
+                if let Some(ref c) = constraint {
+                    match c {
+                        JoinConstraint::On(expr) => {
+                            sql.push_str(" ON ");
+                            sql.push_str(&self.expr_to_sql(expr));
+                        }
+                        JoinConstraint::Using(cols) => {
+                            sql.push_str(" USING (");
+                            sql.push_str(&cols.join(", "));
+                            sql.push(')');
+                        }
+                    }
+                }
+                sql
+            }
+            TableRef::Subquery { query, alias } => {
+                let subq = self.select_to_sql(query);
+                if let Some(a) = alias {
+                    format!("({}) AS {}", subq, a)
+                } else {
+                    format!("({})", subq)
+                }
+            }
+            TableRef::TableFunction { name, args, alias } => {
+                let args_sql: Vec<String> = args.iter().map(|a| self.expr_to_sql(a)).collect();
+                let func_sql = format!("{}({})", name, args_sql.join(", "));
+                if let Some(a) = alias {
+                    format!("{} AS {}", func_sql, a)
+                } else {
+                    func_sql
+                }
+            }
+            TableRef::Parens(inner) => {
+                format!("({})", self.table_ref_to_sql(inner))
+            }
+        }
     }
 
     fn compile_drop(&mut self, drop: &DropStmt, kind: &str) -> Result<Vec<VdbeOp>> {

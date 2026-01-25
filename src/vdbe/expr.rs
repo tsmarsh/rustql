@@ -382,10 +382,34 @@ impl ExprCompiler {
         let r1 = self.compile_expr(left)?;
         let r2 = self.compile_expr(right)?;
 
-        // Generate: if (cmp) goto true; result = 0; goto end; true: result = 1; end:
+        // IS and IS NOT are null-safe (NULL IS NULL = true, NULL IS NOT NULL = false)
+        let is_null_safe = matches!(op, BinaryOp::Is | BinaryOp::IsNot);
+
         let lbl_true = self.make_label();
         let lbl_end = self.make_label();
 
+        // For non-null-safe comparisons, if either operand is NULL, result is NULL
+        if !is_null_safe {
+            let lbl_check_r2 = self.make_label();
+            let lbl_both_not_null = self.make_label();
+
+            // Check if r1 is NULL
+            self.add_op_label(Opcode::NotNull, r1, lbl_check_r2, 0);
+            // r1 is NULL, set result to NULL and exit
+            self.add_op(Opcode::Null, 0, target, 0);
+            self.add_op_label(Opcode::Goto, 0, lbl_end, 0);
+
+            self.resolve_label(lbl_check_r2);
+            // Check if r2 is NULL
+            self.add_op_label(Opcode::NotNull, r2, lbl_both_not_null, 0);
+            // r2 is NULL, set result to NULL and exit
+            self.add_op(Opcode::Null, 0, target, 0);
+            self.add_op_label(Opcode::Goto, 0, lbl_end, 0);
+
+            self.resolve_label(lbl_both_not_null);
+        }
+
+        // Generate: if (cmp) goto true; result = 0; goto end; true: result = 1; end:
         let opcode = match op {
             BinaryOp::Eq | BinaryOp::Is => Opcode::Eq,
             BinaryOp::Ne | BinaryOp::IsNot => Opcode::Ne,
@@ -823,11 +847,13 @@ mod tests {
         compiler.compile_expr(&expr).unwrap();
         let ops = compiler.take_ops();
 
-        // Should have: Integer(5), Integer(10), Lt(jump), Integer(0), Goto, Integer(1)
+        // Should have: Integer(5), Integer(10), NULL checks, Lt(jump), Integer(0), Goto, Integer(1)
+        // The NULL checks add NotNull opcodes before the comparison
         assert!(ops.len() >= 4);
         assert_eq!(ops[0].opcode, Opcode::Integer);
         assert_eq!(ops[1].opcode, Opcode::Integer);
-        assert_eq!(ops[2].opcode, Opcode::Lt);
+        // Lt should appear somewhere in the ops (after NULL checks)
+        assert!(ops.iter().any(|op| op.opcode == Opcode::Lt));
     }
 
     #[test]

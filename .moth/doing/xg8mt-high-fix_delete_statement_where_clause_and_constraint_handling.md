@@ -19,9 +19,16 @@ DELETE statements fail to properly handle WHERE clauses, constraints, and transa
 - delete-12.0: DELETE row count not accurate
 
 ### Current Pass Rate
-- delete.test: 39/67 (58%) ← **UP from 31/67 (46%)**
+- delete.test: 42/67 (62%) ← **UP from 39/67 (58%)**
 
 ## Session Progress
+
+### Completed (Session 4) - count_changes FIX
+- **PRAGMA count_changes now working**: When enabled, INSERT/UPDATE/DELETE return affected row count
+- **The Fix**: Re-enabled count_changes result return in VDBE Halt handler (was disabled due to corruption fears, but corruption was a separate issue)
+- **Result**: 3 more tests passing (39→42)
+- Tests now passing: delete-3.1.6.1, delete-3.1.6.2, delete-5.1.1, delete-5.2.2
+- Files modified: `src/vdbe/engine/mod.rs`
 
 ### Completed (Session 3) - CORRUPTION FIX
 - **ROOT CAUSE IDENTIFIED AND FIXED**: Database corruption after bulk DELETE operations
@@ -36,9 +43,10 @@ DELETE statements fail to properly handle WHERE clauses, constraints, and transa
 - Isolated database corruption to minimal test case
 
 ## Current Status
-- **DELETE tests: 39/67 passing (58%)** ← Up from 46%
+- **DELETE tests: 42/67 passing (62%)** ← Up from 58%
 - **CRITICAL BLOCKER RESOLVED**: Database corruption fixed!
-- **Remaining work**: Complex WHERE expressions, subqueries, readonly database handling
+- **count_changes FIXED**: PRAGMA count_changes now returns row counts
+- **Remaining work**: Complex WHERE expressions (delete-6.5.x), subqueries, readonly database handling
 
 ### ~~CRITICAL ISSUE~~ RESOLVED: Database Corruption in Bulk Operations
 

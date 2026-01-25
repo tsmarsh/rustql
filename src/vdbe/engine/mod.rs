@@ -4249,19 +4249,69 @@ impl Vdbe {
             // Index Operations (for ephemeral tables and DISTINCT)
             // ================================================================
             Opcode::IdxGE => {
-                // IdxGE P1 P2 P3 P4: Check if record exists in ephemeral index
+                // IdxGE P1 P2 P3 P4: jump if index entry >= key
+                // For btree indexes: compare current entry with key and jump if >=
                 // For ephemeral tables: jump to P2 if record P3 exists in cursor P1
-                // P4 = number of key columns
+
+                // Pre-read the record for ephemeral check (before mutable cursor borrow)
                 let record = self.mem(op.p3).to_blob();
-                let mut found = false;
+
+                let key_info = match &op.p4 {
+                    P4::KeyInfo(info) => Some(info),
+                    _ => None,
+                };
+                let key_cols = match &op.p4 {
+                    P4::Int64(n) => *n as usize,
+                    P4::KeyInfo(info) => info.n_key_field as usize,
+                    _ => 0,
+                };
+
+                let mut should_jump = false;
 
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if cursor.is_ephemeral {
-                        found = cursor.ephemeral_set.contains(&record);
+                        // For ephemeral tables: check if record exists
+                        should_jump = cursor.ephemeral_set.contains(&record);
+                    } else if key_cols != 0 {
+                        // For btree indexes: compare current entry with key
+                        if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                            let payload = if let Some(data) = bt_cursor.payload_fetch() {
+                                data.to_vec()
+                            } else {
+                                bt_cursor.payload(0, bt_cursor.payload_size())?
+                            };
+                            let index_mems = self.decode_record_mems(&payload);
+                            let null_mem = Mem::new();
+                            let mut cmp = std::cmp::Ordering::Equal;
+                            for i in 0..key_cols {
+                                let idx_mem = index_mems.get(i).unwrap_or(&null_mem);
+                                let key_mem = self.mem(op.p3 + i as i32);
+
+                                // Get collation for this column
+                                let collation = key_info
+                                    .and_then(|ki| ki.collations.get(i))
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("BINARY");
+                                let col_cmp = idx_mem.compare_with_collation(key_mem, collation);
+
+                                // Apply DESC sort order
+                                let desc = key_info
+                                    .and_then(|ki| ki.sort_orders.get(i).copied())
+                                    .unwrap_or(false);
+                                let col_cmp = if desc { col_cmp.reverse() } else { col_cmp };
+                                if col_cmp != std::cmp::Ordering::Equal {
+                                    cmp = col_cmp;
+                                    break;
+                                }
+                            }
+                            // Jump if index entry >= key (i.e., not less than key)
+                            should_jump = cmp != std::cmp::Ordering::Less;
+                        }
                     }
                 }
 
-                if found {
+                if should_jump {
+                    inc_search_count();
                     self.pc = op.p2;
                 }
             }

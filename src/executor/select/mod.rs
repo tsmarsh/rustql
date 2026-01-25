@@ -11,7 +11,9 @@ pub use types::{ColumnInfo, SelectDest, TableInfo};
 use std::collections::{HashMap, HashSet};
 
 use crate::error::{Error, ErrorCode, Result};
-use crate::executor::where_clause::{IndexInfo, QueryPlanner, WhereInfo, WhereLevel, WherePlan};
+use crate::executor::where_clause::{
+    IndexInfo, QueryPlanner, TermOp, WhereInfo, WhereLevel, WherePlan,
+};
 use crate::executor::window::{select_has_window_functions, WindowCompiler};
 use crate::parser::ast::{
     BinaryOp, ColumnRef, CommonTableExpr, CompoundOp, Distinct, Expr, FromClause, JoinFlags,
@@ -886,6 +888,11 @@ impl<'s> SelectCompiler<'s> {
         let mut scan_info: Vec<(bool, Option<i32>, i32, i32, bool)> =
             Vec::with_capacity(table_cursors.len());
 
+        // Track range end keys for early termination on upper bound constraints
+        // Option<(end_key_reg, key_count, op)> - op is Lt or Le to determine IdxGE vs IdxGT
+        let mut range_end_keys: Vec<Option<(i32, i32, TermOp)>> =
+            Vec::with_capacity(table_cursors.len());
+
         // Now emit the Rewind/loop structure (or index seek structure based on plan)
         for (i, cursor) in table_cursors.iter().enumerate() {
             // Handle FTS3 filter if applicable
@@ -918,6 +925,7 @@ impl<'s> SelectCompiler<'s> {
                 Some(WherePlan::IndexScan {
                     index_name,
                     eq_cols,
+                    range_end,
                     ..
                 }) if *eq_cols > 0 => {
                     // Index scan with equality constraints
@@ -991,7 +999,48 @@ impl<'s> SelectCompiler<'s> {
                     // DeferredSeek sets up table cursor to read from index
                     self.emit(Opcode::DeferredSeek, *cursor, 0, index_cursor, P4::Unused);
 
+                    // Build range end key if we have an upper bound constraint
+                    // IdxGE expects key values in consecutive registers, not as a record
+                    let range_end_info = if let Some((_col_idx, op, term_idx)) = range_end {
+                        // Find the range term's RHS expression
+                        if let Some(info) = &where_info {
+                            if let Some(term) = info.terms.get(*term_idx as usize) {
+                                // The range term expression is col op value, extract the value
+                                if let Expr::Binary { right, .. } = term.expr.as_ref() {
+                                    // Allocate consecutive registers for end key values
+                                    let end_key_base = self.next_reg;
+                                    // Copy eq values first - pre-allocate all registers
+                                    let copy_regs: Vec<i32> =
+                                        (0..*eq_cols).map(|_| self.alloc_reg()).collect();
+                                    for (j, dest_reg) in copy_regs.iter().enumerate() {
+                                        self.emit(
+                                            Opcode::Copy,
+                                            key_base_reg + j as i32,
+                                            *dest_reg,
+                                            0,
+                                            P4::Unused,
+                                        );
+                                    }
+                                    // Compile range bound value into next consecutive register
+                                    let range_val_reg = self.alloc_reg();
+                                    self.compile_expr(right, range_val_reg)?;
+                                    // Return base register of consecutive key values (not a record)
+                                    Some((end_key_base, *eq_cols + 1, *op))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
                     scan_info.push((true, Some(index_cursor), key_base_reg, *eq_cols, false));
+                    range_end_keys.push(range_end_info);
                 }
                 Some(WherePlan::IndexScan {
                     index_name,
@@ -1078,6 +1127,7 @@ impl<'s> SelectCompiler<'s> {
                         if end_expr.is_some() { 1 } else { 0 },
                         false,
                     ));
+                    range_end_keys.push(None);
                 }
                 Some(WherePlan::RowidEq) => {
                     // Direct rowid lookup - find the rowid term and compile it
@@ -1122,6 +1172,7 @@ impl<'s> SelectCompiler<'s> {
                     loop_labels.push(loop_label);
 
                     scan_info.push((false, None, 0, 0, true));
+                    range_end_keys.push(None);
                 }
                 Some(WherePlan::RowidRange {
                     has_start,
@@ -1171,6 +1222,7 @@ impl<'s> SelectCompiler<'s> {
                     loop_labels.push(loop_label);
 
                     scan_info.push((false, None, 0, 0, false));
+                    range_end_keys.push(None);
                 }
                 _ => {
                     // Full scan (default)
@@ -1183,6 +1235,7 @@ impl<'s> SelectCompiler<'s> {
                     loop_labels.push(loop_label);
 
                     scan_info.push((false, None, 0, 0, false));
+                    range_end_keys.push(None);
                 }
             }
 
@@ -1290,8 +1343,25 @@ impl<'s> SelectCompiler<'s> {
                 // (single row lookup, no iteration)
             } else if is_index_scan {
                 if let Some(idx_cursor) = index_cursor {
+                    // Check range end key first (for early termination on upper bound)
+                    if let Some(Some((end_key_reg, end_key_count, op))) = range_end_keys.get(i) {
+                        // For Lt (y < 100): terminate when y >= 100 -> use IdxGE
+                        // For Le (y <= 100): terminate when y > 100 -> use IdxGT
+                        let opcode = match op {
+                            TermOp::Lt => Opcode::IdxGE,
+                            TermOp::Le => Opcode::IdxGT,
+                            _ => Opcode::IdxGE, // Default to IdxGE for safety
+                        };
+                        self.emit(
+                            opcode,
+                            idx_cursor,
+                            next_labels[i],
+                            *end_key_reg,
+                            P4::Int64(*end_key_count as i64),
+                        );
+                    }
                     if key_count > 0 {
-                        // Check if we've gone past the key range
+                        // Check if we've gone past the equality key range
                         // IdxGT jumps to next_labels[i] if current index entry > key
                         self.emit(
                             Opcode::IdxGT,

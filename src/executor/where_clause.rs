@@ -116,6 +116,9 @@ pub enum WherePlan {
         covering: bool,
         /// Has range constraint after equality columns (for BETWEEN, <, >, etc.)
         has_range: bool,
+        /// Range termination info: (column_idx, operator, term_idx) for early scan termination
+        /// Only set for upper-bound constraints (Lt, Le) that can terminate the scan
+        range_end: Option<(i32, TermOp, i32)>,
     },
 
     /// Use primary key/rowid lookup
@@ -1022,6 +1025,33 @@ impl QueryPlanner {
             let has_range =
                 self.index_has_range_match(index, &usable_range_terms, table_idx, eq_match_count);
 
+            // Find range termination term (Lt or Le on the column after eq columns)
+            let range_end = if has_range && eq_match_count > 0 {
+                let next_idx = eq_match_count as usize;
+                if next_idx < index.columns.len() {
+                    let col_idx = index.columns[next_idx];
+                    usable_range_terms.iter().find_map(|t| {
+                        if t.left_col
+                            .is_some_and(|(ti, ci)| ti == table_idx as i32 && ci == col_idx)
+                        {
+                            // Only use Lt or Le for termination (upper bound)
+                            match t.op {
+                                Some(TermOp::Lt) | Some(TermOp::Le) => {
+                                    Some((col_idx, t.op.unwrap(), t.idx))
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             if eq_match_count > 0 || has_range {
                 let rows = if eq_match_count > 0 {
                     self.estimate_index_rows(table, index, eq_match_count)
@@ -1037,6 +1067,7 @@ impl QueryPlanner {
                         eq_cols: eq_match_count,
                         covering: index.is_covering,
                         has_range,
+                        range_end,
                     };
                     level.flags |= WhereLevelFlags::INDEXED;
                     if index.is_unique && eq_match_count == index.columns.len() as i32 {

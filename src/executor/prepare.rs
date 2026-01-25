@@ -4,7 +4,7 @@
 //! Corresponds to SQLite's prepare.c - the interface between the parser
 //! and the code generator.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::Result;
 use crate::parser::ast::*;
@@ -2701,7 +2701,17 @@ impl<'s> StatementCompiler<'s> {
             }
         }
 
-        if planner.analyze_where(core.where_clause.as_deref()).is_err() {
+        // Build alias map and resolve aliases in WHERE clause for proper index detection
+        let aliases = Self::build_alias_map(core);
+        let resolved_where = core.where_clause.as_ref().map(|w| {
+            if aliases.is_empty() {
+                (**w).clone()
+            } else {
+                Self::resolve_aliases_in_expr(&aliases, w)
+            }
+        });
+
+        if planner.analyze_where(resolved_where.as_ref()).is_err() {
             // Return SCAN for each table when WHERE analysis fails
             return table_infos
                 .iter()
@@ -2884,6 +2894,117 @@ impl<'s> StatementCompiler<'s> {
             super::where_clause::TermOp::In => " IN ",
             _ => "",
         }
+    }
+
+    /// Resolve column aliases in a WHERE expression.
+    /// Replaces unqualified column references with their aliased expressions.
+    fn resolve_aliases_in_expr(aliases: &HashMap<String, Expr>, expr: &Expr) -> Expr {
+        match expr {
+            Expr::Column(col_ref) if col_ref.table.is_none() => {
+                let col_lower = col_ref.column.to_lowercase();
+                if let Some(resolved) = aliases.get(&col_lower) {
+                    resolved.clone()
+                } else {
+                    expr.clone()
+                }
+            }
+            Expr::Binary { op, left, right } => Expr::Binary {
+                op: *op,
+                left: Box::new(Self::resolve_aliases_in_expr(aliases, left)),
+                right: Box::new(Self::resolve_aliases_in_expr(aliases, right)),
+            },
+            Expr::Unary { op, expr: inner } => Expr::Unary {
+                op: *op,
+                expr: Box::new(Self::resolve_aliases_in_expr(aliases, inner)),
+            },
+            Expr::Parens(inner) => {
+                Expr::Parens(Box::new(Self::resolve_aliases_in_expr(aliases, inner)))
+            }
+            Expr::In {
+                expr: inner,
+                list,
+                negated,
+            } => {
+                let resolved_list = match list {
+                    InList::Values(exprs) => InList::Values(
+                        exprs
+                            .iter()
+                            .map(|e| Self::resolve_aliases_in_expr(aliases, e))
+                            .collect(),
+                    ),
+                    other => other.clone(),
+                };
+                Expr::In {
+                    expr: Box::new(Self::resolve_aliases_in_expr(aliases, inner)),
+                    list: resolved_list,
+                    negated: *negated,
+                }
+            }
+            Expr::Between {
+                expr: inner,
+                low,
+                high,
+                negated,
+            } => Expr::Between {
+                expr: Box::new(Self::resolve_aliases_in_expr(aliases, inner)),
+                low: Box::new(Self::resolve_aliases_in_expr(aliases, low)),
+                high: Box::new(Self::resolve_aliases_in_expr(aliases, high)),
+                negated: *negated,
+            },
+            Expr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => Expr::Case {
+                operand: operand
+                    .as_ref()
+                    .map(|e| Box::new(Self::resolve_aliases_in_expr(aliases, e))),
+                when_clauses: when_clauses
+                    .iter()
+                    .map(|wc| WhenClause {
+                        when: Box::new(Self::resolve_aliases_in_expr(aliases, &wc.when)),
+                        then: Box::new(Self::resolve_aliases_in_expr(aliases, &wc.then)),
+                    })
+                    .collect(),
+                else_clause: else_clause
+                    .as_ref()
+                    .map(|e| Box::new(Self::resolve_aliases_in_expr(aliases, e))),
+            },
+            Expr::Function(func) => {
+                let args = match &func.args {
+                    FunctionArgs::Exprs(exprs) => FunctionArgs::Exprs(
+                        exprs
+                            .iter()
+                            .map(|e| Self::resolve_aliases_in_expr(aliases, e))
+                            .collect(),
+                    ),
+                    other => other.clone(),
+                };
+                Expr::Function(FunctionCall {
+                    name: func.name.clone(),
+                    args,
+                    distinct: func.distinct,
+                    filter: func.filter.clone(),
+                    over: func.over.clone(),
+                })
+            }
+            _ => expr.clone(),
+        }
+    }
+
+    /// Build alias map from select result columns
+    fn build_alias_map(core: &SelectCore) -> HashMap<String, Expr> {
+        let mut aliases = HashMap::new();
+        for col in &core.columns {
+            if let ResultColumn::Expr {
+                expr,
+                alias: Some(alias),
+            } = col
+            {
+                aliases.insert(alias.to_lowercase(), expr.clone());
+            }
+        }
+        aliases
     }
 
     fn collect_required_columns(

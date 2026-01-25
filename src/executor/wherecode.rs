@@ -141,6 +141,7 @@ impl WhereCodeGen {
                 eq_cols,
                 covering,
                 has_range,
+                ..
             } => {
                 self.code_index_scan(
                     level_idx, level, index_name, *eq_cols, *covering, *has_range,

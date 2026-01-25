@@ -24,23 +24,50 @@ DELETE statements fail to properly handle WHERE clauses, constraints, and transa
 ## Session Progress
 
 ### Completed (Session 2)
-- Fixed VDBE count_changes logic to only apply to DML statements (not SELECT)
-  - Prevents SELECT statements from getting spurious count_changes results
-  - Modified Halt handler to check for modifying opcodes (Delete, Insert, InsertInt)
-  - Removed n_change > 0 condition to allow returning 0 for DELETE with no matches
-  - However, still need to verify actual DELETE counts are correct
+- Investigated count_changes handling - found NOT the root cause of corruption
+- Disabled problematic count_changes Row return (causes cursor/transaction state issues)
+- Isolated database corruption to minimal test case
 
-### Current Issues Being Investigated
-1. **Database corruption on bulk operations** (Critical):
-   - delete-5.2.3 (and 6.1, 6.8): Fails with "database disk image is malformed"
-   - Pattern: Works once with 200 INSERT/COMMIT/SELECT (delete-5.2.1 passes)
-   - Fails on second attempt after DELETE FROM table (delete-5.2.3 fails after delete-5.2.2)
-   - Root cause: Appears to be issue with reusing table space after bulk DELETE
-   - Impact: Breaks all subsequent tests in the sequence (delete-5.3 returns empty table)
+### CRITICAL ISSUE: Database Corruption in Bulk Operations
 
-2. **delete-3.1.4 syntax error**: Parser rejects `DELETE FROM 'table1'` - single quotes not valid for identifiers
+**Minimal Reproduction**:
+```tcl
+CREATE TABLE t(f1 int, f2 int)
+INSERT 4 rows
+DELETE 1 row (WHERE clause)
+DELETE remaining 3 rows (full DELETE)
+INSERT 200 rows → OK
+DELETE 200 rows → OK
+INSERT 200 rows again → FAILS with "database disk image is malformed"
+```
 
-3. **Row count accuracy**: Some DELETE tests expect specific counts but are getting incorrect values due to earlier corruption
+**Key Findings**:
+- NOT caused by count_changes being returned (still fails when disabled)
+- NOT caused by transaction handling
+- Occurs ONLY after specific sequence: initial deletes + bulk delete + bulk insert attempt
+- Symptoms: "database disk image is malformed" error during INSERT loop
+- Root cause: **Freelist/page allocation corruption** after multiple DELETE operations
+- The multiple DELETEs corrupt internal page tracking or freelist structure
+- Impact: **BLOCKS all bulk operation testing** (critical for SQLite compatibility)
+
+**Technical Analysis**:
+- First bulk delete (200 rows) works fine
+- Second bulk insert fails, suggesting freed pages from first delete are corrupted
+- Corruption appears to be in B-tree page management or freelist tracking
+- Likely issue locations:
+  1. Page deallocation in btree/mod.rs during bulk delete
+  2. Freelist management (save_freelist, load_freelist)
+  3. Page reuse logic when allocating new pages
+
+**Next Steps**:
+1. Add debugging to freelist operations
+2. Check page allocation during second INSERT
+3. Verify page checksums/structure after bulk DELETE
+4. Consider page copying/reference counting issues
+
+### Other Issues (Lower Priority)
+1. **delete-3.1.4 syntax error**: Parser rejects `DELETE FROM 'table1'` - single quotes not valid for identifiers
+2. **Readonly database error handling**: delete-8.1-8.6 need proper readonly file setup
 
 ## Root Causes
 1. **WHERE clause evaluation**: Rows not being correctly identified for deletion

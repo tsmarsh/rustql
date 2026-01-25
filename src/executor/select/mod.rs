@@ -940,12 +940,12 @@ impl<'s> SelectCompiler<'s> {
                     }
 
                     // Build index key from equality terms in WHERE clause
-                    // Find and clone the equality expressions (to avoid borrow issues)
-                    let eq_exprs: Vec<Expr> = if let Some(info) = &where_info {
+                    // Find equality expressions and sort by column index to match index order
+                    let mut eq_exprs: Vec<(i32, Expr)> = if let Some(info) = &where_info {
                         if let Some(level) = info.levels.get(i) {
                             self.find_index_equality_terms(info, level, index_name)
                                 .into_iter()
-                                .map(|(_, expr)| expr.clone())
+                                .map(|(col_idx, expr)| (col_idx, expr.clone()))
                                 .collect()
                         } else {
                             Vec::new()
@@ -953,11 +953,13 @@ impl<'s> SelectCompiler<'s> {
                     } else {
                         Vec::new()
                     };
+                    // Sort by column index to ensure index key is built in correct column order
+                    eq_exprs.sort_by_key(|(col_idx, _)| *col_idx);
 
-                    // Compile equality expressions into key registers
-                    for (col_offset, expr) in eq_exprs.iter().enumerate() {
-                        if col_offset < *eq_cols as usize {
-                            self.compile_expr(expr, key_base_reg + col_offset as i32)?;
+                    // Compile equality expressions into key registers (in sorted order)
+                    for (pos, (_, expr)) in eq_exprs.iter().enumerate() {
+                        if pos < *eq_cols as usize {
+                            self.compile_expr(expr, key_base_reg + pos as i32)?;
                         }
                     }
 

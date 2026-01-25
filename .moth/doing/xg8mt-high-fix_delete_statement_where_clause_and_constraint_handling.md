@@ -19,9 +19,18 @@ DELETE statements fail to properly handle WHERE clauses, constraints, and transa
 - delete-12.0: DELETE row count not accurate
 
 ### Current Pass Rate
-- delete.test: 42/67 (62%) ← **UP from 39/67 (58%)**
+- delete.test: 44/74 (59%) ← **UP from 42/74 (57%)**
 
 ## Session Progress
+
+### Completed (Session 5) - PAGE SPLIT FIX
+- **Page split separator key bug fixed**: INSERT/DELETE operations on large tables (350+ rows) were corrupting B-tree structure
+- **The Problem**: Separator key in internal B-tree pages used first key from right page instead of last key from left page
+- **The Fix**: Changed `split_root_leaf` and `split_leaf_with_parent` to use `left_cells.last()` as separator
+- **Result**: 2 more tests passing (42→44), delete-6.5.1 and delete-6.5.2 now pass
+- Tests now passing: delete-6.5.1, delete-6.5.2
+- Files modified: `src/storage/btree/mod.rs`
+- Related moth: ins25 (Fix page split rowid ordering bug)
 
 ### Completed (Session 4) - count_changes FIX
 - **PRAGMA count_changes now working**: When enabled, INSERT/UPDATE/DELETE return affected row count
@@ -43,10 +52,11 @@ DELETE statements fail to properly handle WHERE clauses, constraints, and transa
 - Isolated database corruption to minimal test case
 
 ## Current Status
-- **DELETE tests: 42/67 passing (62%)** ← Up from 58%
+- **DELETE tests: 44/74 passing (59%)** ← Up from 57%
 - **CRITICAL BLOCKER RESOLVED**: Database corruption fixed!
 - **count_changes FIXED**: PRAGMA count_changes now returns row counts
-- **Remaining work**: Complex WHERE expressions (delete-6.5.x), subqueries, readonly database handling
+- **delete-6.5.x FIXED**: Page split bug fixed, large table operations work
+- **Remaining work**: BETWEEN operator (delete-6.3), correlated subqueries (delete-9.x), readonly database handling (delete-8.x)
 
 ### ~~CRITICAL ISSUE~~ RESOLVED: Database Corruption in Bulk Operations
 

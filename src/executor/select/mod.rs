@@ -1605,6 +1605,9 @@ impl<'s> SelectCompiler<'s> {
         // Track if we need sorted output (UNION, INTERSECT, EXCEPT all return sorted results)
         let needs_sorted_output = !matches!(op, CompoundOp::UnionAll);
 
+        // Track right cursor for INTERSECT/EXCEPT filtering
+        let mut right_cursor_for_filtering: Option<i32> = None;
+
         match op {
             CompoundOp::UnionAll => {
                 // Clear tables before compiling right side (but keep column names from left)
@@ -1637,9 +1640,7 @@ impl<'s> SelectCompiler<'s> {
                     cursor: right_cursor,
                 };
                 self.compile_body(right, &right_dest)?;
-
-                self.intersect_tables(result_cursor, right_cursor)?;
-                self.emit(Opcode::Close, right_cursor, 0, 0, P4::Unused);
+                right_cursor_for_filtering = Some(right_cursor);
             }
             CompoundOp::Except => {
                 // Clear tables before compiling right side
@@ -1651,9 +1652,7 @@ impl<'s> SelectCompiler<'s> {
                     cursor: right_cursor,
                 };
                 self.compile_body(right, &right_dest)?;
-
-                self.except_tables(result_cursor, right_cursor)?;
-                self.emit(Opcode::Close, right_cursor, 0, 0, P4::Unused);
+                right_cursor_for_filtering = Some(right_cursor);
             }
         }
 
@@ -1674,13 +1673,42 @@ impl<'s> SelectCompiler<'s> {
         // Restore left side's column names (right side added its own but we want only left's names)
         self.result_column_names = saved_column_names;
 
-        // Output results from ephemeral table
-        // UNION/INTERSECT/EXCEPT return sorted results, UNION ALL does not
-        if needs_sorted_output {
-            self.output_ephemeral_table_sorted(result_cursor, dest)?;
-        } else {
-            self.output_ephemeral_table(result_cursor, dest)?;
+        // Output results from ephemeral table with conditional filtering for INTERSECT/EXCEPT
+        match op {
+            CompoundOp::Intersect => {
+                // INTERSECT: Output only rows from left that also appear in right
+                if let Some(right_cursor) = right_cursor_for_filtering {
+                    self.output_ephemeral_table_intersect(
+                        result_cursor,
+                        right_cursor,
+                        dest,
+                        needs_sorted_output,
+                    )?;
+                    self.emit(Opcode::Close, right_cursor, 0, 0, P4::Unused);
+                }
+            }
+            CompoundOp::Except => {
+                // EXCEPT: Output only rows from left that do NOT appear in right
+                if let Some(right_cursor) = right_cursor_for_filtering {
+                    self.output_ephemeral_table_except(
+                        result_cursor,
+                        right_cursor,
+                        dest,
+                        needs_sorted_output,
+                    )?;
+                    self.emit(Opcode::Close, right_cursor, 0, 0, P4::Unused);
+                }
+            }
+            _ => {
+                // UNION, UNION ALL: Regular output
+                if needs_sorted_output {
+                    self.output_ephemeral_table_sorted(result_cursor, dest)?;
+                } else {
+                    self.output_ephemeral_table(result_cursor, dest)?;
+                }
+            }
         }
+
         self.emit(Opcode::Close, result_cursor, 0, 0, P4::Unused);
 
         Ok(())
@@ -5326,6 +5354,334 @@ impl<'s> SelectCompiler<'s> {
         self.resolve_label(sort_done_label, self.current_addr());
 
         self.emit(Opcode::Close, sorter_cursor, 0, 0, P4::Unused);
+
+        Ok(())
+    }
+
+    fn output_ephemeral_table_intersect(
+        &mut self,
+        left_cursor: i32,
+        right_cursor: i32,
+        dest: &SelectDest,
+        needs_sorted_output: bool,
+    ) -> Result<()> {
+        // INTERSECT: Output only rows from left that also appear in right
+        let col_count = if self.compound_column_count > 0 {
+            self.compound_column_count
+        } else {
+            1
+        };
+
+        if needs_sorted_output {
+            // Create a temp table for filtered results, then sort
+            let temp_cursor = self.alloc_cursor();
+            self.emit(Opcode::OpenEphemeral, temp_cursor, 0, 0, P4::Unused);
+
+            // Filter: iterate left, output to temp if found in right
+            let left_done_label = self.alloc_label();
+            self.emit(Opcode::Rewind, left_cursor, left_done_label, 0, P4::Unused);
+
+            let left_loop_label = self.alloc_label();
+            self.resolve_label(left_loop_label, self.current_addr());
+
+            let base_reg = self.next_reg;
+            for i in 0..col_count {
+                let reg = self.alloc_reg();
+                self.emit(Opcode::Column, left_cursor, i as i32, reg, P4::Unused);
+            }
+
+            let record_reg = self.alloc_reg();
+            self.emit(
+                Opcode::MakeRecord,
+                base_reg,
+                col_count as i32,
+                record_reg,
+                P4::Unused,
+            );
+
+            let skip_label = self.alloc_label();
+            self.emit(
+                Opcode::NotFound,
+                right_cursor,
+                skip_label,
+                record_reg,
+                P4::Unused,
+            );
+
+            // Found in right - insert into temp
+            let rowid_reg = self.alloc_reg();
+            self.emit(Opcode::NewRowid, temp_cursor, rowid_reg, 0, P4::Unused);
+            self.emit(
+                Opcode::Insert,
+                temp_cursor,
+                record_reg,
+                rowid_reg,
+                P4::Unused,
+            );
+
+            self.resolve_label(skip_label, self.current_addr());
+            self.emit(Opcode::Next, left_cursor, left_loop_label, 0, P4::Unused);
+            self.resolve_label(left_done_label, self.current_addr());
+
+            // Now sort temp and output
+            self.emit(Opcode::Close, left_cursor, 0, 0, P4::Unused);
+            let sorter_cursor = self.alloc_cursor();
+            self.emit(
+                Opcode::OpenEphemeral,
+                sorter_cursor,
+                col_count as i32,
+                0,
+                P4::Unused,
+            );
+
+            let sort_done = self.alloc_label();
+            self.emit(Opcode::Rewind, temp_cursor, sort_done, 0, P4::Unused);
+
+            let sort_loop = self.alloc_label();
+            self.resolve_label(sort_loop, self.current_addr());
+
+            let sort_base_reg = self.next_reg;
+            for i in 0..col_count {
+                let reg = self.alloc_reg();
+                self.emit(Opcode::Column, temp_cursor, i as i32, reg, P4::Unused);
+            }
+
+            let sort_record_reg = self.alloc_reg();
+            self.emit(
+                Opcode::MakeRecord,
+                sort_base_reg,
+                col_count as i32,
+                sort_record_reg,
+                P4::Unused,
+            );
+
+            let sort_rowid_reg = self.alloc_reg();
+            self.emit(
+                Opcode::NewRowid,
+                sorter_cursor,
+                sort_rowid_reg,
+                0,
+                P4::Unused,
+            );
+            self.emit(
+                Opcode::Insert,
+                sorter_cursor,
+                sort_record_reg,
+                sort_rowid_reg,
+                P4::Unused,
+            );
+
+            self.emit(Opcode::Next, temp_cursor, sort_loop, 0, P4::Unused);
+            self.resolve_label(sort_done, self.current_addr());
+
+            self.emit(Opcode::Close, temp_cursor, 0, 0, P4::Unused);
+
+            // Output sorted results
+            self.output_ephemeral_table(sorter_cursor, dest)?;
+            self.emit(Opcode::Close, sorter_cursor, 0, 0, P4::Unused);
+        } else {
+            // No sorting needed - just filter and output
+            let done_label = self.alloc_label();
+            self.emit(Opcode::Rewind, left_cursor, done_label, 0, P4::Unused);
+
+            let loop_label = self.alloc_label();
+            self.resolve_label(loop_label, self.current_addr());
+
+            let base_reg = self.next_reg;
+            for i in 0..col_count {
+                let reg = self.alloc_reg();
+                self.emit(Opcode::Column, left_cursor, i as i32, reg, P4::Unused);
+            }
+
+            let record_reg = self.alloc_reg();
+            self.emit(
+                Opcode::MakeRecord,
+                base_reg,
+                col_count as i32,
+                record_reg,
+                P4::Unused,
+            );
+
+            let skip_label = self.alloc_label();
+            self.emit(
+                Opcode::NotFound,
+                right_cursor,
+                skip_label,
+                record_reg,
+                P4::Unused,
+            );
+
+            // Found in right - output this row
+            self.output_row(dest, base_reg, col_count)?;
+
+            self.resolve_label(skip_label, self.current_addr());
+            self.emit(Opcode::Next, left_cursor, loop_label, 0, P4::Unused);
+            self.resolve_label(done_label, self.current_addr());
+        }
+
+        Ok(())
+    }
+
+    fn output_ephemeral_table_except(
+        &mut self,
+        left_cursor: i32,
+        right_cursor: i32,
+        dest: &SelectDest,
+        needs_sorted_output: bool,
+    ) -> Result<()> {
+        // EXCEPT: Output only rows from left that do NOT appear in right
+        let col_count = if self.compound_column_count > 0 {
+            self.compound_column_count
+        } else {
+            1
+        };
+
+        if needs_sorted_output {
+            // Create a temp table for filtered results, then sort
+            let temp_cursor = self.alloc_cursor();
+            self.emit(Opcode::OpenEphemeral, temp_cursor, 0, 0, P4::Unused);
+
+            // Filter: iterate left, output to temp if NOT found in right
+            let left_done_label = self.alloc_label();
+            self.emit(Opcode::Rewind, left_cursor, left_done_label, 0, P4::Unused);
+
+            let left_loop_label = self.alloc_label();
+            self.resolve_label(left_loop_label, self.current_addr());
+
+            let base_reg = self.next_reg;
+            for i in 0..col_count {
+                let reg = self.alloc_reg();
+                self.emit(Opcode::Column, left_cursor, i as i32, reg, P4::Unused);
+            }
+
+            let record_reg = self.alloc_reg();
+            self.emit(
+                Opcode::MakeRecord,
+                base_reg,
+                col_count as i32,
+                record_reg,
+                P4::Unused,
+            );
+
+            let skip_label = self.alloc_label();
+            self.emit(
+                Opcode::Found,
+                right_cursor,
+                skip_label,
+                record_reg,
+                P4::Unused,
+            );
+
+            // NOT found in right - insert into temp
+            let rowid_reg = self.alloc_reg();
+            self.emit(Opcode::NewRowid, temp_cursor, rowid_reg, 0, P4::Unused);
+            self.emit(
+                Opcode::Insert,
+                temp_cursor,
+                record_reg,
+                rowid_reg,
+                P4::Unused,
+            );
+
+            self.resolve_label(skip_label, self.current_addr());
+            self.emit(Opcode::Next, left_cursor, left_loop_label, 0, P4::Unused);
+            self.resolve_label(left_done_label, self.current_addr());
+
+            // Now sort temp and output
+            self.emit(Opcode::Close, left_cursor, 0, 0, P4::Unused);
+            let sorter_cursor = self.alloc_cursor();
+            self.emit(
+                Opcode::OpenEphemeral,
+                sorter_cursor,
+                col_count as i32,
+                0,
+                P4::Unused,
+            );
+
+            let sort_done = self.alloc_label();
+            self.emit(Opcode::Rewind, temp_cursor, sort_done, 0, P4::Unused);
+
+            let sort_loop = self.alloc_label();
+            self.resolve_label(sort_loop, self.current_addr());
+
+            let sort_base_reg = self.next_reg;
+            for i in 0..col_count {
+                let reg = self.alloc_reg();
+                self.emit(Opcode::Column, temp_cursor, i as i32, reg, P4::Unused);
+            }
+
+            let sort_record_reg = self.alloc_reg();
+            self.emit(
+                Opcode::MakeRecord,
+                sort_base_reg,
+                col_count as i32,
+                sort_record_reg,
+                P4::Unused,
+            );
+
+            let sort_rowid_reg = self.alloc_reg();
+            self.emit(
+                Opcode::NewRowid,
+                sorter_cursor,
+                sort_rowid_reg,
+                0,
+                P4::Unused,
+            );
+            self.emit(
+                Opcode::Insert,
+                sorter_cursor,
+                sort_record_reg,
+                sort_rowid_reg,
+                P4::Unused,
+            );
+
+            self.emit(Opcode::Next, temp_cursor, sort_loop, 0, P4::Unused);
+            self.resolve_label(sort_done, self.current_addr());
+
+            self.emit(Opcode::Close, temp_cursor, 0, 0, P4::Unused);
+
+            // Output sorted results
+            self.output_ephemeral_table(sorter_cursor, dest)?;
+            self.emit(Opcode::Close, sorter_cursor, 0, 0, P4::Unused);
+        } else {
+            // No sorting needed - just filter and output
+            let done_label = self.alloc_label();
+            self.emit(Opcode::Rewind, left_cursor, done_label, 0, P4::Unused);
+
+            let loop_label = self.alloc_label();
+            self.resolve_label(loop_label, self.current_addr());
+
+            let base_reg = self.next_reg;
+            for i in 0..col_count {
+                let reg = self.alloc_reg();
+                self.emit(Opcode::Column, left_cursor, i as i32, reg, P4::Unused);
+            }
+
+            let record_reg = self.alloc_reg();
+            self.emit(
+                Opcode::MakeRecord,
+                base_reg,
+                col_count as i32,
+                record_reg,
+                P4::Unused,
+            );
+
+            let skip_label = self.alloc_label();
+            self.emit(
+                Opcode::Found,
+                right_cursor,
+                skip_label,
+                record_reg,
+                P4::Unused,
+            );
+
+            // NOT found in right - output this row
+            self.output_row(dest, base_reg, col_count)?;
+
+            self.resolve_label(skip_label, self.current_addr());
+            self.emit(Opcode::Next, left_cursor, loop_label, 0, P4::Unused);
+            self.resolve_label(done_label, self.current_addr());
+        }
 
         Ok(())
     }

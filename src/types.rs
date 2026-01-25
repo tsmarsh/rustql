@@ -138,6 +138,17 @@ impl Value {
             Value::Null => String::new(),
             Value::Integer(i) => i.to_string(),
             Value::Real(f) => {
+                // Handle special values first
+                if f.is_nan() {
+                    return "NaN".to_string();
+                }
+                if f.is_infinite() {
+                    return if *f > 0.0 {
+                        "inf".to_string()
+                    } else {
+                        "-inf".to_string()
+                    };
+                }
                 // SQLite displays floats with decimal point even for whole numbers
                 // e.g., 1.0 not 1, to distinguish from integers
                 let s = f.to_string();

@@ -1844,8 +1844,16 @@ impl<'s> SelectCompiler<'s> {
         // Clear tables and result column names to avoid accumulating from parent context
         self.tables.clear();
         self.result_column_names.clear();
-        let left_dest = SelectDest::EphemTable {
-            cursor: result_cursor,
+        // For UNION, INTERSECT, EXCEPT we need to deduplicate the left side
+        // For UNION ALL, we don't need deduplication
+        let left_dest = if matches!(op, CompoundOp::UnionAll) {
+            SelectDest::EphemTable {
+                cursor: result_cursor,
+            }
+        } else {
+            SelectDest::EphemTableDistinct {
+                cursor: result_cursor,
+            }
         };
         self.compile_body(left, &left_dest)?;
 
@@ -3942,6 +3950,7 @@ impl<'s> SelectCompiler<'s> {
                     // Comparison opcodes are jump-based: Eq P1 P2 P3 means
                     // "if r[P1] == r[P3], jump to P2"
                     // We need to produce a 0/1 boolean result in dest_reg
+                    // BUT: if either operand is NULL, result must be NULL (SQL semantics)
                     let cmp_opcode = match op {
                         BinaryOp::Eq => Opcode::Eq,
                         BinaryOp::Ne => Opcode::Ne,
@@ -3952,12 +3961,18 @@ impl<'s> SelectCompiler<'s> {
                         _ => unreachable!(),
                     };
 
-                    // Set result to 0 (false) initially
-                    self.emit(Opcode::Integer, 0, dest_reg, 0, P4::Unused);
-
                     // Allocate labels for control flow
                     let true_label = self.alloc_label();
                     let end_label = self.alloc_label();
+                    let null_label = self.alloc_label();
+
+                    // Check if left operand is NULL - if so, result is NULL
+                    self.emit(Opcode::IsNull, left_reg, null_label, 0, P4::Unused);
+                    // Check if right operand is NULL - if so, result is NULL
+                    self.emit(Opcode::IsNull, right_reg, null_label, 0, P4::Unused);
+
+                    // Neither is NULL - set result to 0 (false) initially
+                    self.emit(Opcode::Integer, 0, dest_reg, 0, P4::Unused);
 
                     // Compare: if condition is true, jump to true_label
                     // Comparison opcode format: P1=right operand, P2=jump target, P3=left operand
@@ -3970,6 +3985,11 @@ impl<'s> SelectCompiler<'s> {
                     // True path: set result to 1
                     self.resolve_label(true_label, self.current_addr());
                     self.emit(Opcode::Integer, 1, dest_reg, 0, P4::Unused);
+                    self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+
+                    // Null path: set result to NULL
+                    self.resolve_label(null_label, self.current_addr());
+                    self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
 
                     // End label
                     self.resolve_label(end_label, self.current_addr());
@@ -4145,6 +4165,11 @@ impl<'s> SelectCompiler<'s> {
                         let when_reg = self.alloc_reg();
                         self.compile_expr(&clause.when, when_reg)?;
                         self.emit(Opcode::Ne, op_reg, next_when_label, when_reg, P4::Unused);
+                        // Set JUMPIFNULL flag so NULL comparisons jump to next WHEN clause
+                        // (NULL compared to anything is unknown, so WHEN should not match)
+                        if let Some(op) = self.ops.last_mut() {
+                            op.p5 = crate::vdbe::ops::cmp_flags::JUMPIFNULL as u16;
+                        }
                         self.compile_expr(&clause.then, dest_reg)?;
                         self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
                         self.resolve_label(next_when_label, self.current_addr());
@@ -4519,9 +4544,12 @@ impl<'s> SelectCompiler<'s> {
         // Handle OFFSET: skip rows until offset counter reaches 0
         if let Some(offset_reg) = self.offset_counter_reg {
             let after_offset = self.alloc_label();
-            // If offset <= 0, skip the offset decrement
-            self.emit(Opcode::IfNot, offset_reg, after_offset, 0, P4::Unused);
-            // Decrement offset and skip this row
+            // Use Le (Less or Equal) to check if offset <= 0
+            // This handles negative offsets correctly (treated as 0)
+            let zero_reg = self.alloc_reg();
+            self.emit(Opcode::Integer, 0, zero_reg, 0, P4::Unused);
+            self.emit(Opcode::Le, zero_reg, after_offset, offset_reg, P4::Unused);
+            // offset > 0: Decrement offset and skip this row
             self.emit(Opcode::AddImm, offset_reg, -1, 0, P4::Unused);
             self.emit(
                 Opcode::SorterNext,
@@ -4530,13 +4558,18 @@ impl<'s> SelectCompiler<'s> {
                 0,
                 P4::Unused,
             );
+            // If SorterNext falls through (no more rows), we're done
+            self.emit(Opcode::Goto, 0, sort_done_label, 0, P4::Unused);
             self.resolve_label(after_offset, self.current_addr());
         }
 
         // Handle LIMIT: check if we've output enough rows
+        // Negative LIMIT means no limit (return all rows)
+        // LIMIT 0 means no rows
         if let Some(limit_reg) = self.limit_counter_reg {
             if let Some(done_label) = self.limit_done_label {
-                // If limit <= 0, we're done
+                // IfNot jumps if limit is 0 (or NULL), which is correct for positive limits
+                // For negative limits, IfNot won't jump (negative is truthy) so we continue
                 self.emit(Opcode::IfNot, limit_reg, done_label, 0, P4::Unused);
             }
         }
@@ -4579,6 +4612,23 @@ impl<'s> SelectCompiler<'s> {
                 );
                 self.emit(Opcode::NewRowid, *cursor, rowid_reg, 0, P4::Unused);
                 self.emit(Opcode::Insert, *cursor, record_reg, rowid_reg, P4::Unused);
+            }
+            SelectDest::EphemTableDistinct { cursor } => {
+                // Insert into ephemeral table with DISTINCT
+                let record_reg = self.alloc_reg();
+                let rowid_reg = self.alloc_reg();
+                self.emit(
+                    Opcode::MakeRecord,
+                    result_base_reg,
+                    num_result_cols as i32,
+                    record_reg,
+                    P4::Unused,
+                );
+                let skip_label = self.alloc_label();
+                self.emit(Opcode::Found, *cursor, skip_label, record_reg, P4::Unused);
+                self.emit(Opcode::NewRowid, *cursor, rowid_reg, 0, P4::Unused);
+                self.emit(Opcode::Insert, *cursor, record_reg, rowid_reg, P4::Unused);
+                self.resolve_label(skip_label, self.current_addr());
             }
             _ => {
                 // Output as result row
@@ -4647,11 +4697,15 @@ impl<'s> SelectCompiler<'s> {
         skip_label: i32,
     ) -> Result<()> {
         // Handle OFFSET: skip rows until offset counter reaches 0
+        // Negative OFFSET is treated as 0 (no rows to skip)
         if let Some(offset_reg) = self.offset_counter_reg {
             let after_offset = self.alloc_label();
-            // If offset <= 0, skip the offset decrement
-            self.emit(Opcode::IfNot, offset_reg, after_offset, 0, P4::Unused);
-            // Decrement offset and skip this row
+            // Use Le (Less or Equal) to check if offset <= 0
+            // This handles negative offsets correctly (treated as 0)
+            let zero_reg = self.alloc_reg();
+            self.emit(Opcode::Integer, 0, zero_reg, 0, P4::Unused);
+            self.emit(Opcode::Le, zero_reg, after_offset, offset_reg, P4::Unused);
+            // offset > 0: Decrement offset and skip this row
             self.emit(Opcode::AddImm, offset_reg, -1, 0, P4::Unused);
             self.emit(Opcode::Goto, 0, skip_label, 0, P4::Unused);
             self.resolve_label(after_offset, self.current_addr());
@@ -4705,6 +4759,25 @@ impl<'s> SelectCompiler<'s> {
                 );
                 self.emit(Opcode::NewRowid, *cursor, rowid_reg, 0, P4::Unused);
                 self.emit(Opcode::Insert, *cursor, record_reg, rowid_reg, P4::Unused);
+            }
+            SelectDest::EphemTableDistinct { cursor } => {
+                // Insert into ephemeral table with DISTINCT - skip duplicates
+                let record_reg = self.alloc_reg();
+                let rowid_reg = self.alloc_reg();
+                self.emit(
+                    Opcode::MakeRecord,
+                    base_reg,
+                    count as i32,
+                    record_reg,
+                    P4::Unused,
+                );
+                // Check if this row already exists - skip if found
+                let skip_label = self.alloc_label();
+                self.emit(Opcode::Found, *cursor, skip_label, record_reg, P4::Unused);
+                // Row not found - insert it
+                self.emit(Opcode::NewRowid, *cursor, rowid_reg, 0, P4::Unused);
+                self.emit(Opcode::Insert, *cursor, record_reg, rowid_reg, P4::Unused);
+                self.resolve_label(skip_label, self.current_addr());
             }
             SelectDest::Coroutine { reg } => {
                 for i in 0..count {

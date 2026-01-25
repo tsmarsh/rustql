@@ -20,6 +20,8 @@ pub enum SelectDest {
     Table { cursor: i32 },
     /// Store in ephemeral table for UNION, etc.
     EphemTable { cursor: i32 },
+    /// Store in ephemeral table with DISTINCT (skip duplicates) for UNION
+    EphemTableDistinct { cursor: i32 },
     /// Coroutine yield
     Coroutine { reg: i32 },
     /// EXISTS subquery - set reg to 1 if any rows

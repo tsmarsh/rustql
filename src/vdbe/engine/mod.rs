@@ -1123,14 +1123,20 @@ impl Vdbe {
 
             Opcode::Ne => {
                 // P5 flags: SQLITE_NULLEQ (0x80) means NULL==NULL is true
+                //           JUMPIFNULL (0x10) means jump if either operand is NULL
+                use crate::vdbe::ops::cmp_flags;
                 let left = self.mem(op.p1);
                 let right = self.mem(op.p3);
                 let nulleq = (op.p5 & 0x80) != 0;
+                let jumpifnull = (op.p5 & cmp_flags::JUMPIFNULL) != 0;
 
                 // In standard SQL, comparing with NULL yields unknown (no jump)
-                // unless NULLEQ flag is set
+                // unless NULLEQ or JUMPIFNULL flag is set
                 if left.is_null() || right.is_null() {
-                    if nulleq {
+                    if jumpifnull {
+                        // JUMPIFNULL: jump when either operand is NULL
+                        self.pc = op.p2;
+                    } else if nulleq {
                         if left.is_null() ^ right.is_null() {
                             self.pc = op.p2;
                         }

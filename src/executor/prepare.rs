@@ -2838,10 +2838,15 @@ impl<'s> StatementCompiler<'s> {
     ) -> Vec<String> {
         let mut constraints = Vec::new();
         for col_idx in &index.columns {
+            // Check both left_col and right_col for equality (for join conditions like s=y)
             let eq_term = terms.iter().find(|term| {
-                term.left_col
-                    .is_some_and(|(ti, ci)| ti == table_idx as i32 && ci == *col_idx)
-                    && term.is_equality()
+                let left_matches = term
+                    .left_col
+                    .is_some_and(|(ti, ci)| ti == table_idx as i32 && ci == *col_idx);
+                let right_matches = term
+                    .right_col
+                    .is_some_and(|(ti, ci)| ti == table_idx as i32 && ci == *col_idx);
+                (left_matches || right_matches) && term.is_equality()
             });
             if eq_term.is_some() {
                 constraints.push(format!("{}=?", self.column_name(columns, *col_idx)));

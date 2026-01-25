@@ -167,6 +167,9 @@ pub struct WhereTerm {
     /// Left column index (for equality/range)
     pub left_col: Option<(i32, i32)>, // (table_idx, column_idx)
 
+    /// Right column index (for equality join conditions)
+    pub right_col: Option<(i32, i32)>, // (table_idx, column_idx)
+
     /// Selectivity estimate (0.0-1.0)
     pub selectivity: f64,
 
@@ -205,6 +208,7 @@ impl WhereTerm {
             idx,
             flags: WhereTermFlags::empty(),
             left_col: None,
+            right_col: None,
             selectivity: 0.25, // Default 25% selectivity
             op: None,
             or_terms: Vec::new(),
@@ -633,11 +637,11 @@ impl QueryPlanner {
 
     /// Analyze all terms to extract table references and operator types
     fn analyze_terms(&mut self) -> Result<()> {
-        // Collect table info needed for analysis
+        // Collect table info needed for analysis, including columns for resolution
         let table_usage_info: Vec<_> = self
             .tables
             .iter()
-            .map(|t| (t.name.clone(), t.alias.clone(), t.mask))
+            .map(|t| (t.name.clone(), t.alias.clone(), t.mask, t.columns.clone()))
             .collect();
         // Include ipk_column in the tuple for recognizing INTEGER PRIMARY KEY columns
         let table_info: Vec<_> = self
@@ -655,7 +659,7 @@ impl QueryPlanner {
             .collect();
 
         for term in self.where_clause.iter_mut() {
-            term.mask = where_expr::expr_usage(term.expr.as_ref(), &table_usage_info);
+            term.mask = where_expr::expr_usage_with_columns(term.expr.as_ref(), &table_usage_info);
             term.prereq = term.mask;
             // Determine operator type and selectivity
             Self::analyze_term_expr_static(&table_info, term)?;
@@ -718,13 +722,17 @@ impl QueryPlanner {
                     _ => 0.25,
                 };
 
-                let left = match expr.as_ref() {
-                    Expr::Binary { left, .. } => left,
+                let (left, right) = match expr.as_ref() {
+                    Expr::Binary { left, right, .. } => (left, right),
                     _ => return Ok(()),
                 };
                 Self::analyze_column_ref_static(table_info, term, left)?;
                 if term.left_col.is_some() && term.is_index_usable() {
                     term.flags |= WhereTermFlags::INDEX_CONSTRAINT;
+                }
+                // For equality comparisons, also analyze the right side for join conditions
+                if term.op == Some(TermOp::Eq) || term.op == Some(TermOp::Is) {
+                    Self::analyze_right_column_ref(table_info, term, right)?;
                 }
             }
 
@@ -840,12 +848,72 @@ impl QueryPlanner {
                         }
                     };
 
-                    term.mask |= mask;
                     if let Some(idx) = column_idx {
+                        // Found the column in this table
+                        term.mask |= mask;
                         term.left_col = Some((i as i32, idx));
                         term.flags |= WhereTermFlags::LEFT_COLUMN;
+                        break;
+                    } else if col_ref.table.is_some() {
+                        // Column was qualified but not found in this table
+                        // This shouldn't happen normally, but add the mask anyway
+                        term.mask |= mask;
+                        break;
                     }
-                    break;
+                    // For unqualified columns not found in this table, continue to next table
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Analyze the right side of an equality expression for join conditions
+    /// This populates right_col for terms like col1 = col2
+    fn analyze_right_column_ref(
+        table_info: &[(String, Option<String>, u64, Vec<String>, i32)],
+        term: &mut WhereTerm,
+        expr: &Expr,
+    ) -> Result<()> {
+        if let Some(col_ref) = Self::get_column_ref(expr) {
+            for (i, (name, alias, _mask, columns, ipk_column)) in table_info.iter().enumerate() {
+                let table_matches = match (&col_ref.table, alias) {
+                    (Some(t), Some(a)) => t == a || t == name,
+                    (Some(t), None) => t == name,
+                    (None, _) => true,
+                };
+
+                if table_matches {
+                    let column_idx = if Self::is_rowid_alias(&col_ref.column) {
+                        Some(-1)
+                    } else if let Some(idx) = col_ref.column_index {
+                        if *ipk_column >= 0 && idx == *ipk_column {
+                            Some(-1)
+                        } else {
+                            Some(idx)
+                        }
+                    } else {
+                        let found_idx = columns
+                            .iter()
+                            .position(|c| c.eq_ignore_ascii_case(&col_ref.column))
+                            .map(|idx| idx as i32);
+
+                        if let Some(idx) = found_idx {
+                            if *ipk_column >= 0 && idx == *ipk_column {
+                                Some(-1)
+                            } else {
+                                Some(idx)
+                            }
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some(idx) = column_idx {
+                        term.right_col = Some((i as i32, idx));
+                        break;
+                    } else if col_ref.table.is_some() {
+                        break;
+                    }
                 }
             }
         }
@@ -1015,8 +1083,12 @@ impl QueryPlanner {
         for term in self.where_clause.iter() {
             // Check if term references this table and prereqs are satisfied
             if term.mask & table.mask != 0 {
-                let prereqs_satisfied =
-                    (term.prereq & !prereq_mask) == 0 || term.prereq & table.mask != 0;
+                // For a term to be usable, all its prereqs EXCEPT the current table
+                // must already be in the processed set. This ensures join conditions
+                // like x=q (where x is from t1 and q is from t2) are only usable
+                // when t2 has already been processed.
+                let other_prereqs = term.prereq & !table.mask;
+                let prereqs_satisfied = (other_prereqs & !prereq_mask) == 0;
 
                 if prereqs_satisfied && term.is_index_usable() {
                     if term.is_equality() {
@@ -1206,6 +1278,7 @@ impl QueryPlanner {
     }
 
     /// Count how many index columns match equality terms
+    /// For join conditions, checks both left_col and right_col
     fn count_index_eq_matches(
         &self,
         index: &IndexInfo,
@@ -1215,8 +1288,15 @@ impl QueryPlanner {
         let mut count = 0;
         for (i, &col_idx) in index.columns.iter().enumerate() {
             let has_eq = eq_terms.iter().any(|t| {
-                t.left_col
-                    .is_some_and(|(ti, ci)| ti == table_idx as i32 && ci == col_idx)
+                // Check left_col
+                let left_matches = t
+                    .left_col
+                    .is_some_and(|(ti, ci)| ti == table_idx as i32 && ci == col_idx);
+                // Check right_col for join conditions (e.g., s=y should match y's index)
+                let right_matches = t
+                    .right_col
+                    .is_some_and(|(ti, ci)| ti == table_idx as i32 && ci == col_idx);
+                left_matches || right_matches
             });
 
             if has_eq {

@@ -339,6 +339,40 @@ fn column_usage(
         .fold(0, |mask, (_, _, table_mask)| mask | table_mask)
 }
 
+/// Column usage with column resolution for unqualified columns.
+/// If a column is unqualified, try to find which table(s) have that column.
+fn column_usage_with_columns(
+    col: &crate::parser::ast::ColumnRef,
+    tables: &[(String, Option<String>, u64, Vec<String>)],
+) -> u64 {
+    if let Some(table) = &col.table {
+        // Qualified column - use simple table name matching
+        return table_name_mask_with_columns(table, tables);
+    }
+
+    // Unqualified column - try to resolve to specific table(s) that have this column
+    let col_name_lower = col.column.to_lowercase();
+    let mut resolved_mask = 0u64;
+
+    for (_table_name, _alias, mask, columns) in tables {
+        // Check if this table has the column
+        let has_column = columns.iter().any(|c| c.to_lowercase() == col_name_lower);
+        if has_column {
+            resolved_mask |= mask;
+        }
+    }
+
+    // If we found the column in at least one table, use that mask
+    // Otherwise fall back to all tables (ambiguous or unknown column)
+    if resolved_mask != 0 {
+        resolved_mask
+    } else {
+        tables
+            .iter()
+            .fold(0, |mask, (_, _, table_mask, _)| mask | table_mask)
+    }
+}
+
 fn table_name_mask(name: &str, tables: &[(String, Option<String>, u64)]) -> u64 {
     for (table_name, alias, mask) in tables {
         let matches = match alias {
@@ -349,6 +383,185 @@ fn table_name_mask(name: &str, tables: &[(String, Option<String>, u64)]) -> u64 
             return *mask;
         }
     }
+    0
+}
+
+fn table_name_mask_with_columns(
+    name: &str,
+    tables: &[(String, Option<String>, u64, Vec<String>)],
+) -> u64 {
+    for (table_name, alias, mask, _) in tables {
+        let matches = match alias {
+            Some(alias) => alias == name || table_name == name,
+            None => table_name == name,
+        };
+        if matches {
+            return *mask;
+        }
+    }
+    0
+}
+
+/// Compute a table-usage mask with column resolution for unqualified columns.
+pub fn expr_usage_with_columns(
+    expr: &Expr,
+    tables: &[(String, Option<String>, u64, Vec<String>)],
+) -> u64 {
+    match expr {
+        Expr::Literal(_) | Expr::Variable(_) | Expr::Raise { .. } => 0,
+        Expr::Column(col) => column_usage_with_columns(col, tables),
+        Expr::Unary { expr, .. } => expr_usage_with_columns(expr, tables),
+        Expr::Binary { left, right, .. } => {
+            expr_usage_with_columns(left, tables) | expr_usage_with_columns(right, tables)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_usage_with_columns(expr, tables)
+                | expr_usage_with_columns(low, tables)
+                | expr_usage_with_columns(high, tables)
+        }
+        Expr::In { expr, list, .. } => {
+            expr_usage_with_columns(expr, tables) | in_list_usage_with_columns(list, tables)
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            let mut mask =
+                expr_usage_with_columns(expr, tables) | expr_usage_with_columns(pattern, tables);
+            if let Some(escape) = escape {
+                mask |= expr_usage_with_columns(escape, tables);
+            }
+            mask
+        }
+        Expr::IsNull { expr, .. } => expr_usage_with_columns(expr, tables),
+        Expr::IsDistinct { left, right, .. } => {
+            expr_usage_with_columns(left, tables) | expr_usage_with_columns(right, tables)
+        }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            let mut mask = 0;
+            if let Some(operand) = operand {
+                mask |= expr_usage_with_columns(operand, tables);
+            }
+            for clause in when_clauses {
+                mask |= expr_usage_with_columns(&clause.when, tables);
+                mask |= expr_usage_with_columns(&clause.then, tables);
+            }
+            if let Some(else_clause) = else_clause {
+                mask |= expr_usage_with_columns(else_clause, tables);
+            }
+            mask
+        }
+        Expr::Cast { expr, .. } | Expr::Collate { expr, .. } | Expr::Parens(expr) => {
+            expr_usage_with_columns(expr, tables)
+        }
+        Expr::Function(call) => function_usage_with_columns(call, tables),
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => {
+            select_usage_with_columns(subquery, tables)
+        }
+    }
+}
+
+fn in_list_usage_with_columns(
+    list: &InList,
+    tables: &[(String, Option<String>, u64, Vec<String>)],
+) -> u64 {
+    match list {
+        InList::Values(exprs) => exprs
+            .iter()
+            .fold(0, |mask, expr| mask | expr_usage_with_columns(expr, tables)),
+        InList::Subquery(query) => select_usage_with_columns(query, tables),
+        InList::Table(_) => 0,
+    }
+}
+
+fn function_usage_with_columns(
+    call: &FunctionCall,
+    tables: &[(String, Option<String>, u64, Vec<String>)],
+) -> u64 {
+    let mut mask = 0;
+    if let FunctionArgs::Exprs(exprs) = &call.args {
+        mask |= exprs
+            .iter()
+            .fold(0, |m, expr| m | expr_usage_with_columns(expr, tables));
+    }
+    if let Some(filter) = &call.filter {
+        mask |= expr_usage_with_columns(filter, tables);
+    }
+    if let Some(over) = &call.over {
+        mask |= over_usage_with_columns(over, tables);
+    }
+    mask
+}
+
+fn over_usage_with_columns(
+    over: &Over,
+    tables: &[(String, Option<String>, u64, Vec<String>)],
+) -> u64 {
+    match over {
+        Over::Window(_) => 0,
+        Over::Spec(spec) => window_spec_usage_with_columns(spec, tables),
+    }
+}
+
+fn window_spec_usage_with_columns(
+    spec: &WindowSpec,
+    tables: &[(String, Option<String>, u64, Vec<String>)],
+) -> u64 {
+    let mut mask = 0;
+    if let Some(partition_by) = &spec.partition_by {
+        for expr in partition_by {
+            mask |= expr_usage_with_columns(expr, tables);
+        }
+    }
+    if let Some(order_by) = &spec.order_by {
+        for term in order_by {
+            mask |= expr_usage_with_columns(&term.expr, tables);
+        }
+    }
+    if let Some(frame) = &spec.frame {
+        mask |= window_frame_usage_with_columns(frame, tables);
+    }
+    mask
+}
+
+fn window_frame_usage_with_columns(
+    frame: &WindowFrame,
+    tables: &[(String, Option<String>, u64, Vec<String>)],
+) -> u64 {
+    let mut mask = window_frame_bound_usage_with_columns(&frame.start, tables);
+    if let Some(end) = &frame.end {
+        mask |= window_frame_bound_usage_with_columns(end, tables);
+    }
+    mask
+}
+
+fn window_frame_bound_usage_with_columns(
+    bound: &WindowFrameBound,
+    tables: &[(String, Option<String>, u64, Vec<String>)],
+) -> u64 {
+    match bound {
+        WindowFrameBound::CurrentRow
+        | WindowFrameBound::UnboundedPreceding
+        | WindowFrameBound::UnboundedFollowing => 0,
+        WindowFrameBound::Preceding(expr) | WindowFrameBound::Following(expr) => {
+            expr_usage_with_columns(expr, tables)
+        }
+    }
+}
+
+fn select_usage_with_columns(
+    _query: &SelectStmt,
+    _tables: &[(String, Option<String>, u64, Vec<String>)],
+) -> u64 {
+    // Subqueries don't directly reference outer tables for mask purposes
     0
 }
 

@@ -834,6 +834,25 @@ impl<'s> SelectCompiler<'s> {
             .map(|t| t.join_type)
             .collect();
 
+        // Build iteration order - use optimizer's order if available, else FROM clause order
+        // The optimizer reorders tables by cost (cheapest first), so info.levels[0] is the
+        // table to scan first (outer loop), and the last level is the innermost loop.
+        let iteration_order: Vec<usize> = if let Some(info) = &where_info {
+            if info.levels.len() == table_cursors.len() {
+                // Use optimizer's order - level.from_idx maps to table_cursors position
+                info.levels
+                    .iter()
+                    .map(|level| level.from_idx as usize)
+                    .collect()
+            } else {
+                // Incomplete plan - fall back to FROM clause order
+                (0..table_cursors.len()).collect()
+            }
+        } else {
+            // No query plan - use FROM clause order
+            (0..table_cursors.len()).collect()
+        };
+
         // Generate proper nested loop structure for cross joins
         // For N tables, we need nested Rewind/Next pairs where inner tables
         // get rewound for each row of outer tables.
@@ -894,18 +913,21 @@ impl<'s> SelectCompiler<'s> {
             Vec::with_capacity(table_cursors.len());
 
         // Now emit the Rewind/loop structure (or index seek structure based on plan)
-        for (i, cursor) in table_cursors.iter().enumerate() {
+        // Iterate in optimizer order: iteration_order[loop_pos] gives the FROM clause index
+        for (loop_pos, &from_idx) in iteration_order.iter().enumerate() {
+            let cursor = table_cursors[from_idx];
+
             // Handle FTS3 filter if applicable
             if let Some(filter) = &fts3_filter {
-                if filter.cursor == *cursor {
+                if filter.cursor == cursor {
                     match &filter.pattern {
                         Expr::Literal(Literal::String(text)) => {
-                            self.emit(Opcode::VFilter, *cursor, 0, 0, P4::Text(text.clone()));
+                            self.emit(Opcode::VFilter, cursor, 0, 0, P4::Text(text.clone()));
                         }
                         expr => {
                             let reg = self.alloc_reg();
                             self.compile_expr(expr, reg)?;
-                            self.emit(Opcode::VFilter, *cursor, reg, 0, P4::Unused);
+                            self.emit(Opcode::VFilter, cursor, reg, 0, P4::Unused);
                         }
                     }
                 }
@@ -916,9 +938,10 @@ impl<'s> SelectCompiler<'s> {
             let skip_label = self.alloc_label();
 
             // Check if we have a query plan for this table
+            // levels are already in optimizer order, so loop_pos indexes directly into levels
             let plan = where_info
                 .as_ref()
-                .and_then(|info| info.levels.get(i))
+                .and_then(|info| info.levels.get(loop_pos))
                 .map(|level| &level.plan);
 
             match plan {
@@ -931,7 +954,7 @@ impl<'s> SelectCompiler<'s> {
                 }) if *eq_cols > 0 => {
                     // Index scan with equality constraints
                     let index_cursor = self.alloc_cursor();
-                    self.index_cursors.insert(*cursor, index_cursor);
+                    self.index_cursors.insert(cursor, index_cursor);
 
                     // Open the index
                     self.emit(
@@ -951,7 +974,7 @@ impl<'s> SelectCompiler<'s> {
                     // Build index key from equality terms in WHERE clause
                     // Find equality expressions and sort by column index to match index order
                     let mut eq_exprs: Vec<(i32, Expr)> = if let Some(info) = &where_info {
-                        if let Some(level) = info.levels.get(i) {
+                        if let Some(level) = info.levels.get(loop_pos) {
                             self.find_index_equality_terms(info, level, index_name)
                                 .into_iter()
                                 .map(|(col_idx, expr)| (col_idx, expr.clone()))
@@ -1064,7 +1087,7 @@ impl<'s> SelectCompiler<'s> {
                     loop_labels.push(loop_label);
 
                     // DeferredSeek sets up table cursor to read from index
-                    self.emit(Opcode::DeferredSeek, *cursor, 0, index_cursor, P4::Unused);
+                    self.emit(Opcode::DeferredSeek, cursor, 0, index_cursor, P4::Unused);
 
                     // Build range end key if we have an upper bound constraint
                     // IdxGE expects key values in consecutive registers, not as a record
@@ -1116,7 +1139,7 @@ impl<'s> SelectCompiler<'s> {
                 }) => {
                     // Index range scan (for BETWEEN, <, >, etc.) without equality prefix
                     let index_cursor = self.alloc_cursor();
-                    self.index_cursors.insert(*cursor, index_cursor);
+                    self.index_cursors.insert(cursor, index_cursor);
 
                     // Open the index
                     self.emit(
@@ -1130,7 +1153,7 @@ impl<'s> SelectCompiler<'s> {
                     // Find range terms from WHERE clause
                     // Returns (start_bound, end_bound) where each is (expr, is_strict)
                     let (start_bound, end_bound) = if let Some(info) = &where_info {
-                        if let Some(level) = info.levels.get(i) {
+                        if let Some(level) = info.levels.get(loop_pos) {
                             self.find_range_bounds(info, level)
                         } else {
                             (None, None)
@@ -1191,7 +1214,7 @@ impl<'s> SelectCompiler<'s> {
                     loop_labels.push(loop_label);
 
                     // DeferredSeek sets up table cursor to read from index
-                    self.emit(Opcode::DeferredSeek, *cursor, 0, index_cursor, P4::Unused);
+                    self.emit(Opcode::DeferredSeek, cursor, 0, index_cursor, P4::Unused);
 
                     // Store scan info (no equality keys for pure range scan)
                     scan_info.push((true, Some(index_cursor), 0, 0, false));
@@ -1211,7 +1234,7 @@ impl<'s> SelectCompiler<'s> {
 
                     // Find and compile the rowid equality expression
                     if let Some(info) = &where_info {
-                        if let Some(level) = info.levels.get(i) {
+                        if let Some(level) = info.levels.get(loop_pos) {
                             for &term_idx in &level.used_terms {
                                 if let Some(term) = info.terms.get(term_idx as usize) {
                                     if term.is_equality() {
@@ -1233,13 +1256,7 @@ impl<'s> SelectCompiler<'s> {
                     }
 
                     // SeekRowid positions cursor at exact rowid
-                    self.emit(
-                        Opcode::SeekRowid,
-                        *cursor,
-                        skip_label,
-                        rowid_reg,
-                        P4::Unused,
-                    );
+                    self.emit(Opcode::SeekRowid, cursor, skip_label, rowid_reg, P4::Unused);
                     next_labels.push(skip_label);
 
                     // Mark the loop start (even though there's only one row)
@@ -1261,7 +1278,7 @@ impl<'s> SelectCompiler<'s> {
                         let mut found_start = false;
 
                         if let Some(info) = &where_info {
-                            if let Some(level) = info.levels.get(i) {
+                            if let Some(level) = info.levels.get(loop_pos) {
                                 for &term_idx in &level.used_terms {
                                     if let Some(term) = info.terms.get(term_idx as usize) {
                                         if let Some((_, col_idx)) = term.left_col {
@@ -1284,12 +1301,12 @@ impl<'s> SelectCompiler<'s> {
                         }
 
                         if found_start {
-                            self.emit(Opcode::SeekGE, *cursor, skip_label, start_reg, P4::Unused);
+                            self.emit(Opcode::SeekGE, cursor, skip_label, start_reg, P4::Unused);
                         } else {
-                            self.emit(Opcode::Rewind, *cursor, skip_label, 0, P4::Unused);
+                            self.emit(Opcode::Rewind, cursor, skip_label, 0, P4::Unused);
                         }
                     } else {
-                        self.emit(Opcode::Rewind, *cursor, skip_label, 0, P4::Unused);
+                        self.emit(Opcode::Rewind, cursor, skip_label, 0, P4::Unused);
                     }
                     next_labels.push(skip_label);
 
@@ -1302,7 +1319,7 @@ impl<'s> SelectCompiler<'s> {
                 }
                 _ => {
                     // Full scan (default)
-                    self.emit(Opcode::Rewind, *cursor, skip_label, 0, P4::Unused);
+                    self.emit(Opcode::Rewind, cursor, skip_label, 0, P4::Unused);
                     next_labels.push(skip_label);
 
                     // Mark the loop start for this level
@@ -1317,8 +1334,9 @@ impl<'s> SelectCompiler<'s> {
 
             // Initialize found_match for the NEXT table (if it's an outer join)
             // This must be INSIDE the current loop (after loop_label) so it resets on each iteration
-            if i + 1 < table_cursors.len() {
-                if let Some(reg) = found_match_regs[i + 1] {
+            if loop_pos + 1 < iteration_order.len() {
+                let next_from_idx = iteration_order[loop_pos + 1];
+                if let Some(reg) = found_match_regs[next_from_idx] {
                     self.emit(Opcode::Integer, 0, reg, 0, P4::Unused);
                 }
             }
@@ -1404,13 +1422,14 @@ impl<'s> SelectCompiler<'s> {
         // Each table's Next jumps back to its own loop start
         // When a table's Next fails, fall through to resolve the skip label
         // which then tries Next on the outer table
-        for i in (0..table_cursors.len()).rev() {
-            let cursor = table_cursors[i];
-            let loop_label = loop_labels[i];
+        for loop_pos in (0..iteration_order.len()).rev() {
+            let from_idx = iteration_order[loop_pos];
+            let cursor = table_cursors[from_idx];
+            let loop_label = loop_labels[loop_pos];
 
-            // Get scan info for this table
+            // Get scan info for this table (indexed by loop position)
             let (is_index_scan, index_cursor, key_base_reg, key_count, is_rowid_eq) = scan_info
-                .get(i)
+                .get(loop_pos)
                 .copied()
                 .unwrap_or((false, None, 0, 0, false));
 
@@ -1420,7 +1439,9 @@ impl<'s> SelectCompiler<'s> {
             } else if is_index_scan {
                 if let Some(idx_cursor) = index_cursor {
                     // Check range end key first (for early termination on upper bound)
-                    if let Some(Some((end_key_reg, end_key_count, op))) = range_end_keys.get(i) {
+                    if let Some(Some((end_key_reg, end_key_count, op))) =
+                        range_end_keys.get(loop_pos)
+                    {
                         // For Lt (y < 100): terminate when y >= 100 -> use IdxGE
                         // For Le (y <= 100): terminate when y > 100 -> use IdxGT
                         let opcode = match op {
@@ -1431,18 +1452,18 @@ impl<'s> SelectCompiler<'s> {
                         self.emit(
                             opcode,
                             idx_cursor,
-                            next_labels[i],
+                            next_labels[loop_pos],
                             *end_key_reg,
                             P4::Int64(*end_key_count as i64),
                         );
                     }
                     if key_count > 0 {
                         // Check if we've gone past the equality key range
-                        // IdxGT jumps to next_labels[i] if current index entry > key
+                        // IdxGT jumps to next_labels[loop_pos] if current index entry > key
                         self.emit(
                             Opcode::IdxGT,
                             idx_cursor,
-                            next_labels[i],
+                            next_labels[loop_pos],
                             key_base_reg,
                             P4::Int64(key_count as i64),
                         );
@@ -1457,9 +1478,10 @@ impl<'s> SelectCompiler<'s> {
 
             // For outer joins: if no match was found, emit null row
             // Both empty Rewind and exhausted Next come here
-            if let Some(found_match_reg) = found_match_regs[i] {
+            // found_match_regs is indexed by FROM clause position
+            if let Some(found_match_reg) = found_match_regs[from_idx] {
                 // Resolve the skip label HERE so Rewind jumps to check_match, not past it
-                self.resolve_label(next_labels[i], self.current_addr());
+                self.resolve_label(next_labels[loop_pos], self.current_addr());
 
                 // Label to skip null row output if we found a match
                 let skip_null_output = self.alloc_label();
@@ -1492,7 +1514,7 @@ impl<'s> SelectCompiler<'s> {
                 self.resolve_label(skip_null_output, self.current_addr());
             } else {
                 // Non-outer join: resolve skip label after Next
-                self.resolve_label(next_labels[i], self.current_addr());
+                self.resolve_label(next_labels[loop_pos], self.current_addr());
             }
         }
 
@@ -2862,14 +2884,26 @@ impl<'s> SelectCompiler<'s> {
         _index_name: &str,
     ) -> Vec<(i32, &'a Expr)> {
         let mut result = Vec::new();
+        let table_idx = level.from_idx;
 
         for &term_idx in &level.used_terms {
             if let Some(term) = where_info.terms.get(term_idx as usize) {
                 if term.is_equality() {
-                    if let Some((_, col_idx)) = term.left_col {
-                        // Extract the RHS expression from the equality
-                        if let Expr::Binary { right, .. } = term.expr.as_ref() {
-                            result.push((col_idx, right.as_ref()));
+                    if let Expr::Binary { left, right, .. } = term.expr.as_ref() {
+                        // Check if left_col matches this table's index column
+                        if let Some((ti, col_idx)) = term.left_col {
+                            if ti == table_idx {
+                                // left side is index column, right side is the value
+                                result.push((col_idx, right.as_ref()));
+                                continue;
+                            }
+                        }
+                        // Check if right_col matches this table's index column (for join conditions like s=y)
+                        if let Some((ti, col_idx)) = term.right_col {
+                            if ti == table_idx {
+                                // right side is index column, left side is the value
+                                result.push((col_idx, left.as_ref()));
+                            }
                         }
                     }
                 }

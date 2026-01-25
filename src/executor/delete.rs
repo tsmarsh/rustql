@@ -55,6 +55,12 @@ pub struct DeleteCompiler<'s> {
 
     /// Schema for column resolution
     schema: Option<&'s crate::schema::Schema>,
+
+    /// Parameter names for bound parameter lookup
+    param_names: Vec<Option<String>>,
+
+    /// Next unnamed parameter index (1-based)
+    next_unnamed_param: i32,
 }
 
 impl<'s> DeleteCompiler<'s> {
@@ -71,6 +77,8 @@ impl<'s> DeleteCompiler<'s> {
             column_map: HashMap::new(),
             mapper: None,
             schema: None,
+            param_names: Vec::new(),
+            next_unnamed_param: 1,
         }
     }
 
@@ -87,7 +95,14 @@ impl<'s> DeleteCompiler<'s> {
             column_map: HashMap::new(),
             mapper: None,
             schema: Some(schema),
+            param_names: Vec::new(),
+            next_unnamed_param: 1,
         }
+    }
+
+    /// Set parameter names for Variable compilation
+    pub fn set_param_names(&mut self, param_names: Vec<Option<String>>) {
+        self.param_names = param_names;
     }
 
     /// Compile a DELETE statement
@@ -767,6 +782,28 @@ impl<'s> DeleteCompiler<'s> {
                 } else {
                     self.emit(Opcode::IsNull, dest_reg, 0, dest_reg, P4::Unused);
                 }
+            }
+            Expr::Variable(var) => {
+                // Emit Variable opcode to read bound parameter
+                let param_idx = match var {
+                    crate::parser::ast::Variable::Numbered(Some(idx)) => *idx,
+                    crate::parser::ast::Variable::Numbered(None) => {
+                        // Unnamed parameter - use next sequential index
+                        let idx = self.next_unnamed_param;
+                        self.next_unnamed_param += 1;
+                        idx
+                    }
+                    crate::parser::ast::Variable::Named { prefix, name } => {
+                        // Look up named parameter in param_names
+                        let full_name = format!("{}{}", prefix, name);
+                        self.param_names
+                            .iter()
+                            .position(|n| n.as_deref() == Some(&full_name))
+                            .map(|i| (i + 1) as i32) // 1-based index
+                            .unwrap_or(1) // Default to 1 if not found
+                    }
+                };
+                self.emit(Opcode::Variable, param_idx, dest_reg, 0, P4::Unused);
             }
             _ => {
                 // Default to NULL for unsupported expressions

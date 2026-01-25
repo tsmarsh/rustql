@@ -991,6 +991,92 @@ impl<'s> SelectCompiler<'s> {
 
                     scan_info.push((true, Some(index_cursor), key_base_reg, *eq_cols, false));
                 }
+                Some(WherePlan::IndexScan {
+                    index_name,
+                    has_range: true,
+                    ..
+                }) => {
+                    // Index range scan (for BETWEEN, <, >, etc.) without equality prefix
+                    let index_cursor = self.alloc_cursor();
+                    self.index_cursors.insert(*cursor, index_cursor);
+
+                    // Open the index
+                    self.emit(
+                        Opcode::OpenRead,
+                        index_cursor,
+                        0,
+                        0,
+                        P4::Text(index_name.clone()),
+                    );
+
+                    // Find range terms from WHERE clause
+                    let (start_expr, end_expr) = if let Some(info) = &where_info {
+                        if let Some(level) = info.levels.get(i) {
+                            self.find_range_bounds(info, level)
+                        } else {
+                            (None, None)
+                        }
+                    } else {
+                        (None, None)
+                    };
+
+                    let key_base_reg = self.next_reg;
+                    let start_key_reg = self.alloc_reg();
+                    let end_key_reg = if end_expr.is_some() {
+                        Some(self.alloc_reg())
+                    } else {
+                        None
+                    };
+
+                    // Compile start bound and seek to it
+                    if let Some(start) = &start_expr {
+                        self.compile_expr(start, start_key_reg)?;
+                        // Create a single-column key for the range bound
+                        let key_record_reg = self.alloc_reg();
+                        self.emit(
+                            Opcode::MakeRecord,
+                            start_key_reg,
+                            1,
+                            key_record_reg,
+                            P4::Unused,
+                        );
+                        self.emit(
+                            Opcode::SeekGE,
+                            index_cursor,
+                            skip_label,
+                            key_record_reg,
+                            P4::Int64(1),
+                        );
+                    } else {
+                        // No start bound - start from beginning
+                        self.emit(Opcode::Rewind, index_cursor, skip_label, 0, P4::Unused);
+                    }
+
+                    // Compile end bound for checking in loop
+                    if let (Some(end), Some(end_reg)) = (&end_expr, end_key_reg) {
+                        self.compile_expr(end, end_reg)?;
+                    }
+
+                    next_labels.push(skip_label);
+
+                    // Mark the loop start
+                    let loop_label = self.alloc_label();
+                    self.resolve_label(loop_label, self.current_addr());
+                    loop_labels.push(loop_label);
+
+                    // DeferredSeek sets up table cursor to read from index
+                    self.emit(Opcode::DeferredSeek, *cursor, 0, index_cursor, P4::Unused);
+
+                    // Store info for loop end (including end bound check)
+                    // Use key_base_reg to store the end key register if present
+                    scan_info.push((
+                        true,
+                        Some(index_cursor),
+                        end_key_reg.unwrap_or(-1),
+                        if end_expr.is_some() { 1 } else { 0 },
+                        false,
+                    ));
+                }
                 Some(WherePlan::RowidEq) => {
                     // Direct rowid lookup - find the rowid term and compile it
                     let rowid_reg = self.alloc_reg();
@@ -2538,6 +2624,39 @@ impl<'s> SelectCompiler<'s> {
         }
 
         result
+    }
+
+    /// Find range bounds (start and end) from WHERE clause for index range scan
+    /// Returns (start_expr, end_expr) for BETWEEN-like constraints
+    fn find_range_bounds(
+        &self,
+        where_info: &WhereInfo,
+        level: &WhereLevel,
+    ) -> (Option<Expr>, Option<Expr>) {
+        let mut start_expr = None;
+        let mut end_expr = None;
+
+        for &term_idx in &level.used_terms {
+            if let Some(term) = where_info.terms.get(term_idx as usize) {
+                if term.is_range() {
+                    if let Expr::Binary { op, right, .. } = term.expr.as_ref() {
+                        match op {
+                            BinaryOp::Ge | BinaryOp::Gt => {
+                                // Start bound: col >= val or col > val
+                                start_expr = Some(right.as_ref().clone());
+                            }
+                            BinaryOp::Le | BinaryOp::Lt => {
+                                // End bound: col <= val or col < val
+                                end_expr = Some(right.as_ref().clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        (start_expr, end_expr)
     }
 
     /// Check if a WHERE term should be filtered at runtime

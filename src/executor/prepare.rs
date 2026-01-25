@@ -12,10 +12,7 @@ use crate::parser::grammar::Parser;
 use crate::types::ColumnType;
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
-use super::delete::{compile_delete, compile_delete_with_schema};
-use super::insert::{compile_insert, compile_insert_with_schema};
 use super::select::{SelectCompiler, SelectDest};
-use super::update::{compile_update, compile_update_with_schema};
 use super::where_clause::{IndexInfo, QueryPlanner, WherePlan, WhereTerm};
 
 // ============================================================================
@@ -211,29 +208,38 @@ impl<'s> StatementCompiler<'s> {
             }
 
             Stmt::Insert(insert) => {
-                let ops = if let Some(schema) = self.schema {
-                    compile_insert_with_schema(insert, schema)?
+                let mut compiler = if let Some(schema) = self.schema {
+                    super::insert::InsertCompiler::with_schema(schema)
                 } else {
-                    compile_insert(insert)?
+                    super::insert::InsertCompiler::new()
                 };
+                // Pass parameter names for Variable compilation
+                compiler.set_param_names(self.param_names.clone());
+                let ops = compiler.compile(insert)?;
                 Ok((ops, StmtType::Insert, Vec::new(), Vec::new()))
             }
 
             Stmt::Update(update) => {
-                let ops = if let Some(schema) = self.schema {
-                    compile_update_with_schema(update, schema)?
+                let mut compiler = if let Some(schema) = self.schema {
+                    super::update::UpdateCompiler::with_schema(schema)
                 } else {
-                    compile_update(update)?
+                    super::update::UpdateCompiler::new()
                 };
+                // Pass parameter names for Variable compilation
+                compiler.set_param_names(self.param_names.clone());
+                let ops = compiler.compile(update)?;
                 Ok((ops, StmtType::Update, Vec::new(), Vec::new()))
             }
 
             Stmt::Delete(delete) => {
-                let ops = if let Some(schema) = self.schema {
-                    compile_delete_with_schema(delete, schema)?
+                let mut compiler = if let Some(schema) = self.schema {
+                    super::delete::DeleteCompiler::with_schema(schema)
                 } else {
-                    compile_delete(delete)?
+                    super::delete::DeleteCompiler::new()
                 };
+                // Pass parameter names for Variable compilation
+                compiler.set_param_names(self.param_names.clone());
+                let ops = compiler.compile(delete)?;
                 Ok((ops, StmtType::Delete, Vec::new(), Vec::new()))
             }
 
@@ -807,6 +813,18 @@ impl<'s> StatementCompiler<'s> {
             p3,
             p4,
             p5: 0,
+            comment: None,
+        }
+    }
+
+    fn make_op_with_p5(opcode: Opcode, p1: i32, p2: i32, p3: i32, p4: P4, p5: u16) -> VdbeOp {
+        VdbeOp {
+            opcode,
+            p1,
+            p2,
+            p3,
+            p4,
+            p5,
             comment: None,
         }
     }
@@ -1506,6 +1524,124 @@ impl<'s> StatementCompiler<'s> {
             0,
             P4::Text(sql.clone()),
         ));
+
+        // Populate the index with existing table data
+        // Get column indices for the indexed columns
+        let indexed_col_indices: Vec<usize> = if let Some(schema) = self.schema {
+            if let Some(table) = schema.tables.get(&table_name_lower) {
+                create
+                    .columns
+                    .iter()
+                    .filter_map(|c| {
+                        let col_name = match &c.column {
+                            crate::parser::ast::IndexedColumnKind::Name(n) => n.clone(),
+                            crate::parser::ast::IndexedColumnKind::Expr(_) => return None,
+                        };
+                        table
+                            .columns
+                            .iter()
+                            .position(|tc| tc.name.eq_ignore_ascii_case(&col_name))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        if !indexed_col_indices.is_empty() {
+            let table_cursor = 1;
+            let index_cursor = 2;
+            let num_key_cols = indexed_col_indices.len();
+            let reg_col_base = 10;
+            let reg_rowid = reg_col_base + num_key_cols as i32;
+            let reg_record = reg_rowid + 1;
+            let loop_start = ops.len() as i32 + 1;
+            let loop_end_label = ops.len() as i32 + 10 + (num_key_cols * 2) as i32;
+
+            // OpenRead table cursor
+            ops.push(Self::make_op(
+                Opcode::OpenRead,
+                table_cursor,
+                0,
+                0,
+                P4::Text(table_name.to_string()),
+            ));
+
+            // OpenWrite index cursor using root page from register
+            ops.push(Self::make_op_with_p5(
+                Opcode::OpenWrite,
+                index_cursor,
+                reg_root_page,
+                (num_key_cols + 1) as i32, // +1 for rowid
+                P4::Unused,
+                0x02, // P2 is register
+            ));
+
+            // Rewind table cursor
+            let after_loop = loop_end_label + 2;
+            ops.push(Self::make_op(
+                Opcode::Rewind,
+                table_cursor,
+                after_loop,
+                0,
+                P4::Unused,
+            ));
+
+            let loop_body_start = ops.len() as i32;
+
+            // For each indexed column, read from table cursor
+            for (i, col_idx) in indexed_col_indices.iter().enumerate() {
+                ops.push(Self::make_op(
+                    Opcode::Column,
+                    table_cursor,
+                    *col_idx as i32,
+                    reg_col_base + i as i32,
+                    P4::Unused,
+                ));
+            }
+
+            // Get rowid
+            ops.push(Self::make_op(
+                Opcode::Rowid,
+                table_cursor,
+                reg_rowid,
+                0,
+                P4::Unused,
+            ));
+
+            // MakeRecord for index (columns + rowid)
+            ops.push(Self::make_op(
+                Opcode::MakeRecord,
+                reg_col_base,
+                (num_key_cols + 1) as i32,
+                reg_record,
+                P4::Unused,
+            ));
+
+            // IdxInsert into index cursor
+            ops.push(Self::make_op(
+                Opcode::IdxInsert,
+                index_cursor,
+                reg_record,
+                0,
+                P4::Unused,
+            ));
+
+            // Next table cursor, loop back
+            ops.push(Self::make_op(
+                Opcode::Next,
+                table_cursor,
+                loop_body_start,
+                0,
+                P4::Unused,
+            ));
+
+            // Close cursors
+            ops.push(Self::make_op(Opcode::Close, index_cursor, 0, 0, P4::Unused));
+            ops.push(Self::make_op(Opcode::Close, table_cursor, 0, 0, P4::Unused));
+        }
 
         // Insert into sqlite_master
         let cursor_id = 0;

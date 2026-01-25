@@ -1,7 +1,7 @@
 //! Debug tests for WHERE clause issues
 
 use rustql::types::StepResult;
-use rustql::vdbe::{get_sort_flag, reset_search_count, reset_sort_flag};
+use rustql::vdbe::{get_sort_flag, reset_search_count, reset_sort_count};
 use rustql::{
     sqlite3_close, sqlite3_column_count, sqlite3_column_text, sqlite3_finalize, sqlite3_initialize,
     sqlite3_open, sqlite3_prepare_v2, sqlite3_step, SqliteConnection,
@@ -467,14 +467,14 @@ fn test_sort_flag_with_order_by_expression() {
     exec(&mut conn, "INSERT INTO t3 VALUES(3, 98, 16)");
 
     // ORDER BY a should NOT require sorting (index can provide order)
-    reset_sort_flag();
+    reset_sort_count();
     let result = query_flat(&mut conn, "SELECT * FROM t3 ORDER BY a LIMIT 3");
     println!("ORDER BY a result: {:?}", result);
     let sort_for_order_a = get_sort_flag();
     println!("Sort flag for ORDER BY a: {}", sort_for_order_a);
 
     // ORDER BY a+1 SHOULD require sorting (expression doesn't match index)
-    reset_sort_flag();
+    reset_sort_count();
     let result2 = query_flat(&mut conn, "SELECT * FROM t3 ORDER BY a+1 LIMIT 3");
     println!("ORDER BY a+1 result: {:?}", result2);
     let sort_for_order_a_plus_1 = get_sort_flag();

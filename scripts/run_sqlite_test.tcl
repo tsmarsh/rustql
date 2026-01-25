@@ -135,7 +135,7 @@ array set sqlite_options {
     like 1
     or_opt 1
     reindex 1
-    tclvar 1
+    tclvar 0
     trace 1
     pragma 1
     floatingpoint 1

@@ -60,24 +60,29 @@ pub(crate) fn inc_search_count() {
 }
 
 // ============================================================================
-// Global Sort Flag (for db status sort compatibility)
+// Global Sort Counter (for sqlite_sort_count compatibility)
 // ============================================================================
 
-/// Global flag for tracking whether a sort operation was performed.
-/// This is used by TCL's "db status sort" for test compatibility.
-static SORT_FLAG: AtomicBool = AtomicBool::new(false);
+/// Global counter for tracking sort operations (Sort, SorterSort opcodes).
+/// This is used by sqlite_sort_count() for test compatibility.
+static SORT_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Get whether a sort was performed in the most recent query
+/// Get the current sort count (for sqlite_sort_count variable)
+pub fn get_sort_count() -> u64 {
+    SORT_COUNT.load(AtomicOrdering::Relaxed)
+}
+
+/// Reset the sort count to zero
+pub fn reset_sort_count() {
+    SORT_COUNT.store(0, AtomicOrdering::Relaxed);
+}
+
+/// Increment the sort count (called when Sort/SorterSort executes)
+pub(crate) fn inc_sort_count() {
+    SORT_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+}
+
+/// Get whether a sort was performed (for db status sort compatibility)
 pub fn get_sort_flag() -> bool {
-    SORT_FLAG.load(AtomicOrdering::Relaxed)
-}
-
-/// Reset the sort flag to false (call before executing a query)
-pub fn reset_sort_flag() {
-    SORT_FLAG.store(false, AtomicOrdering::Relaxed);
-}
-
-/// Set the sort flag to true (called when SorterSort executes)
-pub(crate) fn set_sort_flag() {
-    SORT_FLAG.store(true, AtomicOrdering::Relaxed);
+    SORT_COUNT.load(AtomicOrdering::Relaxed) > 0
 }

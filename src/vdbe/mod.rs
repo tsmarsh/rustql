@@ -38,4 +38,6 @@ pub use bytecode::{
     bytecode_schema, explain_bytecode, explain_query_plan, BytecodeIterator, BytecodeRow,
 };
 
-pub use engine::{get_search_count, get_sort_flag, reset_search_count, reset_sort_flag};
+pub use engine::{
+    get_search_count, get_sort_count, get_sort_flag, reset_search_count, reset_sort_count,
+};

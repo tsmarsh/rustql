@@ -18,7 +18,7 @@ use crate::api::{
     sqlite3_bind_parameter_count, sqlite3_bind_parameter_name, sqlite3_bind_text, PreparedStmt,
 };
 use crate::types::{ColumnType, StepResult};
-use crate::vdbe::{get_search_count, reset_search_count};
+use crate::vdbe::{get_search_count, get_sort_count, reset_search_count, reset_sort_count};
 use crate::{
     sqlite3_changes, sqlite3_close, sqlite3_column_count, sqlite3_column_name, sqlite3_column_text,
     sqlite3_column_type, sqlite3_finalize, sqlite3_initialize, sqlite3_last_insert_rowid,
@@ -475,6 +475,16 @@ unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         interp,
         search_count_name.as_ptr(),
         search_count_val.as_ptr(),
+        TCL_GLOBAL_ONLY,
+    );
+
+    // Initialize sqlite_sort_count variable for sort detection tests
+    let sort_count_name = CString::new("::sqlite_sort_count").unwrap();
+    let sort_count_val = CString::new("0").unwrap();
+    Tcl_SetVar(
+        interp,
+        sort_count_name.as_ptr(),
+        sort_count_val.as_ptr(),
         TCL_GLOBAL_ONLY,
     );
 }
@@ -2520,8 +2530,9 @@ unsafe fn db_eval(
         return TCL_ERROR;
     }
 
-    // Reset search count at the start of each eval
+    // Reset search and sort counts at the start of each eval
     reset_search_count();
+    reset_sort_count();
 
     let sql = obj_to_string(*objv.offset(2));
 
@@ -2741,8 +2752,9 @@ unsafe fn db_eval(
             TCL_OK
         });
 
-        // Update ::sqlite_search_count variable with current search count
+        // Update ::sqlite_search_count and ::sqlite_sort_count variables
         update_search_count_var(interp);
+        update_sort_count_var(interp);
 
         result
     }
@@ -2752,6 +2764,18 @@ unsafe fn db_eval(
 unsafe fn update_search_count_var(interp: *mut Tcl_Interp) {
     let var_name = CString::new("::sqlite_search_count").unwrap();
     let count_str = CString::new(get_search_count().to_string()).unwrap();
+    Tcl_SetVar(
+        interp,
+        var_name.as_ptr(),
+        count_str.as_ptr(),
+        TCL_GLOBAL_ONLY,
+    );
+}
+
+/// Update the ::sqlite_sort_count TCL variable with current sort count
+unsafe fn update_sort_count_var(interp: *mut Tcl_Interp) {
+    let var_name = CString::new("::sqlite_sort_count").unwrap();
+    let count_str = CString::new(get_sort_count().to_string()).unwrap();
     Tcl_SetVar(
         interp,
         var_name.as_ptr(),
@@ -2777,9 +2801,13 @@ unsafe fn bind_tcl_variables(interp: *mut Tcl_Interp, stmt: &mut PreparedStmt) {
                 continue; // Unnamed or ? parameters, skip
             };
 
-            // Look up the TCL variable
+            // Look up the TCL variable - first try current scope, then global
             let var_cstr = CString::new(var_name).unwrap_or_else(|_| CString::new("").unwrap());
-            let value_ptr = Tcl_GetVar(interp, var_cstr.as_ptr(), TCL_GLOBAL_ONLY);
+            let mut value_ptr = Tcl_GetVar(interp, var_cstr.as_ptr(), 0);
+            if value_ptr.is_null() {
+                // Try global scope
+                value_ptr = Tcl_GetVar(interp, var_cstr.as_ptr(), TCL_GLOBAL_ONLY);
+            }
 
             if value_ptr.is_null() {
                 // Variable not found, bind NULL

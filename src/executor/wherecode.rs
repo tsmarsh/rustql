@@ -140,8 +140,11 @@ impl WhereCodeGen {
                 index_name,
                 eq_cols,
                 covering,
+                has_range,
             } => {
-                self.code_index_scan(level_idx, level, index_name, *eq_cols, *covering)?;
+                self.code_index_scan(
+                    level_idx, level, index_name, *eq_cols, *covering, *has_range,
+                )?;
             }
             WherePlan::PrimaryKey { eq_cols } => {
                 self.code_pk_lookup(level_idx, level, *eq_cols)?;
@@ -201,6 +204,7 @@ impl WhereCodeGen {
         index_name: &str,
         eq_cols: i32,
         covering: bool,
+        _has_range: bool,
     ) -> Result<()> {
         let cursor = level.from_idx;
         let index_cursor = cursor + 100;

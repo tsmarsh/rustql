@@ -27,11 +27,13 @@ use crate::vdbe::mem::Mem;
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
 // Re-export from state module
-pub use state::{get_search_count, get_sort_flag, reset_search_count, reset_sort_flag};
+pub use state::{
+    get_search_count, get_sort_count, get_sort_flag, reset_search_count, reset_sort_count,
+};
 
 // Use state module items locally
 use state::{
-    inc_search_count, set_sort_flag, DEFAULT_CURSOR_SLOTS, DEFAULT_MEM_SIZE, OE_ABORT, OE_FAIL,
+    inc_search_count, inc_sort_count, DEFAULT_CURSOR_SLOTS, DEFAULT_MEM_SIZE, OE_ABORT, OE_FAIL,
     OE_IGNORE, OE_MASK, OE_NONE, OE_REPLACE, OE_ROLLBACK, OPFLAG_APPEND, OPFLAG_ISUPDATE,
     OPFLAG_LASTROWID, OPFLAG_NCHANGE, VDBE_MAGIC_DEAD, VDBE_MAGIC_HALT, VDBE_MAGIC_INIT,
     VDBE_MAGIC_RUN,
@@ -3652,8 +3654,8 @@ impl Vdbe {
                         cursor.sorter_sorted = true;
                         cursor.sorter_index = 0;
                         cursor.state = CursorState::Valid;
-                        // Mark that a sort was performed for "db status sort"
-                        set_sort_flag();
+                        // Increment sort count (for sqlite_sort_count variable)
+                        inc_sort_count();
                     }
                 } else {
                     self.pc = op.p2;

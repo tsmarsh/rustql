@@ -72,6 +72,12 @@ pub struct UpdateCompiler<'s> {
     /// Base register where column values are loaded (for expression compilation)
     /// When set, column references should use these registers instead of emitting Column opcodes
     column_data_base: Option<i32>,
+
+    /// Parameter names for bound parameter lookup
+    param_names: Vec<Option<String>>,
+
+    /// Next unnamed parameter index (1-based)
+    next_unnamed_param: i32,
 }
 
 impl<'s> UpdateCompiler<'s> {
@@ -91,6 +97,8 @@ impl<'s> UpdateCompiler<'s> {
             table_name: String::new(),
             table_alias: None,
             column_data_base: None,
+            param_names: Vec::new(),
+            next_unnamed_param: 1,
         }
     }
 
@@ -110,7 +118,14 @@ impl<'s> UpdateCompiler<'s> {
             table_name: String::new(),
             table_alias: None,
             column_data_base: None,
+            param_names: Vec::new(),
+            next_unnamed_param: 1,
         }
+    }
+
+    /// Set parameter names for Variable compilation
+    pub fn set_param_names(&mut self, param_names: Vec<Option<String>>) {
+        self.param_names = param_names;
     }
 
     /// Compile an UPDATE statement
@@ -1492,6 +1507,28 @@ impl<'s> UpdateCompiler<'s> {
             Expr::Parens(inner) => {
                 // Parentheses just wrap an expression - compile the inner expression
                 self.compile_expr(inner, dest_reg)?;
+            }
+            Expr::Variable(var) => {
+                // Emit Variable opcode to read bound parameter
+                let param_idx = match var {
+                    crate::parser::ast::Variable::Numbered(Some(idx)) => *idx,
+                    crate::parser::ast::Variable::Numbered(None) => {
+                        // Unnamed parameter - use next sequential index
+                        let idx = self.next_unnamed_param;
+                        self.next_unnamed_param += 1;
+                        idx
+                    }
+                    crate::parser::ast::Variable::Named { prefix, name } => {
+                        // Look up named parameter in param_names
+                        let full_name = format!("{}{}", prefix, name);
+                        self.param_names
+                            .iter()
+                            .position(|n| n.as_deref() == Some(&full_name))
+                            .map(|i| (i + 1) as i32) // 1-based index
+                            .unwrap_or(1) // Default to 1 if not found
+                    }
+                };
+                self.emit(Opcode::Variable, param_idx, dest_reg, 0, P4::Unused);
             }
             _ => {
                 // Default to NULL for unsupported expressions

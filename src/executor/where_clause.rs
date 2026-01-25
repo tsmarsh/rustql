@@ -114,6 +114,8 @@ pub enum WherePlan {
         eq_cols: i32,
         /// Is it a covering index?
         covering: bool,
+        /// Has range constraint after equality columns (for BETWEEN, <, >, etc.)
+        has_range: bool,
     },
 
     /// Use primary key/rowid lookup
@@ -1034,6 +1036,7 @@ impl QueryPlanner {
                         index_name: index.name.clone(),
                         eq_cols: eq_match_count,
                         covering: index.is_covering,
+                        has_range,
                     };
                     level.flags |= WhereLevelFlags::INDEXED;
                     if index.is_unique && eq_match_count == index.columns.len() as i32 {

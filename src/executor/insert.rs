@@ -75,6 +75,12 @@ pub struct InsertCompiler<'a> {
 
     /// Index cursors for maintenance
     index_cursors: Vec<IndexCursor>,
+
+    /// Parameter names for bound parameter lookup
+    param_names: Vec<Option<String>>,
+
+    /// Next unnamed parameter index (1-based)
+    next_unnamed_param: i32,
 }
 
 impl<'a> InsertCompiler<'a> {
@@ -91,6 +97,8 @@ impl<'a> InsertCompiler<'a> {
             column_map: HashMap::new(),
             schema: None,
             index_cursors: Vec::new(),
+            param_names: Vec::new(),
+            next_unnamed_param: 1,
         }
     }
 
@@ -107,7 +115,14 @@ impl<'a> InsertCompiler<'a> {
             column_map: HashMap::new(),
             schema: Some(schema),
             index_cursors: Vec::new(),
+            param_names: Vec::new(),
+            next_unnamed_param: 1,
         }
+    }
+
+    /// Set parameter names for Variable compilation
+    pub fn set_param_names(&mut self, param_names: Vec<Option<String>>) {
+        self.param_names = param_names;
     }
 
     /// Compile an INSERT statement
@@ -1538,6 +1553,28 @@ impl<'a> InsertCompiler<'a> {
                     dest_reg,
                     P4::Text(func_call.name.clone()),
                 );
+            }
+            Expr::Variable(var) => {
+                // Emit Variable opcode to read bound parameter
+                let param_idx = match var {
+                    crate::parser::ast::Variable::Numbered(Some(idx)) => *idx,
+                    crate::parser::ast::Variable::Numbered(None) => {
+                        // Unnamed parameter - use next sequential index
+                        let idx = self.next_unnamed_param;
+                        self.next_unnamed_param += 1;
+                        idx
+                    }
+                    crate::parser::ast::Variable::Named { prefix, name } => {
+                        // Look up named parameter in param_names
+                        let full_name = format!("{}{}", prefix, name);
+                        self.param_names
+                            .iter()
+                            .position(|n| n.as_deref() == Some(&full_name))
+                            .map(|i| (i + 1) as i32) // 1-based index
+                            .unwrap_or(1) // Default to 1 if not found
+                    }
+                };
+                self.emit(Opcode::Variable, param_idx, dest_reg, 0, P4::Unused);
             }
             _ => {
                 // Default to NULL for unsupported expressions

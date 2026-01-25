@@ -2433,7 +2433,9 @@ fn split_root_leaf(
     shared.pager.db_size = right_pgno.max(shared.pager.db_size);
     shared.n_page = shared.pager.db_size;
 
-    let sep_info = parse_cell_from_bytes(mem_page, limits, &right_cells[0])?;
+    // Use the LAST key from left page as separator (not first key from right)
+    // SQLite uses key <= separator to go left, key > separator to go right
+    let sep_info = parse_cell_from_bytes(mem_page, limits, left_cells.last().unwrap())?;
     let internal_flags = if mem_page.is_intkey {
         BTREE_PAGEFLAG_LEAFDATA | BTREE_PAGEFLAG_INTKEY
     } else {
@@ -2516,7 +2518,9 @@ fn split_leaf_with_parent(
     shared.pager.db_size = right_pgno.max(shared.pager.db_size);
     shared.n_page = shared.pager.db_size;
 
-    let sep_info = parse_cell_from_bytes(mem_page, limits, &right_cells[0])?;
+    // Use the LAST key from left page as separator (not first key from right)
+    // SQLite uses key <= separator to go left, key > separator to go right
+    let sep_info = parse_cell_from_bytes(mem_page, limits, left_cells.last().unwrap())?;
     let (mut keys, mut children) = rebuild_internal_children(parent, parent_limits)?;
 
     let insert_pos = child_index as usize;

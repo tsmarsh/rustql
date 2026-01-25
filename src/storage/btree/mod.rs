@@ -1850,6 +1850,16 @@ fn split_internal_with_parent(
     }
 }
 
+/// Result of a merge operation, used to adjust cursor after delete
+enum MergeResult {
+    /// Just borrowed cells between siblings, no structural change
+    Borrowed,
+    /// Full merge: cursor's page was merged into left sibling
+    FullMergeIntoLeft { merged_pgno: Pgno, new_ix: u16 },
+    /// Full merge: right sibling was merged into cursor's page
+    FullMergeFromRight,
+}
+
 fn merge_leaf_with_sibling(
     shared: &mut BtShared,
     parent: &MemPage,
@@ -1858,7 +1868,8 @@ fn merge_leaf_with_sibling(
     leaf_pgno: Pgno,
     leaf: &MemPage,
     leaf_limits: PageLimits,
-) -> Result<()> {
+    cursor_ix: u16,
+) -> Result<MergeResult> {
     if !leaf.is_leaf {
         return Err(Error::new(ErrorCode::Misuse));
     }
@@ -1906,10 +1917,17 @@ fn merge_leaf_with_sibling(
     };
 
     if left_page.n_cell > 1 && right_page.n_cell == 0 {
-        return Ok(());
+        return Ok(MergeResult::Borrowed);
     }
 
-    if left_page.n_cell > 1 && right_page.n_cell > 0 {
+    // Only borrow if the sibling has more cells than the leaf (cursor's page)
+    let (leaf_n_cell, sibling_n_cell) = if use_left {
+        (right_page.n_cell, left_page.n_cell)
+    } else {
+        (left_page.n_cell, right_page.n_cell)
+    };
+
+    if left_page.n_cell > 1 && right_page.n_cell > 0 && sibling_n_cell > leaf_n_cell {
         let borrow_from_left = left_page.n_cell > right_page.n_cell;
         let (donor, receiver, donor_limits, receiver_limits, donor_pgno, receiver_pgno) =
             if borrow_from_left {
@@ -1982,15 +2000,20 @@ fn merge_leaf_with_sibling(
         let donor_data = build_leaf_page_data(donor_limits, flags, &donor_cells)?;
         let mut donor_page = shared.pager.get(donor_pgno, PagerGetFlags::empty())?;
         shared.pager.write(&mut donor_page)?;
-        donor_page.data = donor_data;
+        donor_page.data = donor_data.clone();
+        shared.pager.write_page_to_cache(&donor_page);
 
         let flags = receiver.data[receiver_limits.header_start()];
         let receiver_data = build_leaf_page_data(receiver_limits, flags, &receiver_cells)?;
         let mut receiver_page = shared.pager.get(receiver_pgno, PagerGetFlags::empty())?;
         shared.pager.write(&mut receiver_page)?;
-        receiver_page.data = receiver_data;
-        return Ok(());
+        receiver_page.data = receiver_data.clone();
+        shared.pager.write_page_to_cache(&receiver_page);
+        return Ok(MergeResult::Borrowed);
     }
+
+    // Full merge: all cells go into left page
+    let left_original_n_cell = left_page.n_cell;
 
     let mut cells = Vec::new();
     for i in 0..left_page.n_cell {
@@ -2019,6 +2042,7 @@ fn merge_leaf_with_sibling(
     let mut left_db_page = shared.pager.get(left_pgno, PagerGetFlags::empty())?;
     shared.pager.write(&mut left_db_page)?;
     left_db_page.data = new_left_data;
+    shared.pager.write_page_to_cache(&left_db_page);
 
     let (mut keys, mut children) = rebuild_internal_children(parent, parent_limits)?;
     let key_remove = if use_left {
@@ -2045,14 +2069,24 @@ fn merge_leaf_with_sibling(
     match new_parent {
         Ok(data) => {
             parent_page.data = data;
+            shared.pager.write_page_to_cache(&parent_page);
         }
         Err(_) => {
             split_internal_root(shared, parent.pgno, parent, parent_limits)?;
         }
     }
 
-    let _ = right_pgno;
-    Ok(())
+    // Return merge result based on cursor position
+    if use_left {
+        // Cursor's page (right) was merged into left sibling
+        Ok(MergeResult::FullMergeIntoLeft {
+            merged_pgno: left_pgno,
+            new_ix: left_original_n_cell + cursor_ix,
+        })
+    } else {
+        // Right sibling was merged into cursor's page (left)
+        Ok(MergeResult::FullMergeFromRight)
+    }
 }
 
 fn merge_internal_with_sibling(
@@ -4030,49 +4064,119 @@ impl Btree {
                 } else {
                     PageLimits::new(shared_guard.page_size, shared_guard.usable_size)
                 };
-                let leaf_limits = if root_pgno == 1 {
+                let leaf_limits = if actual_pgno == 1 {
                     PageLimits::for_page1(shared_guard.page_size, shared_guard.usable_size)
                 } else {
                     PageLimits::new(shared_guard.page_size, shared_guard.usable_size)
                 };
                 if mem_page.is_leaf {
-                    let _ = merge_leaf_with_sibling(
+                    let merge_result = merge_leaf_with_sibling(
                         &mut shared_guard,
                         parent,
                         parent_limits,
                         *child_index,
-                        root_pgno,
+                        actual_pgno,
                         &mem_page,
                         leaf_limits,
+                        _cursor.ix,
                     );
+                    match merge_result {
+                        Ok(MergeResult::FullMergeIntoLeft {
+                            merged_pgno,
+                            new_ix,
+                        }) => {
+                            // Cursor's page was merged into left sibling
+                            let merged_limits = if merged_pgno == 1 {
+                                PageLimits::for_page1(
+                                    shared_guard.page_size,
+                                    shared_guard.usable_size,
+                                )
+                            } else {
+                                PageLimits::new(shared_guard.page_size, shared_guard.usable_size)
+                            };
+                            let merged_page = shared_guard
+                                .pager
+                                .get(merged_pgno, PagerGetFlags::empty())?;
+                            let merged_mem_page = MemPage::parse_with_shared(
+                                merged_pgno,
+                                merged_page.data.clone(),
+                                merged_limits,
+                                Some(&shared_guard),
+                            )?;
+                            _cursor.page = Some(merged_mem_page);
+                            _cursor.ix = new_ix;
+                            // Update idx_stack: now pointing to left sibling
+                            if let Some(last_idx) = _cursor.idx_stack.last_mut() {
+                                *last_idx = last_idx.saturating_sub(1);
+                            }
+                        }
+                        Ok(MergeResult::FullMergeFromRight)
+                        | Ok(MergeResult::Borrowed)
+                        | Err(_) => {
+                            // Refresh cursor's page
+                            let refreshed_page = shared_guard
+                                .pager
+                                .get(actual_pgno, PagerGetFlags::empty())?;
+                            let refreshed_mem_page = MemPage::parse_with_shared(
+                                actual_pgno,
+                                refreshed_page.data.clone(),
+                                leaf_limits,
+                                Some(&shared_guard),
+                            )?;
+                            if let Some(ref mut cursor_page) = _cursor.page {
+                                *cursor_page = refreshed_mem_page;
+                            }
+                        }
+                    }
                 } else {
                     let _ = merge_internal_with_sibling(
                         &mut shared_guard,
                         parent,
                         parent_limits,
                         *child_index,
-                        root_pgno,
+                        actual_pgno,
                         &mem_page,
                         leaf_limits,
                     );
+                    // Refresh cursor's page after merge
+                    let refreshed_page = shared_guard
+                        .pager
+                        .get(actual_pgno, PagerGetFlags::empty())?;
+                    let refreshed_mem_page = MemPage::parse_with_shared(
+                        actual_pgno,
+                        refreshed_page.data.clone(),
+                        leaf_limits,
+                        Some(&shared_guard),
+                    )?;
+                    if let Some(ref mut cursor_page) = _cursor.page {
+                        *cursor_page = refreshed_mem_page;
+                    }
+                }
+                // Refresh the page_stack - merge may have modified parent pages
+                for stack_page in _cursor.page_stack.iter_mut() {
+                    let stack_pgno = stack_page.pgno;
+                    let stack_limits = if stack_pgno == 1 {
+                        PageLimits::for_page1(shared_guard.page_size, shared_guard.usable_size)
+                    } else {
+                        PageLimits::new(shared_guard.page_size, shared_guard.usable_size)
+                    };
+                    let fresh_page = shared_guard.pager.get(stack_pgno, PagerGetFlags::empty())?;
+                    let fresh_mem_page = MemPage::parse_with_shared(
+                        stack_pgno,
+                        fresh_page.data.clone(),
+                        stack_limits,
+                        Some(&shared_guard),
+                    )?;
+                    *stack_page = fresh_mem_page;
                 }
             }
         }
 
         // Set skip_next so Next() doesn't advance past the shifted cells
-        // The cursor is still at the same ix, which now contains the "next" row
         _cursor.skip_next = 1;
-        // Keep cursor valid if there are still cells to process
-        if let Some(ref cursor_page) = _cursor.page {
-            if _cursor.ix < cursor_page.n_cell {
-                _cursor.state = CursorState::Valid;
-            } else {
-                _cursor.state = CursorState::Invalid;
-            }
-        } else {
-            _cursor.state = CursorState::Invalid;
-        }
-        let _ = collapse_root_if_empty(&mut shared_guard, root_pgno);
+        // Keep cursor valid - next() will handle navigation if we've exhausted this page
+        _cursor.state = CursorState::Valid;
+        // Don't call collapse_root_if_empty during delete loop - it changes tree structure
         Ok(())
     }
 
@@ -4819,8 +4923,7 @@ impl BtCursor {
                     return Ok(());
                 }
             }
-            self.state = CursorState::Invalid;
-            return Ok(());
+            // ix >= n_cell: we've exhausted this page, fall through to navigate to next page
         }
 
         let page = self.page.as_ref().ok_or(Error::new(ErrorCode::Corrupt))?;

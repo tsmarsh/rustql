@@ -2370,8 +2370,16 @@ impl Vdbe {
                     if cursor.null_row {
                         self.mem_mut(op.p3).set_null();
                     } else if let Some(ref bt_cursor) = cursor.btree_cursor {
-                        // Read payload from BtCursor
-                        if let Some(ref payload) = bt_cursor.info.payload {
+                        // Read payload from BtCursor - handle overflow pages if needed
+                        let payload_data: Option<Vec<u8>> =
+                            if bt_cursor.info.overflow_pgno.is_some() {
+                                // Cell has overflow - read full payload including overflow pages
+                                bt_cursor.payload(0, bt_cursor.info.n_payload).ok()
+                            } else {
+                                // No overflow - use local payload directly
+                                bt_cursor.info.payload.clone()
+                            };
+                        if let Some(ref payload) = payload_data {
                             // Decode the record to get the column value
                             match crate::vdbe::auxdata::decode_record_header(payload) {
                                 Ok((types, header_size)) => {

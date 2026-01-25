@@ -502,8 +502,11 @@ pub fn compare_records_default(rec_a: &[u8], rec_b: &[u8]) -> std::cmp::Ordering
         }
     }
 
-    // If all compared fields are equal, compare by number of fields
-    fields_a.len().cmp(&fields_b.len())
+    // For index comparisons, if all common fields are equal, treat as equal.
+    // The search key specifies only the columns we care about.
+    // If the index entry has more fields (e.g., the trailing rowid), that doesn't
+    // make it "greater" than the search key - it's a match on the relevant columns.
+    std::cmp::Ordering::Equal
 }
 
 /// Compare two record fields using the given collation

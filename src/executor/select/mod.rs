@@ -1128,7 +1128,8 @@ impl<'s> SelectCompiler<'s> {
                     );
 
                     // Find range terms from WHERE clause
-                    let (start_expr, end_expr) = if let Some(info) = &where_info {
+                    // Returns (start_bound, end_bound) where each is (expr, is_strict)
+                    let (start_bound, end_bound) = if let Some(info) = &where_info {
                         if let Some(level) = info.levels.get(i) {
                             self.find_range_bounds(info, level)
                         } else {
@@ -1140,15 +1141,15 @@ impl<'s> SelectCompiler<'s> {
 
                     let key_base_reg = self.next_reg;
                     let start_key_reg = self.alloc_reg();
-                    let end_key_reg = if end_expr.is_some() {
+                    let end_key_reg = if end_bound.is_some() {
                         Some(self.alloc_reg())
                     } else {
                         None
                     };
 
                     // Compile start bound and seek to it
-                    if let Some(start) = &start_expr {
-                        self.compile_expr(start, start_key_reg)?;
+                    if let Some((start_expr, is_strict)) = &start_bound {
+                        self.compile_expr(start_expr, start_key_reg)?;
                         // Create a single-column key for the range bound
                         let key_record_reg = self.alloc_reg();
                         self.emit(
@@ -1158,8 +1159,14 @@ impl<'s> SelectCompiler<'s> {
                             key_record_reg,
                             P4::Unused,
                         );
+                        // Use SeekGT for > (strict), SeekGE for >= (inclusive)
+                        let seek_op = if *is_strict {
+                            Opcode::SeekGT
+                        } else {
+                            Opcode::SeekGE
+                        };
                         self.emit(
-                            Opcode::SeekGE,
+                            seek_op,
                             index_cursor,
                             skip_label,
                             key_record_reg,
@@ -1171,8 +1178,9 @@ impl<'s> SelectCompiler<'s> {
                     }
 
                     // Compile end bound for checking in loop
-                    if let (Some(end), Some(end_reg)) = (&end_expr, end_key_reg) {
-                        self.compile_expr(end, end_reg)?;
+                    if let (Some((end_expr, _is_strict)), Some(end_reg)) = (&end_bound, end_key_reg)
+                    {
+                        self.compile_expr(end_expr, end_reg)?;
                     }
 
                     next_labels.push(skip_label);
@@ -1185,16 +1193,17 @@ impl<'s> SelectCompiler<'s> {
                     // DeferredSeek sets up table cursor to read from index
                     self.emit(Opcode::DeferredSeek, *cursor, 0, index_cursor, P4::Unused);
 
-                    // Store info for loop end (including end bound check)
-                    // Use key_base_reg to store the end key register if present
-                    scan_info.push((
-                        true,
-                        Some(index_cursor),
-                        end_key_reg.unwrap_or(-1),
-                        if end_expr.is_some() { 1 } else { 0 },
-                        false,
-                    ));
-                    range_end_keys.push(None);
+                    // Store scan info (no equality keys for pure range scan)
+                    scan_info.push((true, Some(index_cursor), 0, 0, false));
+
+                    // Store end bound info in range_end_keys
+                    // TermOp::Lt for strict (<), TermOp::Le for inclusive (<=)
+                    let range_end_info = match (&end_bound, end_key_reg) {
+                        (Some((_, true)), Some(reg)) => Some((reg, 1, TermOp::Lt)),
+                        (Some((_, false)), Some(reg)) => Some((reg, 1, TermOp::Le)),
+                        _ => None,
+                    };
+                    range_end_keys.push(range_end_info);
                 }
                 Some(WherePlan::RowidEq) => {
                     // Direct rowid lookup - find the rowid term and compile it
@@ -2871,27 +2880,36 @@ impl<'s> SelectCompiler<'s> {
     }
 
     /// Find range bounds (start and end) from WHERE clause for index range scan
-    /// Returns (start_expr, end_expr) for BETWEEN-like constraints
+    /// Returns ((start_expr, is_strict), (end_expr, is_strict)) for BETWEEN-like constraints
+    /// is_strict is true for > and <, false for >= and <=
     fn find_range_bounds(
         &self,
         where_info: &WhereInfo,
         level: &WhereLevel,
-    ) -> (Option<Expr>, Option<Expr>) {
-        let mut start_expr = None;
-        let mut end_expr = None;
+    ) -> (Option<(Expr, bool)>, Option<(Expr, bool)>) {
+        let mut start_bound = None;
+        let mut end_bound = None;
 
         for &term_idx in &level.used_terms {
             if let Some(term) = where_info.terms.get(term_idx as usize) {
                 if term.is_range() {
                     if let Expr::Binary { op, right, .. } = term.expr.as_ref() {
                         match op {
-                            BinaryOp::Ge | BinaryOp::Gt => {
-                                // Start bound: col >= val or col > val
-                                start_expr = Some(right.as_ref().clone());
+                            BinaryOp::Gt => {
+                                // Strict start bound: col > val
+                                start_bound = Some((right.as_ref().clone(), true));
                             }
-                            BinaryOp::Le | BinaryOp::Lt => {
-                                // End bound: col <= val or col < val
-                                end_expr = Some(right.as_ref().clone());
+                            BinaryOp::Ge => {
+                                // Inclusive start bound: col >= val
+                                start_bound = Some((right.as_ref().clone(), false));
+                            }
+                            BinaryOp::Lt => {
+                                // Strict end bound: col < val
+                                end_bound = Some((right.as_ref().clone(), true));
+                            }
+                            BinaryOp::Le => {
+                                // Inclusive end bound: col <= val
+                                end_bound = Some((right.as_ref().clone(), false));
                             }
                             _ => {}
                         }
@@ -2900,7 +2918,7 @@ impl<'s> SelectCompiler<'s> {
             }
         }
 
-        (start_expr, end_expr)
+        (start_bound, end_bound)
     }
 
     /// Check if a WHERE term should be filtered at runtime

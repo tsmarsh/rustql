@@ -1322,7 +1322,15 @@ impl<'a> InsertCompiler<'a> {
 
                             match col_index {
                                 Some(idx) => {
-                                    targets.push(InsertColumnTarget::Column(idx));
+                                    // Check if this is an INTEGER PRIMARY KEY (rowid alias)
+                                    let col_def = &table.columns[idx];
+                                    if col_def.is_primary_key
+                                        && col_def.affinity == crate::schema::Affinity::Integer
+                                    {
+                                        targets.push(InsertColumnTarget::Rowid);
+                                    } else {
+                                        targets.push(InsertColumnTarget::Column(idx));
+                                    }
                                 }
                                 None => {
                                     // Column doesn't exist in table
@@ -1341,9 +1349,25 @@ impl<'a> InsertCompiler<'a> {
                 Ok(targets)
             }
             None => {
-                // All columns in order
+                // All columns in order - but check for INTEGER PRIMARY KEY (rowid alias)
+                let table_lower = table_name.to_lowercase();
+                let table_opt = self.schema.and_then(|s| s.tables.get(&table_lower));
+
                 Ok((0..self.num_columns)
-                    .map(InsertColumnTarget::Column)
+                    .map(|i| {
+                        // Check if this column is an INTEGER PRIMARY KEY (rowid alias)
+                        if let Some(table) = table_opt {
+                            if i < table.columns.len() {
+                                let col = &table.columns[i];
+                                if col.is_primary_key
+                                    && col.affinity == crate::schema::Affinity::Integer
+                                {
+                                    return InsertColumnTarget::Rowid;
+                                }
+                            }
+                        }
+                        InsertColumnTarget::Column(i)
+                    })
                     .collect())
             }
         }
@@ -1377,13 +1401,15 @@ impl<'a> InsertCompiler<'a> {
     }
 
     /// Get Insert opcode flags for conflict action
+    /// Must match OE_* constants in vdbe/engine/state.rs
     fn conflict_flags(&self, action: ConflictAction) -> i64 {
+        // OE_NONE=0, OE_ROLLBACK=1, OE_ABORT=2, OE_FAIL=3, OE_IGNORE=4, OE_REPLACE=5
         match action {
-            ConflictAction::Abort => 0,
-            ConflictAction::Rollback => 1,
-            ConflictAction::Fail => 2,
-            ConflictAction::Ignore => 3,
-            ConflictAction::Replace => 4,
+            ConflictAction::Abort => 2,    // OE_ABORT
+            ConflictAction::Rollback => 1, // OE_ROLLBACK
+            ConflictAction::Fail => 3,     // OE_FAIL
+            ConflictAction::Ignore => 4,   // OE_IGNORE
+            ConflictAction::Replace => 5,  // OE_REPLACE
         }
     }
 
@@ -1908,11 +1934,12 @@ mod tests {
     #[test]
     fn test_conflict_flags() {
         let compiler = InsertCompiler::new();
-        assert_eq!(compiler.conflict_flags(ConflictAction::Abort), 0);
-        assert_eq!(compiler.conflict_flags(ConflictAction::Rollback), 1);
-        assert_eq!(compiler.conflict_flags(ConflictAction::Fail), 2);
-        assert_eq!(compiler.conflict_flags(ConflictAction::Ignore), 3);
-        assert_eq!(compiler.conflict_flags(ConflictAction::Replace), 4);
+        // Must match OE_* constants: OE_NONE=0, OE_ROLLBACK=1, OE_ABORT=2, OE_FAIL=3, OE_IGNORE=4, OE_REPLACE=5
+        assert_eq!(compiler.conflict_flags(ConflictAction::Abort), 2); // OE_ABORT
+        assert_eq!(compiler.conflict_flags(ConflictAction::Rollback), 1); // OE_ROLLBACK
+        assert_eq!(compiler.conflict_flags(ConflictAction::Fail), 3); // OE_FAIL
+        assert_eq!(compiler.conflict_flags(ConflictAction::Ignore), 4); // OE_IGNORE
+        assert_eq!(compiler.conflict_flags(ConflictAction::Replace), 5); // OE_REPLACE
     }
 
     #[test]

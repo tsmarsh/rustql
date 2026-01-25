@@ -19,7 +19,21 @@ DELETE statements fail to properly handle WHERE clauses, constraints, and transa
 - delete-12.0: DELETE row count not accurate
 
 ### Current Pass Rate
-- delete.test: 28/67 (41%)
+- delete.test: 34/67 (51%)
+
+## Session Progress
+
+### Completed (Session 2)
+- Fixed VDBE count_changes logic to only apply to DML statements (not SELECT)
+  - Prevents SELECT statements from getting spurious count_changes results
+  - Modified Halt handler to check for modifying opcodes (Delete, Insert, InsertInt)
+  - Removed n_change > 0 condition to allow returning 0 for DELETE with no matches
+  - However, still need to verify actual DELETE counts are correct
+
+### Current Issues Being Investigated
+1. **delete-3.1.4 syntax error**: Parser rejects `DELETE FROM 'table1'` - single quotes not valid for identifiers
+2. **delete-5.3 returning 0**: DELETE WHERE f1==$i loop should delete 50 rows, leaving 150, but table ends up empty
+3. **Row count accuracy**: Some DELETE tests expect specific counts but are getting incorrect values
 
 ## Root Causes
 1. **WHERE clause evaluation**: Rows not being correctly identified for deletion

@@ -290,7 +290,13 @@ impl Mem {
         } else if self.is_int() {
             self.i.to_string()
         } else if self.is_real() {
-            self.r.to_string()
+            // SQLite always shows decimal point for real numbers
+            let s = self.r.to_string();
+            if s.contains('.') || s.contains('e') || s.contains('E') {
+                s
+            } else {
+                format!("{}.0", s)
+            }
         } else if self.is_blob() {
             String::from_utf8_lossy(&self.data).into_owned()
         } else {
@@ -307,7 +313,13 @@ impl Mem {
         } else if self.is_int() {
             self.i.to_string().into_bytes()
         } else if self.is_real() {
-            self.r.to_string().into_bytes()
+            // SQLite always shows decimal point for real numbers
+            let s = self.r.to_string();
+            if s.contains('.') || s.contains('e') || s.contains('E') {
+                s.into_bytes()
+            } else {
+                format!("{}.0", s).into_bytes()
+            }
         } else {
             Vec::new()
         }

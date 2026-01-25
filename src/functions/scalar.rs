@@ -129,7 +129,7 @@ pub fn func_abs(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "abs() requires exactly 1 argument",
+            "wrong number of arguments to function abs()",
         ));
     }
 
@@ -144,10 +144,11 @@ pub fn func_abs(args: &[Value]) -> Result<Value> {
             } else if let Ok(f) = s.parse::<f64>() {
                 Ok(Value::Real(f.abs()))
             } else {
-                Ok(Value::Integer(0))
+                // Text that doesn't parse returns 0.0 (Real)
+                Ok(Value::Real(0.0))
             }
         }
-        Value::Blob(_) => Ok(Value::Integer(0)),
+        Value::Blob(_) => Ok(Value::Real(0.0)),
     }
 }
 
@@ -186,7 +187,7 @@ pub fn func_round(args: &[Value]) -> Result<Value> {
     if args.is_empty() || args.len() > 2 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "round() requires 1 or 2 arguments",
+            "wrong number of arguments to function round()",
         ));
     }
 
@@ -198,7 +199,13 @@ pub fn func_round(args: &[Value]) -> Result<Value> {
 
     match &args[0] {
         Value::Null => Ok(Value::Null),
-        Value::Integer(n) => Ok(Value::Integer(*n)),
+        // Integer input still returns Real (e.g., round(2) → 2.0)
+        Value::Integer(n) => {
+            let f = *n as f64;
+            let multiplier = 10f64.powi(precision);
+            let rounded = (f * multiplier).round() / multiplier;
+            Ok(Value::Real(rounded))
+        }
         Value::Real(f) => {
             let multiplier = 10f64.powi(precision);
             let rounded = (f * multiplier).round() / multiplier;
@@ -222,7 +229,7 @@ pub fn func_sign(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "sign() requires exactly 1 argument",
+            "wrong number of arguments to function sign()",
         ));
     }
 
@@ -266,7 +273,7 @@ pub fn func_length(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "length() requires exactly 1 argument",
+            "wrong number of arguments to function length()",
         ));
     }
 
@@ -284,7 +291,7 @@ pub fn func_octet_length(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "octet_length() requires exactly 1 argument",
+            "wrong number of arguments to function octet_length()",
         ));
     }
 
@@ -298,46 +305,85 @@ pub fn func_octet_length(args: &[Value]) -> Result<Value> {
 }
 
 /// substr(X, Y) or substr(X, Y, Z) - Extract substring
+///
+/// SQLite's substr uses 1-based indexing with special rules:
+/// - Positive start: position from beginning (1 = first char)
+/// - Negative start: position from end (-1 = last char)
+/// - Zero start: treated as position before first char
+/// - The length parameter determines how many chars to extract
 pub fn func_substr(args: &[Value]) -> Result<Value> {
     if args.len() < 2 || args.len() > 3 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "substr() requires 2 or 3 arguments",
+            "wrong number of arguments to function substr()",
         ));
+    }
+
+    // Handle NULL input
+    if matches!(args[0], Value::Null) {
+        return Ok(Value::Null);
     }
 
     let s = value_to_string(&args[0]);
     let start = value_to_i64(&args[1]);
     let len = if args.len() == 3 {
-        Some(value_to_i64(&args[2]))
+        value_to_i64(&args[2])
     } else {
-        None
+        i64::MAX // No length specified means rest of string
     };
 
-    // SQLite uses 1-based indexing, negative means from end
     let chars: Vec<char> = s.chars().collect();
     let str_len = chars.len() as i64;
 
-    // Calculate actual start position (0-based)
-    let actual_start = if start > 0 {
-        (start - 1).min(str_len) as usize
-    } else if start < 0 {
-        (str_len + start).max(0) as usize
-    } else {
-        0
-    };
-
-    let actual_len = match len {
-        Some(l) if l >= 0 => l as usize,
-        Some(_) => {
-            // Negative length in SQLite means characters before the position
-            let end_pos = (start - 1).max(0) as usize;
-            end_pos.saturating_sub(actual_start)
+    // Handle negative length (characters before the start position)
+    if len < 0 {
+        // Negative length extracts characters before the start position
+        // substr('abcdef', 4, -2) extracts 2 chars before position 4 = 'bc'
+        let end_pos = if start > 0 {
+            start - 1 // Convert to 0-based, this is where we stop (exclusive)
+        } else if start < 0 {
+            str_len + start // Position from end
+        } else {
+            0
+        };
+        let start_pos = (end_pos + len).max(0); // len is negative
+        if start_pos >= end_pos || end_pos <= 0 {
+            return Ok(Value::Text(String::new()));
         }
-        None => chars.len().saturating_sub(actual_start),
+        let result: String = chars
+            .iter()
+            .skip(start_pos as usize)
+            .take((end_pos - start_pos) as usize)
+            .collect();
+        return Ok(Value::Text(result));
+    }
+
+    // Convert start to 1-based position for calculation
+    let p1: i64 = if start < 0 {
+        // Negative start counts from end: -1 = str_len, -2 = str_len-1, etc.
+        str_len + start + 1
+    } else {
+        start
     };
 
-    let result: String = chars.iter().skip(actual_start).take(actual_len).collect();
+    // p1 is now the 1-based start position (can be <= 0 if start was very negative)
+    // p2 is the 1-based end position (exclusive in our math)
+    let p2 = p1.saturating_add(len);
+
+    // Clamp to valid range [1, str_len+1]
+    let actual_start = p1.max(1).min(str_len + 1) as usize;
+    let actual_end = p2.max(1).min(str_len + 1) as usize;
+
+    if actual_start >= actual_end {
+        return Ok(Value::Text(String::new()));
+    }
+
+    // Convert to 0-based indices
+    let result: String = chars
+        .iter()
+        .skip(actual_start - 1)
+        .take(actual_end - actual_start)
+        .collect();
 
     Ok(Value::Text(result))
 }
@@ -347,7 +393,7 @@ pub fn func_instr(args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "instr() requires exactly 2 arguments",
+            "wrong number of arguments to function instr()",
         ));
     }
 
@@ -373,7 +419,7 @@ pub fn func_upper(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "upper() requires exactly 1 argument",
+            "wrong number of arguments to function upper()",
         ));
     }
 
@@ -389,7 +435,7 @@ pub fn func_lower(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "lower() requires exactly 1 argument",
+            "wrong number of arguments to function lower()",
         ));
     }
 
@@ -405,11 +451,16 @@ pub fn func_trim(args: &[Value]) -> Result<Value> {
     if args.is_empty() || args.len() > 2 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "trim() requires 1 or 2 arguments",
+            "wrong number of arguments to function trim()",
         ));
     }
 
     if matches!(args[0], Value::Null) {
+        return Ok(Value::Null);
+    }
+
+    // If the second argument (chars to trim) is NULL, return NULL
+    if args.len() == 2 && matches!(args[1], Value::Null) {
         return Ok(Value::Null);
     }
 
@@ -429,11 +480,16 @@ pub fn func_ltrim(args: &[Value]) -> Result<Value> {
     if args.is_empty() || args.len() > 2 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "ltrim() requires 1 or 2 arguments",
+            "wrong number of arguments to function ltrim()",
         ));
     }
 
     if matches!(args[0], Value::Null) {
+        return Ok(Value::Null);
+    }
+
+    // If the second argument (chars to trim) is NULL, return NULL
+    if args.len() == 2 && matches!(args[1], Value::Null) {
         return Ok(Value::Null);
     }
 
@@ -453,11 +509,16 @@ pub fn func_rtrim(args: &[Value]) -> Result<Value> {
     if args.is_empty() || args.len() > 2 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "rtrim() requires 1 or 2 arguments",
+            "wrong number of arguments to function rtrim()",
         ));
     }
 
     if matches!(args[0], Value::Null) {
+        return Ok(Value::Null);
+    }
+
+    // If the second argument (chars to trim) is NULL, return NULL
+    if args.len() == 2 && matches!(args[1], Value::Null) {
         return Ok(Value::Null);
     }
 
@@ -477,11 +538,15 @@ pub fn func_replace(args: &[Value]) -> Result<Value> {
     if args.len() != 3 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "replace() requires exactly 3 arguments",
+            "wrong number of arguments to function replace()",
         ));
     }
 
-    if matches!(args[0], Value::Null) {
+    // If any argument is NULL, return NULL
+    if matches!(args[0], Value::Null)
+        || matches!(args[1], Value::Null)
+        || matches!(args[2], Value::Null)
+    {
         return Ok(Value::Null);
     }
 
@@ -501,7 +566,7 @@ pub fn func_reverse(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "reverse() requires exactly 1 argument",
+            "wrong number of arguments to function reverse()",
         ));
     }
 
@@ -521,7 +586,7 @@ pub fn func_typeof(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "typeof() requires exactly 1 argument",
+            "wrong number of arguments to function typeof()",
         ));
     }
 
@@ -551,7 +616,7 @@ pub fn func_nullif(args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "nullif() requires exactly 2 arguments",
+            "wrong number of arguments to function nullif()",
         ));
     }
 
@@ -567,7 +632,7 @@ pub fn func_ifnull(args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "ifnull() requires exactly 2 arguments",
+            "wrong number of arguments to function ifnull()",
         ));
     }
 
@@ -583,7 +648,7 @@ pub fn func_iif(args: &[Value]) -> Result<Value> {
     if args.len() != 3 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "iif() requires exactly 3 arguments",
+            "wrong number of arguments to function iif()",
         ));
     }
 
@@ -646,7 +711,7 @@ pub fn func_hex(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "hex() requires exactly 1 argument",
+            "wrong number of arguments to function hex()",
         ));
     }
 
@@ -667,7 +732,7 @@ pub fn func_unhex(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "unhex() requires exactly 1 argument",
+            "wrong number of arguments to function unhex()",
         ));
     }
 
@@ -698,7 +763,7 @@ pub fn func_zeroblob(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "zeroblob() requires exactly 1 argument",
+            "wrong number of arguments to function zeroblob()",
         ));
     }
 
@@ -720,7 +785,7 @@ pub fn func_quote(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "quote() requires exactly 1 argument",
+            "wrong number of arguments to function quote()",
         ));
     }
 
@@ -769,7 +834,7 @@ pub fn func_randomblob(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "randomblob() requires exactly 1 argument",
+            "wrong number of arguments to function randomblob()",
         ));
     }
 
@@ -790,7 +855,7 @@ pub fn func_unicode(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "unicode() requires exactly 1 argument",
+            "wrong number of arguments to function unicode()",
         ));
     }
 
@@ -839,7 +904,7 @@ pub fn func_like(args: &[Value]) -> Result<Value> {
     if args.len() < 2 || args.len() > 3 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "like() requires 2 or 3 arguments",
+            "wrong number of arguments to function like()",
         ));
     }
 
@@ -865,7 +930,7 @@ pub fn func_glob(args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "glob() requires exactly 2 arguments",
+            "wrong number of arguments to function glob()",
         ));
     }
 

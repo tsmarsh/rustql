@@ -2862,7 +2862,7 @@ impl Vdbe {
                             Ok(value) => {
                                 *self.mem_mut(op.p3) = Mem::from_value(&value);
                             }
-                            Err(_) => self.mem_mut(op.p3).set_null(),
+                            Err(e) => return Err(e),
                         }
                     } else {
                         self.mem_mut(op.p3).set_null();

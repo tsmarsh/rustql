@@ -14,8 +14,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::api::{
-    sqlite3_bind_double, sqlite3_bind_int64, sqlite3_bind_null, sqlite3_bind_parameter_count,
-    sqlite3_bind_parameter_name, sqlite3_bind_text, PreparedStmt,
+    sqlite3_bind_blob, sqlite3_bind_double, sqlite3_bind_int64, sqlite3_bind_null,
+    sqlite3_bind_parameter_count, sqlite3_bind_parameter_name, sqlite3_bind_text, PreparedStmt,
 };
 use crate::types::{ColumnType, StepResult};
 use crate::vdbe::{get_search_count, reset_search_count};

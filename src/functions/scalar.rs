@@ -665,7 +665,14 @@ pub fn func_typeof(args: &[Value]) -> Result<Value> {
 }
 
 /// coalesce(X, Y, ...) - Return first non-NULL argument
+/// Requires at least 2 arguments
 pub fn func_coalesce(args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function coalesce()",
+        ));
+    }
     for arg in args {
         if !matches!(arg, Value::Null) {
             return Ok(arg.clone());

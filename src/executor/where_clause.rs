@@ -119,6 +119,9 @@ pub enum WherePlan {
         /// Range termination info: (column_idx, operator, term_idx) for early scan termination
         /// Only set for upper-bound constraints (Lt, Le) that can terminate the scan
         range_end: Option<(i32, TermOp, i32)>,
+        /// Range start info: (column_idx, operator, term_idx) for seek positioning
+        /// Only set for lower-bound constraints (Gt, Ge) that can seek past initial rows
+        range_start: Option<(i32, TermOp, i32)>,
     },
 
     /// Use primary key/rowid lookup
@@ -1052,6 +1055,33 @@ impl QueryPlanner {
                 None
             };
 
+            // Find range start term (Gt or Ge on the column after eq columns)
+            let range_start = if has_range && eq_match_count > 0 {
+                let next_idx = eq_match_count as usize;
+                if next_idx < index.columns.len() {
+                    let col_idx = index.columns[next_idx];
+                    usable_range_terms.iter().find_map(|t| {
+                        if t.left_col
+                            .is_some_and(|(ti, ci)| ti == table_idx as i32 && ci == col_idx)
+                        {
+                            // Only use Gt or Ge for seek start (lower bound)
+                            match t.op {
+                                Some(TermOp::Gt) | Some(TermOp::Ge) => {
+                                    Some((col_idx, t.op.unwrap(), t.idx))
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             if eq_match_count > 0 || has_range {
                 let rows = if eq_match_count > 0 {
                     self.estimate_index_rows(table, index, eq_match_count)
@@ -1068,6 +1098,7 @@ impl QueryPlanner {
                         covering: index.is_covering,
                         has_range,
                         range_end,
+                        range_start,
                     };
                     level.flags |= WhereLevelFlags::INDEXED;
                     if index.is_unique && eq_match_count == index.columns.len() as i32 {

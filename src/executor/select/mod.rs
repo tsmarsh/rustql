@@ -926,6 +926,7 @@ impl<'s> SelectCompiler<'s> {
                     index_name,
                     eq_cols,
                     range_end,
+                    range_start,
                     ..
                 }) if *eq_cols > 0 => {
                     // Index scan with equality constraints
@@ -971,23 +972,89 @@ impl<'s> SelectCompiler<'s> {
                         }
                     }
 
-                    // Use MakeRecord to create serialized index key
-                    let key_reg = self.alloc_reg();
-                    self.emit(
-                        Opcode::MakeRecord,
-                        key_base_reg,
-                        *eq_cols,
-                        key_reg,
-                        P4::Unused,
-                    );
+                    // Build seek key - includes range start value if present
+                    let (seek_key_reg, seek_key_cols, seek_opcode) =
+                        if let Some((_col_idx, op, term_idx)) = range_start {
+                            // Build extended key with equality + range start value
+                            if let Some(info) = &where_info {
+                                if let Some(term) = info.terms.get(*term_idx as usize) {
+                                    if let Expr::Binary { right, .. } = term.expr.as_ref() {
+                                        // Allocate register for range start value
+                                        let range_val_reg = self.alloc_reg();
+                                        self.compile_expr(right, range_val_reg)?;
 
-                    // SeekGE positions at first entry >= key
+                                        // Create extended key record (eq cols + range start)
+                                        let ext_key_reg = self.alloc_reg();
+                                        self.emit(
+                                            Opcode::MakeRecord,
+                                            key_base_reg,
+                                            *eq_cols + 1,
+                                            ext_key_reg,
+                                            P4::Unused,
+                                        );
+
+                                        // Use SeekGT for > and SeekGE for >=
+                                        let opcode = match op {
+                                            TermOp::Gt => Opcode::SeekGT,
+                                            _ => Opcode::SeekGE,
+                                        };
+                                        (ext_key_reg, *eq_cols + 1, opcode)
+                                    } else {
+                                        // Fallback to equality-only key
+                                        let key_reg = self.alloc_reg();
+                                        self.emit(
+                                            Opcode::MakeRecord,
+                                            key_base_reg,
+                                            *eq_cols,
+                                            key_reg,
+                                            P4::Unused,
+                                        );
+                                        (key_reg, *eq_cols, Opcode::SeekGE)
+                                    }
+                                } else {
+                                    // Fallback to equality-only key
+                                    let key_reg = self.alloc_reg();
+                                    self.emit(
+                                        Opcode::MakeRecord,
+                                        key_base_reg,
+                                        *eq_cols,
+                                        key_reg,
+                                        P4::Unused,
+                                    );
+                                    (key_reg, *eq_cols, Opcode::SeekGE)
+                                }
+                            } else {
+                                // Fallback to equality-only key
+                                let key_reg = self.alloc_reg();
+                                self.emit(
+                                    Opcode::MakeRecord,
+                                    key_base_reg,
+                                    *eq_cols,
+                                    key_reg,
+                                    P4::Unused,
+                                );
+                                (key_reg, *eq_cols, Opcode::SeekGE)
+                            }
+                        } else {
+                            // No range start - use equality-only key
+                            let key_reg = self.alloc_reg();
+                            self.emit(
+                                Opcode::MakeRecord,
+                                key_base_reg,
+                                *eq_cols,
+                                key_reg,
+                                P4::Unused,
+                            );
+                            (key_reg, *eq_cols, Opcode::SeekGE)
+                        };
+
+                    // Seek to first matching entry
                     self.emit(
-                        Opcode::SeekGE,
+                        seek_opcode,
                         index_cursor,
                         skip_label,
-                        key_reg,
-                        P4::Int64(*eq_cols as i64),
+                        seek_key_reg,
+                        P4::Int64(seek_key_cols as i64),
                     );
                     next_labels.push(skip_label);
 

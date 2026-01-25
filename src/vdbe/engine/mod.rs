@@ -28,15 +28,16 @@ use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
 // Re-export from state module
 pub use state::{
-    get_search_count, get_sort_count, get_sort_flag, reset_search_count, reset_sort_count,
+    get_search_count, get_sort_count, get_sort_flag, get_step_count, reset_search_count,
+    reset_sort_count, reset_step_count,
 };
 
 // Use state module items locally
 use state::{
-    inc_search_count, inc_sort_count, DEFAULT_CURSOR_SLOTS, DEFAULT_MEM_SIZE, OE_ABORT, OE_FAIL,
-    OE_IGNORE, OE_MASK, OE_NONE, OE_REPLACE, OE_ROLLBACK, OPFLAG_APPEND, OPFLAG_ISUPDATE,
-    OPFLAG_LASTROWID, OPFLAG_NCHANGE, VDBE_MAGIC_DEAD, VDBE_MAGIC_HALT, VDBE_MAGIC_INIT,
-    VDBE_MAGIC_RUN,
+    inc_search_count, inc_sort_count, inc_step_count, DEFAULT_CURSOR_SLOTS, DEFAULT_MEM_SIZE,
+    OE_ABORT, OE_FAIL, OE_IGNORE, OE_MASK, OE_NONE, OE_REPLACE, OE_ROLLBACK, OPFLAG_APPEND,
+    OPFLAG_ISUPDATE, OPFLAG_LASTROWID, OPFLAG_NCHANGE, VDBE_MAGIC_DEAD, VDBE_MAGIC_HALT,
+    VDBE_MAGIC_INIT, VDBE_MAGIC_RUN,
 };
 
 // ============================================================================
@@ -1966,6 +1967,7 @@ impl Vdbe {
                 }
                 // Jump to P2 if there are more rows
                 if has_more {
+                    inc_step_count(); // Track fullscan step for "db status step"
                     self.pc = op.p2;
                 }
                 if let Some((name, rowid)) = vtab_context {
@@ -4318,6 +4320,8 @@ impl Vdbe {
                     }
 
                     if should_jump {
+                        // Increment search count when terminating the scan
+                        inc_search_count();
                         self.pc = op.p2;
                     }
                 }
@@ -4380,6 +4384,7 @@ impl Vdbe {
                     }
 
                     if should_jump {
+                        inc_search_count();
                         self.pc = op.p2;
                     }
                 }
@@ -4439,6 +4444,7 @@ impl Vdbe {
                     }
 
                     if should_jump {
+                        inc_search_count();
                         self.pc = op.p2;
                     }
                 }

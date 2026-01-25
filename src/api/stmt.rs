@@ -14,7 +14,7 @@ use crate::parser::ast::{AttachStmt, Expr, Literal, QualifiedName, Variable};
 use crate::types::{ColumnType, StepResult, Value};
 use crate::vdbe::engine::Vdbe;
 use crate::vdbe::ops::VdbeOp;
-use crate::vdbe::reset_sort_count;
+use crate::vdbe::{reset_sort_count, reset_step_count};
 
 use super::connection::SqliteConnection;
 

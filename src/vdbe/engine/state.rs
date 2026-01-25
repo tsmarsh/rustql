@@ -86,3 +86,26 @@ pub(crate) fn inc_sort_count() {
 pub fn get_sort_flag() -> bool {
     SORT_COUNT.load(AtomicOrdering::Relaxed) > 0
 }
+
+// ============================================================================
+// Global Step Counter (for db status step compatibility)
+// ============================================================================
+
+/// Global counter for tracking VDBE step/instruction count.
+/// This is used by "db status step" for test compatibility.
+static STEP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Get the current step count (for "db status step" command)
+pub fn get_step_count() -> u64 {
+    STEP_COUNT.load(AtomicOrdering::Relaxed)
+}
+
+/// Reset the step count to zero
+pub fn reset_step_count() {
+    STEP_COUNT.store(0, AtomicOrdering::Relaxed);
+}
+
+/// Increment the step count (called for each VDBE instruction executed)
+pub(crate) fn inc_step_count() {
+    STEP_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+}

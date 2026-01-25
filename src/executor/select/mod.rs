@@ -4065,14 +4065,18 @@ impl<'s> SelectCompiler<'s> {
                         | BinaryOp::Ge
                 );
 
-                if is_comparison {
+                // Check if this is IS/IS NOT (same as comparison but with NULLEQ flag)
+                let is_is_comparison = matches!(op, BinaryOp::Is | BinaryOp::IsNot);
+
+                if is_comparison || is_is_comparison {
                     // Comparison opcodes are jump-based: Eq P1 P2 P3 means
                     // "if r[P1] == r[P3], jump to P2"
                     // We need to produce a 0/1 boolean result in dest_reg
-                    // BUT: if either operand is NULL, result must be NULL (SQL semantics)
+                    // For regular comparisons: if either operand is NULL, result is NULL
+                    // For IS/IS NOT: NULL IS NULL = 1, NULL IS NOT NULL = 0 (uses NULLEQ flag)
                     let cmp_opcode = match op {
-                        BinaryOp::Eq => Opcode::Eq,
-                        BinaryOp::Ne => Opcode::Ne,
+                        BinaryOp::Eq | BinaryOp::Is => Opcode::Eq,
+                        BinaryOp::Ne | BinaryOp::IsNot => Opcode::Ne,
                         BinaryOp::Lt => Opcode::Lt,
                         BinaryOp::Le => Opcode::Le,
                         BinaryOp::Gt => Opcode::Gt,
@@ -4083,35 +4087,55 @@ impl<'s> SelectCompiler<'s> {
                     // Allocate labels for control flow
                     let true_label = self.alloc_label();
                     let end_label = self.alloc_label();
-                    let null_label = self.alloc_label();
 
-                    // Check if left operand is NULL - if so, result is NULL
-                    self.emit(Opcode::IsNull, left_reg, null_label, 0, P4::Unused);
-                    // Check if right operand is NULL - if so, result is NULL
-                    self.emit(Opcode::IsNull, right_reg, null_label, 0, P4::Unused);
+                    if is_is_comparison {
+                        // IS/IS NOT: use NULLEQ flag (0x80) so NULL IS NULL returns true
+                        // No NULL check needed - the comparison handles it
+                        self.emit(Opcode::Integer, 0, dest_reg, 0, P4::Unused);
+                        self.emit_with_p5(
+                            cmp_opcode,
+                            right_reg,
+                            true_label,
+                            left_reg,
+                            P4::Unused,
+                            0x80,
+                        );
+                        self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+                        self.resolve_label(true_label, self.current_addr());
+                        self.emit(Opcode::Integer, 1, dest_reg, 0, P4::Unused);
+                        self.resolve_label(end_label, self.current_addr());
+                    } else {
+                        // Regular comparison: NULL check first
+                        let null_label = self.alloc_label();
 
-                    // Neither is NULL - set result to 0 (false) initially
-                    self.emit(Opcode::Integer, 0, dest_reg, 0, P4::Unused);
+                        // Check if left operand is NULL - if so, result is NULL
+                        self.emit(Opcode::IsNull, left_reg, null_label, 0, P4::Unused);
+                        // Check if right operand is NULL - if so, result is NULL
+                        self.emit(Opcode::IsNull, right_reg, null_label, 0, P4::Unused);
 
-                    // Compare: if condition is true, jump to true_label
-                    // Comparison opcode format: P1=right operand, P2=jump target, P3=left operand
-                    // Lt P1 P2 P3 means "jump to P2 if r[P3] < r[P1]"
-                    self.emit(cmp_opcode, right_reg, true_label, left_reg, P4::Unused);
+                        // Neither is NULL - set result to 0 (false) initially
+                        self.emit(Opcode::Integer, 0, dest_reg, 0, P4::Unused);
 
-                    // Fall through means false - goto end
-                    self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+                        // Compare: if condition is true, jump to true_label
+                        // Comparison opcode format: P1=right operand, P2=jump target, P3=left operand
+                        // Lt P1 P2 P3 means "jump to P2 if r[P3] < r[P1]"
+                        self.emit(cmp_opcode, right_reg, true_label, left_reg, P4::Unused);
 
-                    // True path: set result to 1
-                    self.resolve_label(true_label, self.current_addr());
-                    self.emit(Opcode::Integer, 1, dest_reg, 0, P4::Unused);
-                    self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+                        // Fall through means false - goto end
+                        self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
 
-                    // Null path: set result to NULL
-                    self.resolve_label(null_label, self.current_addr());
-                    self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                        // True path: set result to 1
+                        self.resolve_label(true_label, self.current_addr());
+                        self.emit(Opcode::Integer, 1, dest_reg, 0, P4::Unused);
+                        self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
 
-                    // End label
-                    self.resolve_label(end_label, self.current_addr());
+                        // Null path: set result to NULL
+                        self.resolve_label(null_label, self.current_addr());
+                        self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+
+                        // End label
+                        self.resolve_label(end_label, self.current_addr());
+                    }
                 } else {
                     // Arithmetic and other value-producing operations
                     let opcode = match op {
@@ -6667,6 +6691,11 @@ impl<'s> SelectCompiler<'s> {
 
     fn emit(&mut self, opcode: Opcode, p1: i32, p2: i32, p3: i32, p4: P4) {
         self.ops.push(VdbeOp::with_p4(opcode, p1, p2, p3, p4));
+    }
+
+    fn emit_with_p5(&mut self, opcode: Opcode, p1: i32, p2: i32, p3: i32, p4: P4, p5: u16) {
+        self.ops
+            .push(VdbeOp::with_p4(opcode, p1, p2, p3, p4).with_p5(p5));
     }
 
     fn resolve_labels(&mut self) -> Result<()> {

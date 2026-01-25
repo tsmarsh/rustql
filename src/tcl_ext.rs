@@ -18,7 +18,9 @@ use crate::api::{
     sqlite3_bind_parameter_count, sqlite3_bind_parameter_name, sqlite3_bind_text, PreparedStmt,
 };
 use crate::types::{ColumnType, StepResult};
-use crate::vdbe::{get_search_count, get_sort_count, reset_search_count, reset_sort_count};
+use crate::vdbe::{
+    get_search_count, get_sort_count, reset_search_count, reset_sort_count, reset_step_count,
+};
 use crate::{
     sqlite3_changes, sqlite3_close, sqlite3_column_count, sqlite3_column_name, sqlite3_column_text,
     sqlite3_column_type, sqlite3_finalize, sqlite3_initialize, sqlite3_last_insert_rowid,
@@ -2411,13 +2413,26 @@ unsafe extern "C" fn db_cmd(
         "status" => {
             if objc >= 3 {
                 let what = obj_to_string(*objv.offset(2));
-                if what == "sort" {
-                    // Return whether the most recent query performed a sort
-                    let did_sort = crate::vdbe::get_sort_flag();
-                    set_result_int(interp, if did_sort { 1 } else { 0 });
-                } else {
-                    // Other status queries return 0
-                    set_result_int(interp, 0);
+                match what.as_str() {
+                    "sort" => {
+                        // Return whether the most recent query performed a sort
+                        let did_sort = crate::vdbe::get_sort_flag();
+                        set_result_int(interp, if did_sort { 1 } else { 0 });
+                    }
+                    "step" => {
+                        // Return the number of VDBE steps executed
+                        let step_count = crate::vdbe::get_step_count();
+                        set_result_int(interp, step_count as i32);
+                    }
+                    "vmstep" => {
+                        // Alias for step - some tests use vmstep
+                        let step_count = crate::vdbe::get_step_count();
+                        set_result_int(interp, step_count as i32);
+                    }
+                    _ => {
+                        // Other status queries return 0
+                        set_result_int(interp, 0);
+                    }
                 }
             } else {
                 set_result_string(interp, "");
@@ -2530,9 +2545,10 @@ unsafe fn db_eval(
         return TCL_ERROR;
     }
 
-    // Reset search and sort counts at the start of each eval
+    // Reset search, sort, and step counts at the start of each eval
     reset_search_count();
     reset_sort_count();
+    reset_step_count();
 
     let sql = obj_to_string(*objv.offset(2));
 

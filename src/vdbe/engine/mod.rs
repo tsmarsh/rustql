@@ -2706,9 +2706,9 @@ impl Vdbe {
             // ================================================================
             Opcode::AggStep | Opcode::AggStep0 => {
                 // As emitted by compiler:
-                // P1 = argument register (single arg)
-                // P2 = accumulator register
-                // P3 = 0 (unused)
+                // P1 = argument count
+                // P2 = argument base register
+                // P3 = accumulator register
                 // P4 = function name
                 let func_name = match &op.p4 {
                     P4::Text(s) => s.as_str(),
@@ -2716,12 +2716,15 @@ impl Vdbe {
                     _ => "",
                 };
 
-                let arg_reg = op.p1;
-                let acc_reg = op.p2;
+                let argc = op.p1.max(0) as usize;
+                let arg_base = op.p2;
+                let acc_reg = op.p3;
 
-                // Get argument value
-                let arg = self.mem(arg_reg).to_value();
-                let args = vec![arg];
+                // Get all argument values
+                let mut args = Vec::with_capacity(argc);
+                for i in 0..argc {
+                    args.push(self.mem(arg_base + i as i32).to_value());
+                }
 
                 // Get or create aggregate state
                 let state = self.agg_contexts.entry(acc_reg).or_insert_with(|| {

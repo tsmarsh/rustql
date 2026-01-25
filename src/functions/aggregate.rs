@@ -56,7 +56,7 @@ impl AggregateState {
             "MIN" => Some(AggregateState::Min { value: None }),
             "MAX" => Some(AggregateState::Max { value: None }),
             "TOTAL" => Some(AggregateState::Total { sum: 0.0 }),
-            "GROUP_CONCAT" => Some(AggregateState::GroupConcat {
+            "GROUP_CONCAT" | "STRING_AGG" => Some(AggregateState::GroupConcat {
                 values: Vec::new(),
                 separator: ",".to_string(),
             }),
@@ -171,8 +171,11 @@ impl AggregateState {
                     }
                 }
                 // Optional separator in second argument
+                // NULL separator means empty string (no separator)
                 if let Some(sep) = args.get(1) {
-                    if !matches!(sep, Value::Null) {
+                    if matches!(sep, Value::Null) {
+                        *separator = String::new();
+                    } else {
                         *separator = value_to_string(sep);
                     }
                 }
@@ -234,7 +237,7 @@ impl AggregateState {
 pub fn is_aggregate_function(name: &str) -> bool {
     matches!(
         name.to_uppercase().as_str(),
-        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "TOTAL" | "GROUP_CONCAT"
+        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "TOTAL" | "GROUP_CONCAT" | "STRING_AGG"
     )
 }
 
@@ -275,6 +278,11 @@ pub fn get_aggregate_function(name: &str) -> Option<AggregateInfo> {
         "GROUP_CONCAT" => Some(AggregateInfo {
             name: name_upper,
             min_args: 1,
+            max_args: 2,
+        }),
+        "STRING_AGG" => Some(AggregateInfo {
+            name: name_upper,
+            min_args: 2,
             max_args: 2,
         }),
         _ => None,

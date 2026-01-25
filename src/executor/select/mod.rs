@@ -4008,7 +4008,14 @@ impl<'s> SelectCompiler<'s> {
                 let is_aggregate = !is_multi_arg_min_max
                     && matches!(
                         name_upper.as_str(),
-                        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
+                        "COUNT"
+                            | "SUM"
+                            | "AVG"
+                            | "MIN"
+                            | "MAX"
+                            | "GROUP_CONCAT"
+                            | "STRING_AGG"
+                            | "TOTAL"
                     );
 
                 // Validate aggregate function argument counts
@@ -4867,7 +4874,14 @@ impl<'s> SelectCompiler<'s> {
                 } else {
                     matches!(
                         name_upper.as_str(),
-                        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
+                        "COUNT"
+                            | "SUM"
+                            | "AVG"
+                            | "MIN"
+                            | "MAX"
+                            | "GROUP_CONCAT"
+                            | "STRING_AGG"
+                            | "TOTAL"
                     )
                 };
                 if is_agg {
@@ -4923,7 +4937,14 @@ impl<'s> SelectCompiler<'s> {
                 } else {
                     matches!(
                         name_upper.as_str(),
-                        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
+                        "COUNT"
+                            | "SUM"
+                            | "AVG"
+                            | "MIN"
+                            | "MAX"
+                            | "GROUP_CONCAT"
+                            | "STRING_AGG"
+                            | "TOTAL"
                     )
                 };
 
@@ -4970,7 +4991,14 @@ impl<'s> SelectCompiler<'s> {
                 } else {
                     matches!(
                         name_upper.as_str(),
-                        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
+                        "COUNT"
+                            | "SUM"
+                            | "AVG"
+                            | "MIN"
+                            | "MAX"
+                            | "GROUP_CONCAT"
+                            | "STRING_AGG"
+                            | "TOTAL"
                     )
                 };
                 if is_aggregate {
@@ -5336,7 +5364,14 @@ impl<'s> SelectCompiler<'s> {
 
                 if matches!(
                     name_upper.as_str(),
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
+                    "COUNT"
+                        | "SUM"
+                        | "AVG"
+                        | "MIN"
+                        | "MAX"
+                        | "GROUP_CONCAT"
+                        | "STRING_AGG"
+                        | "TOTAL"
                 ) {
                     if *agg_idx >= agg_regs.len() {
                         return Ok(()); // No more aggregate registers
@@ -5369,22 +5404,26 @@ impl<'s> SelectCompiler<'s> {
                         ));
                     }
 
-                    // Compile argument
-                    let arg_reg = self.alloc_reg();
-                    let mut has_arg = false;
+                    // Compile ALL arguments into consecutive registers
+                    let arg_base = self.next_reg;
+                    let mut argc = 0;
                     if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
-                        if !exprs.is_empty() {
-                            self.compile_expr(&exprs[0], arg_reg)?;
-                            has_arg = true;
+                        for arg_expr in exprs {
+                            let arg_reg = self.alloc_reg();
+                            self.compile_expr(arg_expr, arg_reg)?;
+                            argc += 1;
                         }
                     }
-                    // For COUNT(*), initialize arg_reg with 1 so it's not NULL
-                    if !has_arg && name_upper == "COUNT" {
+                    // For COUNT(*), initialize arg_base with 1 so it's not NULL
+                    if argc == 0 && name_upper == "COUNT" {
+                        let arg_reg = self.alloc_reg();
                         self.emit(Opcode::Integer, 1, arg_reg, 0, P4::Unused);
+                        argc = 1;
                     }
 
                     // Emit aggregate step opcode
-                    self.emit(Opcode::AggStep, arg_reg, reg, 0, P4::Text(name_upper));
+                    // P1 = argc, P2 = arg_base, P3 = accumulator register
+                    self.emit(Opcode::AggStep, argc, arg_base, reg, P4::Text(name_upper));
                     *agg_idx += 1;
                 } else {
                     // Non-aggregate function - recurse into arguments to find nested aggregates
@@ -5465,7 +5504,14 @@ impl<'s> SelectCompiler<'s> {
                     if !is_multi_arg_min_max
                         && matches!(
                             name_upper.as_str(),
-                            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
+                            "COUNT"
+                                | "SUM"
+                                | "AVG"
+                                | "MIN"
+                                | "MAX"
+                                | "GROUP_CONCAT"
+                                | "STRING_AGG"
+                                | "TOTAL"
                         )
                     {
                         let agg_reg = agg_regs[agg_idx];
@@ -5579,7 +5625,14 @@ impl<'s> SelectCompiler<'s> {
                 if !is_multi_arg_min_max
                     && matches!(
                         name_upper.as_str(),
-                        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
+                        "COUNT"
+                            | "SUM"
+                            | "AVG"
+                            | "MIN"
+                            | "MAX"
+                            | "GROUP_CONCAT"
+                            | "STRING_AGG"
+                            | "TOTAL"
                     )
                 {
                     1
@@ -5626,7 +5679,14 @@ impl<'s> SelectCompiler<'s> {
                 if !is_multi_arg_min_max
                     && matches!(
                         name_upper.as_str(),
-                        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
+                        "COUNT"
+                            | "SUM"
+                            | "AVG"
+                            | "MIN"
+                            | "MAX"
+                            | "GROUP_CONCAT"
+                            | "STRING_AGG"
+                            | "TOTAL"
                     )
                 {
                     if *current_idx == target_idx {
@@ -5721,23 +5781,44 @@ impl<'s> SelectCompiler<'s> {
                     if !is_multi_arg_min_max
                         && matches!(
                             name_upper.as_str(),
-                            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
+                            "COUNT"
+                                | "SUM"
+                                | "AVG"
+                                | "MIN"
+                                | "MAX"
+                                | "GROUP_CONCAT"
+                                | "STRING_AGG"
+                                | "TOTAL"
                         )
                     {
-                        let arg_reg = self.alloc_reg();
-                        // For COUNT(*) (arg_count == 0), use a constant instead of reading from sorter
-                        // because COUNT(*) has no argument stored in the sorter
+                        // For COUNT(*) (arg_count == 0), use a constant
+                        // For other cases, read ALL arguments from sorter
+                        let arg_base = self.next_reg;
+                        let argc;
                         if arg_count == 0 && name_upper == "COUNT" {
+                            let arg_reg = self.alloc_reg();
                             self.emit(Opcode::Integer, 1, arg_reg, 0, P4::Unused);
+                            argc = 1;
                         } else {
-                            self.emit(Opcode::Column, cursor, col_idx as i32, arg_reg, P4::Unused);
-                            col_idx += 1;
+                            argc = arg_count;
+                            for _ in 0..arg_count {
+                                let arg_reg = self.alloc_reg();
+                                self.emit(
+                                    Opcode::Column,
+                                    cursor,
+                                    col_idx as i32,
+                                    arg_reg,
+                                    P4::Unused,
+                                );
+                                col_idx += 1;
+                            }
                         }
+                        // Emit AggStep with: P1=argc, P2=arg_base, P3=accumulator
                         self.emit(
                             Opcode::AggStep,
-                            arg_reg,
+                            argc as i32,
+                            arg_base,
                             agg_regs[agg_idx],
-                            0,
                             P4::Text(name_upper),
                         );
                         agg_idx += 1;

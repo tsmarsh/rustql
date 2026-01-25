@@ -1877,7 +1877,7 @@ impl Vdbe {
 
             Opcode::Next => {
                 // Move cursor to next row, jump to P2 if has more rows
-                inc_search_count();
+                // Note: search_count is incremented only on successful advancement (inside has_more block)
                 let mut has_more = false;
                 let mut vtab_context: Option<(Option<String>, Option<i64>)> = None;
                 if let Some(cursor) = self.cursor_mut(op.p1) {
@@ -1967,6 +1967,7 @@ impl Vdbe {
                 }
                 // Jump to P2 if there are more rows
                 if has_more {
+                    inc_search_count(); // Count successful cursor movements only
                     inc_step_count(); // Track fullscan step for "db status step"
                     self.pc = op.p2;
                 }
@@ -1995,7 +1996,7 @@ impl Vdbe {
 
             Opcode::Prev => {
                 // Move cursor to previous row, jump to P2 if has more rows
-                inc_search_count();
+                // Note: search_count is incremented only on successful advancement (inside has_more block)
                 let mut has_more = false;
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     // Invalidate column cache on cursor movement
@@ -2029,6 +2030,7 @@ impl Vdbe {
                 }
                 // Jump to P2 if there are more rows
                 if has_more {
+                    inc_search_count(); // Count successful cursor movements only
                     self.pc = op.p2;
                 }
             }
@@ -4512,6 +4514,10 @@ impl Vdbe {
                         cursor.ephemeral_set.insert(record);
                     } else if let Some(ref mut bt_cursor) = cursor.btree_cursor {
                         // Insert into btree index
+                        // First, position the cursor to find the correct insertion point
+                        let search_key = crate::storage::btree::UnpackedRecord::new(record.clone());
+                        let _res = bt_cursor.index_moveto(&search_key)?;
+
                         // Index key is the serialized record (columns + rowid)
                         if let Some(ref btree) = btree_arc {
                             let payload = BtreePayload {
@@ -4522,7 +4528,8 @@ impl Vdbe {
                                 n_data: 0,
                                 n_zero: 0,
                             };
-                            let flags = BtreeInsertFlags::empty();
+                            // Use USESEEKRESULT since cursor is already positioned
+                            let flags = BtreeInsertFlags::USESEEKRESULT;
                             btree.insert(bt_cursor, &payload, flags, 0)?;
                         }
                     }

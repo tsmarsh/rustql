@@ -3939,7 +3939,15 @@ impl Btree {
             mem_page.n_cell
         } else {
             // Use cursor position (set by prior moveto operation)
-            _cursor.ix.min(mem_page.n_cell)
+            // Adjust for seek_result:
+            // - seek_result == 0: exact match, insert at cursor.ix (replace/duplicate)
+            // - seek_result == -1: entry at ix > search key, insert at cursor.ix (before)
+            // - seek_result == 1: entry at ix < search key, insert at cursor.ix + 1 (after)
+            if _cursor.seek_result == 1 {
+                (_cursor.ix + 1).min(mem_page.n_cell)
+            } else {
+                _cursor.ix.min(mem_page.n_cell)
+            }
         };
 
         let header_start = limits.header_start();

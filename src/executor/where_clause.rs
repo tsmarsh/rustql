@@ -490,6 +490,28 @@ impl QueryPlanner {
         }
     }
 
+    /// Unwrap parentheses from an expression to get the inner expression
+    /// This handles nested parentheses like ((((x)))) -> x
+    fn unwrap_parens(expr: &Expr) -> &Expr {
+        match expr {
+            Expr::Parens(inner) => Self::unwrap_parens(inner),
+            _ => expr,
+        }
+    }
+
+    /// Check if an expression (possibly wrapped in parentheses) is a column reference
+    fn is_column_expr(expr: &Expr) -> bool {
+        matches!(Self::unwrap_parens(expr), Expr::Column(_))
+    }
+
+    /// Extract column reference from an expression (possibly wrapped in parentheses)
+    fn get_column_ref(expr: &Expr) -> Option<&crate::parser::ast::ColumnRef> {
+        match Self::unwrap_parens(expr) {
+            Expr::Column(col_ref) => Some(col_ref),
+            _ => None,
+        }
+    }
+
     /// Add a table to the planner
     pub fn add_table(&mut self, name: String, alias: Option<String>, estimated_rows: i64) {
         let from_idx = self.tables.len() as i32;
@@ -662,8 +684,8 @@ impl QueryPlanner {
                 if !is_comparison {
                     false
                 } else {
-                    let left_is_column = matches!(left.as_ref(), Expr::Column(_));
-                    let right_is_column = matches!(right.as_ref(), Expr::Column(_));
+                    let left_is_column = Self::is_column_expr(left.as_ref());
+                    let right_is_column = Self::is_column_expr(right.as_ref());
                     !left_is_column && right_is_column
                 }
             }
@@ -769,12 +791,14 @@ impl QueryPlanner {
     }
 
     /// Analyze a potential column reference in an expression (static version)
+    /// This handles expressions wrapped in parentheses like (w) or ((w))
     fn analyze_column_ref_static(
         table_info: &[(String, Option<String>, u64, Vec<String>, i32)],
         term: &mut WhereTerm,
         expr: &Expr,
     ) -> Result<()> {
-        if let Expr::Column(col_ref) = expr {
+        // Unwrap parentheses to get the actual column reference
+        if let Some(col_ref) = Self::get_column_ref(expr) {
             // Try to find which table this column belongs to
             for (i, (name, alias, mask, columns, ipk_column)) in table_info.iter().enumerate() {
                 let table_matches = match (&col_ref.table, alias) {

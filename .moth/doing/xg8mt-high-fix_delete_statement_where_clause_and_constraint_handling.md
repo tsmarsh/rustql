@@ -29,9 +29,11 @@ DELETE statements fail to properly handle WHERE clauses, constraints, and transa
 - Isolated database corruption to minimal test case
 
 ## Current Status
-- **DELETE tests: 34/67 passing (51%)**
-- **Blocker: Database corruption prevents progress on bulk operations**
-- **Investigation conducted: Root cause identified as freelist management**
+- **DELETE tests: 31/67 passing (46%)**
+- **CRITICAL BLOCKER: Database corruption on bulk DELETE after DELETE WHERE operations**
+- **Investigation Conducted: Root cause partially identified and partially fixed**
+- **Improvements Made**: Fixed trunk page write ordering and freelist page allocation
+- **Remaining Issue**: DELETE WHERE pattern still triggers corruption despite freelist fixes
 
 ### CRITICAL ISSUE: Database Corruption in Bulk Operations
 
@@ -64,11 +66,23 @@ INSERT 200 rows again → FAILS with "database disk image is malformed"
   2. Freelist management (save_freelist, load_freelist)
   3. Page reuse logic when allocating new pages
 
-**Next Steps**:
-1. Add debugging to freelist operations
-2. Check page allocation during second INSERT
-3. Verify page checksums/structure after bulk DELETE
-4. Consider page copying/reference counting issues
+**Fixes Applied (Session 2)**:
+1. ✓ Removed trunk pages from allocatable free_pages (load_freelist)
+2. ✓ Removed trunk pages after they're selected in save_freelist
+3. ✓ Fixed trunk page write() call ordering (was before data modification, now after)
+
+**Remaining Investigation Needed**:
+1. B-tree structure after DELETE WHERE - may leave page in inconsistent state
+2. Page counting or freelist reconstruction after multiple DELETEs
+3. Whether new trunk pages allocated in save_freelist override old ones correctly
+4. Interaction between partial row deletion and page reuse
+5. Possible cache coherency issue between pager and freelist state
+
+**Key Discovery**:
+- Bulk operations alone work fine (200 rows insert/delete/insert)
+- DELETE WHERE pattern before bulk ops triggers bug
+- Threshold appears around 20-50 initial rows before the pattern fails
+- No specific row count threshold, but pattern-dependent failure
 
 ### Other Issues (Lower Priority)
 1. **delete-3.1.4 syntax error**: Parser rejects `DELETE FROM 'table1'` - single quotes not valid for identifiers

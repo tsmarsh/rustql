@@ -6,17 +6,17 @@
 set script_dir [file dirname [info script]]
 set lib_path [file join $script_dir .. target debug librustql.so]
 
+# Try release build first (more common), then debug
+set lib_path [file join $script_dir .. target release librustql.so]
+if {![file exists $lib_path]} {
+    set lib_path [file join $script_dir .. target debug librustql.so]
+}
 if {[file exists $lib_path]} {
-    load $lib_path Rustql
+    load $lib_path rustql
 } else {
-    set lib_path [file join $script_dir .. target release librustql.so]
-    if {[file exists $lib_path]} {
-        load $lib_path Rustql
-    } else {
-        puts stderr "Error: Cannot find librustql.so"
-        puts stderr "Build with: cargo build --features tcl"
-        exit 1
-    }
+    puts stderr "Error: Cannot find librustql.so"
+    puts stderr "Build with: cargo build --release --features tcl"
+    exit 1
 }
 
 # Minimal tester.tcl implementation for running basic tests

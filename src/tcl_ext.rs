@@ -32,6 +32,8 @@ use std::os::raw::{c_char, c_int};
 // Thread-local storage for database connections (TCL is single-threaded)
 thread_local! {
     static CONNECTIONS: RefCell<HashMap<String, Box<SqliteConnection>>> = RefCell::new(HashMap::new());
+    // Per-connection null value representation (default is empty string)
+    static NULL_VALUES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
 }
 
 /// Initialize the extension - called by TCL when loading
@@ -2459,11 +2461,17 @@ unsafe extern "C" fn db_cmd(
             // Set/get the null representation string
             // Usage: db nullvalue ?string?
             if objc >= 3 {
-                // Setting null value - store it (not implemented yet, just accept)
+                // Setting null value
+                let null_str = obj_to_string(*objv.offset(2));
+                NULL_VALUES.with(|nv| {
+                    nv.borrow_mut().insert(db_name.to_string(), null_str);
+                });
                 TCL_OK
             } else {
-                // Getting null value - return empty string (default)
-                set_result_string(interp, "");
+                // Getting null value
+                let null_str =
+                    NULL_VALUES.with(|nv| nv.borrow().get(db_name).cloned().unwrap_or_default());
+                set_result_string(interp, &null_str);
                 TCL_OK
             }
         }
@@ -2581,7 +2589,9 @@ unsafe fn db_eval(
 
                                     let col_type = sqlite3_column_type(&stmt, i);
                                     let value = match col_type {
-                                        ColumnType::Null => "".to_string(),
+                                        ColumnType::Null => NULL_VALUES.with(|nv| {
+                                            nv.borrow().get(db_name).cloned().unwrap_or_default()
+                                        }),
                                         _ => sqlite3_column_text(&stmt, i),
                                     };
                                     col_values.push(value);
@@ -2705,7 +2715,9 @@ unsafe fn db_eval(
                             for i in 0..col_count {
                                 let col_type = sqlite3_column_type(&stmt, i);
                                 let value = match col_type {
-                                    ColumnType::Null => "".to_string(),
+                                    ColumnType::Null => NULL_VALUES.with(|nv| {
+                                        nv.borrow().get(db_name).cloned().unwrap_or_default()
+                                    }),
                                     _ => sqlite3_column_text(&stmt, i),
                                 };
                                 let obj = string_to_obj(&value);
@@ -2853,7 +2865,9 @@ unsafe fn db_onecolumn(db_name: &str, interp: *mut Tcl_Interp, objv: *const *mut
             Ok(StepResult::Row) => {
                 let col_type = sqlite3_column_type(&stmt, 0);
                 match col_type {
-                    ColumnType::Null => "".to_string(),
+                    ColumnType::Null => {
+                        NULL_VALUES.with(|nv| nv.borrow().get(db_name).cloned().unwrap_or_default())
+                    }
                     _ => sqlite3_column_text(&stmt, 0),
                 }
             }
@@ -2872,6 +2886,10 @@ unsafe fn db_close(db_name: &str, interp: *mut Tcl_Interp) -> c_int {
         if let Some(conn) = connections.borrow_mut().remove(db_name) {
             let _ = sqlite3_close(conn);
         }
+    });
+    // Clean up null value setting
+    NULL_VALUES.with(|nv| {
+        nv.borrow_mut().remove(db_name);
     });
 
     // Delete the command

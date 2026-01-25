@@ -191,31 +191,38 @@ pub fn func_round(args: &[Value]) -> Result<Value> {
         ));
     }
 
-    let precision = if args.len() == 2 {
-        value_to_i64(&args[1]) as i32
+    // Get precision as i64 to handle large values correctly
+    let precision_i64 = if args.len() == 2 {
+        value_to_i64(&args[1])
     } else {
         0
+    };
+
+    // Helper to round a float value
+    let round_float = |f: f64| -> f64 {
+        // For very large precision (> 15), f64 can't represent more precision anyway
+        // so just return the value unchanged
+        if precision_i64 > 15 {
+            return f;
+        }
+        // For very negative precision, the multiplier would underflow
+        if precision_i64 < -15 {
+            return 0.0;
+        }
+        // Safe to use as i32 now
+        let precision = precision_i64 as i32;
+        let multiplier = 10f64.powi(precision);
+        (f * multiplier).round() / multiplier
     };
 
     match &args[0] {
         Value::Null => Ok(Value::Null),
         // Integer input still returns Real (e.g., round(2) → 2.0)
-        Value::Integer(n) => {
-            let f = *n as f64;
-            let multiplier = 10f64.powi(precision);
-            let rounded = (f * multiplier).round() / multiplier;
-            Ok(Value::Real(rounded))
-        }
-        Value::Real(f) => {
-            let multiplier = 10f64.powi(precision);
-            let rounded = (f * multiplier).round() / multiplier;
-            Ok(Value::Real(rounded))
-        }
+        Value::Integer(n) => Ok(Value::Real(round_float(*n as f64))),
+        Value::Real(f) => Ok(Value::Real(round_float(*f))),
         Value::Text(s) => {
             if let Ok(f) = s.parse::<f64>() {
-                let multiplier = 10f64.powi(precision);
-                let rounded = (f * multiplier).round() / multiplier;
-                Ok(Value::Real(rounded))
+                Ok(Value::Real(round_float(f)))
             } else {
                 Ok(Value::Real(0.0))
             }

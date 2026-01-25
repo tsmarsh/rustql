@@ -34,6 +34,16 @@ enum InsertColumnTarget {
 // InsertCompiler
 // ============================================================================
 
+/// Index cursor info for index maintenance
+struct IndexCursor {
+    /// Cursor number
+    cursor: i32,
+    /// Column indices in the index (in order)
+    columns: Vec<i32>,
+    /// Index name
+    name: String,
+}
+
 /// Compiles INSERT statements to VDBE opcodes
 pub struct InsertCompiler<'a> {
     /// Generated VDBE operations
@@ -62,6 +72,9 @@ pub struct InsertCompiler<'a> {
 
     /// Optional schema for validation
     schema: Option<&'a Schema>,
+
+    /// Index cursors for maintenance
+    index_cursors: Vec<IndexCursor>,
 }
 
 impl<'a> InsertCompiler<'a> {
@@ -77,6 +90,7 @@ impl<'a> InsertCompiler<'a> {
             num_columns: 0,
             column_map: HashMap::new(),
             schema: None,
+            index_cursors: Vec::new(),
         }
     }
 
@@ -92,6 +106,7 @@ impl<'a> InsertCompiler<'a> {
             num_columns: 0,
             column_map: HashMap::new(),
             schema: Some(schema),
+            index_cursors: Vec::new(),
         }
     }
 
@@ -125,6 +140,9 @@ impl<'a> InsertCompiler<'a> {
 
         self.num_columns = self.infer_num_columns(insert);
 
+        // Open indexes for writing
+        self.open_indexes_for_write(&insert.table.name)?;
+
         // Handle conflict action
         let conflict_action = insert.or_action.unwrap_or(ConflictAction::Abort);
 
@@ -148,7 +166,13 @@ impl<'a> InsertCompiler<'a> {
             self.compile_returning(returning)?;
         }
 
-        // Close cursor
+        // Close index cursors
+        let index_cursor_ids: Vec<i32> = self.index_cursors.iter().map(|ic| ic.cursor).collect();
+        for cursor in index_cursor_ids {
+            self.emit(Opcode::Close, cursor, 0, 0, P4::Unused);
+        }
+
+        // Close table cursor
         self.emit(Opcode::Close, self.table_cursor, 0, 0, P4::Unused);
 
         // Halt
@@ -287,6 +311,9 @@ impl<'a> InsertCompiler<'a> {
                 P4::Int64(flags),
                 OPFLAG_NCHANGE,
             );
+
+            // Insert into indexes
+            self.emit_index_inserts(data_base, rowid_reg);
         }
 
         Ok(())
@@ -547,6 +574,9 @@ impl<'a> InsertCompiler<'a> {
             OPFLAG_NCHANGE,
         );
 
+        // Insert into indexes
+        self.emit_index_inserts(data_base, rowid_reg);
+
         // Next row in ephemeral table
         self.emit(Opcode::Next, eph_cursor, insert_loop_start, 0, P4::Unused);
         self.resolve_label(insert_loop_end, self.current_addr() as i32);
@@ -745,6 +775,9 @@ impl<'a> InsertCompiler<'a> {
             P4::Int64(flags),
             OPFLAG_NCHANGE,
         );
+
+        // Insert into indexes
+        self.emit_index_inserts(data_base, rowid_reg);
 
         // Next row in ephemeral table
         self.emit(Opcode::Next, eph_cursor, insert_loop_start, 0, P4::Unused);
@@ -1202,6 +1235,9 @@ impl<'a> InsertCompiler<'a> {
             OPFLAG_NCHANGE,
         );
 
+        // Insert into indexes
+        self.emit_index_inserts(data_base, rowid_reg);
+
         Ok(())
     }
 
@@ -1519,6 +1555,111 @@ impl<'a> InsertCompiler<'a> {
         let cursor = self.next_cursor;
         self.next_cursor += 1;
         cursor
+    }
+
+    /// Open indexes for write access
+    fn open_indexes_for_write(&mut self, table_name: &str) -> Result<()> {
+        // Get indexes from schema
+        if let Some(schema) = self.schema {
+            let table_name_lower = table_name.to_lowercase();
+
+            // First check schema.indexes for indexes on this table
+            for (_name, idx) in schema.indexes.iter() {
+                if idx.table.eq_ignore_ascii_case(&table_name_lower) {
+                    let cursor = self.alloc_cursor();
+                    self.emit(
+                        Opcode::OpenWrite,
+                        cursor,
+                        0, // Root page comes from schema lookup at runtime
+                        0,
+                        P4::Text(idx.name.clone()),
+                    );
+
+                    let columns: Vec<i32> = idx.columns.iter().map(|c| c.column_idx).collect();
+                    self.index_cursors.push(IndexCursor {
+                        cursor,
+                        columns,
+                        name: idx.name.clone(),
+                    });
+                }
+            }
+
+            // Also check table.indexes
+            if let Some(table) = schema.tables.get(&table_name_lower) {
+                for idx in &table.indexes {
+                    // Skip if already added
+                    if self
+                        .index_cursors
+                        .iter()
+                        .any(|ic| ic.name.eq_ignore_ascii_case(&idx.name))
+                    {
+                        continue;
+                    }
+
+                    let cursor = self.alloc_cursor();
+                    self.emit(Opcode::OpenWrite, cursor, 0, 0, P4::Text(idx.name.clone()));
+
+                    let columns: Vec<i32> = idx.columns.iter().map(|c| c.column_idx).collect();
+                    self.index_cursors.push(IndexCursor {
+                        cursor,
+                        columns,
+                        name: idx.name.clone(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit index insert operations after inserting a row
+    /// data_base is the register containing the first column value
+    /// rowid_reg is the register containing the rowid
+    fn emit_index_inserts(&mut self, data_base: i32, rowid_reg: i32) {
+        // Clone index_cursors to avoid borrow issues
+        let index_cursors: Vec<_> = self
+            .index_cursors
+            .iter()
+            .map(|ic| (ic.cursor, ic.columns.clone()))
+            .collect();
+
+        for (cursor, columns) in index_cursors {
+            // Build index key: indexed columns + rowid
+            let key_base = self.alloc_regs(columns.len() + 1);
+
+            // Copy indexed columns to key registers
+            for (i, col_idx) in columns.iter().enumerate() {
+                if *col_idx >= 0 {
+                    // Copy column value from data registers
+                    self.emit(
+                        Opcode::Copy,
+                        data_base + *col_idx,
+                        key_base + i as i32,
+                        0,
+                        P4::Unused,
+                    );
+                } else {
+                    // Expression index - not supported yet, use null
+                    self.emit(Opcode::Null, 0, key_base + i as i32, 0, P4::Unused);
+                }
+            }
+
+            // Copy rowid as the last key component
+            let rowid_pos = key_base + columns.len() as i32;
+            self.emit(Opcode::Copy, rowid_reg, rowid_pos, 0, P4::Unused);
+
+            // Make the index record
+            let record_reg = self.alloc_reg();
+            self.emit(
+                Opcode::MakeRecord,
+                key_base,
+                (columns.len() + 1) as i32,
+                record_reg,
+                P4::Unused,
+            );
+
+            // Insert into index
+            self.emit(Opcode::IdxInsert, cursor, record_reg, 0, P4::Unused);
+        }
     }
 
     fn alloc_label(&mut self) -> i32 {

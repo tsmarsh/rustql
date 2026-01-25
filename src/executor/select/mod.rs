@@ -11,6 +11,7 @@ pub use types::{ColumnInfo, SelectDest, TableInfo};
 use std::collections::{HashMap, HashSet};
 
 use crate::error::{Error, ErrorCode, Result};
+use crate::executor::where_clause::{IndexInfo, QueryPlanner, WhereInfo, WhereLevel, WherePlan};
 use crate::executor::window::{select_has_window_functions, WindowCompiler};
 use crate::parser::ast::{
     BinaryOp, ColumnRef, CommonTableExpr, CompoundOp, Distinct, Expr, FromClause, JoinFlags,
@@ -95,6 +96,10 @@ pub struct SelectCompiler<'s> {
     /// Tables at index < outer_tables_boundary are from outer queries and should not be looped over.
     /// Tables at index >= outer_tables_boundary are local to this query and should be looped.
     outer_tables_boundary: usize,
+    /// Map from table cursor to index cursor (for index scans)
+    index_cursors: HashMap<i32, i32>,
+    /// Cached query plan from WHERE clause analysis
+    where_info: Option<WhereInfo>,
 }
 
 impl<'s> SelectCompiler<'s> {
@@ -133,6 +138,8 @@ impl<'s> SelectCompiler<'s> {
             join_conditions: Vec::new(),
             coalesced_columns: HashMap::new(),
             outer_tables_boundary: 0,
+            index_cursors: HashMap::new(),
+            where_info: None,
         }
     }
 
@@ -171,6 +178,8 @@ impl<'s> SelectCompiler<'s> {
             join_conditions: Vec::new(),
             coalesced_columns: HashMap::new(),
             outer_tables_boundary: 0,
+            index_cursors: HashMap::new(),
+            where_info: None,
         }
     }
 
@@ -780,6 +789,10 @@ impl<'s> SelectCompiler<'s> {
         // This follows SQLite's approach of adding join conditions to pWhere
         let remaining_where = self.merge_join_conditions(original_where);
 
+        // Analyze WHERE clause for index optimization
+        // This produces a query plan that may use indexes instead of full scans
+        let where_info = self.analyze_query_plan(remaining_where.as_ref())?;
+
         // Determine if we need DISTINCT processing
         let distinct_cursor = if core.distinct == Distinct::Distinct {
             let cursor = self.alloc_cursor();
@@ -855,7 +868,12 @@ impl<'s> SelectCompiler<'s> {
             found_match_regs.push(found_match_reg);
         }
 
-        // Now emit the Rewind/loop structure
+        // Track scan metadata for each table (for loop end code)
+        // (is_index_scan, index_cursor, key_base_reg, key_count, is_rowid_eq)
+        let mut scan_info: Vec<(bool, Option<i32>, i32, i32, bool)> =
+            Vec::with_capacity(table_cursors.len());
+
+        // Now emit the Rewind/loop structure (or index seek structure based on plan)
         for (i, cursor) in table_cursors.iter().enumerate() {
             // Handle FTS3 filter if applicable
             if let Some(filter) = &fts3_filter {
@@ -876,13 +894,196 @@ impl<'s> SelectCompiler<'s> {
             // For the outermost table, jump to done_all on empty
             // For inner tables, jump to next_outer (advance outer cursor)
             let skip_label = self.alloc_label();
-            self.emit(Opcode::Rewind, *cursor, skip_label, 0, P4::Unused);
-            next_labels.push(skip_label);
 
-            // Mark the loop start for this level
-            let loop_label = self.alloc_label();
-            self.resolve_label(loop_label, self.current_addr());
-            loop_labels.push(loop_label);
+            // Check if we have a query plan for this table
+            let plan = where_info
+                .as_ref()
+                .and_then(|info| info.levels.get(i))
+                .map(|level| &level.plan);
+
+            match plan {
+                Some(WherePlan::IndexScan {
+                    index_name,
+                    eq_cols,
+                    ..
+                }) if *eq_cols > 0 => {
+                    // Index scan with equality constraints
+                    let index_cursor = self.alloc_cursor();
+                    self.index_cursors.insert(*cursor, index_cursor);
+
+                    // Open the index
+                    self.emit(
+                        Opcode::OpenRead,
+                        index_cursor,
+                        0,
+                        0,
+                        P4::Text(index_name.clone()),
+                    );
+
+                    // Allocate registers for the index key
+                    let key_base_reg = self.next_reg;
+                    for _ in 0..*eq_cols {
+                        self.alloc_reg();
+                    }
+
+                    // Build index key from equality terms in WHERE clause
+                    // Find and clone the equality expressions (to avoid borrow issues)
+                    let eq_exprs: Vec<Expr> = if let Some(info) = &where_info {
+                        if let Some(level) = info.levels.get(i) {
+                            self.find_index_equality_terms(info, level, index_name)
+                                .into_iter()
+                                .map(|(_, expr)| expr.clone())
+                                .collect()
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    };
+
+                    // Compile equality expressions into key registers
+                    for (col_offset, expr) in eq_exprs.iter().enumerate() {
+                        if col_offset < *eq_cols as usize {
+                            self.compile_expr(expr, key_base_reg + col_offset as i32)?;
+                        }
+                    }
+
+                    // Use MakeRecord to create serialized index key
+                    let key_reg = self.alloc_reg();
+                    self.emit(
+                        Opcode::MakeRecord,
+                        key_base_reg,
+                        *eq_cols,
+                        key_reg,
+                        P4::Unused,
+                    );
+
+                    // SeekGE positions at first entry >= key
+                    self.emit(
+                        Opcode::SeekGE,
+                        index_cursor,
+                        skip_label,
+                        key_reg,
+                        P4::Int64(*eq_cols as i64),
+                    );
+                    next_labels.push(skip_label);
+
+                    // Mark the loop start
+                    let loop_label = self.alloc_label();
+                    self.resolve_label(loop_label, self.current_addr());
+                    loop_labels.push(loop_label);
+
+                    // DeferredSeek sets up table cursor to read from index
+                    self.emit(Opcode::DeferredSeek, *cursor, 0, index_cursor, P4::Unused);
+
+                    scan_info.push((true, Some(index_cursor), key_base_reg, *eq_cols, false));
+                }
+                Some(WherePlan::RowidEq) => {
+                    // Direct rowid lookup - find the rowid term and compile it
+                    let rowid_reg = self.alloc_reg();
+
+                    // Find and compile the rowid equality expression
+                    if let Some(info) = &where_info {
+                        if let Some(level) = info.levels.get(i) {
+                            for &term_idx in &level.used_terms {
+                                if let Some(term) = info.terms.get(term_idx as usize) {
+                                    if term.is_equality() {
+                                        if let Some((_, col_idx)) = term.left_col {
+                                            if col_idx == -1 {
+                                                // This is the rowid term
+                                                if let Expr::Binary { right, .. } =
+                                                    term.expr.as_ref()
+                                                {
+                                                    self.compile_expr(right, rowid_reg)?;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // SeekRowid positions cursor at exact rowid
+                    self.emit(
+                        Opcode::SeekRowid,
+                        *cursor,
+                        skip_label,
+                        rowid_reg,
+                        P4::Unused,
+                    );
+                    next_labels.push(skip_label);
+
+                    // Mark the loop start (even though there's only one row)
+                    let loop_label = self.alloc_label();
+                    self.resolve_label(loop_label, self.current_addr());
+                    loop_labels.push(loop_label);
+
+                    scan_info.push((false, None, 0, 0, true));
+                }
+                Some(WherePlan::RowidRange {
+                    has_start,
+                    has_end: _,
+                }) => {
+                    // Rowid range scan
+                    if *has_start {
+                        // Find and compile the start value
+                        let start_reg = self.alloc_reg();
+                        let mut found_start = false;
+
+                        if let Some(info) = &where_info {
+                            if let Some(level) = info.levels.get(i) {
+                                for &term_idx in &level.used_terms {
+                                    if let Some(term) = info.terms.get(term_idx as usize) {
+                                        if let Some((_, col_idx)) = term.left_col {
+                                            if col_idx == -1 && term.is_range() {
+                                                // Check if it's a >= or > constraint
+                                                if let Expr::Binary { op, right, .. } =
+                                                    term.expr.as_ref()
+                                                {
+                                                    if matches!(op, BinaryOp::Ge | BinaryOp::Gt) {
+                                                        self.compile_expr(right, start_reg)?;
+                                                        found_start = true;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if found_start {
+                            self.emit(Opcode::SeekGE, *cursor, skip_label, start_reg, P4::Unused);
+                        } else {
+                            self.emit(Opcode::Rewind, *cursor, skip_label, 0, P4::Unused);
+                        }
+                    } else {
+                        self.emit(Opcode::Rewind, *cursor, skip_label, 0, P4::Unused);
+                    }
+                    next_labels.push(skip_label);
+
+                    let loop_label = self.alloc_label();
+                    self.resolve_label(loop_label, self.current_addr());
+                    loop_labels.push(loop_label);
+
+                    scan_info.push((false, None, 0, 0, false));
+                }
+                _ => {
+                    // Full scan (default)
+                    self.emit(Opcode::Rewind, *cursor, skip_label, 0, P4::Unused);
+                    next_labels.push(skip_label);
+
+                    // Mark the loop start for this level
+                    let loop_label = self.alloc_label();
+                    self.resolve_label(loop_label, self.current_addr());
+                    loop_labels.push(loop_label);
+
+                    scan_info.push((false, None, 0, 0, false));
+                }
+            }
 
             // Initialize found_match for the NEXT table (if it's an outer join)
             // This must be INSIDE the current loop (after loop_label) so it resets on each iteration
@@ -977,8 +1178,35 @@ impl<'s> SelectCompiler<'s> {
             let cursor = table_cursors[i];
             let loop_label = loop_labels[i];
 
-            // Next jumps back to this table's loop start
-            self.emit(Opcode::Next, cursor, loop_label, 0, P4::Unused);
+            // Get scan info for this table
+            let (is_index_scan, index_cursor, key_base_reg, key_count, is_rowid_eq) = scan_info
+                .get(i)
+                .copied()
+                .unwrap_or((false, None, 0, 0, false));
+
+            if is_rowid_eq {
+                // Rowid equality - no Next needed, just resolve skip label
+                // (single row lookup, no iteration)
+            } else if is_index_scan {
+                if let Some(idx_cursor) = index_cursor {
+                    if key_count > 0 {
+                        // Check if we've gone past the key range
+                        // IdxGT jumps to next_labels[i] if current index entry > key
+                        self.emit(
+                            Opcode::IdxGT,
+                            idx_cursor,
+                            next_labels[i],
+                            key_base_reg,
+                            P4::Int64(key_count as i64),
+                        );
+                    }
+                    // Next on the index cursor, not the table cursor
+                    self.emit(Opcode::Next, idx_cursor, loop_label, 0, P4::Unused);
+                }
+            } else {
+                // Full scan or rowid range - Next on table cursor
+                self.emit(Opcode::Next, cursor, loop_label, 0, P4::Unused);
+            }
 
             // For outer joins: if no match was found, emit null row
             // Both empty Rewind and exhausted Next come here
@@ -1021,8 +1249,19 @@ impl<'s> SelectCompiler<'s> {
             }
         }
 
-        // Close cursors
-        for cursor in &table_cursors {
+        // Close cursors (including index cursors)
+        for (i, cursor) in table_cursors.iter().enumerate() {
+            // Close index cursor first if we used an index scan
+            let (is_index_scan, index_cursor, _, _, _) = scan_info
+                .get(i)
+                .copied()
+                .unwrap_or((false, None, 0, 0, false));
+            if is_index_scan {
+                if let Some(idx_cursor) = index_cursor {
+                    self.emit(Opcode::Close, idx_cursor, 0, 0, P4::Unused);
+                }
+            }
+            // Close table cursor
             self.emit(Opcode::Close, *cursor, 0, 0, P4::Unused);
         }
 
@@ -1946,6 +2185,360 @@ impl<'s> SelectCompiler<'s> {
             .get(&table_idx)
             .map(|cols| cols.contains(column_lower))
             .unwrap_or(false)
+    }
+
+    /// Build a QueryPlanner from the current table metadata
+    fn build_query_planner(&self) -> Option<QueryPlanner> {
+        let mut planner = QueryPlanner::new();
+
+        // Add tables to the planner (only local tables, skip outer correlation context)
+        for (i, table) in self
+            .tables
+            .iter()
+            .enumerate()
+            .skip(self.outer_tables_boundary)
+        {
+            // Skip subqueries - they don't have schema indexes
+            if table.is_subquery {
+                continue;
+            }
+
+            // Get row estimate from schema or use default
+            let estimated_rows = table
+                .schema_table
+                .as_ref()
+                .map(|t| {
+                    if t.row_estimate > 0 {
+                        t.row_estimate
+                    } else {
+                        1000
+                    }
+                })
+                .unwrap_or(1000);
+
+            planner.add_table(
+                table.table_name.clone(),
+                Some(table.name.clone()),
+                estimated_rows,
+            );
+
+            let table_idx = i - self.outer_tables_boundary;
+
+            // Set table column names for column resolution
+            if let Some(schema_table) = &table.schema_table {
+                let columns: Vec<String> = schema_table
+                    .columns
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect();
+                planner.set_table_columns(table_idx, columns);
+                planner.set_table_rowid(table_idx, !schema_table.without_rowid);
+
+                // Check for INTEGER PRIMARY KEY column (rowid alias)
+                // This is a single-column INTEGER PRIMARY KEY
+                if !schema_table.without_rowid {
+                    if let Some(ref pk_cols) = schema_table.primary_key {
+                        if pk_cols.len() == 1 {
+                            let pk_col_idx = pk_cols[0];
+                            if pk_col_idx < schema_table.columns.len() {
+                                let col = &schema_table.columns[pk_col_idx];
+                                // Check if the column is INTEGER type
+                                if col.affinity == Affinity::Integer {
+                                    planner.set_table_ipk(table_idx, pk_col_idx as i32);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Add indexes for this table from both the schema's global indexes map
+                // and the table's indexes Vec. Prefer schema.indexes as it has resolved column indices.
+                let table_name_lower = table.table_name.to_lowercase();
+                let mut added_indexes: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+
+                // First, look up indexes from the schema's global index map
+                // These have resolved column_idx values from parse_create_index_sql
+                if let Some(schema) = self.schema {
+                    for (_name, idx) in schema.indexes.iter() {
+                        if idx.table.eq_ignore_ascii_case(&table_name_lower) {
+                            let index_cols: Vec<i32> =
+                                idx.columns.iter().map(|ic| ic.column_idx).collect();
+
+                            planner.add_index(
+                                table_idx,
+                                IndexInfo {
+                                    name: idx.name.clone(),
+                                    columns: index_cols.clone(),
+                                    is_primary: idx.is_primary_key,
+                                    is_unique: idx.unique,
+                                    is_covering: false,
+                                    stats: idx.stats.clone(),
+                                },
+                            );
+                            added_indexes.insert(idx.name.to_lowercase());
+                        }
+                    }
+                }
+
+                // Then, add any indexes from schema_table.indexes that weren't in schema.indexes
+                // Only add if column_idx values are resolved (not -1)
+                for index in &schema_table.indexes {
+                    if added_indexes.contains(&index.name.to_lowercase()) {
+                        continue;
+                    }
+
+                    let index_cols: Vec<i32> =
+                        index.columns.iter().map(|ic| ic.column_idx).collect();
+
+                    // Skip if any column_idx is unresolved (-1)
+                    if index_cols.iter().any(|&c| c < 0) {
+                        continue;
+                    }
+
+                    planner.add_index(
+                        table_idx,
+                        IndexInfo {
+                            name: index.name.clone(),
+                            columns: index_cols,
+                            is_primary: index.is_primary_key,
+                            is_unique: index.unique,
+                            is_covering: false,
+                            stats: index.stats.clone(),
+                        },
+                    );
+                }
+            }
+        }
+
+        Some(planner)
+    }
+
+    /// Analyze WHERE clause to get query plan
+    fn analyze_query_plan(&mut self, where_clause: Option<&Expr>) -> Result<Option<WhereInfo>> {
+        // Build planner from table metadata
+        let mut planner = match self.build_query_planner() {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        // Analyze WHERE clause
+        if planner.analyze_where(where_clause).is_err() {
+            // On error, fall back to no optimization
+            return Ok(None);
+        }
+
+        // Find best plan
+        match planner.find_best_plan() {
+            Ok(info) => Ok(Some(info)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Get the plan for a specific table from WhereInfo
+    fn get_table_plan<'a>(
+        &self,
+        where_info: &'a WhereInfo,
+        table_cursor: i32,
+    ) -> Option<&'a WhereLevel> {
+        // Find the table index for this cursor
+        for (i, table) in self
+            .tables
+            .iter()
+            .enumerate()
+            .skip(self.outer_tables_boundary)
+        {
+            if table.cursor == table_cursor {
+                let local_idx = i - self.outer_tables_boundary;
+                return where_info.levels.get(local_idx);
+            }
+        }
+        None
+    }
+
+    /// Emit code for an index scan loop start
+    /// Returns (index_cursor, loop_label, key_base_reg, key_count)
+    fn emit_index_scan_start(
+        &mut self,
+        table_cursor: i32,
+        level: &WhereLevel,
+        index_name: &str,
+        eq_cols: i32,
+        skip_label: i32,
+    ) -> Result<(i32, i32, i32, i32)> {
+        // Allocate index cursor
+        let index_cursor = self.alloc_cursor();
+        self.index_cursors.insert(table_cursor, index_cursor);
+
+        // Open the index
+        self.emit(
+            Opcode::OpenRead,
+            index_cursor,
+            0,
+            0,
+            P4::Text(index_name.to_string()),
+        );
+
+        let loop_label = self.alloc_label();
+        let key_base_reg;
+        let key_count;
+
+        if eq_cols > 0 {
+            // Build the index key from equality terms
+            // We need to compile the RHS of each equality term in the level's used_terms
+            key_base_reg = self.next_reg;
+            key_count = eq_cols;
+
+            // For now, emit a placeholder key - the actual key building will be done
+            // when we have the WHERE terms available during the main compile loop
+            // We'll revisit this when integrating with the main loop
+
+            // Seek to first matching key
+            self.emit(
+                Opcode::SeekGE,
+                index_cursor,
+                skip_label,
+                key_base_reg,
+                P4::Int64(eq_cols as i64),
+            );
+        } else {
+            // No equality constraints - rewind to start
+            key_base_reg = 0;
+            key_count = 0;
+            self.emit(Opcode::Rewind, index_cursor, skip_label, 0, P4::Unused);
+        }
+
+        // Mark loop start
+        self.resolve_label(loop_label, self.current_addr());
+
+        // Set up deferred seek from index to table
+        self.emit(
+            Opcode::DeferredSeek,
+            table_cursor,
+            0,
+            index_cursor,
+            P4::Unused,
+        );
+
+        Ok((index_cursor, loop_label, key_base_reg, key_count))
+    }
+
+    /// Emit code for rowid equality lookup (single row)
+    fn emit_rowid_eq_lookup(
+        &mut self,
+        table_cursor: i32,
+        rowid_reg: i32,
+        skip_label: i32,
+    ) -> Result<()> {
+        // SeekRowid positions cursor at exact rowid or jumps to skip_label if not found
+        self.emit(
+            Opcode::SeekRowid,
+            table_cursor,
+            skip_label,
+            rowid_reg,
+            P4::Unused,
+        );
+        Ok(())
+    }
+
+    /// Emit code for rowid range scan start
+    fn emit_rowid_range_start(
+        &mut self,
+        table_cursor: i32,
+        has_start: bool,
+        start_reg: Option<i32>,
+        skip_label: i32,
+    ) -> Result<i32> {
+        let loop_label = self.alloc_label();
+
+        if has_start {
+            if let Some(reg) = start_reg {
+                // SeekGE positions at first row >= start value
+                self.emit(Opcode::SeekGE, table_cursor, skip_label, reg, P4::Unused);
+            } else {
+                // No start register provided, rewind to beginning
+                self.emit(Opcode::Rewind, table_cursor, skip_label, 0, P4::Unused);
+            }
+        } else {
+            // No start constraint - rewind to beginning
+            self.emit(Opcode::Rewind, table_cursor, skip_label, 0, P4::Unused);
+        }
+
+        self.resolve_label(loop_label, self.current_addr());
+        Ok(loop_label)
+    }
+
+    /// Emit the loop end code for an index scan (IdxGT check + Next)
+    fn emit_index_scan_end(
+        &mut self,
+        index_cursor: i32,
+        loop_label: i32,
+        key_base_reg: i32,
+        key_count: i32,
+        done_label: i32,
+    ) {
+        if key_count > 0 {
+            // IdxGT: jump to done_label if current index entry > key
+            // This ensures we stay within the equality prefix range
+            self.emit(
+                Opcode::IdxGT,
+                index_cursor,
+                done_label,
+                key_base_reg,
+                P4::Int64(key_count as i64),
+            );
+        }
+
+        // Advance to next index entry
+        self.emit(Opcode::Next, index_cursor, loop_label, 0, P4::Unused);
+    }
+
+    /// Find equality terms for index columns in the WHERE info
+    /// Returns Vec of (column_index, term_expr) for building the index key
+    fn find_index_equality_terms<'a>(
+        &'a self,
+        where_info: &'a WhereInfo,
+        level: &'a WhereLevel,
+        _index_name: &str,
+    ) -> Vec<(i32, &'a Expr)> {
+        let mut result = Vec::new();
+
+        for &term_idx in &level.used_terms {
+            if let Some(term) = where_info.terms.get(term_idx as usize) {
+                if term.is_equality() {
+                    if let Some((_, col_idx)) = term.left_col {
+                        // Extract the RHS expression from the equality
+                        if let Expr::Binary { right, .. } = term.expr.as_ref() {
+                            result.push((col_idx, right.as_ref()));
+                        }
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Check if a WHERE term should be filtered at runtime
+    /// (i.e., not already consumed by an index seek)
+    fn is_runtime_filter_term(&self, where_info: &WhereInfo, term_idx: i32) -> bool {
+        // Check if this term is used by any level's index seek
+        for level in &where_info.levels {
+            if level.used_terms.contains(&term_idx) {
+                match &level.plan {
+                    WherePlan::IndexScan { eq_cols, .. } if *eq_cols > 0 => {
+                        // Term is consumed by index seek - don't filter at runtime
+                        return false;
+                    }
+                    WherePlan::RowidEq | WherePlan::PrimaryKey { .. } => {
+                        // Term is consumed by rowid/pk lookup - don't filter at runtime
+                        return false;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        true
     }
 
     /// Process join constraints (NATURAL, USING, ON) and generate WHERE conditions

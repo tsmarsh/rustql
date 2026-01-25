@@ -488,6 +488,24 @@ fn deserialize_field(data: &[u8], serial_type: u32) -> (RecordField, usize) {
     }
 }
 
+/// Compare two SQLite records without KeyInfo (using default collation)
+pub fn compare_records_default(rec_a: &[u8], rec_b: &[u8]) -> std::cmp::Ordering {
+    let fields_a = parse_record_fields(rec_a);
+    let fields_b = parse_record_fields(rec_b);
+
+    let n_fields = fields_a.len().min(fields_b.len());
+
+    for i in 0..n_fields {
+        let cmp = compare_record_fields(&fields_a[i], &fields_b[i], &CollSeq::Binary);
+        if cmp != std::cmp::Ordering::Equal {
+            return cmp;
+        }
+    }
+
+    // If all compared fields are equal, compare by number of fields
+    fields_a.len().cmp(&fields_b.len())
+}
+
 /// Compare two record fields using the given collation
 fn compare_record_fields(
     a: &RecordField,
@@ -5245,11 +5263,12 @@ impl BtCursor {
                     let info = mem_page.parse_cell(cell_offset, limits)?;
                     let payload = info.payload.as_deref().unwrap_or(&[]);
 
-                    // Use KeyInfo comparison if available, otherwise fall back to byte comparison
+                    // Use KeyInfo comparison if available, otherwise use default record comparison
                     let cmp = if let Some(ki) = key_info {
                         ki.compare_records(payload, &search_key.key)
                     } else {
-                        payload.cmp(search_key.key.as_slice())
+                        // Use semantic record comparison, not byte comparison
+                        compare_records_default(payload, &search_key.key)
                     };
 
                     match cmp {
@@ -5295,11 +5314,11 @@ impl BtCursor {
                 let info = mem_page.parse_cell(cell_offset, limits)?;
                 let payload = info.payload.as_deref().unwrap_or(&[]);
 
-                // Use KeyInfo comparison if available
+                // Use KeyInfo comparison if available, otherwise use default record comparison
                 let is_greater = if let Some(ki) = key_info {
                     ki.compare_records(payload, &search_key.key) == std::cmp::Ordering::Greater
                 } else {
-                    payload > search_key.key.as_slice()
+                    compare_records_default(payload, &search_key.key) == std::cmp::Ordering::Greater
                 };
 
                 if is_greater {

@@ -432,6 +432,11 @@ pub struct TableInfo {
 
     /// Table column names (for column index resolution)
     pub columns: Vec<String>,
+
+    /// Column index that is INTEGER PRIMARY KEY (rowid alias), if any
+    /// This is set when a column is declared as `INTEGER PRIMARY KEY` and
+    /// acts as an alias for the rowid. Value is -1 if no IPK column.
+    pub ipk_column: i32,
 }
 
 /// Index information for planning
@@ -491,6 +496,7 @@ impl QueryPlanner {
             indexes: Vec::new(),
             has_rowid: true,
             columns: Vec::new(),
+            ipk_column: -1, // No INTEGER PRIMARY KEY column by default
         });
     }
 
@@ -503,6 +509,14 @@ impl QueryPlanner {
     pub fn set_table_rowid(&mut self, table_idx: usize, has_rowid: bool) {
         if let Some(table) = self.tables.get_mut(table_idx) {
             table.has_rowid = has_rowid;
+        }
+    }
+
+    /// Set the INTEGER PRIMARY KEY column index for a table
+    /// This column is an alias for rowid
+    pub fn set_table_ipk(&mut self, table_idx: usize, ipk_column: i32) {
+        if let Some(table) = self.tables.get_mut(table_idx) {
+            table.ipk_column = ipk_column;
         }
     }
 
@@ -595,10 +609,19 @@ impl QueryPlanner {
             .iter()
             .map(|t| (t.name.clone(), t.alias.clone(), t.mask))
             .collect();
+        // Include ipk_column in the tuple for recognizing INTEGER PRIMARY KEY columns
         let table_info: Vec<_> = self
             .tables
             .iter()
-            .map(|t| (t.name.clone(), t.alias.clone(), t.mask, t.columns.clone()))
+            .map(|t| {
+                (
+                    t.name.clone(),
+                    t.alias.clone(),
+                    t.mask,
+                    t.columns.clone(),
+                    t.ipk_column,
+                )
+            })
             .collect();
 
         for term in self.where_clause.iter_mut() {
@@ -612,7 +635,7 @@ impl QueryPlanner {
 
     /// Analyze a single term's expression (static version for borrow checker)
     fn analyze_term_expr_static(
-        table_info: &[(String, Option<String>, u64, Vec<String>)],
+        table_info: &[(String, Option<String>, u64, Vec<String>, i32)],
         term: &mut WhereTerm,
     ) -> Result<()> {
         let needs_commute = match term.expr.as_ref() {
@@ -739,13 +762,13 @@ impl QueryPlanner {
 
     /// Analyze a potential column reference in an expression (static version)
     fn analyze_column_ref_static(
-        table_info: &[(String, Option<String>, u64, Vec<String>)],
+        table_info: &[(String, Option<String>, u64, Vec<String>, i32)],
         term: &mut WhereTerm,
         expr: &Expr,
     ) -> Result<()> {
         if let Expr::Column(col_ref) = expr {
             // Try to find which table this column belongs to
-            for (i, (name, alias, mask, columns)) in table_info.iter().enumerate() {
+            for (i, (name, alias, mask, columns, ipk_column)) in table_info.iter().enumerate() {
                 let table_matches = match (&col_ref.table, alias) {
                     (Some(t), Some(a)) => t == a || t == name,
                     (Some(t), None) => t == name,
@@ -753,15 +776,36 @@ impl QueryPlanner {
                 };
 
                 if table_matches {
+                    // Determine column index:
+                    // - If it's a rowid alias name (rowid, _rowid_, oid), use -1
+                    // - If the column matches the INTEGER PRIMARY KEY column, use -1 (rowid alias)
+                    // - Otherwise, use the regular column index
                     let column_idx = if Self::is_rowid_alias(&col_ref.column) {
                         Some(-1)
                     } else if let Some(idx) = col_ref.column_index {
-                        Some(idx)
+                        // Check if this column is the INTEGER PRIMARY KEY (rowid alias)
+                        if *ipk_column >= 0 && idx == *ipk_column {
+                            Some(-1) // Treat as rowid
+                        } else {
+                            Some(idx)
+                        }
                     } else {
-                        columns
+                        // Look up column by name
+                        let found_idx = columns
                             .iter()
                             .position(|c| c.eq_ignore_ascii_case(&col_ref.column))
-                            .map(|idx| idx as i32)
+                            .map(|idx| idx as i32);
+
+                        // Check if this column is the INTEGER PRIMARY KEY (rowid alias)
+                        if let Some(idx) = found_idx {
+                            if *ipk_column >= 0 && idx == *ipk_column {
+                                Some(-1) // Treat as rowid
+                            } else {
+                                Some(idx)
+                            }
+                        } else {
+                            None
+                        }
                     };
 
                     term.mask |= mask;

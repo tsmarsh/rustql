@@ -2539,6 +2539,25 @@ impl<'s> StatementCompiler<'s> {
         for (idx, table) in table_infos.iter().enumerate() {
             planner.set_table_columns(idx, table.columns.clone());
             planner.set_table_rowid(idx, table.has_rowid);
+
+            // Set INTEGER PRIMARY KEY column (rowid alias) if present
+            if table.has_rowid {
+                if let Some(schema_table) = schema.table(&table.name) {
+                    if let Some(ref pk_cols) = schema_table.primary_key {
+                        if pk_cols.len() == 1 {
+                            let pk_col_idx = pk_cols[0];
+                            if pk_col_idx < schema_table.columns.len() {
+                                use crate::schema::Affinity;
+                                let col = &schema_table.columns[pk_col_idx];
+                                if col.affinity == Affinity::Integer {
+                                    planner.set_table_ipk(idx, pk_col_idx as i32);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             for index in &table.indexes {
                 planner.add_index(idx, index.clone());
             }

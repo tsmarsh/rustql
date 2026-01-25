@@ -1422,21 +1422,34 @@ impl Vdbe {
                     }
                 } else {
                     let mut table_meta = None;
-                    // If root_page is 0 and we have a table name in P4, look it up in schema
+                    let mut is_index = false;
+                    // If root_page is 0 and we have a name in P4, look it up in schema
+                    // (could be a table or an index)
                     if root_page == 0 {
                         if let Some(ref tname) = table_name {
                             if let Some(ref schema) = self.schema {
                                 if let Ok(schema_guard) = schema.read() {
+                                    // First try as a table
                                     if let Some(table) = schema_guard.tables.get(tname) {
                                         root_page = table.root_page;
                                         table_meta = Some(std::sync::Arc::clone(table));
                                     }
+                                    // If not found as table, try as index
+                                    if root_page == 0 {
+                                        if let Some(index) =
+                                            schema_guard.indexes.get(&tname.to_lowercase())
+                                        {
+                                            root_page = index.root_page;
+                                            is_index = true;
+                                        }
+                                    }
                                 }
                             }
-                            // Table not found - return error (but not if it's a virtual table)
+                            // Not found as table or index - return error
+                            // (but not if it's a virtual table)
                             let is_virtual =
                                 table_meta.as_ref().map(|t| t.is_virtual).unwrap_or(false);
-                            if root_page == 0 && !is_virtual && table_meta.is_none() {
+                            if root_page == 0 && !is_virtual && table_meta.is_none() && !is_index {
                                 return Err(Error::with_message(
                                     ErrorCode::Error,
                                     format!("no such table: {}", tname),
@@ -1467,7 +1480,8 @@ impl Vdbe {
                         if let Some(cursor) = self.cursor_mut(op.p1) {
                             cursor.n_field = op.p3;
                             cursor.table_name = table_name;
-                            // Create a real BtCursor if we have a btree
+                            cursor.is_index = is_index; // Mark as index cursor if opening an index
+                                                        // Create a real BtCursor if we have a btree
                             if let Some(ref btree) = btree {
                                 let flags = BtreeCursorFlags::empty();
                                 match btree.cursor(root_page, flags, None) {
@@ -1491,6 +1505,7 @@ impl Vdbe {
                 // Look up table info from schema first (need to check is_virtual before
                 // deciding if root_page=0 is an error)
                 let mut is_virtual = false;
+                let mut is_index = false;
                 let mut table_name = None;
                 let mut table_columns = None;
                 let mut table_found = false;
@@ -1498,7 +1513,8 @@ impl Vdbe {
                     table_name = Some(name.clone());
                     if let Some(ref schema) = self.schema {
                         if let Ok(schema_guard) = schema.read() {
-                            if let Some(table) = schema_guard.tables.get(name) {
+                            // First try tables
+                            if let Some(table) = schema_guard.tables.get(&name.to_lowercase()) {
                                 table_found = true;
                                 is_virtual = table.is_virtual;
                                 table_columns = Some(table.columns.len() as i32);
@@ -1506,11 +1522,20 @@ impl Vdbe {
                                     root_page = table.root_page;
                                 }
                             }
+                            // If not found as table, try indexes
+                            if root_page == 0 && !table_found {
+                                if let Some(index) = schema_guard.indexes.get(&name.to_lowercase())
+                                {
+                                    table_found = true;
+                                    is_index = true;
+                                    root_page = index.root_page;
+                                }
+                            }
                         }
                     }
                 }
 
-                // For non-virtual tables, root_page=0 means table not found
+                // For non-virtual tables/indexes, root_page=0 means not found
                 if root_page == 0 && !is_virtual {
                     if let Some(ref tname) = table_name {
                         if !table_found {
@@ -1539,6 +1564,7 @@ impl Vdbe {
                     self.open_cursor(op.p1, root_page, true)?;
                     if let Some(cursor) = self.cursor_mut(op.p1) {
                         cursor.n_field = op.p3;
+                        cursor.is_index = is_index;
                         // Create a writable BtCursor if we have a btree
                         if let Some(ref btree) = btree {
                             let flags = BtreeCursorFlags::WRCSR;
@@ -2313,7 +2339,33 @@ impl Vdbe {
                             // Column not in alt-map or mapped to -1, need to finish seek
                             // Fall through to complete the deferred seek
                         }
+
+                        // Complete the deferred seek before reading from table cursor
+                        let target_rowid = cursor.moveto_target;
+                        if let Some(rowid) = target_rowid {
+                            if let Some(cursor) = self.cursor_mut(op.p1) {
+                                if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                                    // Seek to the rowid in the table
+                                    let res = bt_cursor.table_moveto(rowid, false)?;
+                                    // Update cursor state
+                                    if res == 0 {
+                                        cursor.state = CursorState::Valid;
+                                    } else {
+                                        cursor.state = CursorState::Invalid;
+                                    }
+                                }
+                                cursor.deferred_moveto = false;
+                            }
+                        }
                     }
+
+                    // Re-borrow the cursor after the deferred seek handling
+                    let cursor = self.cursor(op.p1);
+                    if cursor.is_none() {
+                        self.mem_mut(op.p3).set_null();
+                        return Ok(ExecResult::Continue);
+                    }
+                    let cursor = cursor.unwrap();
 
                     if cursor.null_row {
                         self.mem_mut(op.p3).set_null();
@@ -4352,12 +4404,30 @@ impl Vdbe {
             }
 
             Opcode::IdxInsert => {
-                // IdxInsert P1 P2 P3: Insert record P2 into ephemeral index P1
+                // IdxInsert P1 P2 P3: Insert record P2 into index P1
+                // For ephemeral indexes: insert into set
+                // For btree indexes: insert into btree
                 let record = self.mem(op.p2).to_blob();
+                let btree_arc = self.btree.clone();
 
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if cursor.is_ephemeral {
                         cursor.ephemeral_set.insert(record);
+                    } else if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                        // Insert into btree index
+                        // Index key is the serialized record (columns + rowid)
+                        if let Some(ref btree) = btree_arc {
+                            let payload = BtreePayload {
+                                key: Some(record.clone()),
+                                n_key: 0,   // Index - key length is in the record header
+                                data: None, // No separate data for indexes
+                                mem: Vec::new(),
+                                n_data: 0,
+                                n_zero: 0,
+                            };
+                            let flags = BtreeInsertFlags::empty();
+                            btree.insert(bt_cursor, &payload, flags, 0)?;
+                        }
                     }
                 }
             }
@@ -4650,6 +4720,28 @@ impl Vdbe {
 
                                 let index_name_lower = index.name.to_lowercase();
                                 let table_name_lower = index.table.to_lowercase();
+
+                                // Resolve column indices from table schema
+                                if let Some(table) = schema_guard.tables.get(&table_name_lower) {
+                                    for ic in &mut index.columns {
+                                        // If column_idx is unresolved (-1), try to resolve from expr
+                                        if ic.column_idx < 0 {
+                                            if let Some(crate::schema::Expr::Column {
+                                                column,
+                                                ..
+                                            }) = &ic.expr
+                                            {
+                                                if let Some(pos) =
+                                                    table.columns.iter().position(|c| {
+                                                        c.name.eq_ignore_ascii_case(column)
+                                                    })
+                                                {
+                                                    ic.column_idx = pos as i32;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
 
                                 // Insert into schema.indexes
                                 schema_guard

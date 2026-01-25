@@ -952,6 +952,19 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
         });
     }
 
+    // Build the primary_key field from columns marked as PRIMARY KEY
+    let pk_indices: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, col)| col.is_primary_key)
+        .map(|(idx, _)| idx)
+        .collect();
+    let primary_key = if pk_indices.is_empty() {
+        None
+    } else {
+        Some(pk_indices)
+    };
+
     // Now build the index structures with proper column indices
     let mut index_list = Vec::new();
     for (index_name, col_names, is_unique) in indexes {
@@ -990,7 +1003,7 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
         db_idx: 0,
         root_page,
         columns,
-        primary_key: None,
+        primary_key,
         indexes: index_list,
         foreign_keys: Vec::new(),
         checks: Vec::new(),
@@ -1894,10 +1907,20 @@ impl Schema {
 
         // Process indexed columns
         for indexed_col in &stmt.columns {
+            eprintln!(
+                "DEBUG create_index: processing indexed_col name={:?}, expr={:?}",
+                indexed_col.name,
+                indexed_col.expr.is_some()
+            );
             let col_idx = if indexed_col.expr.is_some() {
                 -1 // Expression index
             } else if let Some(name) = &indexed_col.name {
-                table.find_column(name)?
+                let idx = table.find_column(name)?;
+                eprintln!(
+                    "DEBUG create_index: found column '{}' at index {}",
+                    name, idx
+                );
+                idx
             } else {
                 return Err(Error::with_message(
                     ErrorCode::Error,
@@ -1916,6 +1939,15 @@ impl Schema {
             });
         }
 
+        eprintln!(
+            "DEBUG create_index: inserting index {} with cols {:?}",
+            stmt.name.name,
+            index
+                .columns
+                .iter()
+                .map(|c| c.column_idx)
+                .collect::<Vec<_>>()
+        );
         self.indexes.insert(name_lower, Arc::new(index));
         Ok(())
     }

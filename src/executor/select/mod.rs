@@ -2429,8 +2429,12 @@ impl<'s> SelectCompiler<'s> {
             None => return Ok(None),
         };
 
+        // Resolve aliases in WHERE clause so the planner can recognize indexed columns
+        // e.g., "w AS abc ... WHERE abc=10" should resolve abc to w for index matching
+        let resolved_where = where_clause.map(|expr| self.resolve_where_aliases(expr));
+
         // Analyze WHERE clause
-        if planner.analyze_where(where_clause).is_err() {
+        if planner.analyze_where(resolved_where.as_ref()).is_err() {
             // On error, fall back to no optimization
             return Ok(None);
         }
@@ -2439,6 +2443,107 @@ impl<'s> SelectCompiler<'s> {
         match planner.find_best_plan() {
             Ok(info) => Ok(Some(info)),
             Err(_) => Ok(None),
+        }
+    }
+
+    /// Resolve result column aliases in a WHERE expression for query planning.
+    /// This replaces alias references with their underlying column expressions
+    /// so the query planner can match them to indexed columns.
+    fn resolve_where_aliases(&self, expr: &Expr) -> Expr {
+        use crate::parser::ast::{InList, WhenClause};
+        match expr {
+            Expr::Column(col_ref) if col_ref.table.is_none() => {
+                // Check if this is an alias
+                let col_lower = col_ref.column.to_lowercase();
+                if let Some(resolved) = self.alias_expressions.get(&col_lower) {
+                    // Return the resolved expression
+                    resolved.clone()
+                } else {
+                    expr.clone()
+                }
+            }
+            Expr::Binary { op, left, right } => Expr::Binary {
+                op: *op,
+                left: Box::new(self.resolve_where_aliases(left)),
+                right: Box::new(self.resolve_where_aliases(right)),
+            },
+            Expr::Unary { op, expr: inner } => Expr::Unary {
+                op: *op,
+                expr: Box::new(self.resolve_where_aliases(inner)),
+            },
+            Expr::Parens(inner) => Expr::Parens(Box::new(self.resolve_where_aliases(inner))),
+            Expr::In {
+                expr: inner,
+                list,
+                negated,
+            } => {
+                let resolved_list = match list {
+                    InList::Values(exprs) => InList::Values(
+                        exprs
+                            .iter()
+                            .map(|e| self.resolve_where_aliases(e))
+                            .collect(),
+                    ),
+                    other => other.clone(),
+                };
+                Expr::In {
+                    expr: Box::new(self.resolve_where_aliases(inner)),
+                    list: resolved_list,
+                    negated: *negated,
+                }
+            }
+            Expr::Between {
+                expr: inner,
+                low,
+                high,
+                negated,
+            } => Expr::Between {
+                expr: Box::new(self.resolve_where_aliases(inner)),
+                low: Box::new(self.resolve_where_aliases(low)),
+                high: Box::new(self.resolve_where_aliases(high)),
+                negated: *negated,
+            },
+            Expr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => Expr::Case {
+                operand: operand
+                    .as_ref()
+                    .map(|e| Box::new(self.resolve_where_aliases(e))),
+                when_clauses: when_clauses
+                    .iter()
+                    .map(|wc| WhenClause {
+                        when: Box::new(self.resolve_where_aliases(&wc.when)),
+                        then: Box::new(self.resolve_where_aliases(&wc.then)),
+                    })
+                    .collect(),
+                else_clause: else_clause
+                    .as_ref()
+                    .map(|e| Box::new(self.resolve_where_aliases(e))),
+            },
+            Expr::Function(func) => {
+                let args = match &func.args {
+                    crate::parser::ast::FunctionArgs::Exprs(exprs) => {
+                        crate::parser::ast::FunctionArgs::Exprs(
+                            exprs
+                                .iter()
+                                .map(|e| self.resolve_where_aliases(e))
+                                .collect(),
+                        )
+                    }
+                    other => other.clone(),
+                };
+                Expr::Function(crate::parser::ast::FunctionCall {
+                    name: func.name.clone(),
+                    args,
+                    distinct: func.distinct,
+                    filter: func.filter.clone(),
+                    over: func.over.clone(),
+                })
+            }
+            // For other expression types, return as-is
+            _ => expr.clone(),
         }
     }
 

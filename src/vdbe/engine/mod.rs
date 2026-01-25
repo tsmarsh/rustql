@@ -918,14 +918,8 @@ impl Vdbe {
                     }
 
                     // Top-level halt - check if we need to return count_changes result
-                    // NOTE: Returning count_changes as a Row from Halt causes database corruption
-                    // because it leaves cursors and transaction state inconsistent.
-                    // Disabled for now - needs proper fix to clean up cursors/state first.
-                    // TODO: Implement proper count_changes handling that:
-                    // 1. Closes all cursors and cleans up VDBE state
-                    // 2. Commits or rolls back transaction as needed
-                    // 3. THEN returns the count as a synthetic row if needed
-                    /*
+                    // When count_changes pragma is enabled, return the number of modified rows
+                    // as a result row before completing execution.
                     if !self.count_changes_returned && self.n_change > 0 {
                         if let Some(conn_ptr) = self.conn_ptr {
                             let conn = unsafe { &*conn_ptr };
@@ -943,7 +937,6 @@ impl Vdbe {
                             }
                         }
                     }
-                    */
                     // execution is done
                     return Ok(ExecResult::Done);
                 }

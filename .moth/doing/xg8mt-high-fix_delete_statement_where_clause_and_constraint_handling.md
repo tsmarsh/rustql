@@ -19,9 +19,16 @@ DELETE statements fail to properly handle WHERE clauses, constraints, and transa
 - delete-12.0: DELETE row count not accurate
 
 ### Current Pass Rate
-- delete.test: 34/67 (51%)
+- delete.test: 39/67 (58%) ← **UP from 31/67 (46%)**
 
 ## Session Progress
+
+### Completed (Session 3) - CORRUPTION FIX
+- **ROOT CAUSE IDENTIFIED AND FIXED**: Database corruption after bulk DELETE operations
+- **The Problem**: In `validate_freeblocks()` and `compute_free_space()`, the infinite loop detection check `steps > n_cell + 1` was too restrictive when n_cell=0 (empty page after DELETE)
+- **The Fix**: Changed the check to use `steps > max_freeblocks` where `max_freeblocks = usable_size / 4` (page size / min freeblock size)
+- **Result**: 8 more tests passing (31→39), corruption no longer occurs on bulk DELETE operations
+- Files modified: `src/storage/btree/mod.rs`
 
 ### Completed (Session 2)
 - Investigated count_changes handling - found NOT the root cause of corruption
@@ -29,60 +36,22 @@ DELETE statements fail to properly handle WHERE clauses, constraints, and transa
 - Isolated database corruption to minimal test case
 
 ## Current Status
-- **DELETE tests: 31/67 passing (46%)**
-- **CRITICAL BLOCKER: Database corruption on bulk DELETE after DELETE WHERE operations**
-- **Investigation Conducted: Root cause partially identified and partially fixed**
-- **Improvements Made**: Fixed trunk page write ordering and freelist page allocation
-- **Remaining Issue**: DELETE WHERE pattern still triggers corruption despite freelist fixes
+- **DELETE tests: 39/67 passing (58%)** ← Up from 46%
+- **CRITICAL BLOCKER RESOLVED**: Database corruption fixed!
+- **Remaining work**: Complex WHERE expressions, subqueries, readonly database handling
 
-### CRITICAL ISSUE: Database Corruption in Bulk Operations
+### ~~CRITICAL ISSUE~~ RESOLVED: Database Corruption in Bulk Operations
 
-**Minimal Reproduction**:
-```tcl
-CREATE TABLE t(f1 int, f2 int)
-INSERT 4 rows
-DELETE 1 row (WHERE clause)
-DELETE remaining 3 rows (full DELETE)
-INSERT 200 rows → OK
-DELETE 200 rows → OK
-INSERT 200 rows again → FAILS with "database disk image is malformed"
-```
+**Root Cause (Session 3)**: The infinite loop detection in `validate_freeblocks()` and `compute_free_space()` used the check `steps > n_cell + 1`. When a page becomes empty after DELETE (n_cell=0), this check incorrectly triggers "corruption" errors when there are more than 1 freeblock in the chain.
 
-**Key Findings**:
-- NOT caused by count_changes being returned (still fails when disabled)
-- NOT caused by transaction handling
-- Occurs ONLY after specific sequence: initial deletes + bulk delete + bulk insert attempt
-- Symptoms: "database disk image is malformed" error during INSERT loop
-- Root cause: **Freelist/page allocation corruption** after multiple DELETE operations
-- The multiple DELETEs corrupt internal page tracking or freelist structure
-- Impact: **BLOCKS all bulk operation testing** (critical for SQLite compatibility)
+**Fix Applied**: Changed the loop detection to use `steps > max_freeblocks` where `max_freeblocks = usable_size / 4`. This allows the correct number of freeblocks while still detecting actual infinite loops.
 
-**Technical Analysis**:
-- First bulk delete (200 rows) works fine
-- Second bulk insert fails, suggesting freed pages from first delete are corrupted
-- Corruption appears to be in B-tree page management or freelist tracking
-- Likely issue locations:
-  1. Page deallocation in btree/mod.rs during bulk delete
-  2. Freelist management (save_freelist, load_freelist)
-  3. Page reuse logic when allocating new pages
+**Location**: `src/storage/btree/mod.rs` - functions `validate_freeblocks()` and `compute_free_space()`
 
-**Fixes Applied (Session 2)**:
+**Previous Fixes Applied (Session 2)**:
 1. ✓ Removed trunk pages from allocatable free_pages (load_freelist)
 2. ✓ Removed trunk pages after they're selected in save_freelist
 3. ✓ Fixed trunk page write() call ordering (was before data modification, now after)
-
-**Remaining Investigation Needed**:
-1. B-tree structure after DELETE WHERE - may leave page in inconsistent state
-2. Page counting or freelist reconstruction after multiple DELETEs
-3. Whether new trunk pages allocated in save_freelist override old ones correctly
-4. Interaction between partial row deletion and page reuse
-5. Possible cache coherency issue between pager and freelist state
-
-**Key Discovery**:
-- Bulk operations alone work fine (200 rows insert/delete/insert)
-- DELETE WHERE pattern before bulk ops triggers bug
-- Threshold appears around 20-50 initial rows before the pattern fails
-- No specific row count threshold, but pattern-dependent failure
 
 ### Other Issues (Lower Priority)
 1. **delete-3.1.4 syntax error**: Parser rejects `DELETE FROM 'table1'` - single quotes not valid for identifiers

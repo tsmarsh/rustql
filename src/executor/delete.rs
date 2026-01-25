@@ -14,6 +14,17 @@ use super::column_mapping::ColumnMapper;
 
 const OPFLAG_NCHANGE: u16 = 0x01;
 
+/// Tracks an index cursor for index maintenance during DELETE
+struct IndexCursor {
+    /// Cursor number
+    cursor: i32,
+    /// Column indices in the index (in order)
+    columns: Vec<i32>,
+    /// Index name
+    #[allow(dead_code)]
+    name: String,
+}
+
 fn is_rowid_alias(name: &str) -> bool {
     name.eq_ignore_ascii_case("rowid")
         || name.eq_ignore_ascii_case("_rowid_")
@@ -61,6 +72,9 @@ pub struct DeleteCompiler<'s> {
 
     /// Next unnamed parameter index (1-based)
     next_unnamed_param: i32,
+
+    /// Index cursors for maintaining indexes during delete
+    index_cursors: Vec<IndexCursor>,
 }
 
 impl<'s> DeleteCompiler<'s> {
@@ -79,6 +93,7 @@ impl<'s> DeleteCompiler<'s> {
             schema: None,
             param_names: Vec::new(),
             next_unnamed_param: 1,
+            index_cursors: Vec::new(),
         }
     }
 
@@ -97,6 +112,7 @@ impl<'s> DeleteCompiler<'s> {
             schema: Some(schema),
             param_names: Vec::new(),
             next_unnamed_param: 1,
+            index_cursors: Vec::new(),
         }
     }
 
@@ -170,6 +186,9 @@ impl<'s> DeleteCompiler<'s> {
             )?);
         }
 
+        // Open indexes for writing (for index maintenance)
+        self.open_indexes_for_write(&delete.table.name)?;
+
         // Compile the DELETE body
         self.compile_delete_body(delete)?;
 
@@ -178,7 +197,13 @@ impl<'s> DeleteCompiler<'s> {
             self.compile_returning(returning)?;
         }
 
-        // Close cursor
+        // Close index cursors
+        let index_cursor_ids: Vec<i32> = self.index_cursors.iter().map(|ic| ic.cursor).collect();
+        for cursor in index_cursor_ids {
+            self.emit(Opcode::Close, cursor, 0, 0, P4::Unused);
+        }
+
+        // Close table cursor
         self.emit(Opcode::Close, self.table_cursor, 0, 0, P4::Unused);
 
         // Halt
@@ -214,10 +239,19 @@ impl<'s> DeleteCompiler<'s> {
         // Loop start
         self.resolve_label(loop_start_label, self.current_addr() as i32);
 
+        // Get rowid register for index maintenance
+        let rowid_reg = self.alloc_reg();
+
         // If we have a WHERE clause, check the condition
         if let Some(where_expr) = &delete.where_clause {
             let skip_label = self.alloc_label();
             self.compile_where_check(where_expr, skip_label)?;
+
+            // Get the rowid before deleting
+            self.emit(Opcode::Rowid, self.table_cursor, rowid_reg, 0, P4::Unused);
+
+            // Delete from indexes first (before deleting the row)
+            self.emit_index_deletes(rowid_reg);
 
             // Delete the row - set OPFLAG_NCHANGE to track deleted rows
             // Pass table name in P4 for trigger dispatch
@@ -234,6 +268,12 @@ impl<'s> DeleteCompiler<'s> {
             self.resolve_label(skip_label, self.current_addr() as i32);
         } else {
             // No WHERE - delete every row
+            // Get the rowid before deleting
+            self.emit(Opcode::Rowid, self.table_cursor, rowid_reg, 0, P4::Unused);
+
+            // Delete from indexes first (before deleting the row)
+            self.emit_index_deletes(rowid_reg);
+
             // Pass table name in P4 for trigger dispatch
             self.emit_with_p5(
                 Opcode::Delete,
@@ -379,6 +419,10 @@ impl<'s> DeleteCompiler<'s> {
             rowid_reg,
             P4::Unused,
         );
+
+        // Delete from indexes first (before deleting the row)
+        self.emit_index_deletes(rowid_reg);
+
         // Pass table name in P4 for trigger dispatch
         self.emit_with_p5(
             Opcode::Delete,
@@ -862,6 +906,116 @@ impl<'s> DeleteCompiler<'s> {
             }
         }
         Ok(())
+    }
+
+    /// Open cursors for all indexes on the table
+    fn open_indexes_for_write(&mut self, table_name: &str) -> Result<()> {
+        // Get indexes from schema
+        if let Some(schema) = self.schema {
+            let table_name_lower = table_name.to_lowercase();
+
+            // First check schema.indexes for indexes on this table
+            for (_name, idx) in schema.indexes.iter() {
+                if idx.table.eq_ignore_ascii_case(&table_name_lower) {
+                    let cursor = self.alloc_cursor();
+                    self.emit(
+                        Opcode::OpenWrite,
+                        cursor,
+                        0, // Root page comes from schema lookup at runtime
+                        0,
+                        P4::Text(idx.name.clone()),
+                    );
+
+                    let columns: Vec<i32> = idx.columns.iter().map(|c| c.column_idx).collect();
+                    self.index_cursors.push(IndexCursor {
+                        cursor,
+                        columns,
+                        name: idx.name.clone(),
+                    });
+                }
+            }
+
+            // Also check table.indexes
+            if let Some(table) = schema.tables.get(&table_name_lower) {
+                for idx in &table.indexes {
+                    // Skip if already added
+                    if self
+                        .index_cursors
+                        .iter()
+                        .any(|ic| ic.name.eq_ignore_ascii_case(&idx.name))
+                    {
+                        continue;
+                    }
+
+                    let cursor = self.alloc_cursor();
+                    self.emit(Opcode::OpenWrite, cursor, 0, 0, P4::Text(idx.name.clone()));
+
+                    let columns: Vec<i32> = idx.columns.iter().map(|c| c.column_idx).collect();
+                    self.index_cursors.push(IndexCursor {
+                        cursor,
+                        columns,
+                        name: idx.name.clone(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit index delete operations before deleting a row
+    /// rowid_reg is the register containing the rowid
+    fn emit_index_deletes(&mut self, rowid_reg: i32) {
+        // Clone index_cursors to avoid borrow issues
+        let index_cursors: Vec<_> = self
+            .index_cursors
+            .iter()
+            .map(|ic| (ic.cursor, ic.columns.clone()))
+            .collect();
+
+        for (cursor, columns) in index_cursors {
+            // Build index key: indexed columns + rowid
+            let key_base = self.alloc_regs(columns.len() + 1);
+
+            // Read indexed columns from the table cursor
+            for (i, col_idx) in columns.iter().enumerate() {
+                if *col_idx >= 0 {
+                    // Read column value from table
+                    self.emit(
+                        Opcode::Column,
+                        self.table_cursor,
+                        *col_idx,
+                        key_base + i as i32,
+                        P4::Unused,
+                    );
+                } else {
+                    // Expression index - not supported yet, use null
+                    self.emit(Opcode::Null, 0, key_base + i as i32, 0, P4::Unused);
+                }
+            }
+
+            // Copy rowid as the last key component
+            let rowid_pos = key_base + columns.len() as i32;
+            self.emit(Opcode::Copy, rowid_reg, rowid_pos, 0, P4::Unused);
+
+            // Make the index record (key to find and delete)
+            let record_reg = self.alloc_reg();
+            self.emit(
+                Opcode::MakeRecord,
+                key_base,
+                (columns.len() + 1) as i32,
+                record_reg,
+                P4::Unused,
+            );
+
+            // Delete from index
+            self.emit(Opcode::IdxDelete, cursor, record_reg, 0, P4::Unused);
+        }
+    }
+
+    fn alloc_regs(&mut self, n: usize) -> i32 {
+        let base = self.next_reg;
+        self.next_reg += n as i32;
+        base
     }
 }
 

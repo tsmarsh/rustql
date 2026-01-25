@@ -4530,12 +4530,30 @@ impl Vdbe {
             }
 
             Opcode::IdxDelete => {
-                // IdxDelete P1 P2 P3: Delete record from ephemeral index
+                // IdxDelete P1 P2 P3: Delete record from index P1
+                // P2 = register containing the index key record
+                // For ephemeral indexes: remove from set
+                // For btree indexes: find and delete the entry
                 let record = self.mem(op.p2).to_blob();
+                let btree_arc = self.btree.clone();
 
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if cursor.is_ephemeral {
                         cursor.ephemeral_set.remove(&record);
+                    } else if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                        // Delete from btree index
+                        // Need to position cursor on the entry first
+                        if let Some(ref btree) = btree_arc {
+                            // Move to the exact key position using index_moveto
+                            let search_key =
+                                crate::storage::btree::UnpackedRecord::new(record.clone());
+                            let move_result = bt_cursor.index_moveto(&search_key)?;
+                            if move_result == 0 {
+                                // Found exact match - delete it
+                                btree.delete(bt_cursor, BtreeInsertFlags::empty())?;
+                            }
+                            // If not found (move_result != 0), nothing to delete
+                        }
                     }
                 }
             }

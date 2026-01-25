@@ -687,6 +687,7 @@ impl fmt::Display for Mem {
 
 impl Mem {
     /// Add two memory cells, storing result in self
+    /// On integer overflow, SQLite converts to float
     pub fn add(&mut self, other: &Mem) -> Result<()> {
         if self.is_null() || other.is_null() {
             self.set_null();
@@ -694,7 +695,12 @@ impl Mem {
         }
 
         if self.is_int() && other.is_int() {
-            self.set_int(self.i.wrapping_add(other.i));
+            if let Some(result) = self.i.checked_add(other.i) {
+                self.set_int(result);
+            } else {
+                // Integer overflow - convert to float like SQLite does
+                self.set_real(self.to_real() + other.to_real());
+            }
         } else {
             self.set_real(self.to_real() + other.to_real());
         }
@@ -702,6 +708,7 @@ impl Mem {
     }
 
     /// Subtract other from self
+    /// On integer overflow, SQLite converts to float
     pub fn subtract(&mut self, other: &Mem) -> Result<()> {
         if self.is_null() || other.is_null() {
             self.set_null();
@@ -709,7 +716,12 @@ impl Mem {
         }
 
         if self.is_int() && other.is_int() {
-            self.set_int(self.i.wrapping_sub(other.i));
+            if let Some(result) = self.i.checked_sub(other.i) {
+                self.set_int(result);
+            } else {
+                // Integer overflow - convert to float like SQLite does
+                self.set_real(self.to_real() - other.to_real());
+            }
         } else {
             self.set_real(self.to_real() - other.to_real());
         }
@@ -717,6 +729,7 @@ impl Mem {
     }
 
     /// Multiply self by other
+    /// On integer overflow, SQLite converts to float
     pub fn multiply(&mut self, other: &Mem) -> Result<()> {
         if self.is_null() || other.is_null() {
             self.set_null();
@@ -724,7 +737,12 @@ impl Mem {
         }
 
         if self.is_int() && other.is_int() {
-            self.set_int(self.i.wrapping_mul(other.i));
+            if let Some(result) = self.i.checked_mul(other.i) {
+                self.set_int(result);
+            } else {
+                // Integer overflow - convert to float like SQLite does
+                self.set_real(self.to_real() * other.to_real());
+            }
         } else {
             self.set_real(self.to_real() * other.to_real());
         }

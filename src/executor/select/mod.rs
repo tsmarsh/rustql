@@ -2440,6 +2440,16 @@ impl<'s> SelectCompiler<'s> {
         }
 
         if let Some(schema_table) = &table.schema_table {
+            // Check if the column is the INTEGER PRIMARY KEY (rowid alias)
+            if let Some(ipk_col_idx) = schema_table.rowid_alias_column() {
+                if schema_table.columns[ipk_col_idx]
+                    .name
+                    .eq_ignore_ascii_case(column)
+                {
+                    return Some(-1); // Return -1 for rowid alias columns
+                }
+            }
+
             return schema_table
                 .columns
                 .iter()
@@ -3457,13 +3467,29 @@ impl<'s> SelectCompiler<'s> {
                                 }
 
                                 let reg = self.alloc_reg();
-                                self.emit(
-                                    Opcode::Column,
-                                    table.cursor,
-                                    col_idx as i32,
-                                    reg,
-                                    P4::Unused,
-                                );
+                                // Check if this is the INTEGER PRIMARY KEY column (rowid alias)
+                                // If so, emit Rowid instead of Column since IPK isn't stored in the table
+                                if let Some(ipk_idx) = schema_table.rowid_alias_column() {
+                                    if col_idx == ipk_idx {
+                                        self.emit(Opcode::Rowid, table.cursor, reg, 0, P4::Unused);
+                                    } else {
+                                        self.emit(
+                                            Opcode::Column,
+                                            table.cursor,
+                                            col_idx as i32,
+                                            reg,
+                                            P4::Unused,
+                                        );
+                                    }
+                                } else {
+                                    self.emit(
+                                        Opcode::Column,
+                                        table.cursor,
+                                        col_idx as i32,
+                                        reg,
+                                        P4::Unused,
+                                    );
+                                }
                                 // Generate column name based on PRAGMA settings
                                 // For * expansion, only short_column_names matters:
                                 //  - short_column_names=ON: just column name
@@ -3521,13 +3547,34 @@ impl<'s> SelectCompiler<'s> {
                                 // Regular table - expand from schema
                                 for (col_idx, col_def) in schema_table.columns.iter().enumerate() {
                                     let reg = self.alloc_reg();
-                                    self.emit(
-                                        Opcode::Column,
-                                        table.cursor,
-                                        col_idx as i32,
-                                        reg,
-                                        P4::Unused,
-                                    );
+                                    // Check if this is the INTEGER PRIMARY KEY column (rowid alias)
+                                    if let Some(ipk_idx) = schema_table.rowid_alias_column() {
+                                        if col_idx == ipk_idx {
+                                            self.emit(
+                                                Opcode::Rowid,
+                                                table.cursor,
+                                                reg,
+                                                0,
+                                                P4::Unused,
+                                            );
+                                        } else {
+                                            self.emit(
+                                                Opcode::Column,
+                                                table.cursor,
+                                                col_idx as i32,
+                                                reg,
+                                                P4::Unused,
+                                            );
+                                        }
+                                    } else {
+                                        self.emit(
+                                            Opcode::Column,
+                                            table.cursor,
+                                            col_idx as i32,
+                                            reg,
+                                            P4::Unused,
+                                        );
+                                    }
                                     self.result_column_names.push(col_def.name.clone());
                                     result_regs.push(reg);
                                 }

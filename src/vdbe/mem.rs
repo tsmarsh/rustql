@@ -11,6 +11,75 @@ use crate::schema::Affinity;
 use crate::types::{ColumnType, Value};
 
 // ============================================================================
+// Integer-Float Comparison
+// ============================================================================
+
+/// Compare an integer to a real number precisely, handling edge cases where
+/// i64 values can't be exactly represented as f64 (e.g., near i64::MAX).
+/// This follows SQLite's comparison semantics.
+fn compare_int_to_real(i: i64, r: f64) -> Ordering {
+    // Handle special float values
+    if r.is_nan() {
+        return Ordering::Greater; // SQLite: NaN compares as less than integers
+    }
+    if r.is_infinite() {
+        return if r.is_sign_positive() {
+            Ordering::Less // +Inf > any integer
+        } else {
+            Ordering::Greater // -Inf < any integer
+        };
+    }
+
+    // If the float is outside i64 range, comparison is straightforward
+    const I64_MAX_F: f64 = i64::MAX as f64;
+    const I64_MIN_F: f64 = i64::MIN as f64;
+
+    if r >= I64_MAX_F {
+        // Float is >= max representable i64, so integer is smaller
+        // But we need to handle the case where r == I64_MAX_F exactly
+        // i64::MAX as f64 rounds up, so any i64 is actually less than or equal
+        if r > I64_MAX_F {
+            return Ordering::Less;
+        }
+        // r == I64_MAX_F (which is approximately 9.223372036854776e18)
+        // Due to rounding, I64_MAX_F > i64::MAX, so i < r
+        // But we need to check: is i == i64::MAX?
+        if i == i64::MAX {
+            // i64::MAX as f64 rounds to I64_MAX_F which is slightly larger than i64::MAX
+            // So i64::MAX < I64_MAX_F
+            return Ordering::Less;
+        }
+        // i < i64::MAX, so i < I64_MAX_F
+        return Ordering::Less;
+    }
+    if r < I64_MIN_F {
+        return Ordering::Greater; // Float is less than any i64
+    }
+
+    // Float is within i64 range - compare truncated values
+    let r_trunc = r.trunc();
+    let r_as_i64 = r_trunc as i64;
+
+    match i.cmp(&r_as_i64) {
+        Ordering::Less => Ordering::Less,
+        Ordering::Greater => Ordering::Greater,
+        Ordering::Equal => {
+            // Integer parts are equal; check fractional part
+            // If r has a positive fractional part, r > i
+            // If r has a negative fractional part (impossible for positive trunc), r < i
+            let frac = r - r_trunc;
+            if frac > 0.0 {
+                Ordering::Less // i < r because r has fractional part
+            } else if frac < 0.0 {
+                Ordering::Greater // i > r
+            } else {
+                Ordering::Equal
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Memory Cell Flags
 // ============================================================================
 
@@ -538,13 +607,10 @@ impl Mem {
             (ColumnType::Float, ColumnType::Float) => {
                 self.r.partial_cmp(&other.r).unwrap_or(Ordering::Equal)
             }
-            (ColumnType::Integer, ColumnType::Float) => (self.i as f64)
-                .partial_cmp(&other.r)
-                .unwrap_or(Ordering::Equal),
-            (ColumnType::Float, ColumnType::Integer) => self
-                .r
-                .partial_cmp(&(other.i as f64))
-                .unwrap_or(Ordering::Equal),
+            (ColumnType::Integer, ColumnType::Float) => compare_int_to_real(self.i, other.r),
+            (ColumnType::Float, ColumnType::Integer) => {
+                compare_int_to_real(other.i, self.r).reverse()
+            }
 
             // Both text
             (ColumnType::Text, ColumnType::Text) => self.data.cmp(&other.data),

@@ -523,6 +523,7 @@ impl<'s> UpdateCompiler<'s> {
     }
 
     /// Get column index by name
+    /// Returns None if column not found, or the index (with special handling for IPK columns)
     fn get_column_index(&self, name: &str) -> Option<usize> {
         // Try mapper first if available
         if let Some(mapper) = &self.mapper {
@@ -533,6 +534,30 @@ impl<'s> UpdateCompiler<'s> {
         // Fall back to column_map
         let name_lower = name.to_lowercase();
         self.column_map.get(&name_lower).copied()
+    }
+
+    /// Get column index for code generation, returning -1 for INTEGER PRIMARY KEY columns
+    fn get_column_index_for_codegen(&self, name: &str) -> Option<i32> {
+        // First check if it's a rowid alias
+        if is_rowid_alias(name) {
+            return Some(-1);
+        }
+
+        // Check if this is an INTEGER PRIMARY KEY column
+        if let Some(schema) = self.schema {
+            let table_name_lower = self.table_name.to_lowercase();
+            if let Some(table) = schema.tables.get(&table_name_lower) {
+                // Check if column is the INTEGER PRIMARY KEY
+                if let Some(ipk_idx) = table.rowid_alias_column() {
+                    if table.columns[ipk_idx].name.eq_ignore_ascii_case(name) {
+                        return Some(-1);
+                    }
+                }
+            }
+        }
+
+        // Otherwise return the column index
+        self.get_column_index(name).map(|i| i as i32)
     }
 
     /// Validate that all column references in an expression exist
@@ -980,16 +1005,11 @@ impl<'s> UpdateCompiler<'s> {
             },
             Expr::Column(col_ref) => {
                 // Column reference - look up in current row
-                if is_rowid_alias(&col_ref.column) {
-                    self.emit(Opcode::Rowid, self.table_cursor, dest_reg, 0, P4::Unused);
-                    return Ok(());
-                }
-
-                // Try to get column index from AST, then column map
+                // Use get_column_index_for_codegen which handles IPK columns correctly
                 let col_idx = if let Some(idx) = col_ref.column_index {
                     idx
-                } else if let Some(idx) = self.get_column_index(&col_ref.column) {
-                    idx as i32
+                } else if let Some(idx) = self.get_column_index_for_codegen(&col_ref.column) {
+                    idx
                 } else {
                     // Column not found - emit Column opcode with name in P4 for runtime resolution
                     self.emit(
@@ -1225,12 +1245,45 @@ impl<'s> UpdateCompiler<'s> {
                         // As a workaround, we can iterate the subquery results manually
                         // TODO: proper subquery compilation integration
 
-                        // Simplified: check if we can get the subquery to evaluate
-                        // For the specific case of IN (SELECT col FROM table), we can
-                        // open the table and scan it
+                        // Compile the subquery and populate the ephemeral table
+                        // Handle different subquery patterns
 
                         if let crate::parser::ast::SelectBody::Select(sel) = &subquery.body {
-                            if let Some(from) = &sel.from {
+                            // Handle simple SELECT without FROM (e.g., SELECT 15)
+                            if sel.from.is_none() {
+                                // Compile each result column expression and insert into ephemeral table
+                                for result_col in &sel.columns {
+                                    if let ResultColumn::Expr { expr, .. } = result_col {
+                                        let col_reg = self.alloc_reg();
+                                        self.compile_expr(expr, col_reg)?;
+
+                                        // Insert into ephemeral table
+                                        let record_reg = self.alloc_reg();
+                                        self.emit(
+                                            Opcode::MakeRecord,
+                                            col_reg,
+                                            1,
+                                            record_reg,
+                                            P4::Unused,
+                                        );
+                                        let key_reg = self.alloc_reg();
+                                        self.emit(
+                                            Opcode::NewRowid,
+                                            subq_cursor,
+                                            key_reg,
+                                            0,
+                                            P4::Unused,
+                                        );
+                                        self.emit(
+                                            Opcode::Insert,
+                                            subq_cursor,
+                                            record_reg,
+                                            key_reg,
+                                            P4::Unused,
+                                        );
+                                    }
+                                }
+                            } else if let Some(from) = &sel.from {
                                 if from.tables.len() == 1 {
                                     if let crate::parser::ast::TableRef::Table { name, .. } =
                                         &from.tables[0]

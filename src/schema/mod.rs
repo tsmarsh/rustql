@@ -621,6 +621,23 @@ impl Table {
         }
         false
     }
+
+    /// Get the INTEGER PRIMARY KEY column index, or None if no rowid alias
+    /// Returns the column index (0-based) if the table has an INTEGER PRIMARY KEY
+    pub fn rowid_alias_column(&self) -> Option<usize> {
+        if self.without_rowid {
+            return None;
+        }
+        if let Some(ref pk) = self.primary_key {
+            if pk.len() == 1 {
+                let col = &self.columns[pk[0]];
+                if col.affinity == Affinity::Integer {
+                    return Some(pk[0]);
+                }
+            }
+        }
+        None
+    }
 }
 
 // ============================================================================

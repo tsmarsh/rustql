@@ -752,6 +752,16 @@ impl Vdbe {
         self.result_count
     }
 
+    /// Check if this VDBE contains any data-modifying opcodes (for count_changes)
+    fn has_modifying_opcodes(&self) -> bool {
+        self.ops.iter().any(|op| {
+            matches!(
+                op.opcode,
+                Opcode::Delete | Opcode::Insert | Opcode::InsertInt
+            )
+        })
+    }
+
     /// Get column name
     pub fn column_name(&self, idx: i32) -> &str {
         self.column_names
@@ -918,11 +928,12 @@ impl Vdbe {
                     }
 
                     // Top-level halt - check if we need to return count_changes result
-                    if !self.count_changes_returned && self.n_change > 0 {
+                    // Only apply count_changes for DML statements that modify data
+                    if !self.count_changes_returned && self.has_modifying_opcodes() {
                         if let Some(conn_ptr) = self.conn_ptr {
                             let conn = unsafe { &*conn_ptr };
                             if conn.db_config.count_changes {
-                                // Return the change count as a result row
+                                // Return the change count as a result row (even if 0)
                                 self.count_changes_returned = true;
                                 // Allocate a register for the count and set result
                                 let count_reg = 1; // Use register 1 for the count

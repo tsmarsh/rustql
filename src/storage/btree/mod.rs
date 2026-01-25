@@ -1038,8 +1038,10 @@ fn load_freelist(shared: &mut BtShared) -> Result<()> {
         // Read next trunk page pointer
         let next_trunk = read_u32(&trunk_page.data, 0).unwrap_or(0);
 
-        // Trunk pages are free pages too.
-        shared.free_pages.push(trunk_pgno);
+        // NOTE: Trunk pages are metadata pages that store the freelist structure.
+        // We do NOT add them to free_pages because they should never be allocated
+        // as regular data pages. If a trunk page is allocated as data and then written to,
+        // it corrupts the freelist structure.
 
         // Read leaf count
         let leaf_count = read_u32(&trunk_page.data, 4).unwrap_or(0) as usize;
@@ -1116,12 +1118,17 @@ fn save_freelist(shared: &mut BtShared) -> Result<()> {
         trunk_pages.push(trunk_pgno);
     }
 
+    // Remove trunk pages from the in-memory free pages list to prevent them from being
+    // allocated as data pages. Trunk pages are metadata pages managed by the freelist system.
+    for trunk_pgno in &trunk_pages {
+        shared.free_pages.retain(|&p| p != *trunk_pgno);
+    }
+
     // Build trunk pages
     let mut leaf_idx = 0;
     let leaf_total = leaf_pages.len();
     for (trunk_idx, &trunk_pgno) in trunk_pages.iter().enumerate() {
         let mut trunk_page = shared.pager.get(trunk_pgno, PagerGetFlags::empty())?;
-        shared.pager.write(&mut trunk_page)?;
         trunk_page.data.fill(0);
 
         // Next trunk page (0 if last)
@@ -1143,6 +1150,9 @@ fn save_freelist(shared: &mut BtShared) -> Result<()> {
             write_u32(&mut trunk_page.data, offset, leaf_pages[leaf_idx])?;
             leaf_idx += 1;
         }
+
+        // Mark the trunk page as dirty so it gets written to disk
+        shared.pager.write(&mut trunk_page)?;
     }
 
     // Update database header

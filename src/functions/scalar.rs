@@ -324,7 +324,9 @@ pub fn func_substr(args: &[Value]) -> Result<Value> {
         return Ok(Value::Null);
     }
 
-    let s = value_to_string(&args[0]);
+    // Check if input is blob - operate on bytes instead of chars
+    let is_blob = matches!(args[0], Value::Blob(_));
+
     let start = value_to_i64(&args[1]);
     let len = if args.len() == 3 {
         value_to_i64(&args[2])
@@ -332,6 +334,60 @@ pub fn func_substr(args: &[Value]) -> Result<Value> {
         i64::MAX // No length specified means rest of string
     };
 
+    if is_blob {
+        // For blobs, operate on bytes
+        let bytes = match &args[0] {
+            Value::Blob(b) => b.clone(),
+            _ => unreachable!(),
+        };
+        let blob_len = bytes.len() as i64;
+
+        // Handle negative length
+        if len < 0 {
+            let end_pos = if start > 0 {
+                start - 1
+            } else if start < 0 {
+                blob_len + start
+            } else {
+                0
+            };
+            let start_pos = (end_pos + len).max(0);
+            if start_pos >= end_pos || end_pos <= 0 {
+                return Ok(Value::Blob(vec![]));
+            }
+            let result: Vec<u8> = bytes
+                .iter()
+                .skip(start_pos as usize)
+                .take((end_pos - start_pos) as usize)
+                .cloned()
+                .collect();
+            return Ok(Value::Blob(result));
+        }
+
+        let p1: i64 = if start < 0 {
+            blob_len + start + 1
+        } else {
+            start
+        };
+        let p2 = p1.saturating_add(len);
+        let actual_start = p1.max(1).min(blob_len + 1) as usize;
+        let actual_end = p2.max(1).min(blob_len + 1) as usize;
+
+        if actual_start >= actual_end {
+            return Ok(Value::Blob(vec![]));
+        }
+
+        let result: Vec<u8> = bytes
+            .iter()
+            .skip(actual_start - 1)
+            .take(actual_end - actual_start)
+            .cloned()
+            .collect();
+        return Ok(Value::Blob(result));
+    }
+
+    // For text, operate on characters
+    let s = value_to_string(&args[0]);
     let chars: Vec<char> = s.chars().collect();
     let str_len = chars.len() as i64;
 

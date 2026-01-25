@@ -3715,7 +3715,12 @@ impl<'s> SelectCompiler<'s> {
                         self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
                     }
                     crate::parser::ast::Literal::Integer(n) => {
-                        self.emit(Opcode::Integer, *n as i32, dest_reg, 0, P4::Unused);
+                        // Use Int64 for values that don't fit in i32
+                        if *n >= i32::MIN as i64 && *n <= i32::MAX as i64 {
+                            self.emit(Opcode::Integer, *n as i32, dest_reg, 0, P4::Unused);
+                        } else {
+                            self.emit(Opcode::Int64, 0, dest_reg, 0, P4::Int64(*n));
+                        }
                     }
                     crate::parser::ast::Literal::Float(f) => {
                         self.emit(Opcode::Real, 0, dest_reg, 0, P4::Real(*f));

@@ -1,3 +1,40 @@
+# RustQL Development Guide
+
+## CRITICAL: SQLite File Format Compatibility
+
+**RustQL database files MUST be 100% compatible with SQLite AT ALL TIMES.**
+
+This is a non-negotiable requirement. Every database file created or modified by RustQL must be readable by the official SQLite CLI tool (`sqlite3`). If you detect any file format drift or incompatibility:
+
+1. **STOP all other work immediately**
+2. **Fix the compatibility issue before doing anything else**
+3. **Verify the fix with**: `sqlite3 <dbfile> "pragma integrity_check;"`
+
+### Verification Commands
+
+After ANY change to storage, pager, btree, or database file handling:
+
+```bash
+# Create a test database with RustQL
+rm -f /tmp/compat_test.db
+echo "CREATE TABLE t1(a, b); INSERT INTO t1 VALUES(1, 2);" | ./target/release/rustql /tmp/compat_test.db
+
+# Verify SQLite can read it
+sqlite3 /tmp/compat_test.db "SELECT * FROM t1;"
+sqlite3 /tmp/compat_test.db "pragma integrity_check;"
+
+# Both commands must succeed without errors
+```
+
+### Common Compatibility Issues
+
+- **Database header**: All 100 bytes of page 1 header must be valid SQLite format
+- **Page format**: Cell pointers, free blocks, and page headers must match SQLite spec
+- **B-tree structure**: Internal and leaf pages must be navigable by SQLite
+- **Schema table**: sqlite_master entries must be properly formatted
+
+---
+
 # Moth Agent Guide
 
 This guide helps LLM agents work effectively with moth, a git-based file issue tracker.

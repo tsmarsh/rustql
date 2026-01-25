@@ -1089,6 +1089,30 @@ fn load_freelist(shared: &mut BtShared) -> Result<()> {
     Ok(())
 }
 
+/// Update the database header on page 1 before commit.
+/// This ensures the header reflects the current database state for SQLite compatibility.
+fn update_database_header(shared: &mut BtShared) -> Result<()> {
+    let mut page1 = shared.pager.get(1, PagerGetFlags::empty())?;
+    shared.pager.write(&mut page1)?;
+
+    // Bytes 24-27: File change counter (increment on each commit)
+    let change_counter = u32::from_be_bytes([
+        page1.data[24],
+        page1.data[25],
+        page1.data[26],
+        page1.data[27],
+    ]);
+    write_u32(&mut page1.data, 24, change_counter.wrapping_add(1))?;
+
+    // Bytes 28-31: Database size in pages
+    write_u32(&mut page1.data, 28, shared.pager.db_size)?;
+
+    // Bytes 92-95: Version-valid-for number (should match change counter)
+    write_u32(&mut page1.data, 92, change_counter.wrapping_add(1))?;
+
+    Ok(())
+}
+
 /// Save the freelist from memory to trunk pages on disk.
 /// Called during commit to persist the freelist.
 ///
@@ -3315,17 +3339,71 @@ impl Btree {
                 page.data.fill(0);
 
                 // Write SQLite file header (first 100 bytes)
-                // Magic header string at offset 0
+                // See https://www.sqlite.org/fileformat.html#the_database_header
+
+                // Magic header string at offset 0-15
                 page.data[0..16].copy_from_slice(b"SQLite format 3\0");
-                // Page size at offset 16 (big-endian)
+
+                // Page size at offset 16-17 (big-endian)
                 let ps = shared.page_size as u16;
                 page.data[16..18].copy_from_slice(&ps.to_be_bytes());
+
                 // File format versions at offset 18-19
-                page.data[18] = 1; // Write version
-                page.data[19] = 1; // Read version
-                                   // Reserved bytes at offset 20
+                page.data[18] = 1; // Write version (1 = legacy)
+                page.data[19] = 1; // Read version (1 = legacy)
+
+                // Reserved space at end of each page at offset 20
                 page.data[20] = 0;
-                // Other header fields are left as 0 for now
+
+                // B-tree payload fractions at offset 21-23 (MUST have these exact values)
+                page.data[21] = 64; // Max embedded payload fraction
+                page.data[22] = 32; // Min embedded payload fraction
+                page.data[23] = 32; // Leaf payload fraction
+
+                // File change counter at offset 24-27
+                page.data[24..28].copy_from_slice(&1u32.to_be_bytes());
+
+                // Database size in pages at offset 28-31
+                page.data[28..32].copy_from_slice(&1u32.to_be_bytes());
+
+                // First freelist trunk page at offset 32-35 (0 = no freelist)
+                page.data[32..36].copy_from_slice(&0u32.to_be_bytes());
+
+                // Total freelist pages at offset 36-39
+                page.data[36..40].copy_from_slice(&0u32.to_be_bytes());
+
+                // Schema cookie at offset 40-43
+                page.data[40..44].copy_from_slice(&0u32.to_be_bytes());
+
+                // Schema format number at offset 44-47 (4 = current format)
+                page.data[44..48].copy_from_slice(&4u32.to_be_bytes());
+
+                // Default page cache size at offset 48-51
+                page.data[48..52].copy_from_slice(&0u32.to_be_bytes());
+
+                // Largest root b-tree page (auto-vacuum) at offset 52-55
+                page.data[52..56].copy_from_slice(&0u32.to_be_bytes());
+
+                // Text encoding at offset 56-59 (1 = UTF-8)
+                page.data[56..60].copy_from_slice(&1u32.to_be_bytes());
+
+                // User version at offset 60-63
+                page.data[60..64].copy_from_slice(&0u32.to_be_bytes());
+
+                // Incremental vacuum mode at offset 64-67
+                page.data[64..68].copy_from_slice(&0u32.to_be_bytes());
+
+                // Application ID at offset 68-71
+                page.data[68..72].copy_from_slice(&0u32.to_be_bytes());
+
+                // Reserved for expansion at offset 72-91 (must be zero)
+                page.data[72..92].fill(0);
+
+                // Version-valid-for number at offset 92-95
+                page.data[92..96].copy_from_slice(&1u32.to_be_bytes());
+
+                // SQLite version number at offset 96-99 (3.45.0 = 3045000)
+                page.data[96..100].copy_from_slice(&3045000u32.to_be_bytes());
 
                 // Write empty leaf btree header at offset 100
                 let header_offset = 100usize;
@@ -3594,6 +3672,8 @@ impl Btree {
         auto_vacuum_commit(&mut shared)?;
         // Save freelist to disk before committing
         save_freelist(&mut shared)?;
+        // Update database header on page 1 before commit
+        update_database_header(&mut shared)?;
         shared.pager.commit_phase_one(super_journal)?;
         Ok(())
     }

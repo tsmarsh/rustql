@@ -196,6 +196,8 @@ impl<'s> StatementCompiler<'s> {
                 };
                 // Pass column naming flags from PRAGMA settings
                 compiler.set_column_name_flags(self.short_column_names, self.full_column_names);
+                // Pass parameter names for Variable compilation
+                compiler.set_param_names(self.param_names.clone());
                 let ops = compiler.compile(select, &SelectDest::Output)?;
                 // Use column names from compiler (properly expanded for Star)
                 let names = if compiler.column_names().is_empty() {

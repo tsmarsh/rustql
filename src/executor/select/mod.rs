@@ -100,6 +100,10 @@ pub struct SelectCompiler<'s> {
     index_cursors: HashMap<i32, i32>,
     /// Cached query plan from WHERE clause analysis
     where_info: Option<WhereInfo>,
+    /// Parameter names for Variable compilation (from prepare.rs extract_parameters)
+    param_names: Vec<Option<String>>,
+    /// Counter for unnamed parameters (?) during compilation
+    next_unnamed_param: i32,
 }
 
 impl<'s> SelectCompiler<'s> {
@@ -140,7 +144,14 @@ impl<'s> SelectCompiler<'s> {
             outer_tables_boundary: 0,
             index_cursors: HashMap::new(),
             where_info: None,
+            param_names: Vec::new(),
+            next_unnamed_param: 1,
         }
+    }
+
+    /// Set parameter names for Variable compilation
+    pub fn set_param_names(&mut self, param_names: Vec<Option<String>>) {
+        self.param_names = param_names;
     }
 
     /// Create a new SELECT compiler with schema access
@@ -180,6 +191,8 @@ impl<'s> SelectCompiler<'s> {
             outer_tables_boundary: 0,
             index_cursors: HashMap::new(),
             where_info: None,
+            param_names: Vec::new(),
+            next_unnamed_param: 1,
         }
     }
 
@@ -4445,6 +4458,28 @@ impl<'s> SelectCompiler<'s> {
             Expr::Collate { expr, .. } => {
                 // COLLATE affects comparison/sorting, but doesn't change the value
                 self.compile_expr(expr, dest_reg)?;
+            }
+            Expr::Variable(var) => {
+                // Emit Variable opcode to read bound parameter
+                let param_idx = match var {
+                    crate::parser::ast::Variable::Numbered(Some(idx)) => *idx,
+                    crate::parser::ast::Variable::Numbered(None) => {
+                        // Unnamed parameter - use next sequential index
+                        let idx = self.next_unnamed_param;
+                        self.next_unnamed_param += 1;
+                        idx
+                    }
+                    crate::parser::ast::Variable::Named { prefix, name } => {
+                        // Look up named parameter in param_names
+                        let full_name = format!("{}{}", prefix, name);
+                        self.param_names
+                            .iter()
+                            .position(|n| n.as_deref() == Some(&full_name))
+                            .map(|i| (i + 1) as i32) // 1-based index
+                            .unwrap_or(1) // Default to 1 if not found
+                    }
+                };
+                self.emit(Opcode::Variable, param_idx, dest_reg, 0, P4::Unused);
             }
             _ => {
                 // For other expression types, emit NULL as placeholder

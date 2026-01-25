@@ -13,6 +13,10 @@
 // Allow raw pointer args in extern "C" functions (required for TCL FFI)
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use crate::api::{
+    sqlite3_bind_double, sqlite3_bind_int64, sqlite3_bind_null, sqlite3_bind_parameter_count,
+    sqlite3_bind_parameter_name, sqlite3_bind_text, PreparedStmt,
+};
 use crate::types::{ColumnType, StepResult};
 use crate::vdbe::{get_search_count, reset_search_count};
 use crate::{
@@ -2560,6 +2564,9 @@ unsafe fn db_eval(
                         continue;
                     }
 
+                    // Bind TCL variables to SQL parameters
+                    bind_tcl_variables(interp, &mut stmt);
+
                     loop {
                         match sqlite3_step(&mut stmt) {
                             Ok(StepResult::Row) => {
@@ -2688,6 +2695,9 @@ unsafe fn db_eval(
                     continue;
                 }
 
+                // Bind TCL variables to SQL parameters
+                bind_tcl_variables(interp, &mut stmt);
+
                 loop {
                     match sqlite3_step(&mut stmt) {
                         Ok(StepResult::Row) => {
@@ -2738,6 +2748,46 @@ unsafe fn update_search_count_var(interp: *mut Tcl_Interp) {
     );
 }
 
+/// Bind TCL variables to SQL parameters
+/// SQLite's TCL extension automatically binds $varname and :varname in SQL
+/// to corresponding TCL variables
+unsafe fn bind_tcl_variables(interp: *mut Tcl_Interp, stmt: &mut PreparedStmt) {
+    let param_count = sqlite3_bind_parameter_count(stmt);
+    for i in 1..=param_count {
+        if let Some(param_name) = sqlite3_bind_parameter_name(stmt, i) {
+            // Parameter names start with $, :, @, or ?
+            // For $ and :, look up the TCL variable
+            let var_name = if param_name.starts_with('$') || param_name.starts_with(':') {
+                &param_name[1..] // Strip the prefix
+            } else if param_name.starts_with('@') {
+                &param_name[1..]
+            } else {
+                continue; // Unnamed or ? parameters, skip
+            };
+
+            // Look up the TCL variable
+            let var_cstr = CString::new(var_name).unwrap_or_else(|_| CString::new("").unwrap());
+            let value_ptr = Tcl_GetVar(interp, var_cstr.as_ptr(), TCL_GLOBAL_ONLY);
+
+            if value_ptr.is_null() {
+                // Variable not found, bind NULL
+                let _ = sqlite3_bind_null(stmt, i);
+            } else {
+                let value_str = std::ffi::CStr::from_ptr(value_ptr).to_str().unwrap_or("");
+
+                // Try to parse as number, otherwise bind as text
+                if let Ok(int_val) = value_str.parse::<i64>() {
+                    let _ = sqlite3_bind_int64(stmt, i, int_val);
+                } else if let Ok(float_val) = value_str.parse::<f64>() {
+                    let _ = sqlite3_bind_double(stmt, i, float_val);
+                } else {
+                    let _ = sqlite3_bind_text(stmt, i, value_str);
+                }
+            }
+        }
+    }
+}
+
 /// Check if query returns any rows
 unsafe fn db_exists(db_name: &str, interp: *mut Tcl_Interp, objv: *const *mut Tcl_Obj) -> c_int {
     let sql = obj_to_string(*objv.offset(2));
@@ -2759,6 +2809,9 @@ unsafe fn db_exists(db_name: &str, interp: *mut Tcl_Interp, objv: *const *mut Tc
                 return TCL_ERROR;
             }
         };
+
+        // Bind TCL variables to SQL parameters
+        bind_tcl_variables(interp, &mut stmt);
 
         let exists = match sqlite3_step(&mut stmt) {
             Ok(StepResult::Row) => 1,
@@ -2792,6 +2845,9 @@ unsafe fn db_onecolumn(db_name: &str, interp: *mut Tcl_Interp, objv: *const *mut
                 return TCL_ERROR;
             }
         };
+
+        // Bind TCL variables to SQL parameters
+        bind_tcl_variables(interp, &mut stmt);
 
         let result = match sqlite3_step(&mut stmt) {
             Ok(StepResult::Row) => {
@@ -2938,4 +2994,6 @@ extern "C" {
         newValue: *const c_char,
         flags: c_int,
     ) -> *const c_char;
+
+    fn Tcl_GetVar(interp: *mut Tcl_Interp, varName: *const c_char, flags: c_int) -> *const c_char;
 }

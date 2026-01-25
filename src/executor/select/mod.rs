@@ -4059,7 +4059,13 @@ impl<'s> SelectCompiler<'s> {
                     self.emit(Opcode::Copy, agg_reg, dest_reg, 0, P4::Unused);
                 } else {
                     // Check if function exists before compiling
+                    // Note: Some functions like LAST_INSERT_ROWID need special VDBE handling
+                    let is_connection_function =
+                        func_call.name.eq_ignore_ascii_case("LAST_INSERT_ROWID")
+                            || func_call.name.eq_ignore_ascii_case("CHANGES")
+                            || func_call.name.eq_ignore_ascii_case("TOTAL_CHANGES");
                     let is_known_function = is_aggregate
+                        || is_connection_function
                         || crate::functions::get_scalar_function(&func_call.name).is_some();
                     if !is_known_function {
                         return Err(Error::with_message(
@@ -5644,6 +5650,36 @@ impl<'s> SelectCompiler<'s> {
                 c1.table == c2.table && c1.column.to_uppercase() == c2.column.to_uppercase()
             }
             (Expr::Literal(l1), Expr::Literal(l2)) => l1 == l2,
+            (Expr::Function(f1), Expr::Function(f2)) => {
+                // Compare function names case-insensitively
+                if !f1.name.eq_ignore_ascii_case(&f2.name) {
+                    return false;
+                }
+                // Compare DISTINCT flags
+                if f1.distinct != f2.distinct {
+                    return false;
+                }
+                // Compare arguments
+                match (&f1.args, &f2.args) {
+                    (
+                        crate::parser::ast::FunctionArgs::Star,
+                        crate::parser::ast::FunctionArgs::Star,
+                    ) => true,
+                    (
+                        crate::parser::ast::FunctionArgs::Exprs(args1),
+                        crate::parser::ast::FunctionArgs::Exprs(args2),
+                    ) => {
+                        if args1.len() != args2.len() {
+                            return false;
+                        }
+                        args1
+                            .iter()
+                            .zip(args2.iter())
+                            .all(|(a, b)| self.exprs_equal(a, b))
+                    }
+                    _ => false,
+                }
+            }
             (Expr::Parens(e1), Expr::Parens(e2)) => self.exprs_equal(e1, e2),
             (Expr::Parens(e1), e2) => self.exprs_equal(e1, e2),
             (e1, Expr::Parens(e2)) => self.exprs_equal(e1, e2),

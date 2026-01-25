@@ -144,9 +144,9 @@ impl Value {
                 }
                 if f.is_infinite() {
                     return if *f > 0.0 {
-                        "inf".to_string()
+                        "Inf".to_string()
                     } else {
-                        "-inf".to_string()
+                        "-Inf".to_string()
                     };
                 }
                 // SQLite displays floats with decimal point even for whole numbers

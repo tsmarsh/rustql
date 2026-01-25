@@ -77,6 +77,8 @@ load $lib_path Rustql
 proc sqlite3_memdebug_malloc_count {} { return 0 }
 proc fpnum_compare {a b} { expr {$a == $b} }
 proc set_test_counter {args} { return 0 }
+proc sqlite_register_test_function {db name} { return }
+proc abuse_create_function {db} { return }
 
 # Set up sqlite_options that tester.tcl expects
 array set sqlite_options {
@@ -137,7 +139,13 @@ array set sqlite_options {
     trace 1
     pragma 1
     floatingpoint 1
+    icu 0
+    deprecated 0
+    direct_read 0
 }
+
+# SQLite compile-time limits
+set ::SQLITE_MAX_FUNCTION_ARG 127
 
 # Source the test infrastructure
 # Set guard flag to prevent double reset_db when test file re-sources tester.tcl

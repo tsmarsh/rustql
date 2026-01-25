@@ -2783,7 +2783,29 @@ impl Vdbe {
                     _ => None,
                 };
                 if let Some(name) = name {
-                    if let Some(func) = crate::functions::get_scalar_function(name) {
+                    // Handle special functions that need connection context
+                    if name.eq_ignore_ascii_case("LAST_INSERT_ROWID") {
+                        let rowid = if let Some(conn) = self.conn_ptr {
+                            unsafe { (*conn).last_insert_rowid.load(AtomicOrdering::SeqCst) }
+                        } else {
+                            0
+                        };
+                        self.mem_mut(op.p3).set_int(rowid);
+                    } else if name.eq_ignore_ascii_case("CHANGES") {
+                        let changes = if let Some(conn) = self.conn_ptr {
+                            unsafe { (*conn).changes.load(AtomicOrdering::SeqCst) }
+                        } else {
+                            0
+                        };
+                        self.mem_mut(op.p3).set_int(changes);
+                    } else if name.eq_ignore_ascii_case("TOTAL_CHANGES") {
+                        let total = if let Some(conn) = self.conn_ptr {
+                            unsafe { (*conn).total_changes.load(AtomicOrdering::SeqCst) }
+                        } else {
+                            0
+                        };
+                        self.mem_mut(op.p3).set_int(total);
+                    } else if let Some(func) = crate::functions::get_scalar_function(name) {
                         let argc = op.p1.max(0) as usize;
                         let arg_base = op.p2;
                         let mut args = Vec::with_capacity(argc);

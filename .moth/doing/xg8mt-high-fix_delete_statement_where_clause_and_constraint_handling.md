@@ -23,6 +23,17 @@ DELETE statements fail to properly handle WHERE clauses, constraints, and transa
 
 ## Session Progress
 
+### Completed (Session 6) - INDEX MAINTENANCE FOR DELETE
+- **DELETE now properly removes index entries**: When deleting rows from tables with indexes, corresponding index entries are removed
+- **The Problem**: IdxDelete opcode only handled ephemeral indexes, not B-tree indexes. DELETE operations left stale entries in indexes causing duplicate results in subsequent queries
+- **The Fix**:
+  - Extended IdxDelete opcode to handle B-tree indexes using index_moveto + delete
+  - Updated DeleteCompiler to open index cursors and emit IdxDelete before each row deletion
+  - Added IndexCursor struct, open_indexes_for_write(), emit_index_deletes() to delete.rs
+- **Result**: Duplicate row issue after DELETE + INSERT cycle is fixed
+- Files modified: `src/vdbe/engine/mod.rs`, `src/executor/delete.rs`
+- Note: Separate issue with CREATE INDEX not registering in sqlite_master remains (pre-existing)
+
 ### Completed (Session 5) - PAGE SPLIT FIX
 - **Page split separator key bug fixed**: INSERT/DELETE operations on large tables (350+ rows) were corrupting B-tree structure
 - **The Problem**: Separator key in internal B-tree pages used first key from right page instead of last key from left page

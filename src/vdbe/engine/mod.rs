@@ -752,16 +752,6 @@ impl Vdbe {
         self.result_count
     }
 
-    /// Check if this VDBE contains any data-modifying opcodes (for count_changes)
-    fn has_modifying_opcodes(&self) -> bool {
-        self.ops.iter().any(|op| {
-            matches!(
-                op.opcode,
-                Opcode::Delete | Opcode::Insert | Opcode::InsertInt
-            )
-        })
-    }
-
     /// Get column name
     pub fn column_name(&self, idx: i32) -> &str {
         self.column_names
@@ -928,12 +918,19 @@ impl Vdbe {
                     }
 
                     // Top-level halt - check if we need to return count_changes result
-                    // Only apply count_changes for DML statements that modify data
-                    if !self.count_changes_returned && self.has_modifying_opcodes() {
+                    // NOTE: Returning count_changes as a Row from Halt causes database corruption
+                    // because it leaves cursors and transaction state inconsistent.
+                    // Disabled for now - needs proper fix to clean up cursors/state first.
+                    // TODO: Implement proper count_changes handling that:
+                    // 1. Closes all cursors and cleans up VDBE state
+                    // 2. Commits or rolls back transaction as needed
+                    // 3. THEN returns the count as a synthetic row if needed
+                    /*
+                    if !self.count_changes_returned && self.n_change > 0 {
                         if let Some(conn_ptr) = self.conn_ptr {
                             let conn = unsafe { &*conn_ptr };
                             if conn.db_config.count_changes {
-                                // Return the change count as a result row (even if 0)
+                                // Return the change count as a result row
                                 self.count_changes_returned = true;
                                 // Allocate a register for the count and set result
                                 let count_reg = 1; // Use register 1 for the count
@@ -946,6 +943,7 @@ impl Vdbe {
                             }
                         }
                     }
+                    */
                     // execution is done
                     return Ok(ExecResult::Done);
                 }

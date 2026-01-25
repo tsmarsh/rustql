@@ -34,9 +34,31 @@ if {![file exists $test_file]} {
     exit 1
 }
 
-# Change to test directory
-cd $test_dir
-set testdir [pwd]
+# Create a unique temp directory for this test run to avoid database locking
+# when multiple tests run in parallel
+set pid [pid]
+set timestamp [clock milliseconds]
+set work_dir [file join "/tmp" "rustql-test-${test_name}-${pid}-${timestamp}"]
+file mkdir $work_dir
+
+# Create symlinks to all .tcl files from the test directory
+# This gives each test its own working directory for test.db
+foreach f [glob -nocomplain -directory $test_dir *.tcl] {
+    set fname [file tail $f]
+    file link -symbolic [file join $work_dir $fname] $f
+}
+
+# Also symlink test data directories that tests may need
+foreach subdir {data testdata} {
+    set src [file join $test_dir $subdir]
+    if {[file exists $src]} {
+        file link -symbolic [file join $work_dir $subdir] $src
+    }
+}
+
+# Change to the unique work directory
+cd $work_dir
+set testdir $test_dir
 
 # Load RustQL TCL extension
 set lib_path [file join $root_dir target release librustql.so]
@@ -168,6 +190,12 @@ if {$exit_code == 0} {
     puts "Status: PASSED"
 } else {
     puts "Status: FAILED"
+}
+
+# Clean up temp directory
+if {[info exists work_dir] && [file exists $work_dir]} {
+    cd /tmp
+    file delete -force $work_dir
 }
 
 exit $exit_code

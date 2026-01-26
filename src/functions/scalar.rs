@@ -1148,6 +1148,15 @@ pub fn func_printf(args: &[Value]) -> Result<Value> {
 
 /// like(X, Y) or like(X, Y, Z) - Pattern matching
 pub fn func_like(args: &[Value]) -> Result<Value> {
+    func_like_impl(args, false)
+}
+
+/// like with explicit case sensitivity control
+pub fn func_like_case_sensitive(args: &[Value], case_sensitive: bool) -> Result<Value> {
+    func_like_impl(args, case_sensitive)
+}
+
+fn func_like_impl(args: &[Value], case_sensitive: bool) -> Result<Value> {
     if args.len() < 2 || args.len() > 3 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
@@ -1168,7 +1177,7 @@ pub fn func_like(args: &[Value]) -> Result<Value> {
         None
     };
 
-    let matched = like_match(&pattern, &text, escape, false);
+    let matched = like_match(&pattern, &text, escape, case_sensitive);
     Ok(Value::Integer(if matched { 1 } else { 0 }))
 }
 

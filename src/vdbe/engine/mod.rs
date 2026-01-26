@@ -4230,9 +4230,16 @@ impl Vdbe {
                 if matches!(text, Value::Null) || matches!(pattern, Value::Null) {
                     self.mem_mut(op.p2).set_null();
                 } else {
+                    // Get case_sensitive_like setting from connection
+                    let case_sensitive = self
+                        .conn_ptr
+                        .map(|ptr| unsafe { &*ptr }.db_config.case_sensitive_like)
+                        .unwrap_or(false);
+
                     // func_like expects [pattern, text] order
                     let args = vec![pattern, text];
-                    match crate::functions::scalar::func_like(&args) {
+                    match crate::functions::scalar::func_like_case_sensitive(&args, case_sensitive)
+                    {
                         Ok(Value::Integer(result)) => {
                             self.mem_mut(op.p2).set_int(result);
                         }

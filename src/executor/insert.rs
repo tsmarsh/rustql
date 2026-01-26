@@ -1045,14 +1045,18 @@ impl<'a> InsertCompiler<'a> {
                 return true;
             }
 
-            // Check for multiple tables (JOINs) - more complex than simple table
+            // Check for multiple tables (JOINs) or subqueries in FROM
             if let Some(from) = &core.from {
                 if from.tables.len() > 1 {
                     return true;
                 }
-                // Check if table is a JOIN
+                // Check if table is a JOIN or subquery
                 if let Some(table_ref) = from.tables.first() {
-                    if matches!(table_ref, crate::parser::ast::TableRef::Join { .. }) {
+                    if matches!(
+                        table_ref,
+                        crate::parser::ast::TableRef::Join { .. }
+                            | crate::parser::ast::TableRef::Subquery { .. }
+                    ) {
                         return true;
                     }
                 }

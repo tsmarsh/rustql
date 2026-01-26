@@ -162,12 +162,43 @@ impl ColumnMapper {
         source_count: usize,
     ) -> Result<(Vec<ColumnSource>, RowidMapping)> {
         let mut mapping = Vec::new();
+        let mut rowid_mapping = RowidMapping::Auto;
 
-        for (target_idx, _col) in target_columns.iter().enumerate() {
-            if target_idx < source_count {
+        // Check if the first column is INTEGER PRIMARY KEY (IPK)
+        // IPK columns act as rowid aliases and need special handling
+        let first_is_ipk = target_columns.first().map_or(false, |col| {
+            col.is_primary_key
+                && col
+                    .type_name
+                    .as_ref()
+                    .map_or(false, |t| t.eq_ignore_ascii_case("INTEGER"))
+        });
+
+        for (target_idx, col) in target_columns.iter().enumerate() {
+            // Check if this column is INTEGER PRIMARY KEY (rowid alias)
+            let is_ipk = col.is_primary_key
+                && col
+                    .type_name
+                    .as_ref()
+                    .map_or(false, |t| t.eq_ignore_ascii_case("INTEGER"));
+
+            if is_ipk && target_idx < source_count {
+                // This IPK column gets its value from the source at this index
+                // The source value will be used as rowid
+                rowid_mapping = RowidMapping::SourceIndex(target_idx);
+                // IPK columns don't need a regular column mapping since they use rowid
+                mapping.push(ColumnSource::Null);
+            } else if target_idx < source_count {
                 // Source has a value for this column
-                mapping.push(ColumnSource::SourceIndex(target_idx));
-            } else if target_columns[target_idx].default_value.is_some() {
+                // But if the first column is IPK, adjust the source index
+                if first_is_ipk && target_idx > 0 {
+                    // When first column is IPK, the remaining columns shift
+                    // Source idx 1 -> column 1, not column 0
+                    mapping.push(ColumnSource::SourceIndex(target_idx));
+                } else {
+                    mapping.push(ColumnSource::SourceIndex(target_idx));
+                }
+            } else if col.default_value.is_some() {
                 // Source doesn't have a value, use DEFAULT
                 mapping.push(ColumnSource::DefaultValue);
             } else {
@@ -176,8 +207,7 @@ impl ColumnMapper {
             }
         }
 
-        // Implicit mapping doesn't have explicit rowid
-        Ok((mapping, RowidMapping::Auto))
+        Ok((mapping, rowid_mapping))
     }
 
     /// Get the mapping for all target columns

@@ -268,14 +268,54 @@ impl<'a> InsertCompiler<'a> {
             // Allocate rowid register
             let rowid_reg = self.alloc_reg();
 
-            // Generate new rowid (autoincrement)
-            self.emit(
-                Opcode::NewRowid,
-                self.table_cursor,
-                rowid_reg,
-                0,
-                P4::Unused,
-            );
+            // Track if we have an explicit rowid value
+            let mut has_explicit_rowid = false;
+            let mut explicit_rowid_idx = 0;
+
+            // First pass: check if we have an explicit rowid
+            for (i, target) in col_targets.iter().enumerate() {
+                if i < row.len() {
+                    if matches!(target, InsertColumnTarget::Rowid) {
+                        has_explicit_rowid = true;
+                        explicit_rowid_idx = i;
+                        break;
+                    }
+                }
+            }
+
+            // Handle rowid: either from explicit value or auto-generated
+            if has_explicit_rowid {
+                // Compile the explicit rowid expression to a temp register
+                let temp_reg = self.alloc_reg();
+                self.compile_expr(&row[explicit_rowid_idx], temp_reg)?;
+
+                // If the value is NULL, generate new rowid; otherwise use the value
+                let skip_newrowid = self.alloc_label();
+                self.emit(Opcode::NotNull, temp_reg, skip_newrowid, 0, P4::Unused);
+                // Value is NULL - generate new rowid
+                self.emit(
+                    Opcode::NewRowid,
+                    self.table_cursor,
+                    rowid_reg,
+                    0,
+                    P4::Unused,
+                );
+                let done_rowid = self.alloc_label();
+                self.emit(Opcode::Goto, 0, done_rowid, 0, P4::Unused);
+                // Value is not NULL - use it as rowid
+                self.resolve_label(skip_newrowid, self.current_addr() as i32);
+                self.emit(Opcode::Copy, temp_reg, rowid_reg, 0, P4::Unused);
+                self.resolve_label(done_rowid, self.current_addr() as i32);
+            } else {
+                // No explicit rowid - auto-generate
+                self.emit(
+                    Opcode::NewRowid,
+                    self.table_cursor,
+                    rowid_reg,
+                    0,
+                    P4::Unused,
+                );
+            }
 
             // Allocate registers for column values
             let data_base = self.next_reg;
@@ -287,7 +327,7 @@ impl<'a> InsertCompiler<'a> {
                 if i < row.len() {
                     match *target {
                         InsertColumnTarget::Rowid => {
-                            self.compile_expr(&row[i], rowid_reg)?;
+                            // Already handled above
                         }
                         InsertColumnTarget::Column(col_idx) => {
                             let dest_reg = data_base + col_idx as i32;
@@ -1231,18 +1271,21 @@ impl<'a> InsertCompiler<'a> {
                 }
             }
             Expr::Function(func_call) => {
-                // Compile function arguments
-                let arg_base = self.next_reg;
+                // Pre-allocate contiguous registers for ALL arguments FIRST,
+                // so nested expression compilation doesn't break the contiguity
                 let argc = match &func_call.args {
-                    crate::parser::ast::FunctionArgs::Exprs(exprs) => {
-                        for arg in exprs {
-                            let reg = self.alloc_reg();
-                            self.compile_select_expr(arg, reg, source_cursor, col_map)?;
-                        }
-                        exprs.len()
-                    }
+                    crate::parser::ast::FunctionArgs::Exprs(exprs) => exprs.len(),
                     crate::parser::ast::FunctionArgs::Star => 0,
                 };
+                let arg_base = self.next_reg;
+                let arg_regs: Vec<i32> = (0..argc).map(|_| self.alloc_reg()).collect();
+
+                // Now compile each argument into its pre-allocated register
+                if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
+                    for (arg, &reg) in exprs.iter().zip(arg_regs.iter()) {
+                        self.compile_select_expr(arg, reg, source_cursor, col_map)?;
+                    }
+                }
 
                 self.emit(
                     Opcode::Function,

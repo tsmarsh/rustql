@@ -4304,7 +4304,52 @@ impl Vdbe {
                 if matches!(text, Value::Null) || matches!(pattern, Value::Null) {
                     self.mem_mut(op.p2).set_null();
                 } else {
+                    // First check if there's a user-defined regexp function
+                    #[cfg(feature = "tcl")]
+                    let matched = {
+                        if crate::tcl_ext::has_tcl_user_function("regexp") {
+                            // Call the user-defined function
+                            let args = vec![pattern.to_text(), text.to_text()];
+                            crate::tcl_ext::call_tcl_user_function("regexp", &args)
+                                .map(|r| r != "0" && !r.is_empty())
+                                .unwrap_or(false)
+                        } else {
+                            regexp_match(&pattern.to_text(), &text.to_text())
+                        }
+                    };
+                    #[cfg(not(feature = "tcl"))]
                     let matched = regexp_match(&pattern.to_text(), &text.to_text());
+
+                    self.mem_mut(op.p2).set_int(if matched { 1 } else { 0 });
+                }
+            }
+
+            Opcode::Match => {
+                // Match P1 P2 P3: Compare text in P1 against pattern in P3
+                // Uses user-defined match function if registered
+                let text = self.mem(op.p1).to_value();
+                let pattern = self.mem(op.p3).to_value();
+
+                if matches!(text, Value::Null) || matches!(pattern, Value::Null) {
+                    self.mem_mut(op.p2).set_null();
+                } else {
+                    // Check if there's a user-defined match function
+                    #[cfg(feature = "tcl")]
+                    let matched = {
+                        if crate::tcl_ext::has_tcl_user_function("match") {
+                            // Call the user-defined function
+                            let args = vec![pattern.to_text(), text.to_text()];
+                            crate::tcl_ext::call_tcl_user_function("match", &args)
+                                .map(|r| r != "0" && !r.is_empty())
+                                .unwrap_or(false)
+                        } else {
+                            // No user-defined function - match always fails for non-FTS tables
+                            false
+                        }
+                    };
+                    #[cfg(not(feature = "tcl"))]
+                    let matched = false; // Without TCL, match always fails for non-FTS
+
                     self.mem_mut(op.p2).set_int(if matched { 1 } else { 0 });
                 }
             }

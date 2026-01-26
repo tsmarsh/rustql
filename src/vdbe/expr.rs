@@ -219,9 +219,10 @@ impl ExprCompiler {
                 expr,
                 pattern,
                 escape,
+                op,
                 negated,
             } => {
-                self.compile_like(expr, pattern, escape.as_deref(), *negated, target)?;
+                self.compile_like(expr, pattern, escape.as_deref(), *op, *negated, target)?;
             }
 
             Expr::IsNull { expr, negated } => {
@@ -357,11 +358,10 @@ impl ExprCompiler {
                 self.add_op(Opcode::Glob, r1, target, r2);
             }
             BinaryOp::Match => {
-                // MATCH is for FTS
-                return Err(Error::with_message(
-                    ErrorCode::Error,
-                    "MATCH operator requires FTS context",
-                ));
+                // MATCH can be used with FTS or with a user-defined match function
+                let r1 = self.compile_expr(left)?;
+                let r2 = self.compile_expr(right)?;
+                self.add_op(Opcode::Match, r1, target, r2);
             }
             BinaryOp::Regexp => {
                 let r1 = self.compile_expr(left)?;
@@ -658,13 +658,14 @@ impl ExprCompiler {
         expr: &Expr,
         pattern: &Expr,
         escape: Option<&Expr>,
+        op: crate::parser::ast::LikeOp,
         negated: bool,
         target: i32,
     ) -> Result<()> {
         let expr_reg = self.compile_expr(expr)?;
         let pattern_reg = self.compile_expr(pattern)?;
 
-        if escape.is_some() {
+        if escape.is_some() && op == crate::parser::ast::LikeOp::Like {
             // LIKE with ESCAPE requires special handling
             return Err(Error::with_message(
                 ErrorCode::Error,
@@ -672,8 +673,14 @@ impl ExprCompiler {
             ));
         }
 
-        // Generate LIKE opcode
-        self.add_op(Opcode::Like, expr_reg, target, pattern_reg);
+        // Generate appropriate opcode based on operator type
+        let opcode = match op {
+            crate::parser::ast::LikeOp::Like => Opcode::Like,
+            crate::parser::ast::LikeOp::Glob => Opcode::Glob,
+            crate::parser::ast::LikeOp::Regexp => Opcode::Regexp,
+            crate::parser::ast::LikeOp::Match => Opcode::Match,
+        };
+        self.add_op(opcode, expr_reg, target, pattern_reg);
 
         if negated {
             // Negate the result

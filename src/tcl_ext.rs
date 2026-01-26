@@ -12,10 +12,11 @@
 
 // Allow raw pointer args in extern "C" functions (required for TCL FFI)
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(non_camel_case_types)]
 
 use crate::api::{
-    sqlite3_bind_blob, sqlite3_bind_double, sqlite3_bind_int64, sqlite3_bind_null,
-    sqlite3_bind_parameter_count, sqlite3_bind_parameter_name, sqlite3_bind_text, PreparedStmt,
+    sqlite3_bind_double, sqlite3_bind_int64, sqlite3_bind_null, sqlite3_bind_parameter_count,
+    sqlite3_bind_parameter_name, sqlite3_bind_text, PreparedStmt,
 };
 use crate::types::{ColumnType, StepResult};
 use crate::vdbe::{
@@ -1304,12 +1305,13 @@ unsafe extern "C" fn sqlite3_mprintf_str_cmd(
 
             // Parse precision
             let mut precision: Option<i64> = None;
-            let mut use_star_precision = false;
+            #[allow(unused_assignments)]
+            let mut _use_star_precision = false;
             if chars.peek() == Some(&'.') {
                 chars.next();
                 if chars.peek() == Some(&'*') {
                     chars.next();
-                    use_star_precision = true;
+                    _use_star_precision = true;
                     precision = Some(star_precision);
                 } else {
                     let mut prec = 0i64;
@@ -2447,7 +2449,7 @@ unsafe extern "C" fn tcl_variable_type_cmd(
     _client_data: *mut std::ffi::c_void,
     interp: *mut Tcl_Interp,
     objc: c_int,
-    objv: *const *mut Tcl_Obj,
+    _objv: *const *mut Tcl_Obj,
 ) -> c_int {
     if objc < 2 {
         set_result_string(
@@ -2671,15 +2673,28 @@ unsafe extern "C" fn db_cmd(
         }
         "function" | "func" => {
             // Register a custom SQL function
-            // Usage: db func name proc
+            // Usage: db func name ?-argcount N? proc
             if objc >= 4 {
                 let func_name = obj_to_string(*objv.offset(2));
-                let proc_name = obj_to_string(*objv.offset(3));
-                USER_FUNCTIONS.with(|funcs| {
-                    funcs
-                        .borrow_mut()
-                        .insert((db_name.to_string(), func_name.to_lowercase()), proc_name);
-                });
+                // Find the proc name, skipping any options like -argcount
+                let mut proc_idx = 3;
+                while proc_idx < objc as isize {
+                    let arg = obj_to_string(*objv.offset(proc_idx));
+                    if arg.starts_with('-') {
+                        // Skip the option and its value
+                        proc_idx += 2;
+                    } else {
+                        break;
+                    }
+                }
+                if proc_idx < objc as isize {
+                    let proc_name = obj_to_string(*objv.offset(proc_idx));
+                    USER_FUNCTIONS.with(|funcs| {
+                        funcs
+                            .borrow_mut()
+                            .insert((db_name.to_string(), func_name.to_lowercase()), proc_name);
+                    });
+                }
             }
             TCL_OK
         }

@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::{Error, ErrorCode, Result};
+use crate::parser::ast::LikeOp;
 use crate::types::Pgno;
 
 // ============================================================================
@@ -146,11 +147,12 @@ pub enum Expr {
         high: Box<Expr>,
         negated: bool,
     },
-    /// LIKE expression
+    /// LIKE expression (includes LIKE, GLOB, REGEXP, MATCH)
     Like {
         expr: Box<Expr>,
         pattern: Box<Expr>,
         escape: Option<Box<Expr>>,
+        op: LikeOp,
         negated: bool,
     },
     /// IS NULL / IS NOT NULL

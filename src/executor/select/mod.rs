@@ -5333,7 +5333,8 @@ impl<'s> SelectCompiler<'s> {
                 let opcode = match op {
                     crate::parser::ast::LikeOp::Like => Opcode::Like,
                     crate::parser::ast::LikeOp::Glob => Opcode::Glob,
-                    _ => Opcode::Like, // Fallback for Regexp/Match
+                    crate::parser::ast::LikeOp::Regexp => Opcode::Regexp,
+                    crate::parser::ast::LikeOp::Match => Opcode::Match,
                 };
 
                 // Like opcode: P1=text, P2=result, P3=pattern

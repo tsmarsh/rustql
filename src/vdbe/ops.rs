@@ -200,6 +200,9 @@ pub enum Opcode {
     /// Check if P1 matches regexp in P3
     Regexp,
 
+    /// Check if P1 matches pattern in P3 (user-defined match function)
+    Match,
+
     // ========================================================================
     // B-tree/Table Operations
     // ========================================================================
@@ -636,6 +639,7 @@ impl Opcode {
             Opcode::Like => "Like",
             Opcode::Glob => "Glob",
             Opcode::Regexp => "Regexp",
+            Opcode::Match => "Match",
             Opcode::OpenRead => "OpenRead",
             Opcode::OpenWrite => "OpenWrite",
             Opcode::OpenEphemeral => "OpenEphemeral",

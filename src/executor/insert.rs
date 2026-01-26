@@ -1187,11 +1187,9 @@ impl<'a> InsertCompiler<'a> {
                     P4::Text(func_call.name.clone()),
                 );
             }
-            Expr::Subquery(_select) => {
-                // Scalar subqueries in INSERT...SELECT require special handling.
-                // For now, fall back to NULL - this is a known limitation.
-                // TODO: Use SelectCompiler to evaluate subqueries properly.
-                self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+            Expr::Subquery(select) => {
+                // Compile scalar subquery - result goes directly into dest_reg
+                self.compile_scalar_subquery(select, dest_reg)?;
             }
             _ => {
                 // Default to NULL for unsupported expressions
@@ -1429,6 +1427,80 @@ impl<'a> InsertCompiler<'a> {
         }
     }
 
+    /// Compile a scalar subquery and store result in dest_reg
+    fn compile_scalar_subquery(&mut self, select: &SelectStmt, dest_reg: i32) -> Result<()> {
+        // Initialize dest_reg to NULL in case subquery returns no rows
+        self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+
+        // Use SelectCompiler to compile the subquery
+        let mut sub_compiler = if let Some(schema) = self.schema {
+            SelectCompiler::with_schema(schema)
+        } else {
+            SelectCompiler::new()
+        };
+
+        // Compile with Set destination - copies first column to dest_reg
+        let sub_dest = SelectDest::Set { reg: dest_reg };
+        let sub_ops = sub_compiler.compile(select, &sub_dest)?;
+
+        // Get offsets for adjusting cursor and register numbers
+        let cursor_offset = self.next_cursor;
+        let base_addr = self.ops.len() as i32;
+
+        // Inline the compiled ops, excluding Init/Halt
+        // We need to offset both cursors AND registers (except dest_reg which is already correct)
+        for mut op in sub_ops {
+            if op.opcode == Opcode::Init || op.opcode == Opcode::Halt {
+                continue;
+            }
+
+            // Adjust jump addresses
+            if op.opcode.is_jump() && op.p2 > 0 {
+                op.p2 += base_addr;
+            }
+
+            // Adjust cursor numbers for table operations
+            if op.opcode == Opcode::OpenRead || op.opcode == Opcode::OpenWrite {
+                op.p1 += cursor_offset;
+            } else if matches!(
+                op.opcode,
+                Opcode::Rewind
+                    | Opcode::Next
+                    | Opcode::Column
+                    | Opcode::Close
+                    | Opcode::SeekGE
+                    | Opcode::SeekGT
+                    | Opcode::SeekLE
+                    | Opcode::SeekLT
+                    | Opcode::SeekRowid
+                    | Opcode::IdxGE
+                    | Opcode::IdxGT
+                    | Opcode::IdxLE
+                    | Opcode::IdxLT
+                    | Opcode::Found
+                    | Opcode::NotFound
+                    | Opcode::SorterInsert
+                    | Opcode::SorterSort
+                    | Opcode::SorterNext
+                    | Opcode::SorterData
+                    | Opcode::OpenEphemeral
+                    | Opcode::OpenAutoindex
+            ) {
+                op.p1 += cursor_offset;
+            }
+
+            self.ops.push(op);
+        }
+
+        // Update cursor count to account for cursors used by SelectCompiler
+        self.next_cursor += 5;
+
+        // Reserve registers used by SelectCompiler
+        self.next_reg += 20;
+
+        Ok(())
+    }
+
     /// Emit conflict checking code
     fn emit_conflict_check(&mut self, action: ConflictAction) -> Result<()> {
         match action {
@@ -1657,6 +1729,10 @@ impl<'a> InsertCompiler<'a> {
                     }
                 };
                 self.emit(Opcode::Variable, param_idx, dest_reg, 0, P4::Unused);
+            }
+            Expr::Subquery(select) => {
+                // Compile scalar subquery - result goes directly into dest_reg
+                self.compile_scalar_subquery(select, dest_reg)?;
             }
             _ => {
                 // Default to NULL for unsupported expressions

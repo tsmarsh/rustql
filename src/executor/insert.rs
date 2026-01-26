@@ -12,7 +12,7 @@ use crate::parser::ast::{
 use crate::schema::Schema;
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
-use super::column_mapping::{ColumnMapper, ColumnSource};
+use super::column_mapping::{ColumnMapper, ColumnSource, RowidMapping};
 use super::select::{SelectCompiler, SelectDest};
 
 fn is_rowid_alias(name: &str) -> bool {
@@ -505,16 +505,6 @@ impl<'a> InsertCompiler<'a> {
         self.emit(Opcode::Rewind, eph_cursor, insert_loop_end, 0, P4::Unused);
         self.resolve_label(insert_loop_start, self.current_addr() as i32);
 
-        // Allocate rowid register for target table
-        let rowid_reg = self.alloc_reg();
-        self.emit(
-            Opcode::NewRowid,
-            self.table_cursor,
-            rowid_reg,
-            0,
-            P4::Unused,
-        );
-
         // Use ColumnMapper to build proper column mapping including DEFAULTs
         let explicit_cols = insert
             .columns
@@ -526,6 +516,44 @@ impl<'a> InsertCompiler<'a> {
             select_col_count,
             self.schema,
         )?;
+
+        // Allocate rowid register for target table
+        let rowid_reg = self.alloc_reg();
+
+        // Check if rowid comes from explicit column or should be auto-generated
+        match mapper.rowid_mapping() {
+            RowidMapping::SourceIndex(src_idx) => {
+                // Read rowid from SELECT result
+                self.emit(
+                    Opcode::Column,
+                    eph_cursor,
+                    src_idx as i32,
+                    rowid_reg,
+                    P4::Unused,
+                );
+                // If rowid is NULL, generate a new rowid instead
+                let skip_newrowid = self.alloc_label();
+                self.emit(Opcode::NotNull, rowid_reg, skip_newrowid, 0, P4::Unused);
+                self.emit(
+                    Opcode::NewRowid,
+                    self.table_cursor,
+                    rowid_reg,
+                    0,
+                    P4::Unused,
+                );
+                self.resolve_label(skip_newrowid, self.current_addr() as i32);
+            }
+            RowidMapping::Auto => {
+                // Generate new rowid
+                self.emit(
+                    Opcode::NewRowid,
+                    self.table_cursor,
+                    rowid_reg,
+                    0,
+                    P4::Unused,
+                );
+            }
+        }
 
         // Read columns from ephemeral row and map to target columns
         let data_base = self.next_reg;
@@ -707,16 +735,6 @@ impl<'a> InsertCompiler<'a> {
         self.emit(Opcode::Rewind, eph_cursor, insert_loop_end, 0, P4::Unused);
         self.resolve_label(insert_loop_start, self.current_addr() as i32);
 
-        // Allocate rowid register for target table
-        let rowid_reg = self.alloc_reg();
-        self.emit(
-            Opcode::NewRowid,
-            self.table_cursor,
-            rowid_reg,
-            0,
-            P4::Unused,
-        );
-
         // Use ColumnMapper to build proper column mapping including DEFAULTs
         let explicit_cols = insert
             .columns
@@ -728,6 +746,44 @@ impl<'a> InsertCompiler<'a> {
             select_col_count,
             self.schema,
         )?;
+
+        // Allocate rowid register for target table
+        let rowid_reg = self.alloc_reg();
+
+        // Check if rowid comes from explicit column or should be auto-generated
+        match mapper.rowid_mapping() {
+            RowidMapping::SourceIndex(src_idx) => {
+                // Read rowid from SELECT result
+                self.emit(
+                    Opcode::Column,
+                    eph_cursor,
+                    src_idx as i32,
+                    rowid_reg,
+                    P4::Unused,
+                );
+                // If rowid is NULL, generate a new rowid instead
+                let skip_newrowid = self.alloc_label();
+                self.emit(Opcode::NotNull, rowid_reg, skip_newrowid, 0, P4::Unused);
+                self.emit(
+                    Opcode::NewRowid,
+                    self.table_cursor,
+                    rowid_reg,
+                    0,
+                    P4::Unused,
+                );
+                self.resolve_label(skip_newrowid, self.current_addr() as i32);
+            }
+            RowidMapping::Auto => {
+                // Generate new rowid
+                self.emit(
+                    Opcode::NewRowid,
+                    self.table_cursor,
+                    rowid_reg,
+                    0,
+                    P4::Unused,
+                );
+            }
+        }
 
         // Read columns from ephemeral row and map to target columns
         let data_base = self.next_reg;

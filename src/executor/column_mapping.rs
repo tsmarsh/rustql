@@ -9,6 +9,7 @@
 //! - NULL filling for unmapped columns
 //! - Case-insensitive column name matching
 //! - Table qualification validation
+//! - Rowid alias handling (rowid, _rowid_, oid)
 
 use std::collections::HashMap;
 
@@ -17,6 +18,13 @@ use crate::schema::{Column, Schema};
 
 #[cfg(test)]
 use crate::schema::DefaultValue;
+
+/// Check if a column name is a rowid alias
+fn is_rowid_alias(name: &str) -> bool {
+    name.eq_ignore_ascii_case("rowid")
+        || name.eq_ignore_ascii_case("_rowid_")
+        || name.eq_ignore_ascii_case("oid")
+}
 
 /// How a target column should be filled
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,11 +37,22 @@ pub enum ColumnSource {
     Null,
 }
 
+/// Tracks which source index maps to rowid (if any)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowidMapping {
+    /// No explicit rowid in column list - use auto-generated
+    Auto,
+    /// Rowid comes from source at this index
+    SourceIndex(usize),
+}
+
 /// Maps source values to target table columns
 pub struct ColumnMapper {
     table_name: String,
     target_columns: Vec<Column>,
     mapping: Vec<ColumnSource>,
+    /// Rowid mapping (if explicit rowid in column list)
+    rowid_mapping: RowidMapping,
 }
 
 impl ColumnMapper {
@@ -70,7 +89,7 @@ impl ColumnMapper {
         };
 
         // Build the mapping
-        let mapping = if let Some(explicit_cols) = explicit_cols {
+        let (mapping, rowid_mapping) = if let Some(explicit_cols) = explicit_cols {
             Self::build_explicit_mapping(&target_columns, explicit_cols, source_count)?
         } else {
             Self::build_implicit_mapping(&target_columns, source_count)?
@@ -80,6 +99,7 @@ impl ColumnMapper {
             table_name: table_name.to_string(),
             target_columns,
             mapping,
+            rowid_mapping,
         })
     }
 
@@ -88,12 +108,19 @@ impl ColumnMapper {
         target_columns: &[Column],
         explicit_cols: &[String],
         source_count: usize,
-    ) -> Result<Vec<ColumnSource>> {
+    ) -> Result<(Vec<ColumnSource>, RowidMapping)> {
         let mut mapping = vec![ColumnSource::Null; target_columns.len()];
+        let mut rowid_mapping = RowidMapping::Auto;
 
         for (src_idx, col_name) in explicit_cols.iter().enumerate() {
             if src_idx >= source_count {
                 break; // More target cols than source cols
+            }
+
+            // Check if this is a rowid alias (rowid, _rowid_, oid)
+            if is_rowid_alias(col_name) {
+                rowid_mapping = RowidMapping::SourceIndex(src_idx);
+                continue;
             }
 
             // Find this column in target table
@@ -126,14 +153,14 @@ impl ColumnMapper {
             }
         }
 
-        Ok(mapping)
+        Ok((mapping, rowid_mapping))
     }
 
     /// Build mapping for implicit column list (INSERT INTO t SELECT ...)
     fn build_implicit_mapping(
         target_columns: &[Column],
         source_count: usize,
-    ) -> Result<Vec<ColumnSource>> {
+    ) -> Result<(Vec<ColumnSource>, RowidMapping)> {
         let mut mapping = Vec::new();
 
         for (target_idx, _col) in target_columns.iter().enumerate() {
@@ -149,12 +176,18 @@ impl ColumnMapper {
             }
         }
 
-        Ok(mapping)
+        // Implicit mapping doesn't have explicit rowid
+        Ok((mapping, RowidMapping::Auto))
     }
 
     /// Get the mapping for all target columns
     pub fn mapping(&self) -> &[ColumnSource] {
         &self.mapping
+    }
+
+    /// Get the rowid mapping
+    pub fn rowid_mapping(&self) -> RowidMapping {
+        self.rowid_mapping
     }
 
     /// Get target column count
@@ -220,10 +253,11 @@ mod tests {
 
         let columns = vec![col_a, col_b];
 
-        let mapping = ColumnMapper::build_implicit_mapping(&columns, 2).unwrap();
+        let (mapping, rowid_mapping) = ColumnMapper::build_implicit_mapping(&columns, 2).unwrap();
         assert_eq!(mapping.len(), 2);
         assert_eq!(mapping[0], ColumnSource::SourceIndex(0));
         assert_eq!(mapping[1], ColumnSource::SourceIndex(1));
+        assert_eq!(rowid_mapping, RowidMapping::Auto);
     }
 
     #[test]
@@ -237,7 +271,7 @@ mod tests {
 
         let columns = vec![col_a, col_b];
 
-        let mapping = ColumnMapper::build_implicit_mapping(&columns, 1).unwrap();
+        let (mapping, _rowid_mapping) = ColumnMapper::build_implicit_mapping(&columns, 1).unwrap();
         assert_eq!(mapping.len(), 2);
         assert_eq!(mapping[0], ColumnSource::SourceIndex(0));
         assert_eq!(mapping[1], ColumnSource::DefaultValue);
@@ -255,7 +289,8 @@ mod tests {
         let columns = vec![col_a, col_b];
         let explicit = vec!["a".to_string()];
 
-        let mapping = ColumnMapper::build_explicit_mapping(&columns, &explicit, 1).unwrap();
+        let (mapping, _rowid_mapping) =
+            ColumnMapper::build_explicit_mapping(&columns, &explicit, 1).unwrap();
         assert_eq!(mapping.len(), 2);
         assert_eq!(mapping[0], ColumnSource::SourceIndex(0));
         assert_eq!(mapping[1], ColumnSource::DefaultValue);
@@ -276,7 +311,8 @@ mod tests {
         let columns = vec![col_a, col_b, col_c];
         let explicit = vec!["b".to_string(), "a".to_string()];
 
-        let mapping = ColumnMapper::build_explicit_mapping(&columns, &explicit, 2).unwrap();
+        let (mapping, _rowid_mapping) =
+            ColumnMapper::build_explicit_mapping(&columns, &explicit, 2).unwrap();
         assert_eq!(mapping.len(), 3);
         assert_eq!(mapping[0], ColumnSource::SourceIndex(1)); // a gets source index 1
         assert_eq!(mapping[1], ColumnSource::SourceIndex(0)); // b gets source index 0

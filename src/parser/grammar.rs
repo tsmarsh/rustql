@@ -100,6 +100,19 @@ impl<'a> Parser<'a> {
         self.current().kind == TokenKind::Eof
     }
 
+    /// Get the remaining unparsed SQL text
+    ///
+    /// Returns the portion of the source string starting from the current token.
+    /// This is useful for determining the "tail" after parsing a statement.
+    pub fn remaining(&self) -> &'a str {
+        let current = self.current();
+        if current.kind == TokenKind::Eof {
+            ""
+        } else {
+            &self.source[current.start..]
+        }
+    }
+
     // ========================================================================
     // Statement Parsers
     // ========================================================================
@@ -1781,6 +1794,7 @@ impl<'a> Parser<'a> {
 
         let name = self.parse_qualified_name()?;
 
+        // Timing is optional in SQLite - defaults to BEFORE when omitted
         let time = if self.match_token(TokenKind::Before) {
             TriggerTime::Before
         } else if self.match_token(TokenKind::After) {
@@ -1789,7 +1803,8 @@ impl<'a> Parser<'a> {
             self.expect(TokenKind::Of)?;
             TriggerTime::InsteadOf
         } else {
-            return Err(self.error("expected BEFORE, AFTER, or INSTEAD OF"));
+            // Default to BEFORE if no timing keyword specified
+            TriggerTime::Before
         };
 
         let event = if self.match_token(TokenKind::Delete) {

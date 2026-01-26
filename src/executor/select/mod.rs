@@ -106,6 +106,8 @@ pub struct SelectCompiler<'s> {
     param_names: Vec<Option<String>>,
     /// Counter for unnamed parameters (?) during compilation
     next_unnamed_param: i32,
+    /// LIKE case sensitivity (for LIKE index optimization)
+    case_sensitive_like: bool,
 }
 
 impl<'s> SelectCompiler<'s> {
@@ -148,6 +150,7 @@ impl<'s> SelectCompiler<'s> {
             where_info: None,
             param_names: Vec::new(),
             next_unnamed_param: 1,
+            case_sensitive_like: false,
         }
     }
 
@@ -195,7 +198,13 @@ impl<'s> SelectCompiler<'s> {
             where_info: None,
             param_names: Vec::new(),
             next_unnamed_param: 1,
+            case_sensitive_like: false,
         }
+    }
+
+    /// Set LIKE case sensitivity for index optimization
+    pub fn set_case_sensitive_like(&mut self, value: bool) {
+        self.case_sensitive_like = value;
     }
 
     /// Set column naming flags from PRAGMA settings
@@ -2909,6 +2918,9 @@ impl<'s> SelectCompiler<'s> {
             Some(p) => p,
             None => return Ok(None),
         };
+
+        // Set case_sensitive_like for LIKE index optimization
+        planner.set_case_sensitive_like(self.case_sensitive_like);
 
         // Resolve aliases in WHERE clause so the planner can recognize indexed columns
         // e.g., "w AS abc ... WHERE abc=10" should resolve abc to w for index matching

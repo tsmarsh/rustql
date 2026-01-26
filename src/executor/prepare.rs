@@ -116,6 +116,8 @@ pub struct StatementCompiler<'s> {
     short_column_names: bool,
     /// PRAGMA full_column_names (default OFF)
     full_column_names: bool,
+    /// LIKE case sensitivity (for LIKE index optimization)
+    case_sensitive_like: bool,
 }
 
 impl<'s> StatementCompiler<'s> {
@@ -128,6 +130,7 @@ impl<'s> StatementCompiler<'s> {
             schema: None,
             short_column_names: true,
             full_column_names: false,
+            case_sensitive_like: false,
         }
     }
 
@@ -140,6 +143,7 @@ impl<'s> StatementCompiler<'s> {
             schema: Some(schema),
             short_column_names: true,
             full_column_names: false,
+            case_sensitive_like: false,
         }
     }
 
@@ -149,6 +153,11 @@ impl<'s> StatementCompiler<'s> {
         self.full_column_names = full_column_names;
     }
 
+    /// Set LIKE case sensitivity for index optimization
+    pub fn set_case_sensitive_like(&mut self, value: bool) {
+        self.case_sensitive_like = value;
+    }
+
     /// Compile a SQL string to VDBE bytecode
     ///
     /// Returns the compiled statement and any remaining SQL (tail).
@@ -156,6 +165,10 @@ impl<'s> StatementCompiler<'s> {
         // Parse the SQL
         let mut parser = Parser::new(sql)?;
         let stmt = parser.parse_stmt()?;
+
+        // Get the tail (remaining unparsed SQL) from the parser
+        // This correctly handles complex statements like CREATE TRIGGER with BEGIN...END
+        let tail = parser.remaining();
 
         // Extract parameters from the AST
         self.extract_parameters(&stmt);
@@ -172,9 +185,6 @@ impl<'s> StatementCompiler<'s> {
             read_only: stmt_type.is_read_only(),
             stmt_type,
         };
-
-        // Calculate the tail (remaining SQL after first statement)
-        let tail = find_statement_tail(sql);
 
         Ok((compiled, tail))
     }
@@ -195,6 +205,8 @@ impl<'s> StatementCompiler<'s> {
                 compiler.set_column_name_flags(self.short_column_names, self.full_column_names);
                 // Pass parameter names for Variable compilation
                 compiler.set_param_names(self.param_names.clone());
+                // Pass LIKE case sensitivity for index optimization
+                compiler.set_case_sensitive_like(self.case_sensitive_like);
                 let ops = compiler.compile(select, &SelectDest::Output)?;
                 // Use column names from compiler (properly expanded for Star)
                 let names = if compiler.column_names().is_empty() {
@@ -2977,6 +2989,7 @@ impl<'s> StatementCompiler<'s> {
         }
 
         let mut planner = QueryPlanner::new();
+        planner.set_case_sensitive_like(self.case_sensitive_like);
         for table in &table_infos {
             planner.add_table(
                 table.name.clone(),
@@ -3544,9 +3557,11 @@ pub fn compile_sql_with_config<'a>(
     schema: &crate::schema::Schema,
     short_column_names: bool,
     full_column_names: bool,
+    case_sensitive_like: bool,
 ) -> Result<(CompiledStmt, &'a str)> {
     let mut compiler = StatementCompiler::with_schema(schema);
     compiler.set_column_name_flags(short_column_names, full_column_names);
+    compiler.set_case_sensitive_like(case_sensitive_like);
     compiler.compile(sql)
 }
 

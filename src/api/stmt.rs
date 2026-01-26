@@ -325,9 +325,16 @@ pub fn sqlite3_prepare_v2<'a>(
     // Pass column naming PRAGMA settings for result column name formatting
     let short_column_names = conn.db_config.short_column_names;
     let full_column_names = conn.db_config.full_column_names;
+    let case_sensitive_like = conn.db_config.case_sensitive_like;
     let compile_result = if let Some(ref schema_arc) = conn.main_db().schema {
         if let Ok(schema) = schema_arc.read() {
-            compile_sql_with_config(sql, &schema, short_column_names, full_column_names)
+            compile_sql_with_config(
+                sql,
+                &schema,
+                short_column_names,
+                full_column_names,
+                case_sensitive_like,
+            )
         } else {
             compile_sql(sql)
         }

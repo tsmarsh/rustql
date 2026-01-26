@@ -592,6 +592,9 @@ pub struct QueryPlanner {
 
     /// Current best plan
     best_cost: f64,
+
+    /// LIKE case sensitivity setting (enables LIKE index optimization when true)
+    case_sensitive_like: bool,
 }
 
 impl QueryPlanner {
@@ -601,7 +604,14 @@ impl QueryPlanner {
             tables: Vec::new(),
             where_clause: WhereClause::new(),
             best_cost: f64::MAX,
+            case_sensitive_like: false,
         }
+    }
+
+    /// Set the case_sensitive_like flag for LIKE index optimization
+    /// When true, LIKE patterns with usable prefixes can use indexes
+    pub fn set_case_sensitive_like(&mut self, value: bool) {
+        self.case_sensitive_like = value;
     }
 
     /// Unwrap parentheses from an expression to get the inner expression
@@ -776,6 +786,108 @@ impl QueryPlanner {
             // Determine operator type and selectivity
             Self::analyze_term_expr_static(&table_info, term)?;
         }
+
+        // LIKE index optimization: when case_sensitive_like is enabled,
+        // generate virtual range terms for LIKE patterns with usable prefixes
+        if self.case_sensitive_like {
+            self.generate_like_range_terms(&table_info, &table_usage_info)?;
+        }
+
+        Ok(())
+    }
+
+    /// Generate virtual range terms for LIKE patterns with usable prefixes
+    /// This allows the query planner to use an index for `x LIKE 'abc%'` queries
+    fn generate_like_range_terms(
+        &mut self,
+        table_info: &[(String, Option<String>, u64, Vec<String>, i32)],
+        table_usage_info: &[(String, Option<String>, u64, Vec<String>)],
+    ) -> Result<()> {
+        // Collect LIKE terms that can be optimized
+        let like_terms: Vec<(usize, Box<Expr>, Box<Expr>, LikeOp, Option<(i32, i32)>, u64)> = self
+            .where_clause
+            .terms
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, term)| {
+                if !term.flags.contains(WhereTermFlags::LIKE_PREFIX) {
+                    return None;
+                }
+                // Only optimize LIKE and GLOB (not REGEXP or MATCH)
+                if let Expr::Like {
+                    expr,
+                    pattern,
+                    op,
+                    negated: false,
+                    ..
+                } = term.expr.as_ref()
+                {
+                    if matches!(op, LikeOp::Like | LikeOp::Glob) {
+                        return Some((
+                            idx,
+                            expr.clone(),
+                            pattern.clone(),
+                            *op,
+                            term.left_col,
+                            term.mask,
+                        ));
+                    }
+                }
+                None
+            })
+            .collect();
+
+        // Generate virtual range terms for each LIKE term
+        for (_like_idx, col_expr, pattern_expr, op, left_col, mask) in like_terms {
+            if let Some((prefix, upper_bound)) = Self::extract_like_bounds(&pattern_expr, op) {
+                // Create lower bound term: col >= 'prefix'
+                let lower_idx = self.where_clause.terms.len() as i32;
+                let lower_expr = Expr::Binary {
+                    op: BinaryOp::Ge,
+                    left: col_expr.clone(),
+                    right: Box::new(Expr::Literal(Literal::String(prefix))),
+                };
+                let mut lower_term = WhereTerm::new(lower_expr, lower_idx);
+                lower_term.flags |= WhereTermFlags::VIRTUAL;
+                lower_term.op = Some(TermOp::Ge);
+                lower_term.left_col = left_col;
+                lower_term.mask = mask;
+                lower_term.prereq = mask;
+                lower_term.selectivity = 0.33;
+
+                // Re-analyze the term to set proper table references
+                lower_term.mask =
+                    where_expr::expr_usage_with_columns(lower_term.expr.as_ref(), table_usage_info);
+                lower_term.prereq = lower_term.mask;
+                Self::analyze_term_expr_static(table_info, &mut lower_term)?;
+                lower_term.flags |= WhereTermFlags::INDEX_CONSTRAINT;
+                self.where_clause.add_term(lower_term);
+
+                // Create upper bound term: col < 'upper_bound'
+                let upper_idx = self.where_clause.terms.len() as i32;
+                let upper_expr = Expr::Binary {
+                    op: BinaryOp::Lt,
+                    left: col_expr,
+                    right: Box::new(Expr::Literal(Literal::String(upper_bound))),
+                };
+                let mut upper_term = WhereTerm::new(upper_expr, upper_idx);
+                upper_term.flags |= WhereTermFlags::VIRTUAL;
+                upper_term.op = Some(TermOp::Lt);
+                upper_term.left_col = left_col;
+                upper_term.mask = mask;
+                upper_term.prereq = mask;
+                upper_term.selectivity = 0.33;
+
+                // Re-analyze the term
+                upper_term.mask =
+                    where_expr::expr_usage_with_columns(upper_term.expr.as_ref(), table_usage_info);
+                upper_term.prereq = upper_term.mask;
+                Self::analyze_term_expr_static(table_info, &mut upper_term)?;
+                upper_term.flags |= WhereTermFlags::INDEX_CONSTRAINT;
+                self.where_clause.add_term(upper_term);
+            }
+        }
+
         Ok(())
     }
 
@@ -1047,6 +1159,91 @@ impl QueryPlanner {
         match op {
             LikeOp::Like | LikeOp::Regexp | LikeOp::Match => first != '%' && first != '_',
             LikeOp::Glob => first != '*' && first != '?',
+        }
+    }
+
+    /// Extract the literal prefix from a LIKE/GLOB pattern for index optimization
+    /// Returns (prefix, upper_bound) where upper_bound is prefix with last char incremented
+    /// Returns None if the pattern cannot be optimized
+    fn extract_like_bounds(pattern: &Expr, op: LikeOp) -> Option<(String, String)> {
+        let text = match pattern {
+            Expr::Literal(Literal::String(text)) => text,
+            _ => return None,
+        };
+
+        // Determine wildcard characters based on LIKE vs GLOB
+        let (multi_wild, single_wild) = match op {
+            LikeOp::Like => ('%', '_'),
+            LikeOp::Glob => ('*', '?'),
+            // REGEXP and MATCH don't support this optimization
+            _ => return None,
+        };
+
+        // Extract prefix up to first wildcard
+        let mut prefix = String::new();
+        let mut chars = text.chars().peekable();
+        let mut escape_next = false;
+
+        while let Some(ch) = chars.next() {
+            if escape_next {
+                prefix.push(ch);
+                escape_next = false;
+                continue;
+            }
+
+            // For LIKE, backslash is escape (if no explicit escape char)
+            // For GLOB, we don't have escape handling in basic implementation
+            if ch == '\\' && op == LikeOp::Like {
+                escape_next = true;
+                continue;
+            }
+
+            if ch == multi_wild || ch == single_wild {
+                // Stop at first wildcard
+                break;
+            }
+
+            // For GLOB, [ starts a character class - stop there
+            if ch == '[' && op == LikeOp::Glob {
+                break;
+            }
+
+            prefix.push(ch);
+        }
+
+        if prefix.is_empty() {
+            return None;
+        }
+
+        // Compute upper bound by incrementing the last character
+        // This handles the range: prefix <= x < upper_bound
+        let upper_bound = Self::increment_string(&prefix)?;
+
+        Some((prefix, upper_bound))
+    }
+
+    /// Increment a string to create an upper bound for range queries
+    /// "abc" -> "abd", handles rollover: "abz" -> "ab{" (in ASCII)
+    fn increment_string(s: &str) -> Option<String> {
+        if s.is_empty() {
+            return None;
+        }
+
+        let mut chars: Vec<char> = s.chars().collect();
+        let mut i = chars.len() - 1;
+
+        loop {
+            let c = chars[i];
+            // Increment the character
+            if let Some(next_c) = char::from_u32(c as u32 + 1) {
+                chars[i] = next_c;
+                return Some(chars.into_iter().collect());
+            }
+            // Overflow - try previous character
+            if i == 0 {
+                return None;
+            }
+            i -= 1;
         }
     }
 

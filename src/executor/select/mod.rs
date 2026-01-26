@@ -804,6 +804,14 @@ impl<'s> SelectCompiler<'s> {
         // This follows SQLite's approach of adding join conditions to pWhere
         let remaining_where = self.merge_join_conditions(original_where);
 
+        // Check for constant-false WHERE clause (e.g., WHERE 0)
+        // In this case, skip all loop generation and return immediately - no rows match
+        if self.is_constant_false_where(remaining_where.as_ref()) {
+            // Generate no rows - jump to end immediately
+            // The result is empty, no output needed
+            return Ok(());
+        }
+
         // Analyze WHERE clause for index optimization
         // This produces a query plan that may use indexes instead of full scans
         let where_info = self.analyze_query_plan(remaining_where.as_ref())?;
@@ -4054,6 +4062,31 @@ impl<'s> SelectCompiler<'s> {
     /// is already determined by the left side.
     fn compile_where_condition(&mut self, expr: &Expr, skip_label: i32) -> Result<()> {
         match expr {
+            // Constant false: always skip (WHERE 0)
+            Expr::Literal(Literal::Integer(0)) => {
+                // Unconditionally jump to skip - this row will never match
+                self.emit(Opcode::Goto, 0, skip_label, 0, P4::Unused);
+                Ok(())
+            }
+
+            // Constant false: float zero
+            Expr::Literal(Literal::Float(f)) if *f == 0.0 => {
+                self.emit(Opcode::Goto, 0, skip_label, 0, P4::Unused);
+                Ok(())
+            }
+
+            // Constant true: no check needed (WHERE 1)
+            Expr::Literal(Literal::Integer(n)) if *n != 0 => {
+                // Always true - no jump needed, fall through
+                Ok(())
+            }
+
+            // Constant true: non-zero float
+            Expr::Literal(Literal::Float(f)) if *f != 0.0 => {
+                // Always true - no jump needed, fall through
+                Ok(())
+            }
+
             // Short-circuit AND: if left is false, skip right entirely
             Expr::Binary {
                 op: BinaryOp::And,
@@ -4104,6 +4137,35 @@ impl<'s> SelectCompiler<'s> {
                 self.emit(Opcode::IfNot, reg, skip_label, 1, P4::Unused);
                 Ok(())
             }
+        }
+    }
+
+    /// Check if a WHERE clause is constant false (e.g., WHERE 0)
+    /// If so, no rows can match and we can skip all loop generation.
+    fn is_constant_false_where(&self, where_clause: Option<&Expr>) -> bool {
+        match where_clause {
+            None => false, // No WHERE means all rows match
+            Some(expr) => self.is_constant_false_expr(expr),
+        }
+    }
+
+    /// Check if an expression is constant false
+    fn is_constant_false_expr(&self, expr: &Expr) -> bool {
+        match expr {
+            // Integer 0 is false
+            Expr::Literal(Literal::Integer(0)) => true,
+            // Float 0.0 is false
+            Expr::Literal(Literal::Float(f)) if *f == 0.0 => true,
+            // AND: if either side is constant false, result is false
+            Expr::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => self.is_constant_false_expr(left) || self.is_constant_false_expr(right),
+            // Parentheses: unwrap
+            Expr::Parens(inner) => self.is_constant_false_expr(inner),
+            // Anything else is not obviously constant false
+            _ => false,
         }
     }
 

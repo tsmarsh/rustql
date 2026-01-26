@@ -6,7 +6,9 @@
 use bitflags::bitflags;
 
 use crate::error::{Error, ErrorCode, Result};
-use crate::parser::ast::{BinaryOp, Expr, LikeOp, Literal, UnaryOp};
+use crate::parser::ast::{
+    BinaryOp, Expr, FunctionArgs, FunctionCall, InList, LikeOp, Literal, UnaryOp,
+};
 use crate::schema::IndexStats;
 
 use super::where_expr;
@@ -178,6 +180,10 @@ pub struct WhereTerm {
 
     /// OR clause components (if this term is an OR expression)
     pub or_terms: Vec<Expr>,
+
+    /// Estimated cost to evaluate this term (lower = cheaper)
+    /// Used to order term evaluation for optimal short-circuit behavior
+    pub eval_cost: i32,
 }
 
 /// Operator type for a WHERE term
@@ -201,6 +207,7 @@ pub enum TermOp {
 impl WhereTerm {
     /// Create a new WHERE term from an expression
     pub fn new(expr: Expr, idx: i32) -> Self {
+        let eval_cost = Self::estimate_expr_cost(&expr);
         WhereTerm {
             expr: Box::new(expr),
             prereq: 0,
@@ -212,6 +219,101 @@ impl WhereTerm {
             selectivity: 0.25, // Default 25% selectivity
             op: None,
             or_terms: Vec::new(),
+            eval_cost,
+        }
+    }
+
+    /// Estimate the cost of evaluating an expression
+    /// Lower values = cheaper to evaluate
+    /// Cost categories:
+    /// - Simple column comparison: 10
+    /// - Simple arithmetic/logic: 15
+    /// - Simple function (ABS, etc): 20
+    /// - String function (LENGTH, SUBSTR, etc): 30
+    /// - LIKE/GLOB pattern matching: 40
+    /// - IN with values list: 50
+    /// - Subquery: 100
+    /// - Correlated subquery: 1000
+    fn estimate_expr_cost(expr: &Expr) -> i32 {
+        match expr {
+            // Simple column reference
+            Expr::Column(_) => 5,
+
+            // Literals are free
+            Expr::Literal(_) => 1,
+
+            // Simple binary comparisons
+            Expr::Binary { op, left, right } => {
+                let base_cost = match op {
+                    BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+                    | BinaryOp::Is
+                    | BinaryOp::IsNot => 10,
+                    BinaryOp::And | BinaryOp::Or => 5,
+                    _ => 15,
+                };
+                base_cost + Self::estimate_expr_cost(left) / 2 + Self::estimate_expr_cost(right) / 2
+            }
+
+            // Unary operations
+            Expr::Unary { expr: inner, .. } => 5 + Self::estimate_expr_cost(inner),
+
+            // Function calls - cost depends on function
+            Expr::Function(FunctionCall { name, args, .. }) => {
+                let func_cost = match name.to_uppercase().as_str() {
+                    // Math functions - relatively cheap
+                    "ABS" | "MAX" | "MIN" | "ROUND" | "COALESCE" | "IFNULL" | "NULLIF" => 20,
+                    // String functions - more expensive
+                    "LENGTH" | "UPPER" | "LOWER" | "TRIM" | "LTRIM" | "RTRIM" => 30,
+                    "SUBSTR" | "REPLACE" | "INSTR" => 35,
+                    // Aggregate functions (shouldn't appear in WHERE, but handle anyway)
+                    "COUNT" | "SUM" | "AVG" => 50,
+                    // Default for unknown functions
+                    _ => 25,
+                };
+                let args_cost: i32 = match args {
+                    FunctionArgs::Star => 0,
+                    FunctionArgs::Exprs(exprs) => {
+                        exprs.iter().map(|a| Self::estimate_expr_cost(a) / 4).sum()
+                    }
+                };
+                func_cost + args_cost
+            }
+
+            // IN with values list or subquery
+            Expr::In { list, .. } => match list {
+                InList::Values(values) => 50 + values.len() as i32 * 2,
+                InList::Subquery(_) => 100,
+                InList::Table(_) => 50,
+            },
+
+            // LIKE/GLOB pattern matching - expensive
+            Expr::Like { expr, pattern, .. } => {
+                40 + Self::estimate_expr_cost(expr) / 2 + Self::estimate_expr_cost(pattern) / 2
+            }
+
+            // Subquery - expensive
+            Expr::Subquery(_) => 100,
+            Expr::Exists { .. } => 100,
+
+            // BETWEEN
+            Expr::Between { .. } => 20,
+
+            // CASE expressions
+            Expr::Case { .. } => 30,
+
+            // Cast
+            Expr::Cast { expr: inner, .. } => 10 + Self::estimate_expr_cost(inner),
+
+            // Parentheses - just unwrap
+            Expr::Parens(inner) => Self::estimate_expr_cost(inner),
+
+            // Default for anything else
+            _ => 20,
         }
     }
 

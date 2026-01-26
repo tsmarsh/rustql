@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::executor::where_clause::{
-    IndexInfo, QueryPlanner, TermOp, WhereInfo, WhereLevel, WherePlan, WhereTermFlags,
+    IndexInfo, QueryPlanner, TermOp, WhereInfo, WhereLevel, WherePlan, WhereTerm, WhereTermFlags,
 };
 use crate::executor::window::{select_has_window_functions, WindowCompiler};
 use crate::parser::ast::{
@@ -4099,7 +4099,8 @@ impl<'s> SelectCompiler<'s> {
     ///
     /// This skips terms that were consumed by index seeks, avoiding
     /// redundant re-evaluation of conditions already satisfied by the index.
-    /// Terms are compiled with short-circuit AND evaluation.
+    /// Terms are sorted by eval_cost (cheapest first) for optimal short-circuit
+    /// behavior, then compiled with short-circuit AND evaluation.
     fn compile_runtime_filter_terms(
         &mut self,
         where_info: &WhereInfo,
@@ -4112,22 +4113,23 @@ impl<'s> SelectCompiler<'s> {
             .flat_map(|level| level.used_terms.iter().copied())
             .collect();
 
-        // Compile each non-consumed term with short-circuit AND
-        let mut any_compiled = false;
-        for term in &where_info.terms {
-            if consumed_terms.contains(&term.idx) {
-                // This term was consumed by an index seek, skip runtime evaluation
-                continue;
-            }
+        // Collect non-consumed, non-virtual terms
+        let mut filter_terms: Vec<&WhereTerm> = where_info
+            .terms
+            .iter()
+            .filter(|term| {
+                !consumed_terms.contains(&term.idx) && !term.flags.contains(WhereTermFlags::VIRTUAL)
+            })
+            .collect();
 
-            // Skip virtual terms (internal use only)
-            if term.flags.contains(WhereTermFlags::VIRTUAL) {
-                continue;
-            }
+        // Sort by eval_cost - cheapest terms first for better short-circuit behavior
+        filter_terms.sort_by_key(|term| term.eval_cost);
 
+        // Compile each term with short-circuit AND
+        let any_compiled = !filter_terms.is_empty();
+        for term in filter_terms {
             // Compile this term - if false, jump to skip_label
             self.compile_where_condition(&term.expr, skip_label)?;
-            any_compiled = true;
         }
 
         Ok(any_compiled)

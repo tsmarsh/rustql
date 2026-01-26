@@ -2267,6 +2267,11 @@ impl<'s> SelectCompiler<'s> {
     ) -> Result<()> {
         self.is_compound = true;
 
+        // Save LIMIT/OFFSET counters - they should be applied to the final output, not individual bodies
+        let saved_limit_reg = self.limit_counter_reg.take();
+        let saved_offset_reg = self.offset_counter_reg.take();
+        let saved_limit_done = self.limit_done_label.take();
+
         // Create ephemeral table for results
         let result_cursor = self.alloc_cursor();
         self.emit(Opcode::OpenEphemeral, result_cursor, 0, 0, P4::Unused);
@@ -2363,6 +2368,11 @@ impl<'s> SelectCompiler<'s> {
 
         // Restore left side's column names (right side added its own but we want only left's names)
         self.result_column_names = saved_column_names;
+
+        // Restore LIMIT/OFFSET counters for the final output phase
+        self.limit_counter_reg = saved_limit_reg;
+        self.offset_counter_reg = saved_offset_reg;
+        self.limit_done_label = saved_limit_done;
 
         // Output results from ephemeral table with conditional filtering for INTERSECT/EXCEPT
         match op {
@@ -2491,6 +2501,29 @@ impl<'s> SelectCompiler<'s> {
                         subquery_columns: Some(columns),
                     });
                     return Ok(());
+                }
+
+                // Check if this is a view - expand views as subqueries
+                if let Some(schema) = self.schema {
+                    if let Some(view) = schema.views.get(&table_name_lower) {
+                        let view_select = (*view.select).clone();
+                        let view_alias = item.alias.clone().unwrap_or_else(|| table_name.clone());
+
+                        // Compile view's SELECT as a subquery into ephemeral table
+                        let subquery_col_names =
+                            self.compile_subquery_to_ephemeral(&view_select, cursor, None)?;
+
+                        self.tables.push(TableInfo {
+                            name: view_alias,
+                            table_name: String::new(),
+                            cursor,
+                            schema_table: None,
+                            is_subquery: true,
+                            join_type: item.join_type,
+                            subquery_columns: Some(subquery_col_names),
+                        });
+                        return Ok(());
+                    }
                 }
 
                 // Look up table in schema if available
@@ -3635,6 +3668,49 @@ impl<'s> SelectCompiler<'s> {
                         row_estimate: 0,
                     }))
                 } else if let Some(schema) = self.schema {
+                    // First check if this is a view
+                    if let Some(view) = schema.views.get(&table_name_lower) {
+                        // Expand view as subquery
+                        let view_select = (*view.select).clone();
+                        let view_alias = alias.clone().unwrap_or_else(|| table_name.clone());
+
+                        // Compile view's SELECT as a subquery
+                        let cursor = self.alloc_cursor();
+                        self.emit(Opcode::OpenEphemeral, cursor, 0, 0, P4::Unused);
+
+                        let subquery_dest = SelectDest::EphemTable { cursor };
+                        let mut subcompiler = SelectCompiler::with_schema(schema);
+                        subcompiler.next_reg = self.next_reg;
+                        subcompiler.next_cursor = self.next_cursor;
+                        subcompiler
+                            .set_column_name_flags(self.short_column_names, self.full_column_names);
+                        let subquery_ops = subcompiler.compile(&view_select, &subquery_dest)?;
+
+                        // Capture view's result column names for * expansion
+                        let subquery_col_names = subcompiler.result_column_names.clone();
+
+                        // Inline the subquery ops
+                        for op in subquery_ops {
+                            if op.opcode != Opcode::Halt {
+                                self.ops.push(op);
+                            }
+                        }
+
+                        self.next_reg = subcompiler.next_reg;
+                        self.next_cursor = subcompiler.next_cursor;
+
+                        self.tables.push(TableInfo {
+                            name: view_alias,
+                            table_name: String::new(),
+                            cursor,
+                            schema_table: None,
+                            is_subquery: true,
+                            join_type,
+                            subquery_columns: Some(subquery_col_names),
+                        });
+                        return Ok(());
+                    }
+
                     // Check if table exists (but not for sqlite_ internal tables)
                     if !table_name_lower.starts_with("sqlite_")
                         && !schema.tables.contains_key(&table_name_lower)
@@ -7077,6 +7153,28 @@ impl<'s> SelectCompiler<'s> {
         let loop_start_label = self.alloc_label();
         self.resolve_label(loop_start_label, self.current_addr());
 
+        // Handle OFFSET: skip rows until offset counter reaches 0
+        if let Some(offset_reg) = self.offset_counter_reg {
+            let after_offset = self.alloc_label();
+            // Check if offset <= 0
+            let zero_reg = self.alloc_reg();
+            self.emit(Opcode::Integer, 0, zero_reg, 0, P4::Unused);
+            self.emit(Opcode::Le, zero_reg, after_offset, offset_reg, P4::Unused);
+            // offset > 0: Decrement and skip this row
+            self.emit(Opcode::AddImm, offset_reg, -1, 0, P4::Unused);
+            self.emit(Opcode::Next, cursor, loop_start_label, 0, P4::Unused);
+            // If Next falls through, we're done
+            self.emit(Opcode::Goto, 0, done_label, 0, P4::Unused);
+            self.resolve_label(after_offset, self.current_addr());
+        }
+
+        // Handle LIMIT: check if we've output enough rows
+        if let Some(limit_reg) = self.limit_counter_reg {
+            if let Some(limit_done) = self.limit_done_label {
+                self.emit(Opcode::IfNot, limit_reg, limit_done, 0, P4::Unused);
+            }
+        }
+
         // Get all columns from the ephemeral table row
         let col_count = if self.compound_column_count > 0 {
             self.compound_column_count
@@ -7093,8 +7191,18 @@ impl<'s> SelectCompiler<'s> {
         // Output based on destination
         self.output_row(dest, base_reg, col_count)?;
 
+        // Decrement limit counter
+        if let Some(limit_reg) = self.limit_counter_reg {
+            self.emit(Opcode::AddImm, limit_reg, -1, 0, P4::Unused);
+        }
+
         self.emit(Opcode::Next, cursor, loop_start_label, 0, P4::Unused);
         self.resolve_label(done_label, self.current_addr());
+
+        // Resolve LIMIT done label (jump here when limit exhausted)
+        if let Some(limit_done) = self.limit_done_label {
+            self.resolve_label(limit_done, self.current_addr());
+        }
 
         Ok(())
     }
@@ -7165,6 +7273,34 @@ impl<'s> SelectCompiler<'s> {
         let sorter_loop_label = self.alloc_label();
         self.resolve_label(sorter_loop_label, self.current_addr());
 
+        // Handle OFFSET: skip rows until offset counter reaches 0
+        if let Some(offset_reg) = self.offset_counter_reg {
+            let after_offset = self.alloc_label();
+            // Check if offset <= 0
+            let zero_reg = self.alloc_reg();
+            self.emit(Opcode::Integer, 0, zero_reg, 0, P4::Unused);
+            self.emit(Opcode::Le, zero_reg, after_offset, offset_reg, P4::Unused);
+            // offset > 0: Decrement and skip this row
+            self.emit(Opcode::AddImm, offset_reg, -1, 0, P4::Unused);
+            self.emit(
+                Opcode::SorterNext,
+                sorter_cursor,
+                sorter_loop_label,
+                0,
+                P4::Unused,
+            );
+            // If SorterNext falls through, we're done
+            self.emit(Opcode::Goto, 0, sort_done_label, 0, P4::Unused);
+            self.resolve_label(after_offset, self.current_addr());
+        }
+
+        // Handle LIMIT: check if we've output enough rows
+        if let Some(limit_reg) = self.limit_counter_reg {
+            if let Some(done_label) = self.limit_done_label {
+                self.emit(Opcode::IfNot, limit_reg, done_label, 0, P4::Unused);
+            }
+        }
+
         // Get row data from sorter
         let sorter_data_reg = self.alloc_reg();
         self.emit(
@@ -7188,6 +7324,11 @@ impl<'s> SelectCompiler<'s> {
         // Output the row
         self.output_row(dest, out_base_reg, col_count)?;
 
+        // Decrement limit counter
+        if let Some(limit_reg) = self.limit_counter_reg {
+            self.emit(Opcode::AddImm, limit_reg, -1, 0, P4::Unused);
+        }
+
         self.emit(
             Opcode::SorterNext,
             sorter_cursor,
@@ -7196,6 +7337,11 @@ impl<'s> SelectCompiler<'s> {
             P4::Unused,
         );
         self.resolve_label(sort_done_label, self.current_addr());
+
+        // Resolve LIMIT done label (jump here when limit exhausted)
+        if let Some(done_label) = self.limit_done_label {
+            self.resolve_label(done_label, self.current_addr());
+        }
 
         self.emit(Opcode::Close, sorter_cursor, 0, 0, P4::Unused);
 

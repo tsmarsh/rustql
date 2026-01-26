@@ -1188,6 +1188,23 @@ pub enum TriggerStep {
 }
 
 // ============================================================================
+// Views
+// ============================================================================
+
+/// Database view
+#[derive(Debug, Clone)]
+pub struct View {
+    /// View name
+    pub name: String,
+    /// CREATE VIEW SQL statement
+    pub sql: String,
+    /// Optional column names
+    pub columns: Option<Vec<String>>,
+    /// The SELECT statement that defines the view
+    pub select: Box<crate::parser::ast::SelectStmt>,
+}
+
+// ============================================================================
 // Schema
 // ============================================================================
 
@@ -1200,6 +1217,8 @@ pub struct Schema {
     pub indexes: HashMap<String, Arc<Index>>,
     /// Triggers
     pub triggers: HashMap<String, Arc<Trigger>>,
+    /// Views
+    pub views: HashMap<String, Arc<View>>,
     /// Schema cookie (version)
     pub schema_cookie: u32,
     /// File format

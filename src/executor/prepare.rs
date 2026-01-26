@@ -1899,17 +1899,140 @@ impl<'s> StatementCompiler<'s> {
     }
 
     fn compile_create_view(&mut self, create: &CreateViewStmt) -> Result<Vec<VdbeOp>> {
+        // Reconstruct the CREATE VIEW SQL for storage
+        let sql = self.reconstruct_create_view_sql(create);
+
         let mut ops = Vec::new();
-        ops.push(Self::make_op(Opcode::Init, 0, 1, 0, P4::Unused));
-        ops.push(Self::make_op(
-            Opcode::Noop,
-            0,
-            0,
-            0,
-            P4::Text(format!("CREATE VIEW {}", create.name)),
-        ));
+        ops.push(Self::make_op(Opcode::Init, 0, 2, 0, P4::Unused));
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
+
+        // Insert into sqlite_master
+        let cursor_id = 0;
+        self.append_sqlite_master_open(&mut ops, cursor_id);
+        self.append_sqlite_master_insert_view(&mut ops, cursor_id, &create.name.name, &sql);
+        self.append_sqlite_master_close(&mut ops, cursor_id);
+
+        // Use ParseSchema to register the view in the schema at runtime
+        // P2=0 (views don't need a root page), P4=SQL text
+        ops.push(Self::make_op(
+            Opcode::ParseSchema,
+            0,
+            0,
+            0,
+            P4::Text(sql.clone()),
+        ));
+        ops.push(Self::make_op(Opcode::Goto, 0, 1, 0, P4::Unused));
+
         Ok(ops)
+    }
+
+    /// Insert a view entry into sqlite_master
+    fn append_sqlite_master_insert_view(
+        &self,
+        ops: &mut Vec<VdbeOp>,
+        cursor_id: i32,
+        view_name: &str,
+        sql: &str,
+    ) {
+        // sqlite_master columns: type, name, tbl_name, rootpage, sql
+        // Views have type='view', tbl_name=view_name, rootpage=0
+        let reg_type = 2;
+        let reg_name = 3;
+        let reg_tbl_name = 4;
+        let reg_rootpage = 5;
+        let reg_sql = 6;
+        let reg_record = 7;
+        let reg_rowid = 8;
+
+        // type = 'view'
+        ops.push(Self::make_op(
+            Opcode::String8,
+            0,
+            reg_type,
+            0,
+            P4::Text("view".to_string()),
+        ));
+        // name = view_name
+        ops.push(Self::make_op(
+            Opcode::String8,
+            0,
+            reg_name,
+            0,
+            P4::Text(view_name.to_string()),
+        ));
+        // tbl_name = view_name (same as name for views)
+        ops.push(Self::make_op(
+            Opcode::String8,
+            0,
+            reg_tbl_name,
+            0,
+            P4::Text(view_name.to_string()),
+        ));
+        // rootpage = 0 (views don't have a root page)
+        ops.push(Self::make_op(
+            Opcode::Integer,
+            0,
+            reg_rootpage,
+            0,
+            P4::Unused,
+        ));
+        // sql = CREATE VIEW statement
+        ops.push(Self::make_op(
+            Opcode::String8,
+            0,
+            reg_sql,
+            0,
+            P4::Text(sql.to_string()),
+        ));
+        // MakeRecord: create record from columns
+        ops.push(Self::make_op(
+            Opcode::MakeRecord,
+            reg_type,
+            5,
+            reg_record,
+            P4::Unused,
+        ));
+        // NewRowid
+        ops.push(Self::make_op(
+            Opcode::NewRowid,
+            cursor_id,
+            reg_rowid,
+            0,
+            P4::Unused,
+        ));
+        // Insert into sqlite_master
+        ops.push(Self::make_op(
+            Opcode::Insert,
+            cursor_id,
+            reg_record,
+            reg_rowid,
+            P4::Text("sqlite_master".to_string()),
+        ));
+    }
+
+    /// Reconstruct CREATE VIEW SQL from the AST
+    fn reconstruct_create_view_sql(&self, create: &CreateViewStmt) -> String {
+        let mut sql = String::from("CREATE ");
+        if create.temporary {
+            sql.push_str("TEMP ");
+        }
+        sql.push_str("VIEW ");
+        if create.if_not_exists {
+            sql.push_str("IF NOT EXISTS ");
+        }
+        sql.push_str(&create.name.to_string());
+
+        // Column names (optional)
+        if let Some(ref columns) = create.columns {
+            sql.push('(');
+            sql.push_str(&columns.join(", "));
+            sql.push(')');
+        }
+
+        sql.push_str(" AS ");
+        sql.push_str(&self.select_to_sql(&create.query));
+
+        sql
     }
 
     fn compile_create_trigger(&mut self, create: &CreateTriggerStmt) -> Result<Vec<VdbeOp>> {
@@ -2130,9 +2253,43 @@ impl<'s> StatementCompiler<'s> {
         }
     }
 
-    /// Convert SELECT to SQL (simplified - handles SelectCore from SelectBody)
+    /// Convert SELECT to SQL including ORDER BY and LIMIT
     fn select_to_sql(&self, select: &SelectStmt) -> String {
-        self.select_body_to_sql(&select.body)
+        use crate::parser::ast::{NullsOrder, SortOrder};
+        let mut sql = self.select_body_to_sql(&select.body);
+
+        // Add ORDER BY if present
+        if let Some(ref order_by) = select.order_by {
+            sql.push_str(" ORDER BY ");
+            let terms: Vec<String> = order_by
+                .iter()
+                .map(|term| {
+                    let mut s = self.expr_to_sql(&term.expr);
+                    if term.order == SortOrder::Desc {
+                        s.push_str(" DESC");
+                    }
+                    if term.nulls == NullsOrder::First {
+                        s.push_str(" NULLS FIRST");
+                    } else if term.nulls == NullsOrder::Last {
+                        s.push_str(" NULLS LAST");
+                    }
+                    s
+                })
+                .collect();
+            sql.push_str(&terms.join(", "));
+        }
+
+        // Add LIMIT if present
+        if let Some(ref limit) = select.limit {
+            sql.push_str(" LIMIT ");
+            sql.push_str(&self.expr_to_sql(&limit.limit));
+            if let Some(ref offset) = limit.offset {
+                sql.push_str(" OFFSET ");
+                sql.push_str(&self.expr_to_sql(offset));
+            }
+        }
+
+        sql
     }
 
     /// Convert SelectBody to SQL

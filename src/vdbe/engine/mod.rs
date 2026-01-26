@@ -1408,6 +1408,16 @@ impl Vdbe {
                                     trigger.sql.clone(),
                                 ));
                             }
+                            // Add views
+                            for (_, view) in schema_guard.views.iter() {
+                                entries.push((
+                                    "view".to_string(),
+                                    view.name.clone(),
+                                    view.name.clone(), // views have tbl_name = view name
+                                    0,                 // views don't have a root page
+                                    Some(view.sql.clone()),
+                                ));
+                            }
                         }
                     }
 
@@ -4838,6 +4848,46 @@ impl Vdbe {
                             }
                         }
                         // Continue to next opcode (trigger handled)
+                    } else if sql_upper.contains("CREATE VIEW")
+                        || sql_upper.contains("CREATE TEMP VIEW")
+                    {
+                        // Handle CREATE VIEW
+                        if let Some(ref schema) = self.schema {
+                            if let Ok(mut schema_guard) = schema.write() {
+                                if let Ok(stmt) = crate::parser::grammar::parse(sql) {
+                                    if let crate::parser::ast::Stmt::CreateView(create) = stmt {
+                                        let view_name_lower = create.name.name.to_lowercase();
+                                        let if_not_exists = create.if_not_exists;
+
+                                        // Check if view already exists
+                                        if schema_guard.views.contains_key(&view_name_lower) {
+                                            if !if_not_exists {
+                                                return Err(crate::error::Error::with_message(
+                                                    crate::error::ErrorCode::Error,
+                                                    format!(
+                                                        "view \"{}\" already exists",
+                                                        create.name.name
+                                                    ),
+                                                ));
+                                            }
+                                            // IF NOT EXISTS was specified, silently succeed
+                                        } else {
+                                            // Create view definition
+                                            let view = crate::schema::View {
+                                                name: create.name.name.clone(),
+                                                sql: sql.clone(),
+                                                columns: create.columns.clone(),
+                                                select: create.query,
+                                            };
+                                            schema_guard
+                                                .views
+                                                .insert(view_name_lower, std::sync::Arc::new(view));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Continue to next opcode (view handled)
                     } else if let Some(ref schema) = self.schema {
                         if let Ok(mut schema_guard) = schema.write() {
                             // Check if IF NOT EXISTS was specified

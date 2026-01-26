@@ -2326,43 +2326,63 @@ impl Vdbe {
                         );
                     }
                     *self.mem_mut(op.p3) = value;
-                } else if let Some(cursor) = self.cursor(op.p1) {
-                    // Check for deferred seek with alt-map redirection
-                    if cursor.deferred_moveto {
-                        if let (Some(alt_cursor_id), Some(ref alt_map)) =
-                            (cursor.alt_cursor, cursor.alt_map.as_ref())
-                        {
-                            // Check if this column is mapped to the alt cursor
-                            if let Some(&mapped_col) = alt_map.get(col_idx) {
-                                if mapped_col >= 0 {
-                                    // Read from alt cursor instead
-                                    if let Some(alt_cursor) = self.cursor(alt_cursor_id) {
-                                        // Get payload data from alt cursor
-                                        let payload_data =
-                                            if let Some(ref bt_cursor) = alt_cursor.btree_cursor {
-                                                bt_cursor.info.payload.clone()
-                                            } else {
-                                                alt_cursor.row_data.clone()
-                                            };
+                } else {
+                    // First, extract deferred seek info from immutable borrow
+                    let deferred_info = if let Some(cursor) = self.cursor(op.p1) {
+                        if cursor.deferred_moveto {
+                            let alt_cursor_id = cursor.alt_cursor;
+                            let alt_map = cursor.alt_map.clone();
+                            let moveto_target = cursor.moveto_target;
+                            Some((alt_cursor_id, alt_map, moveto_target))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
 
-                                        if let Some(ref data) = payload_data {
-                                            let mems = self.decode_record_mems(data);
-                                            if let Some(value) = mems.get(mapped_col as usize) {
-                                                *self.mem_mut(op.p3) = value.clone();
-                                            } else {
-                                                self.mem_mut(op.p3).set_null();
-                                            }
-                                            return Ok(ExecResult::Continue);
-                                        }
+                    // Handle deferred seek with alt-map redirection
+                    if let Some((alt_cursor_id, alt_map, moveto_target)) = deferred_info {
+                        // Check if this column is mapped to the alt cursor
+                        let mapped_col = alt_map
+                            .as_ref()
+                            .and_then(|m| m.get(col_idx).copied())
+                            .filter(|&c| c >= 0);
+
+                        if let (Some(alt_id), Some(mapped)) = (alt_cursor_id, mapped_col) {
+                            // Try to read from alt (index) cursor - needs mutable borrow
+                            let payload_data = if let Some(alt_cursor) = self.cursor_mut(alt_id) {
+                                if let Some(ref mut bt_cursor) = alt_cursor.btree_cursor {
+                                    // Use payload_fetch() or payload() like DeferredSeek does
+                                    if let Some(data) = bt_cursor.payload_fetch() {
+                                        Some(data.to_vec())
+                                    } else if let Ok(data) =
+                                        bt_cursor.payload(0, bt_cursor.payload_size())
+                                    {
+                                        Some(data)
+                                    } else {
+                                        None
                                     }
+                                } else {
+                                    alt_cursor.row_data.clone()
                                 }
+                            } else {
+                                None
+                            };
+
+                            if let Some(ref data) = payload_data {
+                                let mems = self.decode_record_mems(data);
+                                if let Some(value) = mems.get(mapped as usize) {
+                                    *self.mem_mut(op.p3) = value.clone();
+                                } else {
+                                    self.mem_mut(op.p3).set_null();
+                                }
+                                return Ok(ExecResult::Continue);
                             }
-                            // Column not in alt-map or mapped to -1, need to finish seek
-                            // Fall through to complete the deferred seek
                         }
 
-                        // Complete the deferred seek before reading from table cursor
-                        let target_rowid = cursor.moveto_target;
+                        // Column not in alt-map or couldn't read from index, finish deferred seek
+                        let target_rowid = moveto_target;
                         if let Some(rowid) = target_rowid {
                             if let Some(cursor) = self.cursor_mut(op.p1) {
                                 if let Some(ref mut bt_cursor) = cursor.btree_cursor {
@@ -2486,8 +2506,6 @@ impl Vdbe {
                     } else {
                         self.mem_mut(op.p3).set_null();
                     }
-                } else {
-                    self.mem_mut(op.p3).set_null();
                 }
             }
 

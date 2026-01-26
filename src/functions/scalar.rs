@@ -32,6 +32,12 @@ pub fn get_scalar_function(name: &str) -> Option<ScalarFunc> {
         "MIN" => Some(func_min),
         "ROUND" => Some(func_round),
         "SIGN" => Some(func_sign),
+        "LOG" | "LN" => Some(func_log),
+        "LOG10" => Some(func_log10),
+        "LOG2" => Some(func_log2),
+        "EXP" => Some(func_exp),
+        "SQRT" => Some(func_sqrt),
+        "POWER" | "POW" => Some(func_power),
 
         // String functions
         "LENGTH" => Some(func_length),
@@ -268,6 +274,177 @@ pub fn func_sign(args: &[Value]) -> Result<Value> {
             }
         }
         Value::Blob(_) => Ok(Value::Integer(0)),
+    }
+}
+
+/// log(X) - natural logarithm of X
+/// log(B, X) - logarithm of X to base B
+pub fn func_log(args: &[Value]) -> Result<Value> {
+    fn to_float(v: &Value) -> Option<f64> {
+        match v {
+            Value::Null => None,
+            Value::Integer(n) => Some(*n as f64),
+            Value::Real(f) => Some(*f),
+            Value::Text(s) => s.parse().ok(),
+            Value::Blob(_) => Some(0.0),
+        }
+    }
+
+    match args.len() {
+        1 => {
+            // log(X) - natural logarithm
+            let Some(x) = to_float(&args[0]) else {
+                return Ok(Value::Null);
+            };
+            if x <= 0.0 {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Real(x.ln()))
+            }
+        }
+        2 => {
+            // log(B, X) - log base B of X
+            let Some(base) = to_float(&args[0]) else {
+                return Ok(Value::Null);
+            };
+            let Some(x) = to_float(&args[1]) else {
+                return Ok(Value::Null);
+            };
+            if x <= 0.0 || base <= 0.0 || base == 1.0 {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Real(x.ln() / base.ln()))
+            }
+        }
+        _ => Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function log()",
+        )),
+    }
+}
+
+/// log10(X) - logarithm base 10
+pub fn func_log10(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function log10()",
+        ));
+    }
+
+    let x = match &args[0] {
+        Value::Null => return Ok(Value::Null),
+        Value::Integer(n) => *n as f64,
+        Value::Real(f) => *f,
+        Value::Text(s) => s.parse().unwrap_or(0.0),
+        Value::Blob(_) => 0.0,
+    };
+
+    if x <= 0.0 {
+        Ok(Value::Null)
+    } else {
+        Ok(Value::Real(x.log10()))
+    }
+}
+
+/// log2(X) - logarithm base 2
+pub fn func_log2(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function log2()",
+        ));
+    }
+
+    let x = match &args[0] {
+        Value::Null => return Ok(Value::Null),
+        Value::Integer(n) => *n as f64,
+        Value::Real(f) => *f,
+        Value::Text(s) => s.parse().unwrap_or(0.0),
+        Value::Blob(_) => 0.0,
+    };
+
+    if x <= 0.0 {
+        Ok(Value::Null)
+    } else {
+        Ok(Value::Real(x.log2()))
+    }
+}
+
+/// exp(X) - e raised to the power X
+pub fn func_exp(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function exp()",
+        ));
+    }
+
+    let x = match &args[0] {
+        Value::Null => return Ok(Value::Null),
+        Value::Integer(n) => *n as f64,
+        Value::Real(f) => *f,
+        Value::Text(s) => s.parse().unwrap_or(0.0),
+        Value::Blob(_) => 0.0,
+    };
+
+    Ok(Value::Real(x.exp()))
+}
+
+/// sqrt(X) - square root of X
+pub fn func_sqrt(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function sqrt()",
+        ));
+    }
+
+    let x = match &args[0] {
+        Value::Null => return Ok(Value::Null),
+        Value::Integer(n) => *n as f64,
+        Value::Real(f) => *f,
+        Value::Text(s) => s.parse().unwrap_or(0.0),
+        Value::Blob(_) => 0.0,
+    };
+
+    if x < 0.0 {
+        Ok(Value::Null)
+    } else {
+        Ok(Value::Real(x.sqrt()))
+    }
+}
+
+/// power(X, Y) - X raised to the power Y
+pub fn func_power(args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function power()",
+        ));
+    }
+
+    let x = match &args[0] {
+        Value::Null => return Ok(Value::Null),
+        Value::Integer(n) => *n as f64,
+        Value::Real(f) => *f,
+        Value::Text(s) => s.parse().unwrap_or(0.0),
+        Value::Blob(_) => 0.0,
+    };
+
+    let y = match &args[1] {
+        Value::Null => return Ok(Value::Null),
+        Value::Integer(n) => *n as f64,
+        Value::Real(f) => *f,
+        Value::Text(s) => s.parse().unwrap_or(0.0),
+        Value::Blob(_) => 0.0,
+    };
+
+    let result = x.powf(y);
+    if result.is_nan() || result.is_infinite() {
+        Ok(Value::Null)
+    } else {
+        Ok(Value::Real(result))
     }
 }
 

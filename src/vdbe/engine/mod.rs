@@ -1835,6 +1835,11 @@ impl Vdbe {
                             vtab_context = Some((None, None));
                         }
                     } else if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                        // Count Rewind as a search operation for index cursors
+                        // Table scan Rewind is not counted (it's not searching the structure)
+                        if cursor.is_index {
+                            inc_search_count();
+                        }
                         match bt_cursor.first() {
                             Ok(empty) => {
                                 is_empty = empty;

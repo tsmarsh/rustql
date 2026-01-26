@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::executor::where_clause::{
-    IndexInfo, QueryPlanner, TermOp, WhereInfo, WhereLevel, WherePlan,
+    IndexInfo, QueryPlanner, TermOp, WhereInfo, WhereLevel, WherePlan, WhereTermFlags,
 };
 use crate::executor::window::{select_has_window_functions, WindowCompiler};
 use crate::parser::ast::{
@@ -1081,23 +1081,7 @@ impl<'s> SelectCompiler<'s> {
                     );
                     next_labels.push(skip_label);
 
-                    // Mark the loop start
-                    let loop_label = self.alloc_label();
-                    self.resolve_label(loop_label, self.current_addr());
-                    loop_labels.push(loop_label);
-
-                    // DeferredSeek sets up table cursor to read from index
-                    // Build alt-map for covering index optimization
-                    let alt_map_p4 =
-                        if let Some(alt_map) = self.build_index_alt_map(cursor, index_name) {
-                            P4::IntArray(alt_map)
-                        } else {
-                            P4::Unused
-                        };
-                    self.emit(Opcode::DeferredSeek, cursor, 0, index_cursor, alt_map_p4);
-
-                    // Build range end key if we have an upper bound constraint
-                    // IdxGE expects key values in consecutive registers, not as a record
+                    // Build range end key BEFORE the loop so the check can be at loop start
                     let range_end_info = if let Some((_col_idx, op, term_idx)) = range_end {
                         // Find the range term's RHS expression
                         if let Some(info) = &where_info {
@@ -1136,8 +1120,56 @@ impl<'s> SelectCompiler<'s> {
                         None
                     };
 
+                    // Mark the loop start
+                    let loop_label = self.alloc_label();
+                    self.resolve_label(loop_label, self.current_addr());
+                    loop_labels.push(loop_label);
+
+                    // Check if we've gone past the equality key range BEFORE any column reads
+                    // This prevents unnecessary deferred seeks for out-of-range rows
+                    // The check is done at the top of the loop so that after Next advances,
+                    // we immediately exit if past range without triggering deferred seeks
+                    if *eq_cols > 0 {
+                        self.emit(
+                            Opcode::IdxGT,
+                            index_cursor,
+                            skip_label,
+                            key_base_reg,
+                            P4::Int64(*eq_cols as i64),
+                        );
+                    }
+
+                    // Also check range end bound at loop start (for upper bound constraints)
+                    if let Some((end_key_reg, end_key_count, op)) = &range_end_info {
+                        // For Lt (y < 100): terminate when y >= 100 -> use IdxGE
+                        // For Le (y <= 100): terminate when y > 100 -> use IdxGT
+                        let opcode = match op {
+                            TermOp::Lt => Opcode::IdxGE,
+                            TermOp::Le => Opcode::IdxGT,
+                            _ => Opcode::IdxGE,
+                        };
+                        self.emit(
+                            opcode,
+                            index_cursor,
+                            skip_label,
+                            *end_key_reg,
+                            P4::Int64(*end_key_count as i64),
+                        );
+                    }
+
+                    // DeferredSeek sets up table cursor to read from index
+                    // Build alt-map for covering index optimization
+                    let alt_map_p4 =
+                        if let Some(alt_map) = self.build_index_alt_map(cursor, index_name) {
+                            P4::IntArray(alt_map)
+                        } else {
+                            P4::Unused
+                        };
+                    self.emit(Opcode::DeferredSeek, cursor, 0, index_cursor, alt_map_p4);
+
                     scan_info.push((true, Some(index_cursor), key_base_reg, *eq_cols, false));
-                    range_end_keys.push(range_end_info);
+                    // Range end check is now at loop START, so mark as handled
+                    range_end_keys.push(None);
                 }
                 Some(WherePlan::IndexScan {
                     index_name,
@@ -1220,6 +1252,19 @@ impl<'s> SelectCompiler<'s> {
                     self.resolve_label(loop_label, self.current_addr());
                     loop_labels.push(loop_label);
 
+                    // Check range end bound at loop START to avoid unnecessary deferred seeks
+                    // for out-of-range rows. This check must happen before DeferredSeek.
+                    // For Lt (y < 100): terminate when y >= 100 -> use IdxGE
+                    // For Le (y <= 100): terminate when y > 100 -> use IdxGT
+                    if let Some(end_reg) = end_key_reg {
+                        let opcode = match &end_bound {
+                            Some((_, true)) => Opcode::IdxGE,  // strict < uses IdxGE
+                            Some((_, false)) => Opcode::IdxGT, // inclusive <= uses IdxGT
+                            _ => Opcode::IdxGE,
+                        };
+                        self.emit(opcode, index_cursor, skip_label, end_reg, P4::Int64(1));
+                    }
+
                     // DeferredSeek sets up table cursor to read from index
                     // Build alt-map for covering index optimization
                     let alt_map_p4 =
@@ -1233,14 +1278,8 @@ impl<'s> SelectCompiler<'s> {
                     // Store scan info (no equality keys for pure range scan)
                     scan_info.push((true, Some(index_cursor), 0, 0, false));
 
-                    // Store end bound info in range_end_keys
-                    // TermOp::Lt for strict (<), TermOp::Le for inclusive (<=)
-                    let range_end_info = match (&end_bound, end_key_reg) {
-                        (Some((_, true)), Some(reg)) => Some((reg, 1, TermOp::Lt)),
-                        (Some((_, false)), Some(reg)) => Some((reg, 1, TermOp::Le)),
-                        _ => None,
-                    };
-                    range_end_keys.push(range_end_info);
+                    // Range end check is now at loop START, so mark it as handled
+                    range_end_keys.push(None);
                 }
                 Some(WherePlan::RowidEq) => {
                     // Direct rowid lookup - find the rowid term and compile it
@@ -1359,8 +1398,19 @@ impl<'s> SelectCompiler<'s> {
         // Inner loop start is the innermost loop label
         let loop_start_label = *loop_labels.last().unwrap_or(&self.alloc_label());
 
-        // Evaluate WHERE clause
-        let where_skip_label = if let Some(where_expr) = remaining_where.as_ref() {
+        // Evaluate WHERE clause, filtering out terms consumed by index seeks
+        let where_skip_label = if let Some(info) = &where_info {
+            // Use optimized path: only compile terms not consumed by index seeks
+            let label = self.alloc_label();
+            let any_terms = self.compile_runtime_filter_terms(info, label)?;
+            if any_terms {
+                Some(label)
+            } else {
+                // All terms were consumed by index seeks, no runtime filter needed
+                None
+            }
+        } else if let Some(where_expr) = remaining_where.as_ref() {
+            // No query plan available, compile full WHERE clause
             let label = self.alloc_label();
             self.compile_where_condition(where_expr, label)?;
             Some(label)
@@ -1471,17 +1521,8 @@ impl<'s> SelectCompiler<'s> {
                             P4::Int64(*end_key_count as i64),
                         );
                     }
-                    if key_count > 0 {
-                        // Check if we've gone past the equality key range
-                        // IdxGT jumps to next_labels[loop_pos] if current index entry > key
-                        self.emit(
-                            Opcode::IdxGT,
-                            idx_cursor,
-                            next_labels[loop_pos],
-                            key_base_reg,
-                            P4::Int64(key_count as i64),
-                        );
-                    }
+                    // Note: IdxGT for equality key range check is now emitted at loop START
+                    // (before DeferredSeek) to avoid unnecessary deferred seeks for out-of-range rows
                     // Next on the index cursor, not the table cursor
                     self.emit(Opcode::Next, idx_cursor, loop_label, 0, P4::Unused);
                 }
@@ -3992,13 +4033,104 @@ impl<'s> SelectCompiler<'s> {
         }
     }
 
-    /// Compile WHERE condition
+    /// Compile WHERE condition with short-circuit evaluation
+    ///
+    /// For AND: evaluate left, jump to skip if false, then evaluate right
+    /// For OR: evaluate left, jump to success if true, then evaluate right
+    ///
+    /// This avoids unnecessary evaluation of the right side when the result
+    /// is already determined by the left side.
     fn compile_where_condition(&mut self, expr: &Expr, skip_label: i32) -> Result<()> {
-        let reg = self.alloc_reg();
-        self.compile_expr(expr, reg)?;
-        // If false (0), jump to skip_label
-        self.emit(Opcode::IfNot, reg, skip_label, 1, P4::Unused);
-        Ok(())
+        match expr {
+            // Short-circuit AND: if left is false, skip right entirely
+            Expr::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => {
+                // Evaluate left side - if false, jump to skip_label
+                self.compile_where_condition(left, skip_label)?;
+                // If we get here, left was true - now evaluate right side
+                self.compile_where_condition(right, skip_label)?;
+                Ok(())
+            }
+
+            // Short-circuit OR: if left is true, skip right entirely
+            Expr::Binary {
+                op: BinaryOp::Or,
+                left,
+                right,
+            } => {
+                // For OR, we need a "success" label to jump to when left is true
+                let success_label = self.alloc_label();
+
+                // Evaluate left side
+                let left_reg = self.alloc_reg();
+                self.compile_expr(left, left_reg)?;
+                // If left is true (non-zero), jump to success
+                self.emit(Opcode::If, left_reg, success_label, 0, P4::Unused);
+
+                // Left was false, evaluate right side
+                let right_reg = self.alloc_reg();
+                self.compile_expr(right, right_reg)?;
+                // If right is also false, jump to skip_label
+                self.emit(Opcode::IfNot, right_reg, skip_label, 1, P4::Unused);
+
+                // Either left was true (jumped here) or right was true (fell through)
+                self.resolve_label(success_label, self.current_addr());
+                Ok(())
+            }
+
+            // For parentheses, unwrap and recurse
+            Expr::Parens(inner) => self.compile_where_condition(inner, skip_label),
+
+            // For all other expressions, compile normally and check result
+            _ => {
+                let reg = self.alloc_reg();
+                self.compile_expr(expr, reg)?;
+                // If false (0), jump to skip_label
+                self.emit(Opcode::IfNot, reg, skip_label, 1, P4::Unused);
+                Ok(())
+            }
+        }
+    }
+
+    /// Compile only the runtime filter terms from WhereInfo
+    ///
+    /// This skips terms that were consumed by index seeks, avoiding
+    /// redundant re-evaluation of conditions already satisfied by the index.
+    /// Terms are compiled with short-circuit AND evaluation.
+    fn compile_runtime_filter_terms(
+        &mut self,
+        where_info: &WhereInfo,
+        skip_label: i32,
+    ) -> Result<bool> {
+        // Collect term indices that were consumed by index seeks
+        let consumed_terms: std::collections::HashSet<i32> = where_info
+            .levels
+            .iter()
+            .flat_map(|level| level.used_terms.iter().copied())
+            .collect();
+
+        // Compile each non-consumed term with short-circuit AND
+        let mut any_compiled = false;
+        for term in &where_info.terms {
+            if consumed_terms.contains(&term.idx) {
+                // This term was consumed by an index seek, skip runtime evaluation
+                continue;
+            }
+
+            // Skip virtual terms (internal use only)
+            if term.flags.contains(WhereTermFlags::VIRTUAL) {
+                continue;
+            }
+
+            // Compile this term - if false, jump to skip_label
+            self.compile_where_condition(&term.expr, skip_label)?;
+            any_compiled = true;
+        }
+
+        Ok(any_compiled)
     }
 
     fn split_virtual_filter(&self, expr: &Expr) -> (Option<Fts3MatchFilter>, Option<Expr>) {

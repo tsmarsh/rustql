@@ -1097,7 +1097,8 @@ impl QueryPlanner {
                         usable_range_terms.push(term);
                     }
                     total_selectivity *= term.selectivity;
-                    level.used_terms.push(term.idx);
+                    // Note: used_terms is populated AFTER choosing the best plan,
+                    // to only include terms actually consumed by the chosen index
                 }
             }
         }
@@ -1124,11 +1125,14 @@ impl QueryPlanner {
             let has_range =
                 self.index_has_range_match(index, &usable_range_terms, table_idx, eq_match_count);
 
-            // Find range termination term (Lt or Le on the column after eq columns)
-            let range_end = if has_range && eq_match_count > 0 {
-                let next_idx = eq_match_count as usize;
-                if next_idx < index.columns.len() {
-                    let col_idx = index.columns[next_idx];
+            // Find range termination term (Lt or Le on the column after eq columns,
+            // or on the first column for pure range scans)
+            let range_end = if has_range {
+                // For eq_cols > 0: range is on column after eq prefix
+                // For eq_cols = 0: range is on first column
+                let range_col_idx = eq_match_count as usize;
+                if range_col_idx < index.columns.len() {
+                    let col_idx = index.columns[range_col_idx];
                     usable_range_terms.iter().find_map(|t| {
                         if t.left_col
                             .is_some_and(|(ti, ci)| ti == table_idx as i32 && ci == col_idx)
@@ -1151,11 +1155,14 @@ impl QueryPlanner {
                 None
             };
 
-            // Find range start term (Gt or Ge on the column after eq columns)
-            let range_start = if has_range && eq_match_count > 0 {
-                let next_idx = eq_match_count as usize;
-                if next_idx < index.columns.len() {
-                    let col_idx = index.columns[next_idx];
+            // Find range start term (Gt or Ge on the column after eq columns,
+            // or on the first column for pure range scans)
+            let range_start = if has_range {
+                // For eq_cols > 0: range is on column after eq prefix
+                // For eq_cols = 0: range is on first column
+                let range_col_idx = eq_match_count as usize;
+                if range_col_idx < index.columns.len() {
+                    let col_idx = index.columns[range_col_idx];
                     usable_range_terms.iter().find_map(|t| {
                         if t.left_col
                             .is_some_and(|(ti, ci)| ti == table_idx as i32 && ci == col_idx)
@@ -1243,9 +1250,87 @@ impl QueryPlanner {
             _ => table.estimated_rows as f64 * total_selectivity,
         };
 
-        level.plan = best_plan;
+        level.plan = best_plan.clone();
         level.rows_out = output_rows.max(1.0);
         level.cost = best_cost * rows_in;
+
+        // Now populate used_terms based on the chosen plan
+        // Only add terms that are actually consumed by the index seek
+        match &best_plan {
+            WherePlan::IndexScan {
+                index_name,
+                eq_cols,
+                range_end,
+                range_start,
+                ..
+            } => {
+                // Find the index to get its columns
+                if let Some(index) = table.indexes.iter().find(|i| i.name == *index_name) {
+                    // Add equality terms that match the first eq_cols columns
+                    // Check both left_col and right_col for join conditions like x=q
+                    for i in 0..*eq_cols as usize {
+                        if i < index.columns.len() {
+                            let col_idx = index.columns[i];
+                            for term in &usable_eq_terms {
+                                // Check if left column matches this table's index column
+                                let left_matches = term.left_col.is_some_and(|(ti, ci)| {
+                                    ti == table_idx as i32 && ci == col_idx
+                                });
+                                // Check if right column matches (for join conditions)
+                                let right_matches = term.right_col.is_some_and(|(ti, ci)| {
+                                    ti == table_idx as i32 && ci == col_idx
+                                });
+                                if left_matches || right_matches {
+                                    level.used_terms.push(term.idx);
+                                }
+                            }
+                        }
+                    }
+                    // Add range terms if they're used for seeking/termination
+                    if let Some((_, _, term_idx)) = range_end {
+                        level.used_terms.push(*term_idx);
+                    }
+                    if let Some((_, _, term_idx)) = range_start {
+                        level.used_terms.push(*term_idx);
+                    }
+                }
+            }
+            WherePlan::RowidEq => {
+                // Add the rowid equality term
+                for term in &usable_eq_terms {
+                    if let Some((ti, ci)) = term.left_col {
+                        if ti == table_idx as i32 && ci == -1 {
+                            level.used_terms.push(term.idx);
+                        }
+                    }
+                }
+            }
+            WherePlan::PrimaryKey { eq_cols } => {
+                // Add primary key equality terms
+                let mut count = 0;
+                for term in &usable_eq_terms {
+                    if let Some((ti, ci)) = term.left_col {
+                        if ti == table_idx as i32 && ci == -1 && count < *eq_cols {
+                            level.used_terms.push(term.idx);
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            WherePlan::RowidRange { .. } => {
+                // Add rowid range terms
+                for term in &usable_range_terms {
+                    if let Some((ti, ci)) = term.left_col {
+                        if ti == table_idx as i32 && ci == -1 {
+                            level.used_terms.push(term.idx);
+                        }
+                    }
+                }
+            }
+            WherePlan::FullScan => {
+                // No terms consumed
+            }
+        }
 
         Ok((level.cost, level))
     }

@@ -1108,16 +1108,19 @@ impl Vdbe {
             // ================================================================
             Opcode::Eq => {
                 // P5 flags: SQLITE_NULLEQ (0x80) means NULL==NULL is true
+                // P5 lower bits contain affinity
+                use crate::vdbe::ops::cmp_flags;
                 let left = self.mem(op.p1);
                 let right = self.mem(op.p3);
                 let nulleq = (op.p5 & 0x80) != 0;
+                let affinity = op.p5 & cmp_flags::AFFINITY_MASK;
 
                 // In standard SQL, comparing with NULL yields unknown (no jump)
                 // unless NULLEQ flag is set
                 if !nulleq && (left.is_null() || right.is_null()) {
                     // No jump - comparison with NULL is unknown
                 } else {
-                    let cmp = left.compare(right);
+                    let cmp = left.compare_with_affinity(right, affinity);
                     if cmp == Ordering::Equal {
                         self.pc = op.p2;
                     }
@@ -1127,11 +1130,13 @@ impl Vdbe {
             Opcode::Ne => {
                 // P5 flags: SQLITE_NULLEQ (0x80) means NULL==NULL is true
                 //           JUMPIFNULL (0x10) means jump if either operand is NULL
+                //           Lower bits contain affinity
                 use crate::vdbe::ops::cmp_flags;
                 let left = self.mem(op.p1);
                 let right = self.mem(op.p3);
                 let nulleq = (op.p5 & 0x80) != 0;
                 let jumpifnull = (op.p5 & cmp_flags::JUMPIFNULL) != 0;
+                let affinity = op.p5 & cmp_flags::AFFINITY_MASK;
 
                 // In standard SQL, comparing with NULL yields unknown (no jump)
                 // unless NULLEQ or JUMPIFNULL flag is set
@@ -1145,7 +1150,7 @@ impl Vdbe {
                         }
                     }
                 } else {
-                    let cmp = left.compare(right);
+                    let cmp = left.compare_with_affinity(right, affinity);
                     if cmp != Ordering::Equal {
                         self.pc = op.p2;
                     }
@@ -1160,6 +1165,7 @@ impl Vdbe {
                 let left = self.mem(op.p3);
                 let right = self.mem(op.p1);
                 let jumpifnull = (op.p5 & cmp_flags::JUMPIFNULL) != 0;
+                let affinity = op.p5 & cmp_flags::AFFINITY_MASK;
 
                 if left.is_null() || right.is_null() {
                     if jumpifnull {
@@ -1167,7 +1173,7 @@ impl Vdbe {
                     }
                     // Otherwise: standard SQL - result is unknown, no jump
                 } else {
-                    let cmp = left.compare(right);
+                    let cmp = left.compare_with_affinity(right, affinity);
                     if cmp == Ordering::Less {
                         self.pc = op.p2;
                     }
@@ -1181,13 +1187,14 @@ impl Vdbe {
                 let left = self.mem(op.p3);
                 let right = self.mem(op.p1);
                 let jumpifnull = (op.p5 & cmp_flags::JUMPIFNULL) != 0;
+                let affinity = op.p5 & cmp_flags::AFFINITY_MASK;
 
                 if left.is_null() || right.is_null() {
                     if jumpifnull {
                         self.pc = op.p2;
                     }
                 } else {
-                    let cmp = left.compare(right);
+                    let cmp = left.compare_with_affinity(right, affinity);
                     if cmp != Ordering::Greater {
                         self.pc = op.p2;
                     }
@@ -1201,13 +1208,14 @@ impl Vdbe {
                 let left = self.mem(op.p3);
                 let right = self.mem(op.p1);
                 let jumpifnull = (op.p5 & cmp_flags::JUMPIFNULL) != 0;
+                let affinity = op.p5 & cmp_flags::AFFINITY_MASK;
 
                 if left.is_null() || right.is_null() {
                     if jumpifnull {
                         self.pc = op.p2;
                     }
                 } else {
-                    let cmp = left.compare(right);
+                    let cmp = left.compare_with_affinity(right, affinity);
                     if cmp == Ordering::Greater {
                         self.pc = op.p2;
                     }
@@ -1221,13 +1229,14 @@ impl Vdbe {
                 let left = self.mem(op.p3);
                 let right = self.mem(op.p1);
                 let jumpifnull = (op.p5 & cmp_flags::JUMPIFNULL) != 0;
+                let affinity = op.p5 & cmp_flags::AFFINITY_MASK;
 
                 if left.is_null() || right.is_null() {
                     if jumpifnull {
                         self.pc = op.p2;
                     }
                 } else {
-                    let cmp = left.compare(right);
+                    let cmp = left.compare_with_affinity(right, affinity);
                     if cmp != Ordering::Less {
                         self.pc = op.p2;
                     }

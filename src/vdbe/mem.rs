@@ -681,6 +681,107 @@ impl Mem {
         }
     }
 
+    /// Compare with another memory cell using affinity
+    /// affinity: 0=BLOB (type ordering), 1=TEXT, 2=NUMERIC, 3=INTEGER, 4=REAL
+    pub fn compare_with_affinity(&self, other: &Mem, affinity: u16) -> Ordering {
+        // NULL handling
+        if self.is_null() && other.is_null() {
+            return Ordering::Equal;
+        }
+        if self.is_null() {
+            return Ordering::Less;
+        }
+        if other.is_null() {
+            return Ordering::Greater;
+        }
+
+        // Same-type comparisons don't need affinity handling
+        match (self.column_type(), other.column_type()) {
+            (ColumnType::Integer, ColumnType::Integer) => return self.i.cmp(&other.i),
+            (ColumnType::Float, ColumnType::Float) => {
+                return self.r.partial_cmp(&other.r).unwrap_or(Ordering::Equal)
+            }
+            (ColumnType::Text, ColumnType::Text) => return self.data.cmp(&other.data),
+            (ColumnType::Blob, ColumnType::Blob) => return self.data.cmp(&other.data),
+            (ColumnType::Integer, ColumnType::Float) => {
+                return compare_int_to_real(self.i, other.r)
+            }
+            (ColumnType::Float, ColumnType::Integer) => {
+                return compare_int_to_real(other.i, self.r).reverse()
+            }
+            _ => {}
+        }
+
+        // Mixed type comparison - behavior depends on affinity
+        // affinity 0 (BLOB) = use type ordering
+        // affinity 2+ (NUMERIC/INTEGER/REAL) = try numeric conversion
+        let use_numeric_conversion = affinity >= 2;
+
+        match (self.column_type(), other.column_type()) {
+            (ColumnType::Text, ColumnType::Integer | ColumnType::Float) => {
+                if use_numeric_conversion {
+                    // Try to parse text as number
+                    let text_trimmed = self.to_str().trim().to_string();
+                    if let Ok(self_int) = text_trimmed.parse::<i64>() {
+                        return match other.column_type() {
+                            ColumnType::Integer => self_int.cmp(&other.i),
+                            ColumnType::Float => (self_int as f64)
+                                .partial_cmp(&other.r)
+                                .unwrap_or(Ordering::Equal),
+                            _ => Ordering::Greater,
+                        };
+                    } else if let Ok(self_real) = text_trimmed.parse::<f64>() {
+                        return match other.column_type() {
+                            ColumnType::Integer => self_real
+                                .partial_cmp(&(other.i as f64))
+                                .unwrap_or(Ordering::Equal),
+                            ColumnType::Float => {
+                                self_real.partial_cmp(&other.r).unwrap_or(Ordering::Equal)
+                            }
+                            _ => Ordering::Greater,
+                        };
+                    }
+                }
+                // Use type ordering: TEXT > INTEGER/FLOAT
+                Ordering::Greater
+            }
+            (ColumnType::Integer | ColumnType::Float, ColumnType::Text) => {
+                if use_numeric_conversion {
+                    // Try to parse text as number
+                    let text_trimmed = other.to_str().trim().to_string();
+                    if let Ok(other_int) = text_trimmed.parse::<i64>() {
+                        return match self.column_type() {
+                            ColumnType::Integer => self.i.cmp(&other_int),
+                            ColumnType::Float => self
+                                .r
+                                .partial_cmp(&(other_int as f64))
+                                .unwrap_or(Ordering::Equal),
+                            _ => Ordering::Less,
+                        };
+                    } else if let Ok(other_real) = text_trimmed.parse::<f64>() {
+                        return match self.column_type() {
+                            ColumnType::Integer => (self.i as f64)
+                                .partial_cmp(&other_real)
+                                .unwrap_or(Ordering::Equal),
+                            ColumnType::Float => {
+                                self.r.partial_cmp(&other_real).unwrap_or(Ordering::Equal)
+                            }
+                            _ => Ordering::Less,
+                        };
+                    }
+                }
+                // Use type ordering: INTEGER/FLOAT < TEXT
+                Ordering::Less
+            }
+            // Blob vs other types
+            (ColumnType::Text, ColumnType::Blob) => Ordering::Less,
+            (ColumnType::Blob, ColumnType::Text) => Ordering::Greater,
+            (ColumnType::Integer | ColumnType::Float, ColumnType::Blob) => Ordering::Less,
+            (ColumnType::Blob, ColumnType::Integer | ColumnType::Float) => Ordering::Greater,
+            _ => Ordering::Equal,
+        }
+    }
+
     /// Compare with another memory cell using a collation sequence
     pub fn compare_with_collation(&self, other: &Mem, collation: &str) -> Ordering {
         // NULL handling

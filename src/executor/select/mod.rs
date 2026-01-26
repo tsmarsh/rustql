@@ -21,7 +21,7 @@ use crate::parser::ast::{
     SelectStmt, SortOrder, TableRef, WithClause,
 };
 use crate::schema::{Affinity, Table};
-use crate::vdbe::ops::{Opcode, VdbeOp, P4};
+use crate::vdbe::ops::{affinity as vdbe_affinity, Opcode, VdbeOp, P4};
 
 // ============================================================================
 // Select Compiler State
@@ -2474,6 +2474,87 @@ impl<'s> SelectCompiler<'s> {
             .unwrap_or(false)
     }
 
+    /// Get the affinity for a comparison operation.
+    /// If either operand is a column with numeric affinity (INTEGER, REAL, NUMERIC),
+    /// returns NUMERIC affinity to enable type coercion.
+    /// Otherwise returns BLOB (0) for strict type ordering.
+    fn get_comparison_affinity(&self, left: &Expr, right: &Expr) -> u16 {
+        let left_affinity = self.get_expr_affinity(left);
+        let right_affinity = self.get_expr_affinity(right);
+
+        // If either side has numeric affinity, use NUMERIC for coercion
+        if Self::is_numeric_affinity(left_affinity) || Self::is_numeric_affinity(right_affinity) {
+            vdbe_affinity::NUMERIC
+        } else {
+            vdbe_affinity::BLOB
+        }
+    }
+
+    /// Get the affinity of an expression (for comparison purposes).
+    /// Returns Some(Affinity) if the expression is a column with known affinity.
+    fn get_expr_affinity(&self, expr: &Expr) -> Option<Affinity> {
+        match expr {
+            Expr::Column(col_ref) => self.get_column_affinity(col_ref),
+            Expr::Parens(inner) => self.get_expr_affinity(inner),
+            Expr::Cast { type_name, .. } => Some(Self::type_name_to_affinity(&type_name.name)),
+            // Literals have their natural type, not numeric affinity for coercion purposes
+            _ => None,
+        }
+    }
+
+    /// Get the affinity of a column reference.
+    fn get_column_affinity(&self, col_ref: &ColumnRef) -> Option<Affinity> {
+        // Find the table for this column
+        let tables_to_search: Vec<_> = if let Some(table_name) = &col_ref.table {
+            self.tables
+                .iter()
+                .filter(|t| Self::table_name_matches(t, table_name))
+                .collect()
+        } else {
+            // Search all tables for unqualified column
+            self.tables.iter().collect()
+        };
+
+        for table in tables_to_search {
+            if let Some(schema_table) = &table.schema_table {
+                for col in &schema_table.columns {
+                    if col.name.eq_ignore_ascii_case(&col_ref.column) {
+                        return Some(col.affinity);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Check if an affinity is numeric (INTEGER, REAL, or NUMERIC)
+    fn is_numeric_affinity(affinity: Option<Affinity>) -> bool {
+        matches!(
+            affinity,
+            Some(Affinity::Integer) | Some(Affinity::Real) | Some(Affinity::Numeric)
+        )
+    }
+
+    /// Convert a type name to an affinity
+    fn type_name_to_affinity(type_name: &str) -> Affinity {
+        let upper = type_name.to_uppercase();
+        if upper.contains("INT") {
+            Affinity::Integer
+        } else if upper.contains("CHAR")
+            || upper.contains("CLOB")
+            || upper.contains("TEXT")
+            || upper.contains("VARCHAR")
+        {
+            Affinity::Text
+        } else if upper.contains("BLOB") || upper.is_empty() {
+            Affinity::Blob
+        } else if upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB") {
+            Affinity::Real
+        } else {
+            Affinity::Numeric
+        }
+    }
+
     /// Build a QueryPlanner from the current table metadata
     fn build_query_planner(&self) -> Option<QueryPlanner> {
         let mut planner = QueryPlanner::new();
@@ -4412,6 +4493,11 @@ impl<'s> SelectCompiler<'s> {
                 let is_is_comparison = matches!(op, BinaryOp::Is | BinaryOp::IsNot);
 
                 if is_comparison || is_is_comparison {
+                    // Determine affinity for comparison based on operand types
+                    // If either operand is a column with numeric affinity, use NUMERIC (2)
+                    // Otherwise use BLOB (0) for type ordering
+                    let cmp_affinity = self.get_comparison_affinity(left, right);
+
                     // Comparison opcodes are jump-based: Eq P1 P2 P3 means
                     // "if r[P1] == r[P3], jump to P2"
                     // We need to produce a 0/1 boolean result in dest_reg
@@ -4462,7 +4548,15 @@ impl<'s> SelectCompiler<'s> {
                         // Compare: if condition is true, jump to true_label
                         // Comparison opcode format: P1=right operand, P2=jump target, P3=left operand
                         // Lt P1 P2 P3 means "jump to P2 if r[P3] < r[P1]"
-                        self.emit(cmp_opcode, right_reg, true_label, left_reg, P4::Unused);
+                        // P5 contains affinity for type coercion
+                        self.emit_with_p5(
+                            cmp_opcode,
+                            right_reg,
+                            true_label,
+                            left_reg,
+                            P4::Unused,
+                            cmp_affinity,
+                        );
 
                         // Fall through means false - goto end
                         self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
@@ -4939,12 +5033,31 @@ impl<'s> SelectCompiler<'s> {
                 let fail_label = self.alloc_label();
                 let end_label = self.alloc_label();
 
+                // Determine affinity for comparisons
+                // Use the combined affinity from val_expr, low, and high
+                let low_affinity = self.get_comparison_affinity(val_expr, low);
+                let high_affinity = self.get_comparison_affinity(val_expr, high);
+
                 // Check val >= low (fail if val < low)
                 // Lt P1 P2 P3 jumps if r[P3] < r[P1], so P1=low, P3=val
-                self.emit(Opcode::Lt, low_reg, fail_label, val_reg, P4::Unused);
+                self.emit_with_p5(
+                    Opcode::Lt,
+                    low_reg,
+                    fail_label,
+                    val_reg,
+                    P4::Unused,
+                    low_affinity,
+                );
                 // Check val <= high (fail if val > high)
                 // Gt P1 P2 P3 jumps if r[P3] > r[P1], so P1=high, P3=val
-                self.emit(Opcode::Gt, high_reg, fail_label, val_reg, P4::Unused);
+                self.emit_with_p5(
+                    Opcode::Gt,
+                    high_reg,
+                    fail_label,
+                    val_reg,
+                    P4::Unused,
+                    high_affinity,
+                );
 
                 // Success - in range
                 self.emit(

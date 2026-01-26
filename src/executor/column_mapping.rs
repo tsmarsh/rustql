@@ -131,9 +131,13 @@ impl ColumnMapper {
 
             match found {
                 Some(target_idx) => {
-                    // Check if this column already has a source
-                    // (shouldn't happen with valid SQL, but be safe)
-                    mapping[target_idx] = ColumnSource::SourceIndex(src_idx);
+                    // For duplicate column names, use the FIRST occurrence
+                    // (SQLite behavior: later duplicates are ignored for data,
+                    // but the source values are still consumed)
+                    if matches!(mapping[target_idx], ColumnSource::Null) {
+                        mapping[target_idx] = ColumnSource::SourceIndex(src_idx);
+                    }
+                    // If already set, this is a duplicate - ignore it
                 }
                 None => {
                     return Err(crate::error::Error::with_message(

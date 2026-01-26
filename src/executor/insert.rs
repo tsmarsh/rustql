@@ -970,16 +970,30 @@ impl<'a> InsertCompiler<'a> {
         ))
     }
 
+    /// Get number of columns in the source table
+    fn get_source_table_column_count(&self, select: &SelectStmt) -> usize {
+        if let Ok(source_table) = self.get_source_table(select) {
+            if let Some(schema) = self.schema {
+                let table_lower = source_table.to_lowercase();
+                if let Some(table) = schema.tables.get(&table_lower) {
+                    return table.columns.len();
+                }
+            }
+        }
+        self.num_columns
+    }
+
     /// Get number of columns in SELECT result
     fn get_select_column_count(&self, select: &SelectStmt) -> usize {
         if let SelectBody::Select(core) = &select.body {
-            // For SELECT *, return all columns from target (num_columns)
+            // For SELECT *, return all columns from SOURCE table
             // For explicit columns, count them
             let mut count = 0;
             for col in &core.columns {
                 match col {
-                    ResultColumn::Star => return self.num_columns,
-                    ResultColumn::TableStar(_) => return self.num_columns,
+                    ResultColumn::Star | ResultColumn::TableStar(_) => {
+                        return self.get_source_table_column_count(select);
+                    }
                     ResultColumn::Expr { .. } => count += 1,
                 }
             }
@@ -995,8 +1009,9 @@ impl<'a> InsertCompiler<'a> {
             for col in &core.columns {
                 match col {
                     ResultColumn::Star | ResultColumn::TableStar(_) => {
-                        // For SELECT *, generate column references for all columns
-                        for i in 0..self.num_columns {
+                        // For SELECT *, generate column references for all columns in SOURCE table
+                        let source_col_count = self.get_source_table_column_count(select);
+                        for i in 0..source_col_count {
                             exprs.push(Expr::Column(crate::parser::ast::ColumnRef {
                                 database: None,
                                 table: None,
@@ -1161,6 +1176,10 @@ impl<'a> InsertCompiler<'a> {
                         return true;
                     }
                 }
+            } else {
+                // No FROM clause (e.g., SELECT 1, 2) - treat as complex
+                // to use the SelectCompiler which handles this case
+                return true;
             }
 
             // For now, treat any WHERE clause as potentially complex

@@ -1293,9 +1293,33 @@ impl QueryPlanner {
                 } else {
                     (table.estimated_rows as f64 * 0.33).max(1.0)
                 };
-                let cost = INDEX_SEEK_COST + rows * ROW_READ_COST;
 
-                if cost < best_cost {
+                // Calculate cost: seek + rows * read_cost
+                // Covering indexes avoid table lookup, so they're cheaper
+                let lookup_cost = if index.is_covering {
+                    0.0 // No table lookup needed
+                } else {
+                    rows * ROW_READ_COST * 0.5 // Table lookup cost
+                };
+                let cost = INDEX_SEEK_COST + rows * ROW_READ_COST + lookup_cost;
+
+                // Use index if cost is lower, or equal cost but better properties
+                let use_this_index = if cost < best_cost {
+                    true
+                } else if (cost - best_cost).abs() < 1.0 {
+                    // Tie-breaking: prefer covering indexes, then unique indexes
+                    match &best_plan {
+                        WherePlan::IndexScan { covering, .. } => {
+                            (index.is_covering && !covering)
+                                || (index.is_unique && eq_match_count == index.columns.len() as i32)
+                        }
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+
+                if use_this_index {
                     best_cost = cost;
                     best_plan = WherePlan::IndexScan {
                         index_name: index.name.clone(),
@@ -1306,6 +1330,9 @@ impl QueryPlanner {
                         range_start,
                     };
                     level.flags |= WhereLevelFlags::INDEXED;
+                    if index.is_covering {
+                        level.flags |= WhereLevelFlags::IDX_ONLY;
+                    }
                     if index.is_unique && eq_match_count == index.columns.len() as i32 {
                         level.flags |= WhereLevelFlags::UNIQUE;
                     }

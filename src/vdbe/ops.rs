@@ -514,6 +514,7 @@ impl Opcode {
                 | Opcode::SeekGT
                 | Opcode::SeekLE
                 | Opcode::SeekLT
+                | Opcode::SeekRowid
                 | Opcode::NotExists
                 | Opcode::Found
                 | Opcode::NotFound

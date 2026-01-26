@@ -142,6 +142,14 @@ pub enum WherePlan {
         /// End constraint (<=, <)
         has_end: bool,
     },
+
+    /// Rowid IN list (WHERE rowid IN (1, 2, 3))
+    /// Instead of scanning all rows and filtering, iterate through the IN values
+    /// and seek to each rowid directly.
+    RowidIn {
+        /// Index of the term containing the IN expression
+        term_idx: i32,
+    },
 }
 
 // ============================================================================
@@ -1221,6 +1229,33 @@ impl QueryPlanner {
             }
         }
 
+        // Check rowid IN (e.g., rowid IN (1, 2, 3))
+        // This is much more efficient than a full scan - we seek directly to each rowid
+        for term in self.where_clause.iter() {
+            if term.mask & table.mask != 0 && term.op == Some(TermOp::In) {
+                // Check if the IN is on rowid
+                if term.left_col == Some((table_idx as i32, -1)) {
+                    // Get the number of values in the IN list for cost estimation
+                    let values_count = if let Expr::In { list, .. } = term.expr.as_ref() {
+                        match list {
+                            crate::parser::ast::InList::Values(v) => v.len(),
+                            _ => 10, // Estimate for subqueries
+                        }
+                    } else {
+                        10
+                    };
+
+                    // Cost is proportional to number of values (each requires a seek)
+                    let cost = values_count as f64 * (INDEX_SEEK_COST + ROW_READ_COST);
+                    if cost < best_cost {
+                        best_cost = cost;
+                        best_plan = WherePlan::RowidIn { term_idx: term.idx };
+                    }
+                    break;
+                }
+            }
+        }
+
         // Check indexes
         for index in &table.indexes {
             let eq_match_count = self.count_index_eq_matches(index, &usable_eq_terms, table_idx);
@@ -1445,6 +1480,10 @@ impl QueryPlanner {
                         }
                     }
                 }
+            }
+            WherePlan::RowidIn { term_idx } => {
+                // Add the IN term
+                level.used_terms.push(*term_idx);
             }
             WherePlan::RowidRange { .. } => {
                 // Add rowid range terms

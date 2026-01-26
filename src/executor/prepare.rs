@@ -2826,6 +2826,12 @@ impl<'s> StatementCompiler<'s> {
             WherePlan::PrimaryKey { .. } => {
                 format!("SEARCH {} USING INTEGER PRIMARY KEY", display_name)
             }
+            WherePlan::RowidIn { .. } => {
+                format!(
+                    "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
+                    display_name
+                )
+            }
         }
     }
 

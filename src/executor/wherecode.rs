@@ -156,6 +156,12 @@ impl WhereCodeGen {
             WherePlan::RowidRange { has_start, has_end } => {
                 self.code_rowid_range(level_idx, level, *has_start, *has_end)?;
             }
+            WherePlan::RowidIn { term_idx } => {
+                // RowidIn is handled in select/mod.rs - this code path shouldn't be reached
+                // for normal SELECT queries, but add handling for completeness
+                self.code_full_scan(level_idx, level)?;
+                let _ = term_idx; // Suppress unused warning
+            }
         }
 
         // Generate code for remaining WHERE terms at this level

@@ -1981,7 +1981,20 @@ impl Vdbe {
                 }
                 // Jump to P2 if there are more rows
                 if has_more {
-                    inc_search_count(); // Count successful cursor movements only
+                    // Only count real B-tree cursor movements for search_count
+                    // (not ephemeral/virtual/schema tables)
+                    let is_btree_cursor = self
+                        .cursor(op.p1)
+                        .map(|c| {
+                            !c.is_ephemeral
+                                && !c.is_virtual
+                                && !c.is_sqlite_master
+                                && !c.is_sqlite_stat1
+                        })
+                        .unwrap_or(false);
+                    if is_btree_cursor {
+                        inc_search_count(); // Count real B-tree cursor movements only
+                    }
                     inc_step_count(); // Track fullscan step for "db status step"
                     self.pc = op.p2;
                 }

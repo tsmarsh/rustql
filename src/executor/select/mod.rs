@@ -1328,6 +1328,110 @@ impl<'s> SelectCompiler<'s> {
                     scan_info.push((false, None, 0, 0, true));
                     range_end_keys.push(None);
                 }
+                Some(WherePlan::RowidIn { term_idx }) => {
+                    // Rowid IN list - iterate through IN values and seek each rowid
+                    // This is much more efficient than a full scan for small IN lists
+
+                    // Find the IN term and get the values
+                    let in_term = where_info
+                        .as_ref()
+                        .and_then(|info| info.terms.get(*term_idx as usize));
+
+                    if let Some(term) = in_term {
+                        if let Expr::In { list, .. } = term.expr.as_ref() {
+                            if let crate::parser::ast::InList::Values(values) = list {
+                                // Create ephemeral table for the IN values
+                                // Using P3=1 for BTREE_UNORDERED to allow duplicates
+                                let eph_cursor = self.alloc_cursor();
+                                self.emit(Opcode::OpenEphemeral, eph_cursor, 1, 0, P4::Unused);
+
+                                // Populate ephemeral table with IN values as actual rows
+                                // Use Insert (not IdxInsert) so we can read back with Column
+                                let rowid_counter = self.alloc_reg();
+                                self.emit(Opcode::Integer, 0, rowid_counter, 0, P4::Unused);
+
+                                for value in values {
+                                    // Increment rowid counter
+                                    self.emit(Opcode::AddImm, rowid_counter, 1, 0, P4::Unused);
+
+                                    // Compile the value
+                                    let val_reg = self.alloc_reg();
+                                    self.compile_expr(value, val_reg)?;
+
+                                    // Create record with the value
+                                    let rec_reg = self.alloc_reg();
+                                    self.emit(Opcode::MakeRecord, val_reg, 1, rec_reg, P4::Unused);
+
+                                    // Insert as row with explicit rowid
+                                    self.emit(
+                                        Opcode::InsertInt,
+                                        eph_cursor,
+                                        rec_reg,
+                                        rowid_counter,
+                                        P4::Unused,
+                                    );
+                                }
+
+                                // Rewind on ephemeral table
+                                self.emit(Opcode::Rewind, eph_cursor, skip_label, 0, P4::Unused);
+                                next_labels.push(skip_label);
+
+                                // Mark the loop start
+                                let loop_label = self.alloc_label();
+                                self.resolve_label(loop_label, self.current_addr());
+                                loop_labels.push(loop_label);
+
+                                // Read the rowid value from ephemeral table column 0
+                                let rowid_reg = self.alloc_reg();
+                                self.emit(Opcode::Column, eph_cursor, 0, rowid_reg, P4::Unused);
+
+                                // Seek to the rowid in the main table
+                                // If not found, continue to next value
+                                let not_found_label = self.alloc_label();
+                                self.emit(
+                                    Opcode::SeekRowid,
+                                    cursor,
+                                    not_found_label,
+                                    rowid_reg,
+                                    P4::Unused,
+                                );
+
+                                // Store info for loop end generation
+                                // is_index_scan=false, index_cursor=Some(eph_cursor) for Next
+                                // Use a dummy tuple - only the first element (not_found_label) is used
+                                scan_info.push((false, Some(eph_cursor), 0, 0, false));
+                                range_end_keys.push(Some((not_found_label, 0, TermOp::Eq)));
+                            } else {
+                                // Subquery IN - fall back to full scan with filter
+                                self.emit(Opcode::Rewind, cursor, skip_label, 0, P4::Unused);
+                                next_labels.push(skip_label);
+                                let loop_label = self.alloc_label();
+                                self.resolve_label(loop_label, self.current_addr());
+                                loop_labels.push(loop_label);
+                                scan_info.push((false, None, 0, 0, false));
+                                range_end_keys.push(None);
+                            }
+                        } else {
+                            // Not an IN expression - fall back
+                            self.emit(Opcode::Rewind, cursor, skip_label, 0, P4::Unused);
+                            next_labels.push(skip_label);
+                            let loop_label = self.alloc_label();
+                            self.resolve_label(loop_label, self.current_addr());
+                            loop_labels.push(loop_label);
+                            scan_info.push((false, None, 0, 0, false));
+                            range_end_keys.push(None);
+                        }
+                    } else {
+                        // Term not found - fall back
+                        self.emit(Opcode::Rewind, cursor, skip_label, 0, P4::Unused);
+                        next_labels.push(skip_label);
+                        let loop_label = self.alloc_label();
+                        self.resolve_label(loop_label, self.current_addr());
+                        loop_labels.push(loop_label);
+                        scan_info.push((false, None, 0, 0, false));
+                        range_end_keys.push(None);
+                    }
+                }
                 Some(WherePlan::RowidRange {
                     has_start,
                     has_end: _,
@@ -1534,6 +1638,14 @@ impl<'s> SelectCompiler<'s> {
                     // Next on the index cursor, not the table cursor
                     self.emit(Opcode::Next, idx_cursor, loop_label, 0, P4::Unused);
                 }
+            } else if let Some(eph_cursor) = index_cursor {
+                // RowidIn case - index_cursor is the ephemeral table cursor
+                // First resolve the not_found_label so SeekRowid failures come here
+                if let Some(Some((not_found_label, _, _))) = range_end_keys.get(loop_pos) {
+                    self.resolve_label(*not_found_label, self.current_addr());
+                }
+                // Next on the ephemeral cursor to get next value from IN list
+                self.emit(Opcode::Next, eph_cursor, loop_label, 0, P4::Unused);
             } else {
                 // Full scan or rowid range - Next on table cursor
                 self.emit(Opcode::Next, cursor, loop_label, 0, P4::Unused);
@@ -3184,8 +3296,10 @@ impl<'s> SelectCompiler<'s> {
                         // Term is consumed by index seek - don't filter at runtime
                         return false;
                     }
-                    WherePlan::RowidEq | WherePlan::PrimaryKey { .. } => {
-                        // Term is consumed by rowid/pk lookup - don't filter at runtime
+                    WherePlan::RowidEq
+                    | WherePlan::PrimaryKey { .. }
+                    | WherePlan::RowidIn { .. } => {
+                        // Term is consumed by rowid/pk lookup or IN - don't filter at runtime
                         return false;
                     }
                     _ => {}

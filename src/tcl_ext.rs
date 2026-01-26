@@ -2429,6 +2429,18 @@ unsafe extern "C" fn db_cmd(
                         let step_count = crate::vdbe::get_step_count();
                         set_result_int(interp, step_count as i32);
                     }
+                    "search_count" => {
+                        // Return the search count (B-tree seeks)
+                        let search_count = crate::vdbe::get_search_count();
+                        set_result_int(interp, search_count as i32);
+                    }
+                    "reset" => {
+                        // Reset all counters
+                        crate::vdbe::reset_search_count();
+                        crate::vdbe::reset_sort_count();
+                        crate::vdbe::reset_step_count();
+                        set_result_string(interp, "");
+                    }
                     _ => {
                         // Other status queries return 0
                         set_result_int(interp, 0);

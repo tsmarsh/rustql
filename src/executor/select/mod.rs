@@ -2688,6 +2688,13 @@ impl<'s> SelectCompiler<'s> {
                             let index_cols: Vec<i32> =
                                 idx.columns.iter().map(|ic| ic.column_idx).collect();
 
+                            // An index is covering if it contains all table columns
+                            // This is a simple heuristic - full detection requires
+                            // knowing which columns the query actually needs
+                            let num_table_cols = schema_table.columns.len();
+                            let is_covering = index_cols.len() >= num_table_cols
+                                && (0..num_table_cols as i32).all(|c| index_cols.contains(&c));
+
                             planner.add_index(
                                 table_idx,
                                 IndexInfo {
@@ -2695,7 +2702,7 @@ impl<'s> SelectCompiler<'s> {
                                     columns: index_cols.clone(),
                                     is_primary: idx.is_primary_key,
                                     is_unique: idx.unique,
-                                    is_covering: false,
+                                    is_covering,
                                     stats: idx.stats.clone(),
                                 },
                             );
@@ -2719,6 +2726,11 @@ impl<'s> SelectCompiler<'s> {
                         continue;
                     }
 
+                    // Check if index covers all table columns
+                    let num_table_cols = schema_table.columns.len();
+                    let is_covering = index_cols.len() >= num_table_cols
+                        && (0..num_table_cols as i32).all(|c| index_cols.contains(&c));
+
                     planner.add_index(
                         table_idx,
                         IndexInfo {
@@ -2726,7 +2738,7 @@ impl<'s> SelectCompiler<'s> {
                             columns: index_cols,
                             is_primary: index.is_primary_key,
                             is_unique: index.unique,
-                            is_covering: false,
+                            is_covering,
                             stats: index.stats.clone(),
                         },
                     );

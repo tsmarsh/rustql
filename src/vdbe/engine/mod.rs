@@ -2998,12 +2998,20 @@ impl Vdbe {
                                     self.mem_mut(op.p3).set_str(&result);
                                 }
                             } else {
-                                self.mem_mut(op.p3).set_null();
+                                // Unknown function - return error
+                                return Err(crate::error::Error::with_message(
+                                    crate::error::ErrorCode::Error,
+                                    format!("no such function: {}", name),
+                                ));
                             }
                         }
                         #[cfg(not(feature = "tcl"))]
                         {
-                            self.mem_mut(op.p3).set_null();
+                            // Unknown function - return error
+                            return Err(crate::error::Error::with_message(
+                                crate::error::ErrorCode::Error,
+                                format!("no such function: {}", name),
+                            ));
                         }
                     }
                 } else {

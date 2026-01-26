@@ -390,6 +390,26 @@ unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         None,
     );
 
+    // Register sqlite3_exec
+    let cmd_name = CString::new("sqlite3_exec").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(sqlite3_exec_cmd),
+        std::ptr::null_mut(),
+        None,
+    );
+
+    // Register sqlite3_exec_hex
+    let cmd_name = CString::new("sqlite3_exec_hex").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(sqlite3_exec_hex_cmd),
+        std::ptr::null_mut(),
+        None,
+    );
+
     // Initialize sqlite_options array with capability flags
     // These flags tell the test harness which features are supported
     let sqlite_options = [
@@ -439,6 +459,7 @@ unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         ("threadsafe", "0"),
         ("threadsafe1", "0"),
         ("threadsafe2", "0"),
+        ("like_match_blobs", "0"), // LIKE does not match blobs
     ];
 
     let arr_name = CString::new("::sqlite_options").unwrap();
@@ -2218,6 +2239,195 @@ unsafe extern "C" fn sqlite3_txn_state_cmd(
 
     set_result_int(interp, state);
     TCL_OK
+}
+
+/// sqlite3_exec - execute SQL and return result code and results
+/// Usage: sqlite3_exec DB SQL
+/// Returns: {RESULT_CODE {results}}
+unsafe extern "C" fn sqlite3_exec_cmd(
+    _client_data: *mut std::ffi::c_void,
+    interp: *mut Tcl_Interp,
+    objc: c_int,
+    objv: *const *mut Tcl_Obj,
+) -> c_int {
+    if objc < 3 {
+        set_result_string(interp, "wrong # args: should be \"sqlite3_exec DB SQL\"");
+        return TCL_ERROR;
+    }
+
+    let db_name = obj_to_string(*objv.offset(1));
+    let sql = obj_to_string(*objv.offset(2));
+
+    // Execute the SQL and collect results
+    let (result_code, results) = CONNECTIONS.with(|connections| {
+        let mut conns = connections.borrow_mut();
+        if let Some(conn) = conns.get_mut(&db_name) {
+            let mut all_results: Vec<String> = Vec::new();
+
+            // Execute the SQL
+            match execute_sql_collecting_results(conn, &sql) {
+                Ok(rows) => {
+                    for row in rows {
+                        all_results.extend(row);
+                    }
+                    (0, all_results)
+                }
+                Err(_e) => (1, vec![]), // Error
+            }
+        } else {
+            (1, vec![]) // No such connection
+        }
+    });
+
+    // Create result list: {code {results}}
+    let result_str = if results.is_empty() {
+        format!("{} {{}}", result_code)
+    } else {
+        format!("{} {{{}}}", result_code, results.join(" "))
+    };
+    set_result_string(interp, &result_str);
+    TCL_OK
+}
+
+/// sqlite3_exec_hex - execute SQL with hex-encoded bytes
+/// Usage: sqlite3_exec_hex DB SQL
+/// Decodes %XX sequences in SQL before executing
+/// Returns: {RESULT_CODE {column_name value ...}}
+unsafe extern "C" fn sqlite3_exec_hex_cmd(
+    _client_data: *mut std::ffi::c_void,
+    interp: *mut Tcl_Interp,
+    objc: c_int,
+    objv: *const *mut Tcl_Obj,
+) -> c_int {
+    if objc < 3 {
+        set_result_string(
+            interp,
+            "wrong # args: should be \"sqlite3_exec_hex DB SQL\"",
+        );
+        return TCL_ERROR;
+    }
+
+    let db_name = obj_to_string(*objv.offset(1));
+    let sql_hex = obj_to_string(*objv.offset(2));
+
+    // Decode hex escapes in SQL: %XX -> byte
+    let sql = decode_hex_escapes(&sql_hex);
+
+    // Execute the SQL and collect results
+    let (result_code, results) = CONNECTIONS.with(|connections| {
+        let mut conns = connections.borrow_mut();
+        if let Some(conn) = conns.get_mut(&db_name) {
+            // Execute the SQL
+            match execute_sql_collecting_results(conn, &sql) {
+                Ok(rows) => {
+                    let mut all_results: Vec<String> = Vec::new();
+                    for row in rows {
+                        all_results.extend(row);
+                    }
+                    (0, all_results)
+                }
+                Err(_e) => (1, vec![]), // Error
+            }
+        } else {
+            (1, vec![]) // No such connection
+        }
+    });
+
+    // Create result list: {code {column value ...}}
+    let result_str = if results.is_empty() {
+        format!("{} {{}}", result_code)
+    } else {
+        format!("{} {{{}}}", result_code, results.join(" "))
+    };
+    set_result_string(interp, &result_str);
+    TCL_OK
+}
+
+/// Decode hex escapes (%XX) in a string
+fn decode_hex_escapes(s: &str) -> String {
+    let mut result = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            // Try to parse the next two chars as hex
+            let hex_str = &s[i + 1..i + 3];
+            if let Ok(byte) = u8::from_str_radix(hex_str, 16) {
+                result.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        result.push(bytes[i]);
+        i += 1;
+    }
+
+    String::from_utf8_lossy(&result).into_owned()
+}
+
+/// Execute SQL and collect all result rows
+fn execute_sql_collecting_results(
+    conn: &mut SqliteConnection,
+    sql: &str,
+) -> Result<Vec<Vec<String>>, crate::error::Error> {
+    use crate::types::StepResult;
+
+    let mut results = Vec::new();
+    let mut remaining = sql;
+
+    while !remaining.trim().is_empty() {
+        let trimmed = remaining.trim_start();
+
+        // Skip comments
+        if trimmed.starts_with("--") {
+            if let Some(pos) = trimmed.find('\n') {
+                remaining = &trimmed[pos + 1..];
+                continue;
+            } else {
+                break;
+            }
+        }
+
+        let (mut stmt, tail) = match sqlite3_prepare_v2(conn, remaining) {
+            Ok(r) => r,
+            Err(e) => return Err(e),
+        };
+
+        if stmt.sql().is_empty() {
+            remaining = tail;
+            continue;
+        }
+
+        // Step through results
+        loop {
+            match sqlite3_step(&mut stmt) {
+                Ok(StepResult::Row) => {
+                    let col_count = sqlite3_column_count(&stmt);
+                    let mut row = Vec::new();
+
+                    // Get column names and values
+                    for i in 0..col_count {
+                        let col_name = sqlite3_column_name(&stmt, i).unwrap_or("").to_string();
+                        let col_value = sqlite3_column_text(&stmt, i);
+                        row.push(col_name);
+                        row.push(col_value);
+                    }
+                    results.push(row);
+                }
+                Ok(StepResult::Done) => break,
+                Err(e) => {
+                    let _ = sqlite3_finalize(stmt);
+                    return Err(e);
+                }
+            }
+        }
+
+        let _ = sqlite3_finalize(stmt);
+        remaining = tail;
+    }
+
+    Ok(results)
 }
 
 /// working_64bit_int - returns 1 if platform supports 64-bit integers

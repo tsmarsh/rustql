@@ -721,11 +721,8 @@ fn pragma_case_sensitive_like(
     } else if let Some(value) = pragma_value_string(pragma) {
         conn.db_config.case_sensitive_like = parse_bool_value(&value);
     }
-    if pragma.value.is_none() {
-        return Ok(single_int_result(i64::from(
-            conn.db_config.case_sensitive_like,
-        )));
-    }
+    // SQLite's case_sensitive_like pragma does not return a value when queried
+    // (unlike most other pragmas). It only sets the value when given an argument.
     Ok(empty_result())
 }
 

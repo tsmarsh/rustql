@@ -2956,7 +2956,35 @@ impl Vdbe {
                             Err(e) => return Err(e),
                         }
                     } else {
-                        self.mem_mut(op.p3).set_null();
+                        // Check for user-defined TCL function
+                        #[cfg(feature = "tcl")]
+                        {
+                            let argc = op.p1.max(0) as usize;
+                            let arg_base = op.p2;
+                            let mut string_args = Vec::with_capacity(argc);
+                            for i in 0..argc {
+                                let mem = self.mem(arg_base + i as i32);
+                                string_args.push(mem.to_value().to_text());
+                            }
+                            if let Some(result) =
+                                crate::tcl_ext::call_tcl_user_function(name, &string_args)
+                            {
+                                // Try to parse as integer first, then float
+                                if let Ok(i) = result.parse::<i64>() {
+                                    self.mem_mut(op.p3).set_int(i);
+                                } else if let Ok(f) = result.parse::<f64>() {
+                                    self.mem_mut(op.p3).set_real(f);
+                                } else {
+                                    self.mem_mut(op.p3).set_str(&result);
+                                }
+                            } else {
+                                self.mem_mut(op.p3).set_null();
+                            }
+                        }
+                        #[cfg(not(feature = "tcl"))]
+                        {
+                            self.mem_mut(op.p3).set_null();
+                        }
                     }
                 } else {
                     self.mem_mut(op.p3).set_null();

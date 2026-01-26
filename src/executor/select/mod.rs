@@ -5052,9 +5052,14 @@ impl<'s> SelectCompiler<'s> {
                         func_call.name.eq_ignore_ascii_case("LAST_INSERT_ROWID")
                             || func_call.name.eq_ignore_ascii_case("CHANGES")
                             || func_call.name.eq_ignore_ascii_case("TOTAL_CHANGES");
+                    #[cfg(feature = "tcl")]
+                    let is_tcl_function = crate::tcl_ext::has_tcl_user_function(&func_call.name);
+                    #[cfg(not(feature = "tcl"))]
+                    let is_tcl_function = false;
                     let is_known_function = is_aggregate
                         || is_connection_function
-                        || crate::functions::get_scalar_function(&func_call.name).is_some();
+                        || crate::functions::get_scalar_function(&func_call.name).is_some()
+                        || is_tcl_function;
                     if !is_known_function {
                         return Err(Error::with_message(
                             ErrorCode::Error,

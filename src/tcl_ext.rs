@@ -36,6 +36,10 @@ thread_local! {
     static CONNECTIONS: RefCell<HashMap<String, Box<SqliteConnection>>> = RefCell::new(HashMap::new());
     // Per-connection null value representation (default is empty string)
     static NULL_VALUES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    // Current TCL interpreter for user function callbacks
+    static CURRENT_INTERP: RefCell<Option<*mut Tcl_Interp>> = const { RefCell::new(None) };
+    // User-defined TCL functions per connection: (db_name, func_name) -> tcl_proc_name
+    static USER_FUNCTIONS: RefCell<HashMap<(String, String), String>> = RefCell::new(HashMap::new());
 }
 
 /// Initialize the extension - called by TCL when loading
@@ -2456,8 +2460,17 @@ unsafe extern "C" fn db_cmd(
             TCL_OK
         }
         "function" | "func" => {
-            // Register a custom SQL function - stub for now
+            // Register a custom SQL function
             // Usage: db func name proc
+            if objc >= 4 {
+                let func_name = obj_to_string(*objv.offset(2));
+                let proc_name = obj_to_string(*objv.offset(3));
+                USER_FUNCTIONS.with(|funcs| {
+                    funcs
+                        .borrow_mut()
+                        .insert((db_name.to_string(), func_name.to_lowercase()), proc_name);
+                });
+            }
             TCL_OK
         }
         "collate"
@@ -2561,6 +2574,9 @@ unsafe fn db_eval(
     reset_search_count();
     reset_sort_count();
     reset_step_count();
+
+    // Set the current interpreter for user function callbacks
+    set_current_interp(interp);
 
     let sql = obj_to_string(*objv.offset(2));
 
@@ -2784,6 +2800,8 @@ unsafe fn db_eval(
         update_search_count_var(interp);
         update_sort_count_var(interp);
 
+        // Clear the interpreter context
+        clear_current_interp();
         result
     }
 }
@@ -2994,6 +3012,84 @@ unsafe fn set_result_int(interp: *mut Tcl_Interp, i: i32) {
     Tcl_SetObjResult(interp, obj);
 }
 
+/// Set the current TCL interpreter for user function callbacks
+pub fn set_current_interp(interp: *mut Tcl_Interp) {
+    CURRENT_INTERP.with(|cell| {
+        *cell.borrow_mut() = Some(interp);
+    });
+}
+
+/// Clear the current TCL interpreter
+pub fn clear_current_interp() {
+    CURRENT_INTERP.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+}
+
+/// Call a user-defined TCL function and return its result
+/// Returns None if no such function is registered or interp is not set
+pub fn call_tcl_user_function(func_name: &str, args: &[String]) -> Option<String> {
+    // Get the current interpreter
+    let interp = CURRENT_INTERP.with(|cell| *cell.borrow())?;
+    if interp.is_null() {
+        return None;
+    }
+
+    // Find the function - check all connections for now
+    let proc_name = USER_FUNCTIONS.with(|funcs| {
+        let funcs = funcs.borrow();
+        // Find any registered function with this name (ignoring db_name for simplicity)
+        for ((_, fname), proc) in funcs.iter() {
+            if fname.eq_ignore_ascii_case(func_name) {
+                return Some(proc.clone());
+            }
+        }
+        None
+    })?;
+
+    // Build the TCL command: proc_name arg1 arg2 ...
+    let mut cmd = proc_name;
+    for arg in args {
+        cmd.push(' ');
+        // Quote the argument
+        cmd.push('{');
+        cmd.push_str(arg);
+        cmd.push('}');
+    }
+
+    // Execute the TCL command
+    unsafe {
+        let cmd_cstr = CString::new(cmd).ok()?;
+        let result = Tcl_Eval(interp, cmd_cstr.as_ptr());
+        if result == TCL_OK {
+            // Get the result
+            let result_obj = Tcl_GetObjResult(interp);
+            if !result_obj.is_null() {
+                let mut len: c_int = 0;
+                let ptr = Tcl_GetStringFromObj(result_obj, &mut len);
+                if !ptr.is_null() {
+                    let slice = std::slice::from_raw_parts(ptr as *const u8, len as usize);
+                    return Some(String::from_utf8_lossy(slice).to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Check if a user-defined TCL function exists
+pub fn has_tcl_user_function(func_name: &str) -> bool {
+    USER_FUNCTIONS.with(|funcs| {
+        let funcs = funcs.borrow();
+        for ((_, fname), _) in funcs.iter() {
+            if fname.eq_ignore_ascii_case(func_name) {
+                return true;
+            }
+        }
+        false
+    })
+}
+
 // TCL C API bindings
 const TCL_OK: c_int = 0;
 const TCL_ERROR: c_int = 1;
@@ -3030,6 +3126,8 @@ extern "C" {
     fn Tcl_DeleteCommand(interp: *mut Tcl_Interp, cmdName: *const c_char) -> c_int;
 
     fn Tcl_SetObjResult(interp: *mut Tcl_Interp, objPtr: *mut Tcl_Obj);
+
+    fn Tcl_GetObjResult(interp: *mut Tcl_Interp) -> *mut Tcl_Obj;
 
     fn Tcl_GetStringFromObj(objPtr: *mut Tcl_Obj, lengthPtr: *mut c_int) -> *const c_char;
 

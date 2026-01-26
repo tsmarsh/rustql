@@ -100,7 +100,7 @@ list-tests:
 tcl-extension: $(TCL_EXT)
 
 $(TCL_EXT): $(RUST_SOURCES) Cargo.toml
-	$(CARGO) build --release --features tcl
+	$(CARGO) build --release --features tcl --lib
 
 # Build the rustql binary
 rustql: $(RUSTQL_BIN)

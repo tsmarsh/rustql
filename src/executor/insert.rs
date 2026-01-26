@@ -1045,6 +1045,15 @@ impl<'a> InsertCompiler<'a> {
                 return true;
             }
 
+            // Check for aggregate functions in SELECT columns
+            for col in &core.columns {
+                if let ResultColumn::Expr { expr, .. } = col {
+                    if self.find_aggregate_in_expr(expr).is_some() {
+                        return true;
+                    }
+                }
+            }
+
             // Check for multiple tables (JOINs) or subqueries in FROM
             if let Some(from) = &core.from {
                 if from.tables.len() > 1 {

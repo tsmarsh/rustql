@@ -2366,7 +2366,8 @@ impl Vdbe {
                         if let Some(rowid) = target_rowid {
                             if let Some(cursor) = self.cursor_mut(op.p1) {
                                 if let Some(ref mut bt_cursor) = cursor.btree_cursor {
-                                    // Seek to the rowid in the table
+                                    // Seek to the rowid in the table - this counts as a search
+                                    inc_search_count();
                                     let res = bt_cursor.table_moveto(rowid, false)?;
                                     // Update cursor state
                                     if res == 0 {
@@ -4322,7 +4323,8 @@ impl Vdbe {
                 }
 
                 if should_jump {
-                    inc_search_count();
+                    // Note: Idx* comparison opcodes don't count as search operations
+                    // Only MoveTo (Seek*) and Next/Prev count toward search_count
                     self.pc = op.p2;
                 }
             }
@@ -4381,8 +4383,7 @@ impl Vdbe {
                     }
 
                     if should_jump {
-                        // Increment search count when terminating the scan
-                        inc_search_count();
+                        // Note: Idx* comparison opcodes don't count as search operations
                         self.pc = op.p2;
                     }
                 }
@@ -4445,7 +4446,7 @@ impl Vdbe {
                     }
 
                     if should_jump {
-                        inc_search_count();
+                        // Note: Idx* comparison opcodes don't count as search operations
                         self.pc = op.p2;
                     }
                 }
@@ -4505,7 +4506,7 @@ impl Vdbe {
                     }
 
                     if should_jump {
-                        inc_search_count();
+                        // Note: Idx* comparison opcodes don't count as search operations
                         self.pc = op.p2;
                     }
                 }

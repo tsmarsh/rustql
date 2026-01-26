@@ -1087,7 +1087,14 @@ impl<'s> SelectCompiler<'s> {
                     loop_labels.push(loop_label);
 
                     // DeferredSeek sets up table cursor to read from index
-                    self.emit(Opcode::DeferredSeek, cursor, 0, index_cursor, P4::Unused);
+                    // Build alt-map for covering index optimization
+                    let alt_map_p4 =
+                        if let Some(alt_map) = self.build_index_alt_map(cursor, index_name) {
+                            P4::IntArray(alt_map)
+                        } else {
+                            P4::Unused
+                        };
+                    self.emit(Opcode::DeferredSeek, cursor, 0, index_cursor, alt_map_p4);
 
                     // Build range end key if we have an upper bound constraint
                     // IdxGE expects key values in consecutive registers, not as a record
@@ -1214,7 +1221,14 @@ impl<'s> SelectCompiler<'s> {
                     loop_labels.push(loop_label);
 
                     // DeferredSeek sets up table cursor to read from index
-                    self.emit(Opcode::DeferredSeek, cursor, 0, index_cursor, P4::Unused);
+                    // Build alt-map for covering index optimization
+                    let alt_map_p4 =
+                        if let Some(alt_map) = self.build_index_alt_map(cursor, index_name) {
+                            P4::IntArray(alt_map)
+                        } else {
+                            P4::Unused
+                        };
+                    self.emit(Opcode::DeferredSeek, cursor, 0, index_cursor, alt_map_p4);
 
                     // Store scan info (no equality keys for pure range scan)
                     scan_info.push((true, Some(index_cursor), 0, 0, false));
@@ -2885,12 +2899,18 @@ impl<'s> SelectCompiler<'s> {
         self.resolve_label(loop_label, self.current_addr());
 
         // Set up deferred seek from index to table
+        // Build alt-map for covering index optimization
+        let alt_map_p4 = if let Some(alt_map) = self.build_index_alt_map(table_cursor, index_name) {
+            P4::IntArray(alt_map)
+        } else {
+            P4::Unused
+        };
         self.emit(
             Opcode::DeferredSeek,
             table_cursor,
             0,
             index_cursor,
-            P4::Unused,
+            alt_map_p4,
         );
 
         Ok((index_cursor, loop_label, key_base_reg, key_count))
@@ -2964,6 +2984,52 @@ impl<'s> SelectCompiler<'s> {
 
         // Advance to next index entry
         self.emit(Opcode::Next, index_cursor, loop_label, 0, P4::Unused);
+    }
+
+    /// Build alt-map for covering index optimization
+    /// The alt-map redirects Column reads from table cursor to index cursor
+    /// when the needed column is present in the index.
+    ///
+    /// alt_map[table_col_idx] = index_col_position, or -1 if not in index
+    fn build_index_alt_map(&self, table_cursor: i32, index_name: &str) -> Option<Vec<i64>> {
+        // Find the table info for this cursor
+        let table_info = self.tables.iter().find(|t| t.cursor == table_cursor)?;
+
+        // Get the schema table for column count
+        let schema_table = table_info.schema_table.as_ref()?;
+        let num_columns = schema_table.columns.len();
+
+        // Look up the index columns from schema
+        let index_columns: Vec<i32> = if let Some(schema) = self.schema {
+            // First try the global schema.indexes
+            if let Some(idx) = schema.indexes.get(&index_name.to_lowercase()) {
+                idx.columns.iter().map(|ic| ic.column_idx).collect()
+            } else {
+                // Fall back to schema_table.indexes
+                schema_table
+                    .indexes
+                    .iter()
+                    .find(|idx| idx.name.eq_ignore_ascii_case(index_name))
+                    .map(|idx| idx.columns.iter().map(|ic| ic.column_idx).collect())?
+            }
+        } else {
+            // No schema available, try schema_table.indexes
+            schema_table
+                .indexes
+                .iter()
+                .find(|idx| idx.name.eq_ignore_ascii_case(index_name))
+                .map(|idx| idx.columns.iter().map(|ic| ic.column_idx).collect())?
+        };
+
+        // Build the alt_map: for each table column, find its position in the index
+        let mut alt_map = vec![-1i64; num_columns];
+        for (index_pos, &table_col) in index_columns.iter().enumerate() {
+            if table_col >= 0 && (table_col as usize) < num_columns {
+                alt_map[table_col as usize] = index_pos as i64;
+            }
+        }
+
+        Some(alt_map)
     }
 
     /// Find equality terms for index columns in the WHERE info

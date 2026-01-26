@@ -129,7 +129,7 @@ pub fn execute_pragma(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Resul
         "quick_check" => pragma_integrity_check(conn, schema_name, pragma),
         "vdbe_listing" => pragma_vdbe_listing(conn, pragma),
         // Legacy pragmas (aliases)
-        "default_cache_size" => pragma_cache_size(conn, schema_name, pragma),
+        "default_cache_size" => pragma_default_cache_size(conn, schema_name, pragma),
         "default_synchronous" => pragma_synchronous(conn, schema_name, pragma),
         // Additional pragmas
         "case_sensitive_like" => pragma_case_sensitive_like(conn, pragma),
@@ -456,6 +456,29 @@ fn pragma_cache_size(
     }
     if pragma.value.is_none() {
         return Ok(single_int_result(db.cache_size));
+    }
+    Ok(empty_result())
+}
+
+fn pragma_default_cache_size(
+    conn: &mut SqliteConnection,
+    schema_name: &str,
+    pragma: &PragmaStmt,
+) -> Result<PragmaResult> {
+    let db = lookup_db_mut(conn, schema_name)?;
+    if let Some(value) = pragma_value_i64(pragma) {
+        // default_cache_size is always stored as positive (pages)
+        // unlike cache_size where negative means KiB
+        let abs_value = value.abs();
+        db.default_cache_size = abs_value;
+        // Also update the current cache_size to match when setting default
+        db.cache_size = abs_value;
+
+        // TODO: Persist to database header (page 1, offset 48-51)
+        // For now, the value is only connection-local
+    }
+    if pragma.value.is_none() {
+        return Ok(single_int_result(db.default_cache_size));
     }
     Ok(empty_result())
 }

@@ -581,8 +581,10 @@ pub struct DbInfo {
     pub busy: bool,
     /// Page size in bytes
     pub page_size: u32,
-    /// Cache size in pages
+    /// Cache size in pages (connection-specific)
     pub cache_size: i64,
+    /// Default cache size (persistent, stored in database header)
+    pub default_cache_size: i64,
     /// Journal mode
     pub journal_mode: JournalMode,
     /// Locking mode
@@ -591,6 +593,9 @@ pub struct DbInfo {
     pub btree: Option<Arc<Btree>>,
 }
 
+/// Default cache size in KiB (SQLite default is -2000 meaning 2000 KiB)
+pub const DEFAULT_CACHE_SIZE: i64 = -2000;
+
 impl DbInfo {
     /// Create a new database info
     pub fn new(name: &str) -> Self {
@@ -598,10 +603,11 @@ impl DbInfo {
             name: name.to_string(),
             path: None,
             schema: Some(Arc::new(RwLock::new(Schema::new()))),
-            safety_level: SafetyLevel::Normal,
+            safety_level: SafetyLevel::Full, // SQLite default is FULL (2)
             busy: false,
             page_size: DEFAULT_PAGE_SIZE,
-            cache_size: 0,
+            cache_size: DEFAULT_CACHE_SIZE,
+            default_cache_size: DEFAULT_CACHE_SIZE,
             journal_mode: JournalMode::Delete,
             locking_mode: LockingMode::Normal,
             btree: None,

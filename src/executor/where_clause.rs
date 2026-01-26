@@ -710,6 +710,8 @@ impl QueryPlanner {
                 high,
                 negated: false,
             } => {
+                // Split BETWEEN into two range terms (>= and <=)
+                // Don't mark as VIRTUAL since these need runtime evaluation
                 let idx = self.where_clause.terms.len() as i32;
                 let mut lower = WhereTerm::new(
                     Expr::Binary {
@@ -719,7 +721,7 @@ impl QueryPlanner {
                     },
                     idx,
                 );
-                lower.flags |= WhereTermFlags::BETWEEN | WhereTermFlags::VIRTUAL;
+                lower.flags |= WhereTermFlags::BETWEEN;
                 self.where_clause.add_term(lower);
 
                 let idx = self.where_clause.terms.len() as i32;
@@ -731,7 +733,7 @@ impl QueryPlanner {
                     },
                     idx,
                 );
-                upper.flags |= WhereTermFlags::BETWEEN | WhereTermFlags::VIRTUAL;
+                upper.flags |= WhereTermFlags::BETWEEN;
                 self.where_clause.add_term(upper);
             }
 

@@ -834,6 +834,7 @@ impl<'s> StatementCompiler<'s> {
     // ========================================================================
 
     fn compile_create_table(&mut self, create: &CreateTableStmt) -> Result<Vec<VdbeOp>> {
+        use crate::parser::ast::TableDefinition;
         use crate::storage::btree::BTREE_INTKEY;
 
         let mut ops = Vec::new();
@@ -844,7 +845,7 @@ impl<'s> StatementCompiler<'s> {
         // 0: Init - jump to start of program
         ops.push(Self::make_op(Opcode::Init, 0, 2, 0, P4::Unused));
 
-        // 1: Halt - end of program
+        // 1: Halt - end of program (placeholder, will be patched later if AsSelect)
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
 
         // 2: CreateBtree - create the table's root page
@@ -881,8 +882,66 @@ impl<'s> StatementCompiler<'s> {
         );
         self.append_sqlite_master_close(&mut ops, cursor_id);
 
-        // 4: Goto end
-        ops.push(Self::make_op(Opcode::Goto, 0, 1, 0, P4::Unused));
+        // Handle AsSelect case - need to also insert rows from SELECT
+        if let TableDefinition::AsSelect(select) = &create.definition {
+            // Get column count from the SELECT
+            let select_cols = self.resolve_select_columns_for_create(select);
+            let num_cols = select_cols.len() as i32;
+
+            // Open the new table for writing (by name, it was just created)
+            // Use cursor 1 since cursor 0 is used for sqlite_master
+            let target_cursor = 1;
+            ops.push(Self::make_op(
+                Opcode::OpenWrite,
+                target_cursor,
+                0, // root page 0 = look up by name
+                num_cols,
+                P4::Text(create.name.name.clone()),
+            ));
+
+            // Compile the SELECT using SelectCompiler with Table destination
+            let mut select_compiler = if let Some(schema) = self.schema {
+                SelectCompiler::with_schema(schema)
+            } else {
+                SelectCompiler::new()
+            };
+
+            // Compile the SELECT with Table destination to insert directly
+            let dest = SelectDest::Table {
+                cursor: target_cursor,
+            };
+            let select_ops = select_compiler.compile(select, &dest)?;
+
+            // Append select ops, adjusting jump targets
+            let offset = ops.len() as i32;
+            for op in select_ops {
+                let mut new_op = op;
+                // Patch jump targets to account for the offset
+                // But skip Init since it's already at the start
+                if new_op.opcode.is_jump() && new_op.p2 > 0 {
+                    new_op.p2 += offset;
+                }
+                if new_op.opcode == Opcode::Init && new_op.p2 > 0 {
+                    new_op.p2 += offset;
+                }
+                // Convert Halt to Close + Goto to our Halt at position 1
+                if new_op.opcode == Opcode::Halt {
+                    ops.push(Self::make_op(
+                        Opcode::Close,
+                        target_cursor,
+                        0,
+                        0,
+                        P4::Unused,
+                    ));
+                    ops.push(Self::make_op(Opcode::Goto, 0, 1, 0, P4::Unused));
+                    continue;
+                }
+                ops.push(new_op);
+            }
+        } else {
+            // Regular CREATE TABLE - just Goto to the Halt
+            ops.push(Self::make_op(Opcode::Goto, 0, 1, 0, P4::Unused));
+        }
 
         Ok(ops)
     }
@@ -983,6 +1042,81 @@ impl<'s> StatementCompiler<'s> {
         Ok(ops)
     }
 
+    /// Resolve column names from a SELECT statement for CREATE TABLE AS SELECT
+    /// This handles star expansion using schema information
+    fn resolve_select_columns_for_create(&self, select: &SelectStmt) -> Vec<(String, String)> {
+        let mut columns = Vec::new();
+
+        if let SelectBody::Select(core) = &select.body {
+            // Get source table info for star expansion
+            let from_tables: Vec<String> = if let Some(from) = &core.from {
+                from.tables
+                    .iter()
+                    .filter_map(|t| match t {
+                        TableRef::Table { name, .. } => Some(name.name.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            for (i, col) in core.columns.iter().enumerate() {
+                match col {
+                    ResultColumn::Star => {
+                        // Expand * using schema if available
+                        if let Some(schema) = self.schema {
+                            for table_name in &from_tables {
+                                if let Some(table) = schema.table(table_name) {
+                                    for col_def in &table.columns {
+                                        let type_str =
+                                            col_def.type_name.clone().unwrap_or_default();
+                                        columns.push((col_def.name.clone(), type_str));
+                                    }
+                                }
+                            }
+                        }
+                        if columns.is_empty() {
+                            // Fallback if no schema
+                            columns.push((format!("column{}", i), String::new()));
+                        }
+                    }
+                    ResultColumn::TableStar(table) => {
+                        // Expand table.* using schema
+                        if let Some(schema) = self.schema {
+                            if let Some(schema_table) = schema.table(table) {
+                                for col_def in &schema_table.columns {
+                                    let type_str = col_def.type_name.clone().unwrap_or_default();
+                                    columns.push((col_def.name.clone(), type_str));
+                                }
+                            }
+                        }
+                        if columns.is_empty() {
+                            columns.push((format!("{}_{}", table, i), String::new()));
+                        }
+                    }
+                    ResultColumn::Expr { expr, alias } => {
+                        let name = if let Some(alias) = alias {
+                            alias.clone()
+                        } else {
+                            self.expr_name(expr, i)
+                        };
+                        let type_name = match self.infer_type(expr) {
+                            ColumnType::Integer => "INTEGER",
+                            ColumnType::Float => "REAL",
+                            ColumnType::Text => "TEXT",
+                            ColumnType::Blob => "BLOB",
+                            _ => "",
+                        };
+                        columns.push((name, type_name.to_string()));
+                    }
+                }
+            }
+        }
+
+        columns
+    }
+
     /// Build CREATE TABLE SQL from AST for storage in schema
     fn build_create_table_sql(&self, create: &CreateTableStmt) -> String {
         use crate::parser::ast::{ColumnConstraintKind, TableConstraintKind, TableDefinition};
@@ -994,154 +1128,173 @@ impl<'s> StatementCompiler<'s> {
         sql.push_str(&create.name.name);
         sql.push_str(" (");
 
-        if let TableDefinition::Columns {
-            columns,
-            constraints,
-        } = &create.definition
-        {
-            let col_defs: Vec<String> = columns
-                .iter()
-                .map(|col| {
-                    let mut col_sql = col.name.clone();
-                    if let Some(ref type_name) = col.type_name {
-                        col_sql.push(' ');
-                        col_sql.push_str(&type_name.name);
-                    }
-                    // Add column constraints
-                    for constraint in &col.constraints {
-                        match &constraint.kind {
-                            ColumnConstraintKind::PrimaryKey { autoincrement, .. } => {
-                                col_sql.push_str(" PRIMARY KEY");
-                                if *autoincrement {
-                                    col_sql.push_str(" AUTOINCREMENT");
+        match &create.definition {
+            TableDefinition::Columns {
+                columns,
+                constraints,
+            } => {
+                let col_defs: Vec<String> = columns
+                    .iter()
+                    .map(|col| {
+                        let mut col_sql = col.name.clone();
+                        if let Some(ref type_name) = col.type_name {
+                            col_sql.push(' ');
+                            col_sql.push_str(&type_name.name);
+                        }
+                        // Add column constraints
+                        for constraint in &col.constraints {
+                            match &constraint.kind {
+                                ColumnConstraintKind::PrimaryKey { autoincrement, .. } => {
+                                    col_sql.push_str(" PRIMARY KEY");
+                                    if *autoincrement {
+                                        col_sql.push_str(" AUTOINCREMENT");
+                                    }
                                 }
-                            }
-                            ColumnConstraintKind::NotNull { .. } => {
-                                col_sql.push_str(" NOT NULL");
-                            }
-                            ColumnConstraintKind::Unique { .. } => {
-                                col_sql.push_str(" UNIQUE");
-                            }
-                            ColumnConstraintKind::Default(val) => {
-                                col_sql.push_str(" DEFAULT ");
-                                match val {
-                                    crate::parser::ast::DefaultValue::Literal(lit) => match lit {
-                                        crate::parser::ast::Literal::Null => {
-                                            col_sql.push_str("NULL");
+                                ColumnConstraintKind::NotNull { .. } => {
+                                    col_sql.push_str(" NOT NULL");
+                                }
+                                ColumnConstraintKind::Unique { .. } => {
+                                    col_sql.push_str(" UNIQUE");
+                                }
+                                ColumnConstraintKind::Default(val) => {
+                                    col_sql.push_str(" DEFAULT ");
+                                    match val {
+                                        crate::parser::ast::DefaultValue::Literal(lit) => match lit
+                                        {
+                                            crate::parser::ast::Literal::Null => {
+                                                col_sql.push_str("NULL");
+                                            }
+                                            crate::parser::ast::Literal::Integer(n) => {
+                                                col_sql.push_str(&n.to_string());
+                                            }
+                                            crate::parser::ast::Literal::Float(f) => {
+                                                col_sql.push_str(&f.to_string());
+                                            }
+                                            crate::parser::ast::Literal::String(s) => {
+                                                col_sql.push('\'');
+                                                col_sql.push_str(&s.replace("'", "''"));
+                                                col_sql.push('\'');
+                                            }
+                                            crate::parser::ast::Literal::Blob(_) => {
+                                                col_sql.push_str("X''");
+                                            }
+                                            crate::parser::ast::Literal::Bool(b) => {
+                                                col_sql.push_str(if *b { "1" } else { "0" });
+                                            }
+                                            crate::parser::ast::Literal::CurrentTime => {
+                                                col_sql.push_str("current_time");
+                                            }
+                                            crate::parser::ast::Literal::CurrentDate => {
+                                                col_sql.push_str("current_date");
+                                            }
+                                            crate::parser::ast::Literal::CurrentTimestamp => {
+                                                col_sql.push_str("current_timestamp");
+                                            }
+                                        },
+                                        crate::parser::ast::DefaultValue::Expr(_) => {
+                                            col_sql.push_str("(expression)");
                                         }
-                                        crate::parser::ast::Literal::Integer(n) => {
-                                            col_sql.push_str(&n.to_string());
-                                        }
-                                        crate::parser::ast::Literal::Float(f) => {
-                                            col_sql.push_str(&f.to_string());
-                                        }
-                                        crate::parser::ast::Literal::String(s) => {
-                                            col_sql.push('\'');
-                                            col_sql.push_str(&s.replace("'", "''"));
-                                            col_sql.push('\'');
-                                        }
-                                        crate::parser::ast::Literal::Blob(_) => {
-                                            col_sql.push_str("X''");
-                                        }
-                                        crate::parser::ast::Literal::Bool(b) => {
-                                            col_sql.push_str(if *b { "1" } else { "0" });
-                                        }
-                                        crate::parser::ast::Literal::CurrentTime => {
+                                        crate::parser::ast::DefaultValue::CurrentTime => {
                                             col_sql.push_str("current_time");
                                         }
-                                        crate::parser::ast::Literal::CurrentDate => {
+                                        crate::parser::ast::DefaultValue::CurrentDate => {
                                             col_sql.push_str("current_date");
                                         }
-                                        crate::parser::ast::Literal::CurrentTimestamp => {
+                                        crate::parser::ast::DefaultValue::CurrentTimestamp => {
                                             col_sql.push_str("current_timestamp");
                                         }
-                                    },
-                                    crate::parser::ast::DefaultValue::Expr(_) => {
-                                        col_sql.push_str("(expression)");
-                                    }
-                                    crate::parser::ast::DefaultValue::CurrentTime => {
-                                        col_sql.push_str("current_time");
-                                    }
-                                    crate::parser::ast::DefaultValue::CurrentDate => {
-                                        col_sql.push_str("current_date");
-                                    }
-                                    crate::parser::ast::DefaultValue::CurrentTimestamp => {
-                                        col_sql.push_str("current_timestamp");
                                     }
                                 }
+                                ColumnConstraintKind::Collate(name) => {
+                                    col_sql.push_str(" COLLATE ");
+                                    col_sql.push_str(name);
+                                }
+                                _ => {}
                             }
-                            ColumnConstraintKind::Collate(name) => {
-                                col_sql.push_str(" COLLATE ");
-                                col_sql.push_str(name);
-                            }
-                            _ => {}
                         }
-                    }
-                    col_sql
-                })
-                .collect();
-            sql.push_str(&col_defs.join(", "));
+                        col_sql
+                    })
+                    .collect();
+                sql.push_str(&col_defs.join(", "));
 
-            // Add table-level constraints
-            for constraint in constraints {
-                sql.push_str(", ");
-                if let Some(name) = &constraint.name {
-                    sql.push_str("CONSTRAINT ");
-                    sql.push_str(name);
-                    sql.push(' ');
-                }
-                match &constraint.kind {
-                    TableConstraintKind::PrimaryKey { columns, .. } => {
-                        sql.push_str("PRIMARY KEY (");
-                        let col_names: Vec<String> = columns
-                            .iter()
-                            .filter_map(|c| {
-                                if let crate::parser::ast::IndexedColumnKind::Name(name) = &c.column
-                                {
-                                    Some(name.clone())
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        sql.push_str(&col_names.join(", "));
-                        sql.push(')');
+                // Add table-level constraints
+                for constraint in constraints {
+                    sql.push_str(", ");
+                    if let Some(name) = &constraint.name {
+                        sql.push_str("CONSTRAINT ");
+                        sql.push_str(name);
+                        sql.push(' ');
                     }
-                    TableConstraintKind::Unique { columns, .. } => {
-                        sql.push_str("UNIQUE (");
-                        let col_names: Vec<String> = columns
-                            .iter()
-                            .filter_map(|c| {
-                                if let crate::parser::ast::IndexedColumnKind::Name(name) = &c.column
-                                {
-                                    Some(name.clone())
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        sql.push_str(&col_names.join(", "));
-                        sql.push(')');
-                    }
-                    TableConstraintKind::Check(expr) => {
-                        sql.push_str("CHECK (");
-                        sql.push_str(&format!("{:?}", expr));
-                        sql.push(')');
-                    }
-                    TableConstraintKind::ForeignKey {
-                        columns, clause, ..
-                    } => {
-                        sql.push_str("FOREIGN KEY (");
-                        sql.push_str(&columns.join(", "));
-                        sql.push_str(") REFERENCES ");
-                        sql.push_str(&clause.table);
-                        if let Some(ref_cols) = &clause.columns {
-                            sql.push_str(" (");
-                            sql.push_str(&ref_cols.join(", "));
+                    match &constraint.kind {
+                        TableConstraintKind::PrimaryKey { columns, .. } => {
+                            sql.push_str("PRIMARY KEY (");
+                            let col_names: Vec<String> = columns
+                                .iter()
+                                .filter_map(|c| {
+                                    if let crate::parser::ast::IndexedColumnKind::Name(name) =
+                                        &c.column
+                                    {
+                                        Some(name.clone())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            sql.push_str(&col_names.join(", "));
                             sql.push(')');
                         }
+                        TableConstraintKind::Unique { columns, .. } => {
+                            sql.push_str("UNIQUE (");
+                            let col_names: Vec<String> = columns
+                                .iter()
+                                .filter_map(|c| {
+                                    if let crate::parser::ast::IndexedColumnKind::Name(name) =
+                                        &c.column
+                                    {
+                                        Some(name.clone())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            sql.push_str(&col_names.join(", "));
+                            sql.push(')');
+                        }
+                        TableConstraintKind::Check(expr) => {
+                            sql.push_str("CHECK (");
+                            sql.push_str(&format!("{:?}", expr));
+                            sql.push(')');
+                        }
+                        TableConstraintKind::ForeignKey {
+                            columns, clause, ..
+                        } => {
+                            sql.push_str("FOREIGN KEY (");
+                            sql.push_str(&columns.join(", "));
+                            sql.push_str(") REFERENCES ");
+                            sql.push_str(&clause.table);
+                            if let Some(ref_cols) = &clause.columns {
+                                sql.push_str(" (");
+                                sql.push_str(&ref_cols.join(", "));
+                                sql.push(')');
+                            }
+                        }
                     }
                 }
+            }
+            TableDefinition::AsSelect(select) => {
+                // For CREATE TABLE AS SELECT, derive columns from the SELECT
+                let cols = self.resolve_select_columns_for_create(select);
+                let col_defs: Vec<String> = cols
+                    .iter()
+                    .map(|(name, type_name)| {
+                        if type_name.is_empty() {
+                            name.clone()
+                        } else {
+                            format!("{} {}", name, type_name)
+                        }
+                    })
+                    .collect();
+                sql.push_str(&col_defs.join(", "));
             }
         }
         sql.push(')');

@@ -5504,6 +5504,35 @@ impl<'s> SelectCompiler<'s> {
                 };
                 self.emit(Opcode::Variable, param_idx, dest_reg, 0, P4::Unused);
             }
+            Expr::Cast { expr, type_name } => {
+                // Compile the expression first
+                self.compile_expr(expr, dest_reg)?;
+                // Then apply the cast using the Cast opcode
+                // P2 is affinity: 'A'=BLOB, 'B'=TEXT, 'C'=NUMERIC, 'D'=INTEGER, 'E'=REAL
+                let affinity = match type_name.name.to_uppercase().as_str() {
+                    "TEXT" | "VARCHAR" | "CHAR" | "CLOB" | "NCHAR" | "NVARCHAR" => b'B', // TEXT
+                    "INTEGER" | "INT" | "TINYINT" | "SMALLINT" | "MEDIUMINT" | "BIGINT"
+                    | "INT2" | "INT8" => b'D', // INTEGER
+                    "REAL" | "DOUBLE" | "FLOAT" => b'E',                                 // REAL
+                    "NUMERIC" | "DECIMAL" => b'C',                                       // NUMERIC
+                    "BLOB" | "NONE" => b'A',                                             // BLOB
+                    _ => {
+                        // Check for type names with size like VARCHAR(255)
+                        let name_upper = type_name.name.to_uppercase();
+                        if name_upper.starts_with("VARCHAR")
+                            || name_upper.starts_with("CHAR")
+                            || name_upper.starts_with("TEXT")
+                        {
+                            b'B' // TEXT
+                        } else if name_upper.starts_with("INT") {
+                            b'D' // INTEGER
+                        } else {
+                            b'C' // Default to NUMERIC
+                        }
+                    }
+                };
+                self.emit(Opcode::Cast, dest_reg, affinity as i32, 0, P4::Unused);
+            }
             _ => {
                 // For other expression types, emit NULL as placeholder
                 self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);

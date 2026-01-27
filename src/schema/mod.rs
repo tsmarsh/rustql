@@ -984,6 +984,17 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
         Some(pk_indices)
     };
 
+    // Create auto-indexes for columns with UNIQUE constraint
+    // (Column-level UNIQUE like "b UNIQUE" needs its own index)
+    let mut auto_idx_count = indexes.len();
+    for (col_idx, col) in columns.iter().enumerate() {
+        if col.is_unique && !col.is_primary_key {
+            auto_idx_count += 1;
+            let index_name = format!("sqlite_autoindex_{}_{}", table_name, auto_idx_count);
+            indexes.push((index_name, vec![col.name.clone()], true));
+        }
+    }
+
     // Now build the index structures with proper column indices
     let mut index_list = Vec::new();
     for (index_name, col_names, is_unique) in indexes {

@@ -892,6 +892,121 @@ impl<'s> StatementCompiler<'s> {
             reg_root_page,
             &create_sql,
         );
+
+        // Create auto-indexes for UNIQUE column constraints
+        let reg_index_page = 2; // Use a separate register for index root pages
+        if let TableDefinition::Columns {
+            columns,
+            constraints,
+        } = &create.definition
+        {
+            use crate::storage::btree::BTREE_BLOBKEY;
+
+            let mut auto_idx_num = 0;
+
+            // Create indexes for column-level UNIQUE constraints
+            for col_def in columns {
+                for constraint in &col_def.constraints {
+                    if matches!(
+                        constraint.kind,
+                        crate::parser::ast::ColumnConstraintKind::Unique { .. }
+                    ) {
+                        auto_idx_num += 1;
+                        let index_name =
+                            format!("sqlite_autoindex_{}_{}", create.name.name, auto_idx_num);
+                        let index_sql = format!(
+                            "CREATE UNIQUE INDEX {} ON {}({})",
+                            index_name, create.name.name, col_def.name
+                        );
+
+                        // CreateBtree for the index (BLOBKEY for index btrees)
+                        ops.push(Self::make_op(
+                            Opcode::CreateBtree,
+                            0,
+                            reg_index_page,
+                            BTREE_BLOBKEY as i32,
+                            P4::Unused,
+                        ));
+
+                        // ParseSchemaIndex to register the index in schema cache
+                        ops.push(Self::make_op(
+                            Opcode::ParseSchemaIndex,
+                            1, // unique = true
+                            reg_index_page,
+                            0,
+                            P4::Text(index_sql.clone()),
+                        ));
+
+                        // Insert into sqlite_master
+                        self.append_sqlite_master_insert_index(
+                            &mut ops,
+                            cursor_id,
+                            &index_name,
+                            &create.name.name,
+                            reg_index_page,
+                            &index_sql,
+                        );
+                    }
+                }
+            }
+
+            // Create indexes for table-level UNIQUE constraints
+            for constraint in constraints {
+                if let crate::parser::ast::TableConstraintKind::Unique {
+                    columns: idx_cols, ..
+                } = &constraint.kind
+                {
+                    auto_idx_num += 1;
+                    let index_name =
+                        format!("sqlite_autoindex_{}_{}", create.name.name, auto_idx_num);
+                    let col_names: Vec<String> = idx_cols
+                        .iter()
+                        .filter_map(|c| {
+                            if let crate::parser::ast::IndexedColumnKind::Name(name) = &c.column {
+                                Some(name.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    let index_sql = format!(
+                        "CREATE UNIQUE INDEX {} ON {}({})",
+                        index_name,
+                        create.name.name,
+                        col_names.join(", ")
+                    );
+
+                    // CreateBtree for the index
+                    ops.push(Self::make_op(
+                        Opcode::CreateBtree,
+                        0,
+                        reg_index_page,
+                        BTREE_BLOBKEY as i32,
+                        P4::Unused,
+                    ));
+
+                    // ParseSchemaIndex to register the index
+                    ops.push(Self::make_op(
+                        Opcode::ParseSchemaIndex,
+                        1, // unique = true
+                        reg_index_page,
+                        0,
+                        P4::Text(index_sql.clone()),
+                    ));
+
+                    // Insert into sqlite_master
+                    self.append_sqlite_master_insert_index(
+                        &mut ops,
+                        cursor_id,
+                        &index_name,
+                        &create.name.name,
+                        reg_index_page,
+                        &index_sql,
+                    );
+                }
+            }
+        }
+
         self.append_sqlite_master_close(&mut ops, cursor_id);
 
         // Handle AsSelect case - need to also insert rows from SELECT

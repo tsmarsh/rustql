@@ -355,7 +355,7 @@ impl UnpackedRecord {
 }
 
 /// Parse a SQLite record into field values
-fn parse_record_fields(data: &[u8]) -> Vec<RecordField> {
+pub fn parse_record_fields(data: &[u8]) -> Vec<RecordField> {
     if data.is_empty() {
         return Vec::new();
     }

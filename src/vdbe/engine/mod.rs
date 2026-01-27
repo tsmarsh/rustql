@@ -154,6 +154,10 @@ pub struct VdbeCursor {
     pub sorter_index: usize,
     /// Sequence counter for OP_Sequence
     pub seq_count: i64,
+    /// Is this a UNIQUE index cursor?
+    pub is_unique: bool,
+    /// Index name (for UNIQUE constraint error messages)
+    pub index_name: Option<String>,
     /// Has the sorter been sorted?
     pub sorter_sorted: bool,
     /// Sort directions for each ORDER BY column (true = DESC, false = ASC)
@@ -218,6 +222,8 @@ impl VdbeCursor {
             sorter_data: Vec::new(),
             sorter_index: 0,
             seq_count: 0,
+            is_unique: false,
+            index_name: None,
             sorter_sorted: false,
             sort_desc: Vec::new(),
             ephemeral_set: std::collections::HashSet::new(),
@@ -1475,6 +1481,8 @@ impl Vdbe {
                 } else {
                     let mut table_meta = None;
                     let mut is_index = false;
+                    let mut index_unique = false;
+                    let mut index_table_name: Option<String> = None;
                     // If root_page is 0 and we have a name in P4, look it up in schema
                     // (could be a table or an index)
                     if root_page == 0 {
@@ -1493,6 +1501,27 @@ impl Vdbe {
                                         {
                                             root_page = index.root_page;
                                             is_index = true;
+                                            index_unique = index.unique;
+                                            index_table_name = Some(index.table.clone());
+                                        }
+                                    }
+
+                                    // Also search for auto-indexes in table.indexes
+                                    if root_page == 0 && !is_index {
+                                        let tname_lower = tname.to_lowercase();
+                                        for (_table_name, tbl) in schema_guard.tables.iter() {
+                                            for idx in &tbl.indexes {
+                                                if idx.name.to_lowercase() == tname_lower {
+                                                    root_page = idx.root_page;
+                                                    is_index = true;
+                                                    index_unique = idx.unique;
+                                                    index_table_name = Some(idx.table.clone());
+                                                    break;
+                                                }
+                                            }
+                                            if is_index {
+                                                break;
+                                            }
                                         }
                                     }
                                 }
@@ -1531,9 +1560,11 @@ impl Vdbe {
                         self.open_cursor(op.p1, root_page, false)?;
                         if let Some(cursor) = self.cursor_mut(op.p1) {
                             cursor.n_field = op.p3;
-                            cursor.table_name = table_name;
+                            cursor.table_name = table_name.clone();
                             cursor.is_index = is_index; // Mark as index cursor if opening an index
-                                                        // Create a real BtCursor if we have a btree
+                            cursor.is_unique = index_unique;
+                            cursor.index_name = if is_index { table_name } else { None };
+                            // Create a real BtCursor if we have a btree
                             if let Some(ref btree) = btree {
                                 let flags = BtreeCursorFlags::empty();
                                 match btree.cursor(root_page, flags, None) {
@@ -1558,6 +1589,7 @@ impl Vdbe {
                 // deciding if root_page=0 is an error)
                 let mut is_virtual = false;
                 let mut is_index = false;
+                let mut index_unique = false;
                 let mut table_name = None;
                 let mut table_columns = None;
                 let mut table_found = false;
@@ -1580,7 +1612,27 @@ impl Vdbe {
                                 {
                                     table_found = true;
                                     is_index = true;
+                                    index_unique = index.unique;
                                     root_page = index.root_page;
+                                }
+                            }
+
+                            // Also search for auto-indexes in table.indexes
+                            if root_page == 0 && !table_found {
+                                let name_lower = name.to_lowercase();
+                                for (_tbl_name, tbl) in schema_guard.tables.iter() {
+                                    for idx in &tbl.indexes {
+                                        if idx.name.to_lowercase() == name_lower {
+                                            table_found = true;
+                                            is_index = true;
+                                            index_unique = idx.unique;
+                                            root_page = idx.root_page;
+                                            break;
+                                        }
+                                    }
+                                    if table_found {
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -1617,6 +1669,8 @@ impl Vdbe {
                     if let Some(cursor) = self.cursor_mut(op.p1) {
                         cursor.n_field = op.p3;
                         cursor.is_index = is_index;
+                        cursor.is_unique = index_unique;
+                        cursor.index_name = if is_index { table_name.clone() } else { None };
                         // Create a writable BtCursor if we have a btree
                         if let Some(ref btree) = btree {
                             let flags = BtreeCursorFlags::WRCSR;
@@ -4715,18 +4769,11 @@ impl Vdbe {
                 // IdxInsert P1 P2 P3: Insert record P2 into index P1
                 // For ephemeral indexes: insert into set
                 // For btree indexes: insert into btree
-                //
-                // TODO(kfhht): UNIQUE index constraint checking is NOT implemented here.
-                // For UNIQUE indexes, before inserting we should:
-                // 1. Check if a record with the same key (excluding rowid) already exists
-                // 2. If it does, handle based on conflict resolution mode (P5):
-                //    - OE_ABORT: Return "UNIQUE constraint failed: index_name" error
-                //    - OE_REPLACE: Delete the existing row, then insert
-                //    - OE_IGNORE: Skip the insert silently
-                // This affects insert-16.x, insert-17.x tests.
-                // See also: cursor.is_unique flag and index schema for uniqueness info.
+                // P5 contains conflict resolution mode (OE_ABORT, OE_IGNORE, etc.)
                 let record = self.mem(op.p2).to_blob();
                 let btree_arc = self.btree.clone();
+                let schema = self.schema.clone();
+                let on_error = (op.p5 as u8) & OE_MASK;
 
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if cursor.is_ephemeral {
@@ -4735,21 +4782,179 @@ impl Vdbe {
                         // Insert into btree index
                         // First, position the cursor to find the correct insertion point
                         let search_key = crate::storage::btree::UnpackedRecord::new(record.clone());
-                        let _res = bt_cursor.index_moveto(&search_key)?;
+                        let move_res = bt_cursor.index_moveto(&search_key)?;
+
+                        // UNIQUE index constraint checking
+                        let mut skip_insert = false;
+                        if cursor.is_unique {
+                            // Parse the new record fields
+                            let new_fields = crate::storage::btree::parse_record_fields(&record);
+                            if new_fields.len() >= 2 {
+                                // Check for duplicate key prefix
+                                // Index records are (col1, col2, ..., colN, rowid)
+                                // We need to check if any record has the same prefix (all except rowid)
+                                let mut has_duplicate = false;
+
+                                // Helper to check if existing record has matching prefix
+                                let check_prefix =
+                                    |existing: &[u8],
+                                     new_fields: &[crate::storage::btree::RecordField]|
+                                     -> bool {
+                                        let existing_fields =
+                                            crate::storage::btree::parse_record_fields(existing);
+                                        if existing_fields.len() != new_fields.len()
+                                            || new_fields.len() < 2
+                                        {
+                                            return false;
+                                        }
+                                        let prefix_len = new_fields.len() - 1;
+                                        for i in 0..prefix_len {
+                                            if existing_fields[i] != new_fields[i] {
+                                                return false;
+                                            }
+                                        }
+                                        true
+                                    };
+
+                                if move_res == 0 {
+                                    // Exact match means same key including rowid
+                                    // This would only happen for UPDATE in place - not a UNIQUE violation
+                                } else if move_res == -1 {
+                                    // Cursor is at a record GREATER than search key
+                                    // A record with matching prefix would be at PREVIOUS position
+                                    // (because it would have same prefix but smaller rowid)
+                                    // Move back, check, then move forward again
+                                    if let Ok(()) = bt_cursor.previous(0) {
+                                        let existing_payload =
+                                            if let Some(data) = bt_cursor.payload_fetch() {
+                                                Some(data.to_vec())
+                                            } else if bt_cursor.payload_size() > 0 {
+                                                bt_cursor.payload(0, bt_cursor.payload_size()).ok()
+                                            } else {
+                                                None
+                                            };
+
+                                        if let Some(existing) = existing_payload {
+                                            has_duplicate = check_prefix(&existing, &new_fields);
+                                        }
+
+                                        // Move back to original position for insert
+                                        let _ = bt_cursor.next(0);
+                                    }
+                                } else {
+                                    // move_res == 1: cursor is at or after last cell
+                                    // Check current position - might have matching prefix with smaller rowid
+                                    let existing_payload =
+                                        if let Some(data) = bt_cursor.payload_fetch() {
+                                            Some(data.to_vec())
+                                        } else if bt_cursor.payload_size() > 0 {
+                                            bt_cursor.payload(0, bt_cursor.payload_size()).ok()
+                                        } else {
+                                            None
+                                        };
+
+                                    if let Some(existing) = existing_payload {
+                                        has_duplicate = check_prefix(&existing, &new_fields);
+                                    }
+                                }
+
+                                if has_duplicate {
+                                    // Get error message with table.column format
+                                    let error_msg = if let Some(ref idx_name) = cursor.index_name {
+                                        // Try to look up index in schema for table.column name
+                                        if let Some(ref schema) = schema {
+                                            if let Ok(schema_guard) = schema.read() {
+                                                if let Some(index) = schema_guard
+                                                    .indexes
+                                                    .get(&idx_name.to_lowercase())
+                                                {
+                                                    if !index.columns.is_empty() {
+                                                        // Get column name from table using column_idx
+                                                        let col_idx = index.columns[0].column_idx;
+                                                        let col_name = if col_idx >= 0 {
+                                                            if let Some(table) = schema_guard
+                                                                .tables
+                                                                .get(&index.table.to_lowercase())
+                                                            {
+                                                                if let Some(col) = table
+                                                                    .columns
+                                                                    .get(col_idx as usize)
+                                                                {
+                                                                    col.name.clone()
+                                                                } else {
+                                                                    format!("column{}", col_idx)
+                                                                }
+                                                            } else {
+                                                                format!("column{}", col_idx)
+                                                            }
+                                                        } else {
+                                                            // Expression index - use index name
+                                                            idx_name.clone()
+                                                        };
+                                                        format!(
+                                                            "UNIQUE constraint failed: {}.{}",
+                                                            index.table, col_name
+                                                        )
+                                                    } else {
+                                                        format!(
+                                                            "UNIQUE constraint failed: {}",
+                                                            idx_name
+                                                        )
+                                                    }
+                                                } else {
+                                                    format!(
+                                                        "UNIQUE constraint failed: {}",
+                                                        idx_name
+                                                    )
+                                                }
+                                            } else {
+                                                format!("UNIQUE constraint failed: {}", idx_name)
+                                            }
+                                        } else {
+                                            format!("UNIQUE constraint failed: {}", idx_name)
+                                        }
+                                    } else {
+                                        "UNIQUE constraint failed".to_string()
+                                    };
+
+                                    match on_error {
+                                        OE_IGNORE => {
+                                            // Skip the insert silently
+                                            skip_insert = true;
+                                        }
+                                        OE_REPLACE => {
+                                            // Delete existing row and continue with insert
+                                            // Note: Full REPLACE handling requires deleting from main table too
+                                            // For now, just skip to avoid duplicates
+                                            skip_insert = true;
+                                        }
+                                        _ => {
+                                            // OE_ABORT, OE_FAIL, OE_ROLLBACK: Return error
+                                            return Err(Error::with_message(
+                                                ErrorCode::Constraint,
+                                                error_msg,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
 
                         // Index key is the serialized record (columns + rowid)
-                        if let Some(ref btree) = btree_arc {
-                            let payload = BtreePayload {
-                                key: Some(record.clone()),
-                                n_key: 0,   // Index - key length is in the record header
-                                data: None, // No separate data for indexes
-                                mem: Vec::new(),
-                                n_data: 0,
-                                n_zero: 0,
-                            };
-                            // Use USESEEKRESULT since cursor is already positioned
-                            let flags = BtreeInsertFlags::USESEEKRESULT;
-                            btree.insert(bt_cursor, &payload, flags, 0)?;
+                        if !skip_insert {
+                            if let Some(ref btree) = btree_arc {
+                                let payload = BtreePayload {
+                                    key: Some(record.clone()),
+                                    n_key: 0,   // Index - key length is in the record header
+                                    data: None, // No separate data for indexes
+                                    mem: Vec::new(),
+                                    n_data: 0,
+                                    n_zero: 0,
+                                };
+                                // Use USESEEKRESULT since cursor is already positioned
+                                let flags = BtreeInsertFlags::USESEEKRESULT;
+                                btree.insert(bt_cursor, &payload, flags, 0)?;
+                            }
                         }
                     }
                 }

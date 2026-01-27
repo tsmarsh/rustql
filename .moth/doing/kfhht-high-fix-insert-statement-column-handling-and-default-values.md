@@ -3,51 +3,57 @@
 ## Problem
 INSERT statements fail to properly handle column specifications, defaults, triggers, and ordering.
 
-### Current Pass Rate: 64/83 (77%)
+### Current Pass Rate: 65/83 (78%)
 
-**Progress**: 59 → 64 tests (+5 tests this session)
+**Progress**: 59 → 64 → 65 tests (+6 total)
 
-**Target**: 80% = 66/83 tests (need 2 more)
+**Target**: 80% = 66/83 tests (need 1 more)
 
 ---
 
-## Latest Session Notes (2026-01-27)
+## Latest Session Notes (2026-01-27 - Session 2)
 
 ### What Was Fixed This Session
 
-1. **Index affinity coercion for type comparison** (`src/executor/select/mod.rs`)
-   - **Bug**: Index seeks failed when comparing text literal against integer column (e.g., `WHERE f1='111'` wouldn't match integer 111)
-   - **Root cause**: The index search key was built without applying column type affinities
-   - **Fix**: Added emission of `Opcode::Affinity` before `MakeRecord` when building index seek keys
-   - **Impact**: Fixes insert-3.2 and insert-3.3 (+2 tests)
+1. **UNIQUE Index Constraint Enforcement in IdxInsert** (`src/vdbe/engine/mod.rs`)
+   - **Bug**: IdxInsert opcode didn't check for duplicate keys in UNIQUE indexes
+   - **Root cause**: No duplicate key checking before btree insert
+   - **Fix**: Added is_unique/index_name fields to VdbeCursor; implemented prefix comparison in IdxInsert to detect duplicates; proper error message generation with table.column format
+   - **Impact**: Enables secondary UNIQUE index constraint checking
 
-2. **Scalar subquery register conflict** (`src/executor/insert.rs`, `src/executor/select/mod.rs`)
-   - **Bug**: `INSERT INTO t VALUES((SELECT x FROM t WHERE a=0),1,2)` produced wrong value when subquery returned no rows
-   - **Root cause**: SelectCompiler started registers at 1, conflicting with dest_reg
-   - **Fix**: Added `set_register_base()` to SelectCompiler; InsertCompiler sets subcompiler to start at dest_reg+1
-   - **Impact**: Fixes insert-4.4 and insert-4.5 (+2 tests, NULL correctly returned from empty subquery)
+2. **Auto-index creation for column-level UNIQUE constraints** (`src/executor/prepare.rs`, `src/schema/mod.rs`)
+   - **Bug**: `CREATE TABLE t(a, b UNIQUE)` didn't create the auto-index for column b
+   - **Root cause**: Column-level UNIQUE constraints only set is_unique flag on Column, didn't create actual B-tree indexes
+   - **Fix**: Modified compile_create_table to emit CreateBtree + ParseSchemaIndex + sqlite_master insert for each UNIQUE column/table constraint
+   - **Impact**: Fixes insert-16.6 (+1 test), enables proper UNIQUE checking for column-level constraints
 
-3. **Column scope validation in INSERT VALUES** (`src/executor/insert.rs`)
-   - **Bug**: `INSERT INTO t VALUES(1,t.a,3)` silently used wrong value instead of erroring
-   - **Root cause**: `compile_expr` for Column didn't reject table-qualified columns in VALUES context
-   - **Fix**: Return "no such column: t.a" error for Expr::Column in INSERT VALUES
-   - **Impact**: Fixes insert-4.3 (+1 test)
+3. **Auto-index lookup in OpenRead/OpenWrite** (`src/vdbe/engine/mod.rs`)
+   - **Bug**: Auto-indexes stored in table.indexes weren't found by cursor open operations
+   - **Root cause**: OpenRead/OpenWrite only checked schema.indexes, not table.indexes
+   - **Fix**: Added search loop to check table.indexes for auto-index names
+   - **Impact**: Required for auto-index UNIQUE enforcement to work
 
-### Remaining Issues (19 tests)
+### Remaining Issues (18 tests)
 
-All remaining failures require significant architectural changes:
+1. **INTEGER PRIMARY KEY UNIQUE in Triggers** (insert-16.4, 17.x - multiple tests)
+   - Trigger tries to insert conflicting rowid, should fail with "UNIQUE constraint failed: t.a"
+   - Issue: Insert opcode's rowid conflict detection doesn't work correctly in trigger context
+   - The secondary UNIQUE checking works, but PRIMARY KEY (rowid) conflicts need different handling
 
-1. **UNIQUE Index Constraint Enforcement** (insert-16.x, 17.x - 12 tests)
-   - IdxInsert opcode doesn't check for duplicate keys in UNIQUE indexes
-   - Requires: Add `is_unique` to VdbeCursor, check during IdxInsert, handle conflict modes
-   - Location: `src/vdbe/engine/mod.rs:4680` has TODO comment
+2. **REPLACE Semantics** (insert-6.2, 6.3, 6.4)
+   - REPLACE should delete existing row before inserting new one
+   - Currently inserts without properly deleting conflicting rows
 
-2. **UPDATE OR REPLACE Semantics** (insert-6.3, 6.4 - 2 tests)
-   - UPDATE with conflict resolution not properly deleting conflicting rows
-   - Requires: Fix UPDATE compiler to handle OR REPLACE mode
+3. **Expression Index Parsing** (insert-13.1)
+   - `CREATE INDEX t13x1 ON t13(-b=b)` fails with "syntax error"
+   - Parser doesn't handle negative sign in expression indexes
 
-3. **Blob-to-TEXT Coercion During REPLACE** (insert-15.1 - 1 test)
-   - Blobs inserted into TEXT columns via REPLACE get corrupted
+4. **sqlite_temp_master** (insert-5.5)
+   - Query on sqlite_temp_master for temporary tables not working
+
+---
+
+## Previous Session Notes (2026-01-27 - Session 1)
    - Requires: Fix type coercion in record serialization/deserialization
 
 ---

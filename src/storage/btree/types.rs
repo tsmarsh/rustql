@@ -212,7 +212,7 @@ impl Default for CollSeq {
 }
 
 /// Represents a parsed field value from a SQLite record
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum RecordField {
     Null,
     Int(i64),

@@ -84,26 +84,53 @@ The trigger1.test suite fails with syntax errors because:
 - trigger1-1.11: UPDATE trigger with DELETE in body
 - trigger1-3.1: CREATE TRIGGER after DROP TABLE (trigger cleanup)
 
+### Completed (Session 4) - INSERT Triggers & Validation
+
+- **INSERT trigger integration** in `src/executor/insert.rs`:
+  - Added std::sync::Arc, Trigger, TriggerEvent, TriggerTiming imports
+  - Added find_matching_triggers, generate_trigger_code imports
+  - Added before_triggers and after_triggers fields to InsertCompiler
+  - Look up triggers in compile() method
+  - Added emit_before_triggers and emit_after_triggers methods
+  - Integrated into compile_values, compile_select, compile_default_values
+
+- **Trigger validation** in `src/vdbe/engine/mod.rs`:
+  - Check for system tables (sqlite_master etc.) - error "cannot create trigger on system table"
+  - Validate INSTEAD OF triggers only allowed on views
+  - Validate BEFORE/AFTER triggers only allowed on tables (not views)
+  - Proper error messages for each case
+
+- **DROP VIEW fix** in `src/vdbe/engine/mod.rs` and `src/executor/prepare.rs`:
+  - DropSchema case 2 now removes from schema.views instead of tables
+  - compile_drop now checks schema.views for view existence
+
+- **Test status**: trigger1.test 26/55 (47.3%) passing
+
+### Passing Tests (Session 4)
+- trigger1-1.9: Cannot create trigger on system table
+- trigger1-1.12: Cannot create INSTEAD OF trigger on table
+- trigger1-1.13: Cannot create BEFORE trigger on view
+- trigger1-1.14: Cannot create AFTER trigger on view
+
 ### Remaining Work
 
 #### High Priority
-- More tests needed to reach 50% target
+- Need 2 more tests to reach 50% target (28/55)
 
 #### Medium Priority
 - **Error message format**: Some tests fail due to message differences
   - "no such table: main.t2" vs "no such table: t2"
   - Quoted trigger names in error messages
-- **Trigger validation**:
-  - INSTEAD OF triggers only on views
-  - BEFORE/AFTER triggers only on tables
-  - Cannot create triggers on sqlite_master
+- **TEMP trigger handling**: Triggers on temp tables should go to sqlite_temp_master
+- **Schema resolution**: Triggers need proper main vs temp schema resolution
 
 ## Definition of Done
 - [x] Parser accepts optional timing keyword (defaults to BEFORE) - DONE
 - [x] Statement tail calculation handles BEGIN...END - DONE
-- [ ] trigger1.test pass rate: >=50% (currently 40%)
+- [ ] trigger1.test pass rate: >=50% (currently 47.3%)
 - [x] Basic AFTER DELETE triggers fire and execute body statements - DONE
 - [x] BEFORE triggers working - DONE (via emit_before_triggers)
 - [x] INSERT triggers working - DONE
 - [x] UPDATE triggers working - DONE
 - [x] DELETE in trigger body - DONE
+- [x] Trigger validation (INSTEAD OF on views only, BEFORE/AFTER on tables only) - DONE

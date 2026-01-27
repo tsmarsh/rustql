@@ -4,16 +4,18 @@
 //! Corresponds to insert.c in SQLite.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::error::Result;
 use crate::parser::ast::{
     ConflictAction, Expr, InsertSource, InsertStmt, ResultColumn, SelectBody, SelectStmt, TableRef,
 };
-use crate::schema::Schema;
+use crate::schema::{Schema, Trigger, TriggerEvent, TriggerTiming};
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
 use super::column_mapping::{ColumnMapper, ColumnSource, RowidMapping};
 use super::select::{SelectCompiler, SelectDest};
+use super::trigger::{find_matching_triggers, generate_trigger_code};
 
 fn is_rowid_alias(name: &str) -> bool {
     name.eq_ignore_ascii_case("rowid")
@@ -81,6 +83,12 @@ pub struct InsertCompiler<'a> {
 
     /// Next unnamed parameter index (1-based)
     next_unnamed_param: i32,
+
+    /// BEFORE INSERT triggers
+    before_triggers: Vec<Arc<Trigger>>,
+
+    /// AFTER INSERT triggers
+    after_triggers: Vec<Arc<Trigger>>,
 }
 
 impl<'a> InsertCompiler<'a> {
@@ -99,6 +107,8 @@ impl<'a> InsertCompiler<'a> {
             index_cursors: Vec::new(),
             param_names: Vec::new(),
             next_unnamed_param: 1,
+            before_triggers: Vec::new(),
+            after_triggers: Vec::new(),
         }
     }
 
@@ -117,6 +127,8 @@ impl<'a> InsertCompiler<'a> {
             index_cursors: Vec::new(),
             param_names: Vec::new(),
             next_unnamed_param: 1,
+            before_triggers: Vec::new(),
+            after_triggers: Vec::new(),
         }
     }
 
@@ -157,6 +169,24 @@ impl<'a> InsertCompiler<'a> {
 
         // Open indexes for writing
         self.open_indexes_for_write(&insert.table.name)?;
+
+        // Look up triggers
+        if let Some(schema) = self.schema {
+            self.before_triggers = find_matching_triggers(
+                schema,
+                &insert.table.name,
+                TriggerTiming::Before,
+                TriggerEvent::Insert,
+                None,
+            );
+            self.after_triggers = find_matching_triggers(
+                schema,
+                &insert.table.name,
+                TriggerTiming::After,
+                TriggerEvent::Insert,
+                None,
+            );
+        }
 
         // Handle conflict action
         let conflict_action = insert.or_action.unwrap_or(ConflictAction::Abort);
@@ -306,6 +336,10 @@ impl<'a> InsertCompiler<'a> {
             // Handle conflict action
             self.emit_conflict_check(conflict_action)?;
 
+            // Fire BEFORE INSERT triggers
+            let table_name = insert.table.name.clone();
+            self.emit_before_triggers(&table_name, data_base)?;
+
             // Make record
             let record_reg = self.alloc_reg();
             self.emit(
@@ -329,6 +363,9 @@ impl<'a> InsertCompiler<'a> {
 
             // Insert into indexes
             self.emit_index_inserts(data_base, rowid_reg);
+
+            // Fire AFTER INSERT triggers
+            self.emit_after_triggers(&table_name, data_base)?;
         }
 
         Ok(())
@@ -597,6 +634,10 @@ impl<'a> InsertCompiler<'a> {
         // Handle conflict
         self.emit_conflict_check(conflict_action)?;
 
+        // Fire BEFORE INSERT triggers
+        let table_name = insert.table.name.clone();
+        self.emit_before_triggers(&table_name, data_base)?;
+
         // Make and insert record
         let record_reg = self.alloc_reg();
         self.emit(
@@ -619,6 +660,9 @@ impl<'a> InsertCompiler<'a> {
 
         // Insert into indexes
         self.emit_index_inserts(data_base, rowid_reg);
+
+        // Fire AFTER INSERT triggers
+        self.emit_after_triggers(&table_name, data_base)?;
 
         // Next row in ephemeral table
         self.emit(Opcode::Next, eph_cursor, insert_loop_start, 0, P4::Unused);
@@ -828,6 +872,10 @@ impl<'a> InsertCompiler<'a> {
         // Handle conflict
         self.emit_conflict_check(conflict_action)?;
 
+        // Fire BEFORE INSERT triggers
+        let table_name = insert.table.name.clone();
+        self.emit_before_triggers(&table_name, data_base)?;
+
         // Make and insert record
         let record_reg = self.alloc_reg();
         self.emit(
@@ -850,6 +898,9 @@ impl<'a> InsertCompiler<'a> {
 
         // Insert into indexes
         self.emit_index_inserts(data_base, rowid_reg);
+
+        // Fire AFTER INSERT triggers
+        self.emit_after_triggers(&table_name, data_base)?;
 
         // Next row in ephemeral table
         self.emit(Opcode::Next, eph_cursor, insert_loop_start, 0, P4::Unused);
@@ -1276,7 +1327,7 @@ impl<'a> InsertCompiler<'a> {
     /// Compile INSERT...DEFAULT VALUES
     fn compile_default_values(
         &mut self,
-        _insert: &InsertStmt,
+        insert: &InsertStmt,
         conflict_action: ConflictAction,
     ) -> Result<()> {
         // Allocate rowid
@@ -1302,6 +1353,10 @@ impl<'a> InsertCompiler<'a> {
         // Handle conflict
         self.emit_conflict_check(conflict_action)?;
 
+        // Fire BEFORE INSERT triggers
+        let table_name = insert.table.name.clone();
+        self.emit_before_triggers(&table_name, data_base)?;
+
         // Make and insert record
         let record_reg = self.alloc_reg();
         self.emit(
@@ -1324,6 +1379,9 @@ impl<'a> InsertCompiler<'a> {
 
         // Insert into indexes
         self.emit_index_inserts(data_base, rowid_reg);
+
+        // Fire AFTER INSERT triggers
+        self.emit_after_triggers(&table_name, data_base)?;
 
         Ok(())
     }
@@ -1754,6 +1812,66 @@ impl<'a> InsertCompiler<'a> {
                 self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
             }
         }
+        Ok(())
+    }
+
+    // ========================================================================
+    // Trigger methods
+    // ========================================================================
+
+    /// Emit BEFORE INSERT triggers
+    fn emit_before_triggers(&mut self, table_name: &str, new_base_reg: i32) -> Result<()> {
+        if self.before_triggers.is_empty() {
+            return Ok(());
+        }
+
+        let return_label = self.alloc_label();
+
+        let trigger_ops = generate_trigger_code(
+            &self.before_triggers,
+            self.schema,
+            table_name,
+            None, // No OLD row for INSERT
+            Some(new_base_reg),
+            self.num_columns as i32,
+            &mut self.next_reg,
+            return_label,
+        )?;
+
+        for op in trigger_ops {
+            self.ops.push(op);
+        }
+
+        self.resolve_label(return_label, self.current_addr() as i32);
+
+        Ok(())
+    }
+
+    /// Emit AFTER INSERT triggers
+    fn emit_after_triggers(&mut self, table_name: &str, new_base_reg: i32) -> Result<()> {
+        if self.after_triggers.is_empty() {
+            return Ok(());
+        }
+
+        let return_label = self.alloc_label();
+
+        let trigger_ops = generate_trigger_code(
+            &self.after_triggers,
+            self.schema,
+            table_name,
+            None, // No OLD row for INSERT
+            Some(new_base_reg),
+            self.num_columns as i32,
+            &mut self.next_reg,
+            return_label,
+        )?;
+
+        for op in trigger_ops {
+            self.ops.push(op);
+        }
+
+        self.resolve_label(return_label, self.current_addr() as i32);
+
         Ok(())
     }
 

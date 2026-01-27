@@ -2477,7 +2477,7 @@ impl<'s> StatementCompiler<'s> {
             let exists = match kind {
                 "table" => schema.tables.contains_key(&name_lower),
                 "index" => schema.indexes.contains_key(&name_lower),
-                "view" => schema.tables.contains_key(&name_lower), // views stored in tables
+                "view" => schema.views.contains_key(&name_lower),
                 "trigger" => schema.triggers.contains_key(&name_lower),
                 _ => true, // Unknown kind - let it through
             };

@@ -4843,13 +4843,72 @@ impl Vdbe {
                                     if let crate::parser::ast::Stmt::CreateTrigger(create) = stmt {
                                         let if_not_exists = create.if_not_exists;
 
-                                        // Validate table exists
+                                        // Check for system tables
                                         let table_name_lower = create.table.to_lowercase();
-                                        if !schema_guard.tables.contains_key(&table_name_lower) {
+                                        if table_name_lower == "sqlite_master"
+                                            || table_name_lower == "sqlite_schema"
+                                            || table_name_lower == "sqlite_temp_master"
+                                            || table_name_lower == "sqlite_temp_schema"
+                                        {
                                             return Err(Error::with_message(
                                                 ErrorCode::Error,
-                                                format!("no such table: {}", create.table),
+                                                "cannot create trigger on system table".to_string(),
                                             ));
+                                        }
+
+                                        // Check if target is table or view
+                                        let is_table =
+                                            schema_guard.tables.contains_key(&table_name_lower);
+                                        let is_view =
+                                            schema_guard.views.contains_key(&table_name_lower);
+
+                                        // Validate INSTEAD OF triggers only on views
+                                        if matches!(
+                                            create.time,
+                                            crate::parser::ast::TriggerTime::InsteadOf
+                                        ) {
+                                            if is_table {
+                                                return Err(Error::with_message(
+                                                    ErrorCode::Error,
+                                                    format!(
+                                                        "cannot create INSTEAD OF trigger on table: {}",
+                                                        create.table
+                                                    ),
+                                                ));
+                                            }
+                                            if !is_view {
+                                                return Err(Error::with_message(
+                                                    ErrorCode::Error,
+                                                    format!("no such view: {}", create.table),
+                                                ));
+                                            }
+                                        } else {
+                                            // BEFORE/AFTER triggers - check if view
+                                            if is_view {
+                                                let timing_str = match create.time {
+                                                    crate::parser::ast::TriggerTime::Before => {
+                                                        "BEFORE"
+                                                    }
+                                                    crate::parser::ast::TriggerTime::After => {
+                                                        "AFTER"
+                                                    }
+                                                    _ => "BEFORE",
+                                                };
+                                                return Err(Error::with_message(
+                                                    ErrorCode::Error,
+                                                    format!(
+                                                        "cannot create {} trigger on view: {}",
+                                                        timing_str, create.table
+                                                    ),
+                                                ));
+                                            }
+                                            // Must be a table
+                                            if !is_table {
+                                                return Err(Error::with_message(
+                                                    ErrorCode::Error,
+                                                    format!("no such table: {}", create.table),
+                                                ));
+                                            }
                                         }
 
                                         // Convert timing/event
@@ -5109,8 +5168,8 @@ impl Vdbe {
                                     }
                                 }
                                 2 => {
-                                    // Drop view (stored in tables)
-                                    schema_guard.tables.remove(&name_lower);
+                                    // Drop view
+                                    schema_guard.views.remove(&name_lower);
                                 }
                                 3 => {
                                     // Drop trigger

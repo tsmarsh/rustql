@@ -1394,7 +1394,19 @@ impl Vdbe {
                 // Check for sqlite_master virtual table
                 let is_sqlite_master = table_name
                     .as_ref()
-                    .map(|n| n.eq_ignore_ascii_case("sqlite_master"))
+                    .map(|n| {
+                        n.eq_ignore_ascii_case("sqlite_master")
+                            || n.eq_ignore_ascii_case("sqlite_schema")
+                    })
+                    .unwrap_or(false);
+
+                // Check for sqlite_temp_master virtual table (temp schema)
+                let is_sqlite_temp_master = table_name
+                    .as_ref()
+                    .map(|n| {
+                        n.eq_ignore_ascii_case("sqlite_temp_master")
+                            || n.eq_ignore_ascii_case("sqlite_temp_schema")
+                    })
                     .unwrap_or(false);
 
                 // Check for sqlite_stat1 virtual table
@@ -1403,50 +1415,60 @@ impl Vdbe {
                     .map(|n| n.eq_ignore_ascii_case("sqlite_stat1"))
                     .unwrap_or(false);
 
-                if is_sqlite_master {
+                if is_sqlite_master || is_sqlite_temp_master {
+                    // Filter by db_idx: 0 for main (sqlite_master), 1 for temp (sqlite_temp_master)
+                    let target_db_idx = if is_sqlite_temp_master { 1 } else { 0 };
                     // Populate schema entries from current schema BEFORE borrowing cursor
                     let mut entries = Vec::new();
                     if let Some(ref schema) = self.schema {
                         if let Ok(schema_guard) = schema.read() {
-                            // Add tables
+                            // Add tables (filter by db_idx)
                             for (_, table) in schema_guard.tables.iter() {
-                                entries.push((
-                                    "table".to_string(),
-                                    table.name.clone(),
-                                    table.name.clone(),
-                                    table.root_page,
-                                    table.sql.clone(),
-                                ));
+                                if table.db_idx == target_db_idx {
+                                    entries.push((
+                                        "table".to_string(),
+                                        table.name.clone(),
+                                        table.name.clone(),
+                                        table.root_page,
+                                        table.sql.clone(),
+                                    ));
+                                }
                             }
-                            // Add indexes
+                            // Add indexes (filter by db_idx)
                             for (_, index) in schema_guard.indexes.iter() {
-                                entries.push((
-                                    "index".to_string(),
-                                    index.name.clone(),
-                                    index.table.clone(),
-                                    index.root_page,
-                                    index.sql.clone(),
-                                ));
+                                if index.db_idx == target_db_idx {
+                                    entries.push((
+                                        "index".to_string(),
+                                        index.name.clone(),
+                                        index.table.clone(),
+                                        index.root_page,
+                                        index.sql.clone(),
+                                    ));
+                                }
                             }
-                            // Add triggers
+                            // Add triggers (filter by db_idx)
                             for (_, trigger) in schema_guard.triggers.iter() {
-                                entries.push((
-                                    "trigger".to_string(),
-                                    trigger.name.clone(),
-                                    trigger.table.clone(),
-                                    0, // triggers don't have a root page
-                                    trigger.sql.clone(),
-                                ));
+                                if trigger.db_idx == target_db_idx {
+                                    entries.push((
+                                        "trigger".to_string(),
+                                        trigger.name.clone(),
+                                        trigger.table.clone(),
+                                        0, // triggers don't have a root page
+                                        trigger.sql.clone(),
+                                    ));
+                                }
                             }
-                            // Add views
+                            // Add views (filter by db_idx)
                             for (_, view) in schema_guard.views.iter() {
-                                entries.push((
-                                    "view".to_string(),
-                                    view.name.clone(),
-                                    view.name.clone(), // views have tbl_name = view name
-                                    0,                 // views don't have a root page
-                                    Some(view.sql.clone()),
-                                ));
+                                if view.db_idx == target_db_idx {
+                                    entries.push((
+                                        "view".to_string(),
+                                        view.name.clone(),
+                                        view.name.clone(), // views have tbl_name = view name
+                                        0,                 // views don't have a root page
+                                        Some(view.sql.clone()),
+                                    ));
+                                }
                             }
                         }
                     }
@@ -5350,6 +5372,7 @@ impl Vdbe {
                                         let trigger = crate::schema::Trigger {
                                             name: create.name.name.clone(),
                                             table: create.table.clone(),
+                                            db_idx: if create.temporary { 1 } else { 0 },
                                             timing,
                                             event,
                                             for_each_row: create.for_each_row,
@@ -5409,6 +5432,7 @@ impl Vdbe {
                                             // Create view definition
                                             let view = crate::schema::View {
                                                 name: create.name.name.clone(),
+                                                db_idx: create.name.database_idx(),
                                                 sql: sql.clone(),
                                                 columns: create.columns.clone(),
                                                 select: create.query,

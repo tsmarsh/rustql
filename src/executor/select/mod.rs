@@ -2646,11 +2646,17 @@ impl<'s> SelectCompiler<'s> {
     fn lookup_table_schema(&self, table_name_lower: &str) -> Option<std::sync::Arc<Table>> {
         use crate::schema::Column;
 
-        if table_name_lower == "sqlite_master" {
-            // Create a virtual schema for sqlite_master
+        // Handle sqlite_master, sqlite_schema, sqlite_temp_master, sqlite_temp_schema
+        if table_name_lower == "sqlite_master"
+            || table_name_lower == "sqlite_schema"
+            || table_name_lower == "sqlite_temp_master"
+            || table_name_lower == "sqlite_temp_schema"
+        {
+            // Create a virtual schema for sqlite_master/sqlite_temp_master
+            let is_temp = table_name_lower.contains("temp");
             Some(std::sync::Arc::new(Table {
-                name: "sqlite_master".to_string(),
-                db_idx: 0,
+                name: table_name_lower.to_string(),
+                db_idx: if is_temp { 1 } else { 0 },
                 root_page: 1,
                 columns: vec![
                     Column {
@@ -3763,12 +3769,17 @@ impl<'s> SelectCompiler<'s> {
                 let table_name_lower = table_name.to_lowercase();
 
                 // Look up table in schema if available
-                let schema_table = if table_name_lower == "sqlite_master" {
-                    // Create a virtual schema for sqlite_master
+                let schema_table = if table_name_lower == "sqlite_master"
+                    || table_name_lower == "sqlite_schema"
+                    || table_name_lower == "sqlite_temp_master"
+                    || table_name_lower == "sqlite_temp_schema"
+                {
+                    // Create a virtual schema for sqlite_master/sqlite_temp_master
                     use crate::schema::{Affinity, Column, Table};
+                    let is_temp = table_name_lower.contains("temp");
                     Some(std::sync::Arc::new(Table {
-                        name: "sqlite_master".to_string(),
-                        db_idx: 0,
+                        name: table_name_lower.clone(),
+                        db_idx: if is_temp { 1 } else { 0 },
                         root_page: 1,
                         columns: vec![
                             Column {

@@ -515,6 +515,8 @@ pub struct Index {
     pub name: String,
     /// Table this indexes
     pub table: String,
+    /// Database index (0=main, 1=temp, 2+=attached)
+    pub db_idx: i32,
     /// Index columns
     pub columns: Vec<IndexColumn>,
     /// Root page
@@ -827,12 +829,26 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
         });
     }
 
-    if !sql_upper.starts_with("CREATE TABLE") {
+    // Check for TEMP/TEMPORARY keyword
+    let is_temp = sql_upper.starts_with("CREATE TEMP TABLE")
+        || sql_upper.starts_with("CREATE TEMPORARY TABLE");
+
+    if !sql_upper.starts_with("CREATE TABLE")
+        && !sql_upper.starts_with("CREATE TEMP TABLE")
+        && !sql_upper.starts_with("CREATE TEMPORARY TABLE")
+    {
         return None;
     }
 
-    // Extract table name
-    let after_create = sql[12..].trim(); // Skip "CREATE TABLE"
+    // Extract table name - skip "CREATE TABLE" or "CREATE TEMP TABLE" etc
+    let skip_len = if sql_upper.starts_with("CREATE TEMPORARY TABLE") {
+        22 // "CREATE TEMPORARY TABLE"
+    } else if sql_upper.starts_with("CREATE TEMP TABLE") {
+        17 // "CREATE TEMP TABLE"
+    } else {
+        12 // "CREATE TABLE"
+    };
+    let after_create = sql[skip_len..].trim();
     let after_create = if after_create.to_uppercase().starts_with("IF NOT EXISTS") {
         after_create[13..].trim()
     } else {
@@ -1032,6 +1048,7 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
             index_list.push(std::sync::Arc::new(Index {
                 name: index_name,
                 table: table_name.clone(),
+                db_idx: 0, // TODO: propagate from table creation context
                 columns: index_columns,
                 root_page: 0, // No separate btree for implicit indexes
                 unique: is_unique,
@@ -1045,7 +1062,7 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
 
     Some(Table {
         name: table_name,
-        db_idx: 0,
+        db_idx: if is_temp { 1 } else { 0 },
         root_page,
         columns,
         primary_key,
@@ -1126,6 +1143,7 @@ pub fn parse_create_index_sql(sql: &str, _is_unique: bool) -> Option<Index> {
     Some(Index {
         name: index_name,
         table: table_name,
+        db_idx: 0, // TODO: parse from schema context
         columns,
         unique: is_unique,
         partial: None,
@@ -1163,6 +1181,8 @@ pub struct Trigger {
     pub name: String,
     /// Table this trigger is on
     pub table: String,
+    /// Database index (0=main, 1=temp, 2+=attached)
+    pub db_idx: i32,
     /// Timing (BEFORE, AFTER, INSTEAD OF)
     pub timing: TriggerTiming,
     /// Event type (INSERT, UPDATE, DELETE)
@@ -1184,6 +1204,7 @@ impl Default for Trigger {
         Self {
             name: String::new(),
             table: String::new(),
+            db_idx: 0,
             timing: TriggerTiming::Before,
             event: TriggerEvent::Insert,
             for_each_row: true,
@@ -1224,6 +1245,8 @@ pub enum TriggerStep {
 pub struct View {
     /// View name
     pub name: String,
+    /// Database index (0=main, 1=temp, 2+=attached)
+    pub db_idx: i32,
     /// CREATE VIEW SQL statement
     pub sql: String,
     /// Optional column names
@@ -1440,6 +1463,8 @@ pub fn type_affinity(type_name: &str) -> Affinity {
 pub struct CreateTableStmt {
     /// IF NOT EXISTS
     pub if_not_exists: bool,
+    /// TEMP/TEMPORARY
+    pub temporary: bool,
     /// Table name
     pub name: QualifiedName,
     /// Table definition
@@ -1640,9 +1665,15 @@ impl Schema {
         constraints: &[TableConstraint],
         stmt: &CreateTableStmt,
     ) -> Result<Table> {
+        // Use db_idx=1 for TEMP tables, otherwise use the schema qualifier
+        let db_idx = if stmt.temporary {
+            1
+        } else {
+            name.database_idx()
+        };
         let mut table = Table {
             name: name.name.clone(),
-            db_idx: name.database_idx(),
+            db_idx,
             root_page: 0, // Will be set when allocating btree page
             columns: Vec::new(),
             primary_key: None,
@@ -1857,6 +1888,7 @@ impl Schema {
                     table.indexes.push(std::sync::Arc::new(Index {
                         name: index_name,
                         table: table.name.clone(),
+                        db_idx: table.db_idx,
                         columns: index_columns,
                         root_page: 0, // Will be set when btree is created
                         unique: true,
@@ -1960,6 +1992,7 @@ impl Schema {
         let mut index = Index {
             name: stmt.name.name.clone(),
             table: stmt.table.clone(),
+            db_idx: table.db_idx,
             columns: Vec::new(),
             root_page: 0, // Will be set when allocating btree page
             unique: stmt.unique,
@@ -2545,6 +2578,7 @@ mod tests {
 
         let stmt = CreateTableStmt {
             if_not_exists: false,
+            temporary: false,
             name: QualifiedName::new("users"),
             definition: TableDefinition::Columns {
                 columns: vec![
@@ -2595,6 +2629,7 @@ mod tests {
 
         let stmt = CreateTableStmt {
             if_not_exists: false,
+            temporary: false,
             name: QualifiedName::new("users"),
             definition: TableDefinition::Columns {
                 columns: vec![ColumnDef {
@@ -2626,6 +2661,7 @@ mod tests {
         // First create a table
         let table_stmt = CreateTableStmt {
             if_not_exists: false,
+            temporary: false,
             name: QualifiedName::new("users"),
             definition: TableDefinition::Columns {
                 columns: vec![
@@ -2677,6 +2713,7 @@ mod tests {
 
         let stmt = CreateTableStmt {
             if_not_exists: false,
+            temporary: false,
             name: QualifiedName::new("users"),
             definition: TableDefinition::Columns {
                 columns: vec![ColumnDef {
@@ -2718,6 +2755,7 @@ mod tests {
 
         let parent = CreateTableStmt {
             if_not_exists: false,
+            temporary: false,
             name: QualifiedName::new("parent"),
             definition: TableDefinition::Columns {
                 columns: vec![ColumnDef {
@@ -2737,6 +2775,7 @@ mod tests {
 
         let child = CreateTableStmt {
             if_not_exists: false,
+            temporary: false,
             name: QualifiedName::new("child"),
             definition: TableDefinition::Columns {
                 columns: vec![ColumnDef {
@@ -2793,6 +2832,7 @@ mod tests {
 
         let stmt = CreateTableStmt {
             if_not_exists: false,
+            temporary: false,
             name: QualifiedName::new("items"),
             definition: TableDefinition::Columns {
                 columns: vec![
@@ -2848,6 +2888,7 @@ mod tests {
 
         let stmt = CreateTableStmt {
             if_not_exists: false,
+            temporary: false,
             name: QualifiedName::new("test"),
             definition: TableDefinition::Columns {
                 columns: vec![ColumnDef {
@@ -2877,6 +2918,7 @@ mod tests {
 
         let stmt = CreateTableStmt {
             if_not_exists: false,
+            temporary: false,
             name: QualifiedName::new("test"),
             definition: TableDefinition::Columns {
                 columns: vec![

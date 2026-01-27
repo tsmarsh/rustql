@@ -31,6 +31,15 @@ impl QualifiedName {
             name: name.into(),
         }
     }
+
+    /// Get database index (0=main, 1=temp, 2+=attached)
+    pub fn database_idx(&self) -> i32 {
+        match self.schema.as_deref() {
+            None | Some("main") => 0,
+            Some("temp") => 1,
+            _ => 2, // Will need proper lookup for attached DBs
+        }
+    }
 }
 
 impl fmt::Display for QualifiedName {

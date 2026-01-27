@@ -52,6 +52,7 @@ pub fn compile_create_trigger(
     let trigger = Trigger {
         name: create.name.name.clone(),
         table: table_name.clone(),
+        db_idx: if create.temporary { 1 } else { 0 },
         timing,
         event,
         for_each_row: create.for_each_row,

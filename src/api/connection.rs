@@ -1442,6 +1442,7 @@ fn parse_create_index_sql(
     Some(Index {
         name: index_name,
         table: table_name.to_string(),
+        db_idx: 0,
         columns,
         root_page,
         unique,

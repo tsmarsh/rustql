@@ -1263,7 +1263,11 @@ impl<'s> StatementCompiler<'s> {
     fn build_create_table_sql(&self, create: &CreateTableStmt) -> String {
         use crate::parser::ast::{ColumnConstraintKind, TableConstraintKind, TableDefinition};
 
-        let mut sql = String::from("CREATE TABLE ");
+        let mut sql = String::from("CREATE ");
+        if create.temporary {
+            sql.push_str("TEMP ");
+        }
+        sql.push_str("TABLE ");
         if create.if_not_exists {
             sql.push_str("IF NOT EXISTS ");
         }

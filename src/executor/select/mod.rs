@@ -2682,6 +2682,20 @@ impl<'s> SelectCompiler<'s> {
                 }
             }
 
+            // For FTS3/FTS4/FTS5 tables, the table name itself is a valid pseudo-column
+            // This is used in functions like snippet(tablename), offsets(tablename), etc.
+            if let Some(ref module) = schema_table.virtual_module {
+                if (module.eq_ignore_ascii_case("fts3")
+                    || module.eq_ignore_ascii_case("fts4")
+                    || module.eq_ignore_ascii_case("fts5"))
+                    && table.table_name.eq_ignore_ascii_case(column)
+                {
+                    // Return -2 as a sentinel for "FTS table content" pseudo-column
+                    // The actual value doesn't matter much as snippet() uses FTS context
+                    return Some(-2);
+                }
+            }
+
             return schema_table
                 .columns
                 .iter()
@@ -5126,7 +5140,15 @@ impl<'s> SelectCompiler<'s> {
                     }
                 };
 
-                if col_idx < 0 {
+                if col_idx == -1 {
+                    // Rowid alias
+                    self.emit(Opcode::Rowid, cursor, dest_reg, 0, P4::Unused);
+                } else if col_idx == -2 {
+                    // FTS pseudo-column (table name used as column in snippet(), etc.)
+                    // Return NULL - the actual value is not used by FTS functions
+                    self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                } else if col_idx < 0 {
+                    // Other negative values - treat as rowid for compatibility
                     self.emit(Opcode::Rowid, cursor, dest_reg, 0, P4::Unused);
                 } else {
                     self.emit(

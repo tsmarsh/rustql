@@ -2953,9 +2953,17 @@ impl Vdbe {
                                 }
                             } else if args.len() == 1 {
                                 if let Some(text) = text {
-                                    let query = args.remove(0);
+                                    // Get the original query arg - but if it's NULL, use vtab_query
+                                    let query_arg = args.remove(0);
                                     args.push(text);
-                                    args.push(query);
+                                    // If query arg is NULL (pseudo-column placeholder), use vtab_query
+                                    if matches!(query_arg, Value::Null) {
+                                        if let Some(query) = self.vtab_query.clone() {
+                                            args.push(Value::Text(query));
+                                        }
+                                    } else {
+                                        args.push(query_arg);
+                                    }
                                 } else if let Some(query) = self.vtab_query.clone() {
                                     args.push(Value::Text(query));
                                 }

@@ -82,7 +82,6 @@ fn temp_db_path(tag: &str) -> String {
 }
 
 #[test]
-#[ignore] // TODO: FTS3 context query not propagated after database reopen - snippet() gets empty query
 fn test_fts3_persists_internal_content() {
     init_sqlite();
     let path = temp_db_path("persist_internal");

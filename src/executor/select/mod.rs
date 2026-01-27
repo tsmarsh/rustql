@@ -5524,7 +5524,7 @@ impl<'s> SelectCompiler<'s> {
                 pattern,
                 op,
                 negated,
-                ..
+                escape,
             } => {
                 // Compile LIKE/GLOB expression
                 let text_reg = self.alloc_reg();
@@ -5539,8 +5539,16 @@ impl<'s> SelectCompiler<'s> {
                     crate::parser::ast::LikeOp::Match => Opcode::Match,
                 };
 
-                // Like opcode: P1=text, P2=result, P3=pattern
-                self.emit(opcode, text_reg, dest_reg, pattern_reg, P4::Unused);
+                // Like opcode: P1=text, P2=result, P3=pattern, P4=escape reg (if any)
+                // Compile escape expression if present and store register in P4
+                let p4 = if let Some(esc_expr) = escape {
+                    let esc_reg = self.alloc_reg();
+                    self.compile_expr(esc_expr, esc_reg)?;
+                    P4::Mem(esc_reg as i32)
+                } else {
+                    P4::Unused
+                };
+                self.emit(opcode, text_reg, dest_reg, pattern_reg, p4);
 
                 if *negated {
                     // Negate the result

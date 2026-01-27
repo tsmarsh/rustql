@@ -4227,7 +4227,7 @@ impl Vdbe {
                 // LIKE P1 P2 P3 P4
                 // Compare text in P1 against pattern in P3
                 // Store result (1 for match, 0 for no match) in P2
-                // P4 may contain escape character
+                // P4 may contain register with escape character
                 inc_like_count();
                 let text = self.mem(op.p1).to_value();
                 let pattern = self.mem(op.p3).to_value();
@@ -4242,8 +4242,15 @@ impl Vdbe {
                         .map(|ptr| unsafe { &*ptr }.db_config.case_sensitive_like)
                         .unwrap_or(false);
 
-                    // func_like expects [pattern, text] order
-                    let args = vec![pattern, text];
+                    // func_like expects [pattern, text, optional_escape] order
+                    let mut args = vec![pattern, text];
+
+                    // Check if P4 contains an escape register
+                    if let P4::Mem(esc_reg) = &op.p4 {
+                        let escape_val = self.mem(*esc_reg).to_value();
+                        args.push(escape_val);
+                    }
+
                     match crate::functions::scalar::func_like_case_sensitive(&args, case_sensitive)
                     {
                         Ok(Value::Integer(result)) => {

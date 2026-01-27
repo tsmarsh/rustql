@@ -1332,12 +1332,14 @@ fn like_match_impl(pattern: &[char], text: &[char], escape: Option<char>) -> boo
 
             // Check for escape character
             if Some(p_char) == escape && p_idx + 1 < pattern.len() {
+                // Escape character found - the next char is literal
                 p_idx += 1;
                 if pattern[p_idx] == text[t_idx] {
                     p_idx += 1;
                     t_idx += 1;
                     continue;
                 }
+                // Escaped char doesn't match - this is a mismatch, fall through to backtrack
             } else if p_char == '%' {
                 star_p_idx = Some(p_idx);
                 star_t_idx = Some(t_idx);

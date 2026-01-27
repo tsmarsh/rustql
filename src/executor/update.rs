@@ -10,13 +10,15 @@
 //! This prevents hangs caused by modifying the btree while iterating it.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::error::Result;
 use crate::parser::ast::{ConflictAction, Expr, ResultColumn, UpdateStmt};
-use crate::schema::Schema;
+use crate::schema::{Trigger, TriggerEvent, TriggerTiming};
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
 use super::column_mapping::ColumnMapper;
+use super::trigger::{find_matching_triggers, generate_trigger_code};
 
 /// Flag to indicate that this operation should update the change counter
 const OPFLAG_NCHANGE: u16 = 0x01;
@@ -78,6 +80,12 @@ pub struct UpdateCompiler<'s> {
 
     /// Next unnamed parameter index (1-based)
     next_unnamed_param: i32,
+
+    /// BEFORE UPDATE triggers to fire
+    before_triggers: Vec<Arc<Trigger>>,
+
+    /// AFTER UPDATE triggers to fire
+    after_triggers: Vec<Arc<Trigger>>,
 }
 
 impl<'s> UpdateCompiler<'s> {
@@ -99,6 +107,8 @@ impl<'s> UpdateCompiler<'s> {
             column_data_base: None,
             param_names: Vec::new(),
             next_unnamed_param: 1,
+            before_triggers: Vec::new(),
+            after_triggers: Vec::new(),
         }
     }
 
@@ -120,6 +130,8 @@ impl<'s> UpdateCompiler<'s> {
             column_data_base: None,
             param_names: Vec::new(),
             next_unnamed_param: 1,
+            before_triggers: Vec::new(),
+            after_triggers: Vec::new(),
         }
     }
 
@@ -153,6 +165,31 @@ impl<'s> UpdateCompiler<'s> {
 
         // Build column map from schema
         self.build_column_map_from_schema(&update.table.name);
+
+        // Look up UPDATE triggers for this table
+        if let Some(schema) = self.schema {
+            let update_columns: Vec<String> = update
+                .assignments
+                .iter()
+                .flat_map(|a| a.columns.iter().cloned())
+                .collect();
+
+            self.before_triggers = find_matching_triggers(
+                schema,
+                &update.table.name,
+                TriggerTiming::Before,
+                TriggerEvent::Update,
+                Some(&update_columns),
+            );
+
+            self.after_triggers = find_matching_triggers(
+                schema,
+                &update.table.name,
+                TriggerTiming::After,
+                TriggerEvent::Update,
+                Some(&update_columns),
+            );
+        }
 
         // Initialize ColumnMapper for validation
         if let Some(schema) = self.schema {
@@ -389,7 +426,11 @@ impl<'s> UpdateCompiler<'s> {
         rowid_reg: i32,
         conflict_action: ConflictAction,
     ) -> Result<()> {
-        // Allocate registers for all column values
+        let has_before_triggers = !self.before_triggers.is_empty();
+        let has_after_triggers = !self.after_triggers.is_empty();
+        let table_name = self.table_name.clone();
+
+        // Allocate registers for all column values (will become NEW values)
         let data_base = self.next_reg;
         let _data_regs = self.alloc_regs(self.num_columns);
 
@@ -398,6 +439,23 @@ impl<'s> UpdateCompiler<'s> {
             let reg = data_base + i as i32;
             self.emit(Opcode::Column, cursor, i as i32, reg, P4::Unused);
         }
+
+        // If we have triggers, save OLD values before modifying data_base
+        let old_save_base = if has_before_triggers || has_after_triggers {
+            let old_base = self.alloc_regs(self.num_columns);
+            for i in 0..self.num_columns {
+                self.emit(
+                    Opcode::SCopy,
+                    data_base + i as i32,
+                    old_base + i as i32,
+                    0,
+                    P4::Unused,
+                );
+            }
+            Some(old_base)
+        } else {
+            None
+        };
 
         // Set column_data_base so compile_expr knows to use registers for column refs
         self.column_data_base = Some(data_base);
@@ -433,6 +491,31 @@ impl<'s> UpdateCompiler<'s> {
                     ));
                 }
             }
+        }
+
+        // For BEFORE triggers: build NEW values by copying OLD and applying updates
+        let new_for_before = if has_before_triggers {
+            let new_base = self.alloc_regs(self.num_columns);
+            for i in 0..self.num_columns {
+                self.emit(
+                    Opcode::SCopy,
+                    data_base + i as i32,
+                    new_base + i as i32,
+                    0,
+                    P4::Unused,
+                );
+            }
+            for &(col_idx, temp_reg) in &temp_assignments {
+                self.emit(Opcode::SCopy, temp_reg, new_base + col_idx, 0, P4::Unused);
+            }
+            Some(new_base)
+        } else {
+            None
+        };
+
+        // Fire BEFORE UPDATE triggers
+        if let (Some(old_base), Some(new_base)) = (old_save_base, new_for_before) {
+            self.emit_before_triggers(&table_name, old_base, new_base)?;
         }
 
         // Phase 2: Copy temp values to data registers
@@ -483,6 +566,13 @@ impl<'s> UpdateCompiler<'s> {
             P4::Int64(flags),
             OPFLAG_NCHANGE,
         );
+
+        // Fire AFTER UPDATE triggers
+        if let Some(old_base) = old_save_base {
+            if has_after_triggers {
+                self.emit_after_triggers(&table_name, old_base, data_base)?;
+            }
+        }
 
         Ok(())
     }
@@ -1802,6 +1892,76 @@ impl<'s> UpdateCompiler<'s> {
         }
 
         self.resolve_label(end_label, self.current_addr() as i32);
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Trigger methods
+    // ========================================================================
+
+    /// Emit BEFORE UPDATE triggers
+    fn emit_before_triggers(
+        &mut self,
+        table_name: &str,
+        old_base_reg: i32,
+        new_base_reg: i32,
+    ) -> Result<()> {
+        if self.before_triggers.is_empty() {
+            return Ok(());
+        }
+
+        let return_label = self.alloc_label();
+
+        let trigger_ops = generate_trigger_code(
+            &self.before_triggers,
+            self.schema,
+            table_name,
+            Some(old_base_reg),
+            Some(new_base_reg),
+            self.num_columns as i32,
+            &mut self.next_reg,
+            return_label,
+        )?;
+
+        for op in trigger_ops {
+            self.ops.push(op);
+        }
+
+        self.resolve_label(return_label, self.current_addr() as i32);
+
+        Ok(())
+    }
+
+    /// Emit AFTER UPDATE triggers
+    fn emit_after_triggers(
+        &mut self,
+        table_name: &str,
+        old_base_reg: i32,
+        new_base_reg: i32,
+    ) -> Result<()> {
+        if self.after_triggers.is_empty() {
+            return Ok(());
+        }
+
+        let return_label = self.alloc_label();
+
+        let trigger_ops = generate_trigger_code(
+            &self.after_triggers,
+            self.schema,
+            table_name,
+            Some(old_base_reg),
+            Some(new_base_reg),
+            self.num_columns as i32,
+            &mut self.next_reg,
+            return_label,
+        )?;
+
+        for op in trigger_ops {
+            self.ops.push(op);
+        }
+
+        self.resolve_label(return_label, self.current_addr() as i32);
 
         Ok(())
     }

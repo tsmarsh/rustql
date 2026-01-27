@@ -470,15 +470,152 @@ impl<'s> TriggerBodyCompiler<'s> {
     }
 
     /// Compile a DELETE statement in a trigger body
-    fn compile_delete(&mut self, _delete: &crate::parser::ast::DeleteStmt) -> Result<()> {
-        // For now, emit a no-op - DELETE in trigger is complex
+    fn compile_delete(&mut self, delete: &crate::parser::ast::DeleteStmt) -> Result<()> {
+        // Open table for writing
+        let cursor = self.alloc_cursor();
         self.emit(
-            Opcode::Noop,
+            Opcode::OpenWrite,
+            cursor,
             0,
             0,
-            0,
-            P4::Text("DELETE in trigger".to_string()),
+            P4::Text(delete.table.name.clone()),
         );
+
+        // Labels for the scan loop
+        let loop_start = self.alloc_label();
+        let loop_end = self.alloc_label();
+        let skip_delete = self.alloc_label();
+
+        // Rewind to start of table
+        self.emit(Opcode::Rewind, cursor, loop_end, 0, P4::Unused);
+
+        // Loop start
+        self.resolve_label(loop_start, self.current_addr() as i32);
+
+        // If WHERE clause, evaluate and skip if false
+        if let Some(ref where_expr) = delete.where_clause {
+            let cond_reg = self.alloc_reg();
+            self.compile_delete_where(where_expr, cursor, cond_reg, &delete.table.name)?;
+            // If condition is false (0), skip the delete
+            self.emit(Opcode::IfNot, cond_reg, skip_delete, 1, P4::Unused);
+        }
+
+        // Delete the current row
+        self.emit(Opcode::Delete, cursor, 0, 0, P4::Unused);
+
+        // Skip delete label
+        self.resolve_label(skip_delete, self.current_addr() as i32);
+
+        // Move to next row
+        self.emit(Opcode::Next, cursor, loop_start, 0, P4::Unused);
+
+        // Loop end
+        self.resolve_label(loop_end, self.current_addr() as i32);
+
+        // Close cursor
+        self.emit(Opcode::Close, cursor, 0, 0, P4::Unused);
+
+        Ok(())
+    }
+
+    /// Compile a WHERE clause for DELETE, handling OLD/NEW references
+    fn compile_delete_where(
+        &mut self,
+        expr: &crate::parser::ast::Expr,
+        cursor: i32,
+        dest_reg: i32,
+        table_name: &str,
+    ) -> Result<()> {
+        use crate::parser::ast::{BinaryOp, Expr, Literal};
+
+        match expr {
+            Expr::Binary { op, left, right } => {
+                let left_reg = self.alloc_reg();
+                let right_reg = self.alloc_reg();
+
+                self.compile_delete_where(left, cursor, left_reg, table_name)?;
+                self.compile_delete_where(right, cursor, right_reg, table_name)?;
+
+                match op {
+                    BinaryOp::Eq => {
+                        let set_true = self.alloc_label();
+                        let end_label = self.alloc_label();
+                        self.emit(Opcode::Integer, 0, dest_reg, 0, P4::Unused);
+                        self.emit(Opcode::Eq, right_reg, set_true, left_reg, P4::Unused);
+                        self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+                        self.resolve_label(set_true, self.current_addr() as i32);
+                        self.emit(Opcode::Integer, 1, dest_reg, 0, P4::Unused);
+                        self.resolve_label(end_label, self.current_addr() as i32);
+                    }
+                    BinaryOp::Add => {
+                        self.emit(Opcode::Add, right_reg, left_reg, dest_reg, P4::Unused);
+                    }
+                    BinaryOp::Sub => {
+                        self.emit(Opcode::Subtract, right_reg, left_reg, dest_reg, P4::Unused);
+                    }
+                    _ => {
+                        self.emit(Opcode::SCopy, left_reg, dest_reg, 0, P4::Unused);
+                    }
+                }
+            }
+
+            Expr::Column(col_ref) => {
+                if let Some(ref table) = col_ref.table {
+                    let table_upper = table.to_uppercase();
+                    if table_upper == "OLD" || table_upper == "NEW" {
+                        let p1 = if table_upper == "OLD" { 0 } else { 1 };
+                        let col_lower = col_ref.column.to_lowercase();
+                        let col_idx = self
+                            .column_map
+                            .get(&col_lower)
+                            .map(|&idx| idx as i32)
+                            .unwrap_or(-1);
+                        self.emit(Opcode::Param, p1, col_idx, dest_reg, P4::Unused);
+                        return Ok(());
+                    }
+                }
+
+                let col_lower = col_ref.column.to_lowercase();
+                let col_idx = if let Some(schema) = self.schema {
+                    let table_lower = table_name.to_lowercase();
+                    if let Some(table) = schema.tables.get(&table_lower) {
+                        table
+                            .columns
+                            .iter()
+                            .position(|c| c.name.to_lowercase() == col_lower)
+                            .map(|i| i as i32)
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    }
+                } else {
+                    self.column_map
+                        .get(&col_lower)
+                        .map(|&i| i as i32)
+                        .unwrap_or(0)
+                };
+
+                self.emit(Opcode::Column, cursor, col_idx, dest_reg, P4::Unused);
+            }
+
+            Expr::Literal(lit) => match lit {
+                Literal::Integer(n) => {
+                    self.emit(Opcode::Integer, *n as i32, dest_reg, 0, P4::Unused);
+                }
+                _ => {
+                    self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                }
+            },
+
+            Expr::Parens(inner) => {
+                self.compile_delete_where(inner, cursor, dest_reg, table_name)?;
+            }
+
+            _ => {
+                self.compile_expr(expr, dest_reg)?;
+            }
+        }
+
         Ok(())
     }
 

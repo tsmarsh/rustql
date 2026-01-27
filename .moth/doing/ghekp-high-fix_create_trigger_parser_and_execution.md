@@ -52,12 +52,42 @@ The trigger1.test suite fails with syntax errors because:
 - trigger1-1.10: DELETE trigger now fires correctly
 - Previous passing tests still work
 
+### Completed (Session 3) - INSERT/UPDATE Triggers & DELETE in Trigger Body
+
+- **INSERT trigger integration** in `src/executor/insert.rs`:
+  - Added trigger imports and fields to InsertCompiler
+  - Looks up BEFORE/AFTER INSERT triggers at compile time
+  - Added emit_before_triggers and emit_after_triggers methods
+  - Integrated into compile_values, compile_select, compile_default_values
+
+- **UPDATE trigger integration** in `src/executor/update.rs`:
+  - Added trigger imports and fields to UpdateCompiler
+  - Looks up BEFORE/AFTER UPDATE triggers with column filtering
+  - Saves OLD values before modification for trigger access
+  - Builds NEW values for BEFORE triggers
+  - Fires AFTER triggers with OLD (saved) and NEW (updated) values
+
+- **DELETE in trigger body** in `src/executor/trigger.rs`:
+  - Implemented compile_delete for TriggerBodyCompiler
+  - Opens table, loops through rows, evaluates WHERE clause
+  - Handles OLD/NEW references via Param opcode
+  - compile_delete_where handles binary ops, column refs, literals
+
+- **Drop table triggers fix** in `src/vdbe/engine/mod.rs`:
+  - DropSchema opcode now removes triggers when dropping table
+  - Fixes cascading trigger cleanup
+
+- **Test status**: trigger1.test 22/55 (40%) passing
+
+### Passing Tests (Session 3)
+- trigger1-1.10: DELETE trigger with DELETE in body
+- trigger1-1.11: UPDATE trigger with DELETE in body
+- trigger1-3.1: CREATE TRIGGER after DROP TABLE (trigger cleanup)
+
 ### Remaining Work
 
 #### High Priority
-- INSERT trigger execution
-- UPDATE trigger execution
-- BEFORE triggers (currently only AFTER DELETE works)
+- More tests needed to reach 50% target
 
 #### Medium Priority
 - **Error message format**: Some tests fail due to message differences
@@ -71,8 +101,9 @@ The trigger1.test suite fails with syntax errors because:
 ## Definition of Done
 - [x] Parser accepts optional timing keyword (defaults to BEFORE) - DONE
 - [x] Statement tail calculation handles BEGIN...END - DONE
-- [ ] trigger1.test pass rate: >=50% (currently 36%)
+- [ ] trigger1.test pass rate: >=50% (currently 40%)
 - [x] Basic AFTER DELETE triggers fire and execute body statements - DONE
-- [ ] BEFORE triggers working
-- [ ] INSERT triggers working
-- [ ] UPDATE triggers working
+- [x] BEFORE triggers working - DONE (via emit_before_triggers)
+- [x] INSERT triggers working - DONE
+- [x] UPDATE triggers working - DONE
+- [x] DELETE in trigger body - DONE

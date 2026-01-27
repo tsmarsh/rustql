@@ -476,6 +476,12 @@ pub enum Opcode {
     /// Mark end of trigger prolog (where OLD/NEW setup ends)
     TriggerProlog,
 
+    /// Set OLD/NEW row values for trigger execution
+    /// P1 = 0 for OLD row, 1 for NEW row
+    /// P2 = base register containing row values
+    /// P3 = number of columns
+    SetTriggerRow,
+
     // ========================================================================
     // RowSet Operations (for IN clause optimization)
     // ========================================================================
@@ -715,6 +721,7 @@ impl Opcode {
             Opcode::Param => "Param",
             Opcode::TriggerTest => "TriggerTest",
             Opcode::TriggerProlog => "TriggerProlog",
+            Opcode::SetTriggerRow => "SetTriggerRow",
             Opcode::RowSetAdd => "RowSetAdd",
             Opcode::RowSetRead => "RowSetRead",
             Opcode::RowSetTest => "RowSetTest",

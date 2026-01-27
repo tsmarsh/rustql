@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::error::{Error, ErrorCode, Result};
 use crate::parser::ast::{CreateTriggerStmt, TriggerEvent as AstTriggerEvent, TriggerTime};
 use crate::schema::{Schema, Trigger, TriggerEvent, TriggerTiming};
-use crate::vdbe::ops::{Opcode, VdbeOp, P4};
+use crate::vdbe::ops::{Opcode, SubProgram, VdbeOp, P4};
 
 // ============================================================================
 // Trigger Compilation
@@ -244,22 +244,527 @@ pub fn find_matching_triggers(
         .collect()
 }
 
+/// Compiler for trigger body statements
+///
+/// This compiles trigger body SQL into VDBE bytecode that can be executed
+/// as a subprogram. It handles OLD/NEW pseudo-table references by converting
+/// them to Param opcodes.
+pub struct TriggerBodyCompiler<'s> {
+    /// Schema for name resolution
+    schema: Option<&'s Schema>,
+    /// Generated opcodes
+    ops: Vec<VdbeOp>,
+    /// Next register to allocate
+    next_reg: i32,
+    /// Next cursor to allocate
+    next_cursor: i32,
+    /// Next label
+    next_label: i32,
+    /// Table name this trigger is on (for column resolution)
+    table_name: String,
+    /// Column map for the trigger's table: column_name -> index
+    column_map: std::collections::HashMap<String, usize>,
+    /// Labels for resolution
+    labels: std::collections::HashMap<i32, i32>,
+    /// Number of columns in the table
+    num_columns: usize,
+}
+
+impl<'s> TriggerBodyCompiler<'s> {
+    /// Create a new trigger body compiler
+    pub fn new(schema: Option<&'s Schema>, table_name: &str) -> Self {
+        let mut compiler = Self {
+            schema,
+            ops: Vec::new(),
+            next_reg: 1,
+            next_cursor: 0,
+            next_label: -1,
+            table_name: table_name.to_string(),
+            column_map: std::collections::HashMap::new(),
+            labels: std::collections::HashMap::new(),
+            num_columns: 0,
+        };
+
+        // Build column map from schema
+        if let Some(schema) = schema {
+            let table_lower = table_name.to_lowercase();
+            if let Some(table) = schema.tables.get(&table_lower) {
+                compiler.num_columns = table.columns.len();
+                for (idx, col) in table.columns.iter().enumerate() {
+                    compiler.column_map.insert(col.name.to_lowercase(), idx);
+                }
+            }
+        }
+
+        compiler
+    }
+
+    /// Allocate a register
+    fn alloc_reg(&mut self) -> i32 {
+        let r = self.next_reg;
+        self.next_reg += 1;
+        r
+    }
+
+    /// Allocate a cursor
+    fn alloc_cursor(&mut self) -> i32 {
+        let c = self.next_cursor;
+        self.next_cursor += 1;
+        c
+    }
+
+    /// Allocate a label
+    fn alloc_label(&mut self) -> i32 {
+        let l = self.next_label;
+        self.next_label -= 1;
+        l
+    }
+
+    /// Current address (for label resolution)
+    fn current_addr(&self) -> usize {
+        self.ops.len()
+    }
+
+    /// Resolve a label to an address
+    fn resolve_label(&mut self, label: i32, addr: i32) {
+        self.labels.insert(label, addr);
+    }
+
+    /// Emit an opcode
+    fn emit(&mut self, opcode: Opcode, p1: i32, p2: i32, p3: i32, p4: P4) {
+        self.ops.push(VdbeOp {
+            opcode,
+            p1,
+            p2,
+            p3,
+            p4,
+            p5: 0,
+            comment: None,
+        });
+    }
+
+    /// Compile a trigger body to a SubProgram
+    ///
+    /// Takes the parsed trigger body statements and compiles them to VDBE bytecode.
+    /// OLD/NEW references are converted to Param opcodes.
+    pub fn compile_body(&mut self, body: &[crate::parser::ast::Stmt]) -> Result<SubProgram> {
+        // Compile each statement in the body
+        for stmt in body {
+            self.compile_stmt(stmt)?;
+        }
+
+        // Add Halt at the end
+        self.emit(Opcode::Halt, 0, 0, 0, P4::Unused);
+
+        // Resolve labels
+        self.resolve_labels()?;
+
+        Ok(SubProgram {
+            ops: std::mem::take(&mut self.ops),
+            n_mem: self.next_reg,
+            n_cursor: self.next_cursor,
+            trigger: None,
+        })
+    }
+
+    /// Resolve all labels to actual addresses
+    fn resolve_labels(&mut self) -> Result<()> {
+        for op in &mut self.ops {
+            // Check P2 for negative (label) values
+            if op.p2 < 0 {
+                if let Some(&addr) = self.labels.get(&op.p2) {
+                    op.p2 = addr;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile a single statement
+    fn compile_stmt(&mut self, stmt: &crate::parser::ast::Stmt) -> Result<()> {
+        use crate::parser::ast::Stmt;
+
+        match stmt {
+            Stmt::Insert(insert) => self.compile_insert(insert),
+            Stmt::Update(update) => self.compile_update(update),
+            Stmt::Delete(delete) => self.compile_delete(delete),
+            Stmt::Select(select) => self.compile_select(select),
+            _ => {
+                // Other statements not supported in triggers
+                Err(Error::with_message(
+                    ErrorCode::Error,
+                    "unsupported statement in trigger body",
+                ))
+            }
+        }
+    }
+
+    /// Compile an INSERT statement in a trigger body
+    fn compile_insert(&mut self, insert: &crate::parser::ast::InsertStmt) -> Result<()> {
+        use crate::parser::ast::InsertSource;
+
+        // Open target table for writing
+        let cursor = self.alloc_cursor();
+        self.emit(
+            Opcode::OpenWrite,
+            cursor,
+            0,
+            0,
+            P4::Text(insert.table.name.clone()),
+        );
+
+        // Handle INSERT ... VALUES
+        if let InsertSource::Values(rows) = &insert.source {
+            for row in rows {
+                // Build the record from values
+                let base_reg = self.alloc_reg();
+                let num_cols = row.len();
+
+                // Allocate registers for all columns
+                for _ in 1..num_cols {
+                    self.alloc_reg();
+                }
+
+                // Compile each value expression
+                for (i, expr) in row.iter().enumerate() {
+                    let dest_reg = base_reg + i as i32;
+                    self.compile_expr(expr, dest_reg)?;
+                }
+
+                // Allocate rowid register
+                let rowid_reg = self.alloc_reg();
+                self.emit(Opcode::NewRowid, cursor, rowid_reg, 0, P4::Unused);
+
+                // Make the record
+                let record_reg = self.alloc_reg();
+                self.emit(
+                    Opcode::MakeRecord,
+                    base_reg,
+                    num_cols as i32,
+                    record_reg,
+                    P4::Unused,
+                );
+
+                // Insert
+                self.emit(Opcode::Insert, cursor, record_reg, rowid_reg, P4::Unused);
+            }
+        }
+
+        // Close cursor
+        self.emit(Opcode::Close, cursor, 0, 0, P4::Unused);
+
+        Ok(())
+    }
+
+    /// Compile an UPDATE statement in a trigger body
+    fn compile_update(&mut self, _update: &crate::parser::ast::UpdateStmt) -> Result<()> {
+        // For now, emit a no-op - UPDATE in trigger is complex
+        self.emit(
+            Opcode::Noop,
+            0,
+            0,
+            0,
+            P4::Text("UPDATE in trigger".to_string()),
+        );
+        Ok(())
+    }
+
+    /// Compile a DELETE statement in a trigger body
+    fn compile_delete(&mut self, _delete: &crate::parser::ast::DeleteStmt) -> Result<()> {
+        // For now, emit a no-op - DELETE in trigger is complex
+        self.emit(
+            Opcode::Noop,
+            0,
+            0,
+            0,
+            P4::Text("DELETE in trigger".to_string()),
+        );
+        Ok(())
+    }
+
+    /// Compile a SELECT statement in a trigger body
+    fn compile_select(&mut self, _select: &crate::parser::ast::SelectStmt) -> Result<()> {
+        // SELECT in trigger body is executed for side effects (like RAISE)
+        // For now, emit a no-op
+        self.emit(
+            Opcode::Noop,
+            0,
+            0,
+            0,
+            P4::Text("SELECT in trigger".to_string()),
+        );
+        Ok(())
+    }
+
+    /// Compile an expression, handling OLD/NEW references
+    fn compile_expr(&mut self, expr: &crate::parser::ast::Expr, dest_reg: i32) -> Result<()> {
+        use crate::parser::ast::{ColumnRef, Expr, Literal};
+
+        match expr {
+            Expr::Literal(lit) => {
+                match lit {
+                    Literal::Null => {
+                        self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                    }
+                    Literal::Integer(n) => {
+                        self.emit(Opcode::Integer, *n as i32, dest_reg, 0, P4::Unused);
+                    }
+                    Literal::Float(f) => {
+                        self.emit(Opcode::Real, 0, dest_reg, 0, P4::Real(*f));
+                    }
+                    Literal::String(s) => {
+                        self.emit(Opcode::String8, 0, dest_reg, 0, P4::Text(s.clone()));
+                    }
+                    Literal::Blob(b) => {
+                        self.emit(
+                            Opcode::Blob,
+                            b.len() as i32,
+                            dest_reg,
+                            0,
+                            P4::Blob(b.clone()),
+                        );
+                    }
+                    Literal::Bool(b) => {
+                        self.emit(
+                            Opcode::Integer,
+                            if *b { 1 } else { 0 },
+                            dest_reg,
+                            0,
+                            P4::Unused,
+                        );
+                    }
+                    Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp => {
+                        // Use NULL for now - time functions need special handling
+                        self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                    }
+                }
+            }
+
+            Expr::Column(col_ref) => {
+                // Check if this is an OLD or NEW reference
+                self.compile_column_ref(col_ref, dest_reg)?;
+            }
+
+            Expr::Binary { op, left, right } => {
+                // Compile binary operation
+                let left_reg = self.alloc_reg();
+                let right_reg = self.alloc_reg();
+
+                self.compile_expr(left, left_reg)?;
+                self.compile_expr(right, right_reg)?;
+
+                // Emit appropriate opcode based on operator
+                use crate::parser::ast::BinaryOp;
+                match op {
+                    BinaryOp::Add => {
+                        self.emit(Opcode::Add, right_reg, left_reg, dest_reg, P4::Unused)
+                    }
+                    BinaryOp::Sub => {
+                        self.emit(Opcode::Subtract, right_reg, left_reg, dest_reg, P4::Unused)
+                    }
+                    BinaryOp::Mul => {
+                        self.emit(Opcode::Multiply, right_reg, left_reg, dest_reg, P4::Unused)
+                    }
+                    BinaryOp::Div => {
+                        self.emit(Opcode::Divide, right_reg, left_reg, dest_reg, P4::Unused)
+                    }
+                    BinaryOp::Concat => {
+                        self.emit(Opcode::Concat, left_reg, right_reg, dest_reg, P4::Unused)
+                    }
+                    _ => {
+                        // For other operators, just use left value for now
+                        self.emit(Opcode::SCopy, left_reg, dest_reg, 0, P4::Unused);
+                    }
+                }
+            }
+
+            Expr::Parens(inner) => {
+                // Parenthesized expression - just compile the inner expression
+                self.compile_expr(inner, dest_reg)?;
+            }
+
+            Expr::Unary { op, expr: inner } => {
+                self.compile_expr(inner, dest_reg)?;
+                match op {
+                    crate::parser::ast::UnaryOp::Neg => {
+                        self.emit(Opcode::Negative, dest_reg, dest_reg, 0, P4::Unused);
+                    }
+                    crate::parser::ast::UnaryOp::Not => {
+                        self.emit(Opcode::Not, dest_reg, dest_reg, 0, P4::Unused);
+                    }
+                    _ => {}
+                }
+            }
+
+            _ => {
+                // For complex expressions, use NULL for now
+                self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Compile a column reference, handling OLD/NEW pseudo-tables
+    fn compile_column_ref(
+        &mut self,
+        col_ref: &crate::parser::ast::ColumnRef,
+        dest_reg: i32,
+    ) -> Result<()> {
+        // Check if table qualifier is OLD or NEW
+        if let Some(ref table) = col_ref.table {
+            let table_upper = table.to_uppercase();
+
+            if table_upper == "OLD" || table_upper == "NEW" {
+                // This is an OLD/NEW reference - use Param opcode
+                let p1 = if table_upper == "OLD" { 0 } else { 1 };
+
+                // Find column index
+                let col_lower = col_ref.column.to_lowercase();
+                let col_idx = self
+                    .column_map
+                    .get(&col_lower)
+                    .map(|&idx| idx as i32)
+                    .unwrap_or(-1); // -1 for rowid
+
+                // Special case: check for rowid aliases
+                if col_ref.column.eq_ignore_ascii_case("rowid")
+                    || col_ref.column.eq_ignore_ascii_case("_rowid_")
+                    || col_ref.column.eq_ignore_ascii_case("oid")
+                {
+                    self.emit(Opcode::Param, p1, -1, dest_reg, P4::Unused);
+                } else {
+                    self.emit(Opcode::Param, p1, col_idx, dest_reg, P4::Unused);
+                }
+
+                return Ok(());
+            }
+        }
+
+        // Not an OLD/NEW reference - use NULL for now
+        // A full implementation would resolve the column from the current context
+        self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+        Ok(())
+    }
+}
+
 /// Generate code to fire triggers for an operation
 ///
-/// This is a placeholder that returns empty bytecode.
-/// A full implementation would:
-/// 1. Check each matching trigger's WHEN condition
-/// 2. Execute the trigger body statements
-/// 3. Handle recursive trigger prevention
+/// This compiles matching triggers and generates Program opcodes to execute them.
+/// The caller is responsible for setting up OLD/NEW row values in the VDBE before
+/// executing the generated code.
+///
+/// Parameters:
+/// - triggers: List of triggers to fire
+/// - schema: Schema for name resolution in trigger bodies
+/// - table_name: Name of the table (for column resolution)
+/// - old_base_reg: Base register containing OLD row values (or None for INSERT)
+/// - new_base_reg: Base register containing NEW row values (or None for DELETE)
+/// - num_columns: Number of columns in the table
+/// - next_reg: Pointer to next register counter (updated)
+/// - return_label: Label to jump to after trigger execution
 pub fn generate_trigger_code(
-    _triggers: &[Arc<Trigger>],
-    _old_reg: Option<i32>,
-    _new_reg: Option<i32>,
-    _rowid_reg: i32,
+    triggers: &[Arc<Trigger>],
+    schema: Option<&Schema>,
+    table_name: &str,
+    old_base_reg: Option<i32>,
+    new_base_reg: Option<i32>,
+    num_columns: i32,
+    next_reg: &mut i32,
+    return_label: i32,
 ) -> Result<Vec<VdbeOp>> {
-    // Full implementation requires nested VDBE execution
-    // which is complex and will be done incrementally
-    Ok(Vec::new())
+    let mut ops = Vec::new();
+
+    if triggers.is_empty() {
+        return Ok(ops);
+    }
+
+    for trigger in triggers {
+        // Parse the trigger SQL to get the body statements
+        let body_stmts = if let Some(sql) = &trigger.sql {
+            // Parse the SQL to get the trigger AST
+            match crate::parser::grammar::parse(sql) {
+                Ok(crate::parser::ast::Stmt::CreateTrigger(create)) => create.body,
+                _ => continue, // Skip if can't parse
+            }
+        } else {
+            continue; // No SQL stored
+        };
+
+        if body_stmts.is_empty() {
+            continue;
+        }
+
+        // Compile the trigger body to a SubProgram
+        let mut compiler = TriggerBodyCompiler::new(schema, table_name);
+        let subprogram = compiler.compile_body(&body_stmts)?;
+
+        // Before calling the trigger, we need to set up OLD/NEW row values
+        // This is done by emitting Copy opcodes to move values from the base registers
+        // to the trigger's expected locations
+
+        // For OLD values (DELETE/UPDATE triggers)
+        if let Some(old_reg) = old_base_reg {
+            // Emit opcodes to copy OLD row to trigger_old_row in VDBE
+            // The SetTriggerRow opcode stores the row values
+            let copy_reg = *next_reg;
+            *next_reg += num_columns;
+
+            for i in 0..num_columns {
+                ops.push(make_op(
+                    Opcode::SCopy,
+                    old_reg + i,
+                    copy_reg + i,
+                    0,
+                    P4::Unused,
+                ));
+            }
+
+            // SetTriggerRow stores the row for Param opcode to read
+            ops.push(make_op(
+                Opcode::SetTriggerRow,
+                0, // 0 = OLD row
+                copy_reg,
+                num_columns,
+                P4::Unused,
+            ));
+        }
+
+        // For NEW values (INSERT/UPDATE triggers)
+        if let Some(new_reg) = new_base_reg {
+            let copy_reg = *next_reg;
+            *next_reg += num_columns;
+
+            for i in 0..num_columns {
+                ops.push(make_op(
+                    Opcode::SCopy,
+                    new_reg + i,
+                    copy_reg + i,
+                    0,
+                    P4::Unused,
+                ));
+            }
+
+            ops.push(make_op(
+                Opcode::SetTriggerRow,
+                1, // 1 = NEW row
+                copy_reg,
+                num_columns,
+                P4::Unused,
+            ));
+        }
+
+        // Emit Program opcode to execute the trigger
+        ops.push(make_op(
+            Opcode::Program,
+            0,
+            return_label,
+            0,
+            P4::Subprogram(Arc::new(subprogram)),
+        ));
+    }
+
+    Ok(ops)
 }
 
 /// Context for trigger execution

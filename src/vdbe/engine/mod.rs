@@ -28,16 +28,16 @@ use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
 // Re-export from state module
 pub use state::{
-    get_search_count, get_sort_count, get_sort_flag, get_step_count, reset_search_count,
-    reset_sort_count, reset_step_count,
+    get_like_count, get_search_count, get_sort_count, get_sort_flag, get_step_count,
+    reset_like_count, reset_search_count, reset_sort_count, reset_step_count,
 };
 
 // Use state module items locally
 use state::{
-    inc_search_count, inc_sort_count, inc_step_count, DEFAULT_CURSOR_SLOTS, DEFAULT_MEM_SIZE,
-    OE_ABORT, OE_FAIL, OE_IGNORE, OE_MASK, OE_NONE, OE_REPLACE, OE_ROLLBACK, OPFLAG_APPEND,
-    OPFLAG_ISUPDATE, OPFLAG_LASTROWID, OPFLAG_NCHANGE, VDBE_MAGIC_DEAD, VDBE_MAGIC_HALT,
-    VDBE_MAGIC_INIT, VDBE_MAGIC_RUN,
+    inc_like_count, inc_search_count, inc_sort_count, inc_step_count, DEFAULT_CURSOR_SLOTS,
+    DEFAULT_MEM_SIZE, OE_ABORT, OE_FAIL, OE_IGNORE, OE_MASK, OE_NONE, OE_REPLACE, OE_ROLLBACK,
+    OPFLAG_APPEND, OPFLAG_ISUPDATE, OPFLAG_LASTROWID, OPFLAG_NCHANGE, VDBE_MAGIC_DEAD,
+    VDBE_MAGIC_HALT, VDBE_MAGIC_INIT, VDBE_MAGIC_RUN,
 };
 
 // ============================================================================
@@ -898,6 +898,10 @@ impl Vdbe {
                 // Check if we're in a subprogram (trigger)
                 if let Some((parent_ops, return_pc, _parent_pc)) = self.subprogram_stack.pop() {
                     // Return from subprogram to parent
+                    eprintln!(
+                        "DEBUG Halt: returning from subprogram to parent, return_pc={}, parent ops len={}",
+                        return_pc, parent_ops.len()
+                    );
                     self.ops = parent_ops;
                     self.pc = return_pc - 1; // -1 because it will be incremented
                     self.trigger_depth = self.trigger_depth.saturating_sub(1);
@@ -3480,15 +3484,18 @@ impl Vdbe {
                     }
                 }
 
-                // Fire AFTER DELETE triggers if a row was successfully deleted
-                if deleted {
-                    // Get table name from P4
-                    if let P4::Text(ref table_name) = op.p4 {
-                        self.fire_after_delete_triggers(table_name)?;
-                    } else if let P4::Table(ref table_name) = op.p4 {
-                        self.fire_after_delete_triggers(table_name)?;
-                    }
-                }
+                // Note: AFTER DELETE triggers are now handled at compile time
+                // via Program opcodes emitted by delete.rs. The fire_after_delete_triggers
+                // approach was interfering with register values because it doesn't preserve
+                // the register state during trigger execution.
+                // Disabled to allow the compile-time approach to work correctly.
+                // if deleted {
+                //     if let P4::Text(ref table_name) = op.p4 {
+                //         self.fire_after_delete_triggers(table_name)?;
+                //     } else if let P4::Table(ref table_name) = op.p4 {
+                //         self.fire_after_delete_triggers(table_name)?;
+                //     }
+                // }
             }
 
             Opcode::Last => {
@@ -4223,6 +4230,7 @@ impl Vdbe {
                 // Compare text in P1 against pattern in P3
                 // Store result (1 for match, 0 for no match) in P2
                 // P4 may contain escape character
+                inc_like_count();
                 let text = self.mem(op.p1).to_value();
                 let pattern = self.mem(op.p3).to_value();
 
@@ -5376,6 +5384,11 @@ impl Vdbe {
 
                 // Get the subprogram from P4
                 if let P4::Subprogram(ref subprog) = op.p4 {
+                    eprintln!(
+                        "DEBUG Program: entering subprogram ({} ops), return_pc(P2)={}, current_pc={}",
+                        subprog.ops.len(), op.p2, self.pc
+                    );
+
                     // Save current execution state
                     let return_pc = op.p2;
                     let current_ops = std::mem::take(&mut self.ops);
@@ -5387,10 +5400,17 @@ impl Vdbe {
 
                     // Load subprogram
                     self.ops = subprog.ops.clone();
-                    self.pc = -1; // Will be incremented to 0
+                    // Set pc to 0 to start at first instruction
+                    // (exec_op will increment it after executing each opcode)
+                    // Note: We return Continue here, and step() will call exec_op()
+                    // which will execute ops[0] and then increment pc to 1.
+                    self.pc = 0;
 
                     // Increment trigger depth
                     self.trigger_depth += 1;
+
+                    // Return Continue so step() continues with the subprogram
+                    return Ok(ExecResult::Continue);
                 } else {
                     // No subprogram - this is an error or no-op
                     // Just continue to next instruction
@@ -5404,6 +5424,7 @@ impl Vdbe {
                 // P2 = column index (-1 for rowid)
                 // P3 = destination register
 
+                let row_type = if op.p1 == 0 { "OLD" } else { "NEW" };
                 let row = if op.p1 == 0 {
                     &self.trigger_old_row
                 } else {
@@ -5442,6 +5463,30 @@ impl Vdbe {
                 // TriggerProlog
                 // Marks end of trigger prolog (where OLD/NEW setup ends)
                 // This is a no-op marker used for debugging/tracing
+            }
+
+            Opcode::SetTriggerRow => {
+                // SetTriggerRow P1 P2 P3
+                // Set OLD/NEW row values for trigger execution
+                // P1 = 0 for OLD row, 1 for NEW row
+                // P2 = base register containing row values
+                // P3 = number of columns
+                let base_reg = op.p2;
+                let num_cols = op.p3 as usize;
+
+                // Collect values from registers
+                let mut row = Vec::with_capacity(num_cols);
+                for i in 0..num_cols {
+                    let val = self.mem(base_reg + i as i32).clone();
+                    row.push(val);
+                }
+
+                // Store in trigger context
+                if op.p1 == 0 {
+                    self.trigger_old_row = Some(row);
+                } else {
+                    self.trigger_new_row = Some(row);
+                }
             }
 
             // ================================================================

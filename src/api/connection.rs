@@ -1405,16 +1405,7 @@ fn parse_create_index_sql(
     let col_list = &after_create[paren_start + 1..paren_end];
 
     // Parse columns - look up column indices from table schema
-    eprintln!(
-        "DEBUG parse_create_index_sql: looking for table '{}' in schema with {} tables",
-        table_name.to_lowercase(),
-        schema.tables.len()
-    );
     let table = schema.tables.get(&table_name.to_lowercase())?;
-    eprintln!(
-        "DEBUG parse_create_index_sql: found table with {} columns",
-        table.columns.len()
-    );
     let mut columns = Vec::new();
 
     for col_str in col_list.split(',') {
@@ -1439,10 +1430,6 @@ fn parse_create_index_sql(
             .position(|c| c.name.to_lowercase() == col_name)
             .map(|i| i as i32)
             .unwrap_or(-1);
-        eprintln!(
-            "DEBUG parse_create_index_sql: col '{}' -> index {}",
-            col_name, column_idx
-        );
 
         columns.push(IndexColumn {
             column_idx,

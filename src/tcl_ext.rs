@@ -20,7 +20,8 @@ use crate::api::{
 };
 use crate::types::{ColumnType, StepResult};
 use crate::vdbe::{
-    get_search_count, get_sort_count, reset_search_count, reset_sort_count, reset_step_count,
+    get_like_count, get_search_count, get_sort_count, reset_like_count, reset_search_count,
+    reset_sort_count, reset_step_count,
 };
 use crate::{
     sqlite3_changes, sqlite3_close, sqlite3_column_count, sqlite3_column_name, sqlite3_column_text,
@@ -513,6 +514,16 @@ unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         interp,
         sort_count_name.as_ptr(),
         sort_count_val.as_ptr(),
+        TCL_GLOBAL_ONLY,
+    );
+
+    // Initialize sqlite_like_count variable for LIKE function call counting
+    let like_count_name = CString::new("::sqlite_like_count").unwrap();
+    let like_count_val = CString::new("0").unwrap();
+    Tcl_SetVar(
+        interp,
+        like_count_name.as_ptr(),
+        like_count_val.as_ptr(),
         TCL_GLOBAL_ONLY,
     );
 }
@@ -2655,6 +2666,7 @@ unsafe extern "C" fn db_cmd(
                         crate::vdbe::reset_search_count();
                         crate::vdbe::reset_sort_count();
                         crate::vdbe::reset_step_count();
+                        crate::vdbe::reset_like_count();
                         set_result_string(interp, "");
                     }
                     _ => {
@@ -2795,15 +2807,21 @@ unsafe fn db_eval(
         return TCL_ERROR;
     }
 
-    // Reset search, sort, and step counts at the start of each eval
+    let sql = obj_to_string(*objv.offset(2));
+    let sql_trimmed = sql.trim().to_uppercase();
+    let is_explain = sql_trimmed.starts_with("EXPLAIN");
+
+    // Reset search, sort, step, and like counts at the start of each eval
+    // But don't reset like_count for EXPLAIN queries (preserves count from actual query)
     reset_search_count();
     reset_sort_count();
     reset_step_count();
+    if !is_explain {
+        reset_like_count();
+    }
 
     // Set the current interpreter for user function callbacks
     set_current_interp(interp);
-
-    let sql = obj_to_string(*objv.offset(2));
 
     // Check if we have array-name and script arguments
     let (array_name, script) = if objc >= 5 {
@@ -3021,9 +3039,13 @@ unsafe fn db_eval(
             TCL_OK
         });
 
-        // Update ::sqlite_search_count and ::sqlite_sort_count variables
+        // Update ::sqlite_search_count, ::sqlite_sort_count, and ::sqlite_like_count variables
+        // Don't update like_count for EXPLAIN queries (preserves count from actual query)
         update_search_count_var(interp);
         update_sort_count_var(interp);
+        if !is_explain {
+            update_like_count_var(interp);
+        }
 
         // Clear the interpreter context
         clear_current_interp();
@@ -3047,6 +3069,19 @@ unsafe fn update_search_count_var(interp: *mut Tcl_Interp) {
 unsafe fn update_sort_count_var(interp: *mut Tcl_Interp) {
     let var_name = CString::new("::sqlite_sort_count").unwrap();
     let count_str = CString::new(get_sort_count().to_string()).unwrap();
+    Tcl_SetVar(
+        interp,
+        var_name.as_ptr(),
+        count_str.as_ptr(),
+        TCL_GLOBAL_ONLY,
+    );
+}
+
+/// Update the ::sqlite_like_count TCL variable with current like count
+unsafe fn update_like_count_var(interp: *mut Tcl_Interp) {
+    let count = get_like_count();
+    let var_name = CString::new("::sqlite_like_count").unwrap();
+    let count_str = CString::new(count.to_string()).unwrap();
     Tcl_SetVar(
         interp,
         var_name.as_ptr(),

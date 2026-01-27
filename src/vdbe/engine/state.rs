@@ -88,6 +88,29 @@ pub fn get_sort_flag() -> bool {
 }
 
 // ============================================================================
+// Global Like Counter (for sqlite_like_count compatibility)
+// ============================================================================
+
+/// Global counter for tracking LIKE comparisons.
+/// This is used by sqlite_like_count for test compatibility.
+static LIKE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Get the current like count (for sqlite_like_count variable)
+pub fn get_like_count() -> u64 {
+    LIKE_COUNT.load(AtomicOrdering::Relaxed)
+}
+
+/// Reset the like count to zero
+pub fn reset_like_count() {
+    LIKE_COUNT.store(0, AtomicOrdering::Relaxed);
+}
+
+/// Increment the like count (called when Like opcode executes)
+pub(crate) fn inc_like_count() {
+    LIKE_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+}
+
+// ============================================================================
 // Global Step Counter (for db status step compatibility)
 // ============================================================================
 

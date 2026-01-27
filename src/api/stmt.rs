@@ -14,7 +14,7 @@ use crate::parser::ast::{AttachStmt, Expr, Literal, QualifiedName, Variable};
 use crate::types::{ColumnType, StepResult, Value};
 use crate::vdbe::engine::Vdbe;
 use crate::vdbe::ops::VdbeOp;
-use crate::vdbe::{reset_sort_count, reset_step_count};
+use crate::vdbe::{reset_like_count, reset_sort_count, reset_step_count};
 
 use super::connection::SqliteConnection;
 
@@ -462,8 +462,9 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
             return Ok(StepResult::Done);
         }
 
-        // Reset the sort count before executing a new query
+        // Reset the sort and like counts before executing a new query
         reset_sort_count();
+        reset_like_count();
 
         // Create VDBE from compiled bytecode
         let mut vdbe = Vdbe::from_ops(stmt.ops.clone());

@@ -4,13 +4,15 @@
 //! Corresponds to delete.c in SQLite.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::error::Result;
 use crate::parser::ast::{DeleteStmt, Expr, ResultColumn};
-use crate::schema::Schema;
+use crate::schema::{Schema, Trigger, TriggerEvent, TriggerTiming};
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
 use super::column_mapping::ColumnMapper;
+use super::trigger::{find_matching_triggers, generate_trigger_code};
 
 const OPFLAG_NCHANGE: u16 = 0x01;
 
@@ -75,6 +77,12 @@ pub struct DeleteCompiler<'s> {
 
     /// Index cursors for maintaining indexes during delete
     index_cursors: Vec<IndexCursor>,
+
+    /// BEFORE DELETE triggers
+    before_triggers: Vec<Arc<Trigger>>,
+
+    /// AFTER DELETE triggers
+    after_triggers: Vec<Arc<Trigger>>,
 }
 
 impl<'s> DeleteCompiler<'s> {
@@ -94,6 +102,8 @@ impl<'s> DeleteCompiler<'s> {
             param_names: Vec::new(),
             next_unnamed_param: 1,
             index_cursors: Vec::new(),
+            before_triggers: Vec::new(),
+            after_triggers: Vec::new(),
         }
     }
 
@@ -112,6 +122,8 @@ impl<'s> DeleteCompiler<'s> {
             schema: Some(schema),
             param_names: Vec::new(),
             next_unnamed_param: 1,
+            before_triggers: Vec::new(),
+            after_triggers: Vec::new(),
             index_cursors: Vec::new(),
         }
     }
@@ -189,6 +201,30 @@ impl<'s> DeleteCompiler<'s> {
         // Open indexes for writing (for index maintenance)
         self.open_indexes_for_write(&delete.table.name)?;
 
+        // Find matching triggers for DELETE
+        if let Some(schema) = self.schema {
+            self.before_triggers = find_matching_triggers(
+                schema,
+                &delete.table.name,
+                TriggerTiming::Before,
+                TriggerEvent::Delete,
+                None,
+            );
+            self.after_triggers = find_matching_triggers(
+                schema,
+                &delete.table.name,
+                TriggerTiming::After,
+                TriggerEvent::Delete,
+                None,
+            );
+            eprintln!(
+                "DEBUG: Found {} BEFORE and {} AFTER DELETE triggers for {}",
+                self.before_triggers.len(),
+                self.after_triggers.len(),
+                delete.table.name
+            );
+        }
+
         // Compile the DELETE body
         self.compile_delete_body(delete)?;
 
@@ -223,6 +259,9 @@ impl<'s> DeleteCompiler<'s> {
             return self.compile_delete_with_limit(delete);
         }
 
+        let has_before_triggers = !self.before_triggers.is_empty();
+        let has_after_triggers = !self.after_triggers.is_empty();
+
         // Simple delete - just iterate and delete matching rows
         let loop_start_label = self.alloc_label();
         let loop_end_label = self.alloc_label();
@@ -242,6 +281,18 @@ impl<'s> DeleteCompiler<'s> {
         // Get rowid register for index maintenance
         let rowid_reg = self.alloc_reg();
 
+        // Allocate registers for OLD row if we have triggers
+        let old_base_reg = if has_before_triggers || has_after_triggers {
+            let reg = self.alloc_reg();
+            // Allocate additional registers for all columns
+            for _ in 1..self.num_columns {
+                self.alloc_reg();
+            }
+            Some(reg)
+        } else {
+            None
+        };
+
         // If we have a WHERE clause, check the condition
         if let Some(where_expr) = &delete.where_clause {
             let skip_label = self.alloc_label();
@@ -249,6 +300,16 @@ impl<'s> DeleteCompiler<'s> {
 
             // Get the rowid before deleting
             self.emit(Opcode::Rowid, self.table_cursor, rowid_reg, 0, P4::Unused);
+
+            // Load OLD row values into registers if we have triggers
+            if let Some(old_reg) = old_base_reg {
+                self.emit_load_row(old_reg)?;
+            }
+
+            // Fire BEFORE DELETE triggers
+            if has_before_triggers {
+                self.emit_before_triggers(&delete.table.name, old_base_reg, rowid_reg)?;
+            }
 
             // Delete from indexes first (before deleting the row)
             self.emit_index_deletes(rowid_reg);
@@ -264,12 +325,27 @@ impl<'s> DeleteCompiler<'s> {
                 OPFLAG_NCHANGE,
             );
 
+            // Fire AFTER DELETE triggers
+            if has_after_triggers {
+                self.emit_after_triggers(&delete.table.name, old_base_reg, rowid_reg)?;
+            }
+
             // Skip label (for rows that don't match WHERE)
             self.resolve_label(skip_label, self.current_addr() as i32);
         } else {
             // No WHERE - delete every row
             // Get the rowid before deleting
             self.emit(Opcode::Rowid, self.table_cursor, rowid_reg, 0, P4::Unused);
+
+            // Load OLD row values into registers if we have triggers
+            if let Some(old_reg) = old_base_reg {
+                self.emit_load_row(old_reg)?;
+            }
+
+            // Fire BEFORE DELETE triggers
+            if has_before_triggers {
+                self.emit_before_triggers(&delete.table.name, old_base_reg, rowid_reg)?;
+            }
 
             // Delete from indexes first (before deleting the row)
             self.emit_index_deletes(rowid_reg);
@@ -283,6 +359,11 @@ impl<'s> DeleteCompiler<'s> {
                 P4::Table(delete.table.name.clone()),
                 OPFLAG_NCHANGE,
             );
+
+            // Fire AFTER DELETE triggers
+            if has_after_triggers {
+                self.emit_after_triggers(&delete.table.name, old_base_reg, rowid_reg)?;
+            }
         }
 
         // Move to next row
@@ -297,6 +378,88 @@ impl<'s> DeleteCompiler<'s> {
         // Loop end
         self.resolve_label(loop_end_label, self.current_addr() as i32);
 
+        Ok(())
+    }
+
+    /// Load the current row values into registers
+    fn emit_load_row(&mut self, base_reg: i32) -> Result<()> {
+        for i in 0..self.num_columns {
+            self.emit(
+                Opcode::Column,
+                self.table_cursor,
+                i as i32,
+                base_reg + i as i32,
+                P4::Unused,
+            );
+        }
+        Ok(())
+    }
+
+    /// Emit BEFORE DELETE trigger calls
+    fn emit_before_triggers(
+        &mut self,
+        table_name: &str,
+        old_base_reg: Option<i32>,
+        _rowid_reg: i32,
+    ) -> Result<()> {
+        // Use a label for the return address - will be resolved after all trigger ops are added
+        let return_label = self.alloc_label();
+        let num_cols = self.num_columns as i32;
+        let triggers = self.before_triggers.clone();
+        let schema = self.schema;
+
+        let trigger_ops = generate_trigger_code(
+            &triggers,
+            schema,
+            table_name,
+            old_base_reg,
+            None, // No NEW row for DELETE
+            num_cols,
+            &mut self.next_reg,
+            return_label, // Use label instead of fixed address
+        )?;
+
+        // Append trigger ops
+        for op in trigger_ops {
+            self.ops.push(op);
+        }
+
+        // Resolve the return label to point to the instruction after all trigger ops
+        self.resolve_label(return_label, self.current_addr() as i32);
+        Ok(())
+    }
+
+    /// Emit AFTER DELETE trigger calls
+    fn emit_after_triggers(
+        &mut self,
+        table_name: &str,
+        old_base_reg: Option<i32>,
+        _rowid_reg: i32,
+    ) -> Result<()> {
+        // Use a label for the return address - will be resolved after all trigger ops are added
+        let return_label = self.alloc_label();
+        let num_cols = self.num_columns as i32;
+        let triggers = self.after_triggers.clone();
+        let schema = self.schema;
+
+        let trigger_ops = generate_trigger_code(
+            &triggers,
+            schema,
+            table_name,
+            old_base_reg,
+            None, // No NEW row for DELETE
+            num_cols,
+            &mut self.next_reg,
+            return_label, // Use label instead of fixed address
+        )?;
+
+        // Append trigger ops
+        for op in trigger_ops {
+            self.ops.push(op);
+        }
+
+        // Resolve the return label to point to the instruction after all trigger ops
+        self.resolve_label(return_label, self.current_addr() as i32);
         Ok(())
     }
 

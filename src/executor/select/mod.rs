@@ -255,42 +255,53 @@ impl<'s> SelectCompiler<'s> {
 
         // If ORDER BY is present, redirect output to a sorter
         // Skip sorter for simple aggregate queries (only one row, ORDER BY is meaningless)
+        // Also skip sorter if ORDER BY is satisfied by an index scan
         let (actual_dest, sorter_cursor, order_by_cols) = if let Some(order_by) = &select.order_by {
             if is_simple_aggregate {
                 // Simple aggregate query - ignore ORDER BY
                 (dest.clone(), None, None)
             } else {
-                let sorter_cursor = self.alloc_cursor();
-                let num_cols = order_by.len();
-                // Open ephemeral table for sorting
-                self.emit(
-                    Opcode::OpenEphemeral,
-                    sorter_cursor,
-                    num_cols as i32,
-                    0,
-                    P4::Unused,
-                );
-                // Configure sort directions (0=ASC, 1=DESC)
-                let sort_dirs: Vec<u8> = order_by
-                    .iter()
-                    .map(|t| if t.order == SortOrder::Desc { 1 } else { 0 })
-                    .collect();
-                self.emit(
-                    Opcode::SorterConfig,
-                    sorter_cursor,
-                    0,
-                    0,
-                    P4::Blob(sort_dirs),
-                );
-                // Store ORDER BY terms so output_row_inner can include them in records
-                self.order_by_terms = Some(order_by.clone());
-                (
-                    SelectDest::Sorter {
-                        cursor: sorter_cursor,
-                    },
-                    Some(sorter_cursor),
-                    Some(order_by.clone()),
-                )
+                // Check if ORDER BY is satisfied by an index scan
+                let order_satisfied = match &select.body {
+                    SelectBody::Select(core) => self.check_order_by_satisfied(core, order_by),
+                    SelectBody::Compound { .. } => false,
+                };
+                if order_satisfied {
+                    // Index scan provides correct order, no sorter needed
+                    (dest.clone(), None, None)
+                } else {
+                    let sorter_cursor = self.alloc_cursor();
+                    let num_cols = order_by.len();
+                    // Open ephemeral table for sorting
+                    self.emit(
+                        Opcode::OpenEphemeral,
+                        sorter_cursor,
+                        num_cols as i32,
+                        0,
+                        P4::Unused,
+                    );
+                    // Configure sort directions (0=ASC, 1=DESC)
+                    let sort_dirs: Vec<u8> = order_by
+                        .iter()
+                        .map(|t| if t.order == SortOrder::Desc { 1 } else { 0 })
+                        .collect();
+                    self.emit(
+                        Opcode::SorterConfig,
+                        sorter_cursor,
+                        0,
+                        0,
+                        P4::Blob(sort_dirs),
+                    );
+                    // Store ORDER BY terms so output_row_inner can include them in records
+                    self.order_by_terms = Some(order_by.clone());
+                    (
+                        SelectDest::Sorter {
+                            cursor: sorter_cursor,
+                        },
+                        Some(sorter_cursor),
+                        Some(order_by.clone()),
+                    )
+                }
             }
         } else {
             (dest.clone(), None, None)
@@ -2937,6 +2948,163 @@ impl<'s> SelectCompiler<'s> {
             Ok(info) => Ok(Some(info)),
             Err(_) => Ok(None),
         }
+    }
+
+    /// Check if ORDER BY would be satisfied by an index scan
+    /// Returns true if the index scan produces rows in the required order
+    /// This method pre-populates tables from the SelectCore to analyze the query plan
+    fn check_order_by_satisfied(&mut self, core: &SelectCore, order_by: &[OrderingTerm]) -> bool {
+        // Only handle simple cases: single ORDER BY column, ASC order
+        if order_by.len() != 1 {
+            return false;
+        }
+
+        let order_term = &order_by[0];
+
+        // ORDER BY must be ASC for index to satisfy it (indexes are stored in ascending order)
+        // DESC would require reverse scan which we don't support yet
+        if order_term.order == SortOrder::Desc {
+            return false;
+        }
+
+        // Get the ORDER BY column name - handle both direct column refs and positional refs
+        let order_col = match &order_term.expr {
+            Expr::Column(col_ref) => col_ref.column.to_lowercase(),
+            Expr::Literal(Literal::Integer(n)) => {
+                // ORDER BY 1 means first column in SELECT list
+                let idx = (*n as usize).saturating_sub(1);
+                // Get the column from SELECT list
+                if idx < core.columns.len() {
+                    match &core.columns[idx] {
+                        ResultColumn::Expr { expr, .. } => match expr {
+                            Expr::Column(col_ref) => col_ref.column.to_lowercase(),
+                            _ => return false,
+                        },
+                        _ => return false,
+                    }
+                } else {
+                    return false;
+                }
+            }
+            _ => return false,
+        };
+
+        // Extract FROM clause - only handle simple single-table case
+        let from = match &core.from {
+            Some(from) => from,
+            None => return false,
+        };
+
+        // Get the source items from FROM clause
+        let src_list = from.to_src_list();
+        if src_list.items.len() != 1 {
+            return false;
+        }
+
+        let item = &src_list.items[0];
+        use crate::parser::ast::TableSource;
+        let table_name = match &item.source {
+            TableSource::Table(name) => &name.name,
+            _ => return false, // Subqueries and table functions not supported
+        };
+        let table_name_lower = table_name.to_lowercase();
+
+        // Look up schema table
+        let schema_table = match self.lookup_table_schema(&table_name_lower) {
+            Some(t) => t,
+            None => return false,
+        };
+
+        // Temporarily add table info for query plan analysis
+        let display_name = item.alias.clone().unwrap_or_else(|| table_name.clone());
+        self.tables.push(TableInfo {
+            name: display_name,
+            table_name: table_name.clone(),
+            cursor: 0, // Placeholder - not used for analysis
+            schema_table: Some(schema_table.clone()),
+            is_subquery: false,
+            join_type: item.join_type,
+            subquery_columns: None,
+        });
+
+        // Analyze the query plan
+        let result = self.check_order_by_satisfied_inner(
+            &schema_table,
+            core.where_clause.as_deref(),
+            &order_col,
+        );
+
+        // Clear temporary tables
+        self.tables.clear();
+
+        result
+    }
+
+    /// Inner helper for check_order_by_satisfied after tables are set up
+    fn check_order_by_satisfied_inner(
+        &mut self,
+        schema_table: &std::sync::Arc<Table>,
+        where_clause: Option<&Expr>,
+        order_col: &str,
+    ) -> bool {
+        // Analyze the query plan
+        let plan_result = self.analyze_query_plan(where_clause);
+        let info = match plan_result {
+            Ok(Some(info)) => info,
+            _ => return false,
+        };
+
+        // Check if the plan uses an IndexScan on the ORDER BY column
+        if info.levels.is_empty() {
+            return false;
+        }
+
+        let level = &info.levels[0];
+        if let WherePlan::IndexScan {
+            index_name,
+            has_range,
+            ..
+        } = &level.plan
+        {
+            // For LIKE optimization with range scan, check if the index is on the ORDER BY column
+            if *has_range {
+                // Check schema's global indexes first
+                if let Some(schema) = self.schema {
+                    for (_name, idx) in schema.indexes.iter() {
+                        if idx.name.eq_ignore_ascii_case(index_name) {
+                            // Check if the first column of the index matches ORDER BY column
+                            if let Some(first_col) = idx.columns.first() {
+                                let col_idx = first_col.column_idx;
+                                if col_idx >= 0 && (col_idx as usize) < schema_table.columns.len() {
+                                    let idx_col_name = &schema_table.columns[col_idx as usize].name;
+                                    if idx_col_name.eq_ignore_ascii_case(order_col) {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Also check table's indexes
+                for index in &schema_table.indexes {
+                    if index.name.eq_ignore_ascii_case(index_name) {
+                        // Check if the first column of the index matches ORDER BY column
+                        if let Some(first_col) = index.columns.first() {
+                            let col_idx = first_col.column_idx;
+                            if col_idx >= 0 && (col_idx as usize) < schema_table.columns.len() {
+                                let idx_col_name = &schema_table.columns[col_idx as usize].name;
+                                if idx_col_name.eq_ignore_ascii_case(order_col) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        false
     }
 
     /// Resolve result column aliases in a WHERE expression for query planning.

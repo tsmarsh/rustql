@@ -646,6 +646,11 @@ impl<'s> SelectCompiler<'s> {
         self.resolve_label(loop_start_label, self.current_addr());
         self.emit(Opcode::Rewind, queue_cursor, done_label, 0, P4::Unused);
 
+        // Clear next_cursor at the start of each iteration to avoid accumulating
+        // rows from all previous iterations. Each iteration should only see
+        // the rows produced by THIS iteration's recursive SELECT.
+        self.emit(Opcode::OpenEphemeral, next_cursor, 0, 0, P4::Unused);
+
         let mut subcompiler = if let Some(schema) = self.schema {
             SelectCompiler::with_schema(schema)
         } else {
@@ -682,7 +687,9 @@ impl<'s> SelectCompiler<'s> {
 
         let offset = self.ops.len() as i32;
         for mut op in recursive_ops {
-            if op.opcode != Opcode::Halt {
+            // Filter out Init and Halt - they're control flow for standalone queries,
+            // not needed when inlining into the recursive loop
+            if op.opcode != Opcode::Halt && op.opcode != Opcode::Init {
                 if op.opcode.is_jump() {
                     op.p2 += offset;
                     op.p5 = 0xFFFF;

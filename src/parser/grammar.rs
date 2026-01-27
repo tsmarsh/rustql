@@ -235,7 +235,7 @@ impl<'a> Parser<'a> {
 
     fn parse_select_body(&mut self) -> Result<SelectBody> {
         let mut left = if self.match_token(TokenKind::Values) {
-            SelectBody::Select(self.parse_values_core()?)
+            self.parse_values_body()?
         } else {
             SelectBody::Select(self.parse_select_core()?)
         };
@@ -272,7 +272,7 @@ impl<'a> Parser<'a> {
             };
 
             let right = if self.match_token(TokenKind::Values) {
-                SelectBody::Select(self.parse_values_core()?)
+                self.parse_values_body()?
             } else {
                 SelectBody::Select(self.parse_select_core()?)
             };
@@ -341,32 +341,43 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_values_core(&mut self) -> Result<SelectCore> {
+    fn parse_values_body(&mut self) -> Result<SelectBody> {
         // VALUES was already consumed
         let mut rows = vec![self.parse_values_row()?];
         while self.match_token(TokenKind::Comma) {
             rows.push(self.parse_values_row()?);
         }
 
-        // Convert VALUES to a SELECT with VALUES as a synthetic construct
-        Ok(SelectCore {
-            distinct: Distinct::All,
-            columns: rows
-                .into_iter()
-                .next()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|e| ResultColumn::Expr {
-                    expr: e,
-                    alias: None,
-                })
-                .collect(),
-            from: None,
-            where_clause: None,
-            group_by: None,
-            having: None,
-            window: None,
-        })
+        // Convert VALUES rows to UNION ALL chain
+        // VALUES(1),(2),(3) becomes SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3
+        let mut result: Option<SelectBody> = None;
+        for row in rows {
+            let core = SelectCore {
+                distinct: Distinct::All,
+                columns: row
+                    .into_iter()
+                    .map(|e| ResultColumn::Expr {
+                        expr: e,
+                        alias: None,
+                    })
+                    .collect(),
+                from: None,
+                where_clause: None,
+                group_by: None,
+                having: None,
+                window: None,
+            };
+            let body = SelectBody::Select(core);
+            result = Some(match result {
+                None => body,
+                Some(left) => SelectBody::Compound {
+                    op: CompoundOp::UnionAll,
+                    left: Box::new(left),
+                    right: Box::new(body),
+                },
+            });
+        }
+        Ok(result.unwrap())
     }
 
     fn parse_values_row(&mut self) -> Result<Vec<Expr>> {

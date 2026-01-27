@@ -1257,7 +1257,11 @@ impl QueryPlanner {
     pub fn find_best_plan(&mut self) -> Result<WhereInfo> {
         let n_tables = self.tables.len();
         if n_tables == 0 {
-            return Ok(WhereInfo::new());
+            // No tables to plan, but still include WHERE terms so they get
+            // compiled as runtime filters (e.g., for CTE/subquery-only queries)
+            let mut info = WhereInfo::new();
+            info.terms = self.where_clause.terms.clone();
+            return Ok(info);
         }
 
         if n_tables > MAX_TABLES {

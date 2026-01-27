@@ -54,6 +54,30 @@ Looking at the codebase:
 - Non-recursive CTEs may work (treated as named subqueries)
 - Recursive execution loop is not implemented
 
+## Discovered Bug (2026-01-27)
+
+**WITH RECURSIVE causes infinite loop / timeout**
+
+The `compile_recursive_cte` function in `src/executor/select/mod.rs` (line 544)
+has been implemented, but executing any WITH RECURSIVE query hits the 100M
+instruction limit and aborts with "query aborted".
+
+**Reproduction:**
+```sql
+WITH RECURSIVE cnt(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM cnt WHERE x<5)
+SELECT x FROM cnt;
+-- Times out / aborts
+```
+
+**Root cause investigation needed:**
+1. Check if `queue_cursor` is properly being cleared between iterations
+2. Verify the Rewind/Next loop terminates when queue is empty
+3. Check if `next_cursor` rows are being transferred to `queue_cursor` correctly
+4. Verify WHERE clause `x<5` is being evaluated (termination condition)
+
+**Key code location:** `compile_recursive_cte()` at line 544-712 and
+`emit_recursive_cte_process_cursor()` at line 715-800 in `src/executor/select/mod.rs`
+
 ## Implementation Plan
 
 ### Phase 1: Parser Updates

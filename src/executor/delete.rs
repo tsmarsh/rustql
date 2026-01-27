@@ -103,6 +103,9 @@ pub struct DeleteCompiler<'s> {
 
     /// Schema table info for correlated subquery column resolution
     schema_table: Option<Arc<crate::schema::Table>>,
+
+    /// WITH clause for CTE support
+    with_clause: Option<crate::parser::ast::WithClause>,
 }
 
 impl<'s> DeleteCompiler<'s> {
@@ -130,6 +133,7 @@ impl<'s> DeleteCompiler<'s> {
             table_name: String::new(),
             table_alias: None,
             schema_table: None,
+            with_clause: None,
         }
     }
 
@@ -157,6 +161,7 @@ impl<'s> DeleteCompiler<'s> {
             table_name: String::new(),
             table_alias: None,
             schema_table: None,
+            with_clause: None,
         }
     }
 
@@ -182,6 +187,9 @@ impl<'s> DeleteCompiler<'s> {
 
         // Store target table name for subquery reference detection
         self.target_table = table_name_lower.clone();
+
+        // Store WITH clause for CTE support in subqueries
+        self.with_clause = delete.with.clone();
 
         // Initialize
         self.emit(Opcode::Init, 0, 0, 0, P4::Unused);
@@ -1252,6 +1260,198 @@ impl<'s> DeleteCompiler<'s> {
 
                 // Update cursor count
                 self.next_cursor += 5;
+            }
+            Expr::In {
+                expr: val_expr,
+                list,
+                negated,
+            } => {
+                // Compile IN expression
+                let val_reg = self.alloc_reg();
+                self.compile_expr(val_expr, val_reg)?;
+
+                match list {
+                    crate::parser::ast::InList::Values(values) => {
+                        if values.is_empty() {
+                            // Empty list - always false
+                            self.emit(
+                                Opcode::Integer,
+                                if *negated { 1 } else { 0 },
+                                dest_reg,
+                                0,
+                                P4::Unused,
+                            );
+                        } else {
+                            let match_label = self.alloc_label();
+                            let end_label = self.alloc_label();
+
+                            for value in values {
+                                let cmp_reg = self.alloc_reg();
+                                self.compile_expr(value, cmp_reg)?;
+                                // If equal, jump to match
+                                self.emit(Opcode::Eq, val_reg, match_label, cmp_reg, P4::Unused);
+                            }
+
+                            // No match found
+                            self.emit(
+                                Opcode::Integer,
+                                if *negated { 1 } else { 0 },
+                                dest_reg,
+                                0,
+                                P4::Unused,
+                            );
+                            self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+
+                            // Match found
+                            self.resolve_label(match_label, self.current_addr() as i32);
+                            self.emit(
+                                Opcode::Integer,
+                                if *negated { 0 } else { 1 },
+                                dest_reg,
+                                0,
+                                P4::Unused,
+                            );
+
+                            self.resolve_label(end_label, self.current_addr() as i32);
+                        }
+                    }
+                    crate::parser::ast::InList::Subquery(subquery) => {
+                        // Compile IN subquery using SelectCompiler
+                        // The subcompiler will allocate cursors starting at self.next_cursor
+                        let cursor_offset = self.next_cursor;
+
+                        // The ephemeral table cursor will be at cursor_offset
+                        // (subcompiler uses cursor 0 internally, which becomes cursor_offset after adjustment)
+                        let subq_cursor = cursor_offset;
+
+                        // Compile subquery to ephemeral table
+                        let mut sub_compiler = if let Some(schema) = self.schema {
+                            SelectCompiler::with_schema(schema)
+                        } else {
+                            SelectCompiler::new()
+                        };
+
+                        // Set starting register/cursor to avoid conflicts with val_reg
+                        // Reserve cursor 0 for dest table, subcompiler uses cursors starting at 1
+                        // After inlining with offset, cursor 0 becomes cursor_offset (the dest)
+                        sub_compiler.set_register_base(self.next_reg, 1);
+
+                        // Process DELETE's WITH clause so CTEs are available to the subquery
+                        if let Some(with) = &self.with_clause {
+                            sub_compiler.process_with_clause(with)?;
+                        }
+
+                        // Compile subquery to fill ephemeral table
+                        // Open the dest ephemeral table at cursor 0 (will become cursor_offset after inline)
+                        // EphemTable expects the cursor to be already open
+                        self.emit(Opcode::OpenEphemeral, subq_cursor, 1, 0, P4::Unused);
+
+                        // Use cursor 0 internally - it will be adjusted to cursor_offset when inlined
+                        let sub_dest = SelectDest::EphemTable { cursor: 0 };
+                        let sub_ops = sub_compiler.compile(subquery, &sub_dest)?;
+
+                        // Inline the compiled ops, excluding Init/Halt
+                        let base_addr = self.ops.len() as i32;
+                        for mut op in sub_ops {
+                            if op.opcode == Opcode::Init || op.opcode == Opcode::Halt {
+                                continue;
+                            }
+
+                            // Adjust jump addresses
+                            if op.opcode.is_jump() && op.p2 > 0 {
+                                op.p2 += base_addr;
+                            }
+
+                            // Adjust cursor numbers for all cursor operations
+                            if matches!(
+                                op.opcode,
+                                Opcode::OpenRead
+                                    | Opcode::OpenWrite
+                                    | Opcode::Rewind
+                                    | Opcode::Next
+                                    | Opcode::Column
+                                    | Opcode::Close
+                                    | Opcode::SeekGE
+                                    | Opcode::SeekGT
+                                    | Opcode::SeekLE
+                                    | Opcode::SeekLT
+                                    | Opcode::SeekRowid
+                                    | Opcode::OpenEphemeral
+                                    | Opcode::NewRowid
+                                    | Opcode::Insert
+                                    | Opcode::Delete
+                                    | Opcode::Found
+                                    | Opcode::NotFound
+                                    | Opcode::IdxGE
+                                    | Opcode::IdxGT
+                                    | Opcode::IdxLE
+                                    | Opcode::IdxLT
+                                    | Opcode::IdxInsert
+                                    | Opcode::SorterInsert
+                                    | Opcode::SorterSort
+                                    | Opcode::SorterNext
+                                    | Opcode::SorterData
+                                    | Opcode::Rowid
+                            ) {
+                                op.p1 += cursor_offset;
+                            }
+
+                            self.ops.push(op);
+                        }
+
+                        // Update cursor count based on what the subcompiler used
+                        self.next_cursor += 5;
+
+                        // Check if value exists in ephemeral table
+                        let record_reg = self.alloc_reg();
+                        self.emit(Opcode::MakeRecord, val_reg, 1, record_reg, P4::Unused);
+
+                        let found_label = self.alloc_label();
+                        let end_label = self.alloc_label();
+
+                        // Found jumps if record exists in cursor
+                        // Note: subq_cursor was allocated from DeleteCompiler's pool, so no offset needed
+                        self.emit(
+                            Opcode::Found,
+                            subq_cursor,
+                            found_label,
+                            record_reg,
+                            P4::Unused,
+                        );
+
+                        // Not found
+                        self.emit(
+                            Opcode::Integer,
+                            if *negated { 1 } else { 0 },
+                            dest_reg,
+                            0,
+                            P4::Unused,
+                        );
+                        self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+
+                        // Found
+                        self.resolve_label(found_label, self.current_addr() as i32);
+                        self.emit(
+                            Opcode::Integer,
+                            if *negated { 0 } else { 1 },
+                            dest_reg,
+                            0,
+                            P4::Unused,
+                        );
+
+                        self.resolve_label(end_label, self.current_addr() as i32);
+                    }
+                    crate::parser::ast::InList::Table(table_name) => {
+                        // IN with table name - not commonly used, default to false
+                        self.emit(
+                            Opcode::Integer,
+                            if *negated { 1 } else { 0 },
+                            dest_reg,
+                            0,
+                            P4::Unused,
+                        );
+                    }
+                }
             }
             _ => {
                 // Default to NULL for unsupported expressions

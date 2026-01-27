@@ -898,12 +898,10 @@ impl Vdbe {
                 // Check if we're in a subprogram (trigger)
                 if let Some((parent_ops, return_pc, _parent_pc)) = self.subprogram_stack.pop() {
                     // Return from subprogram to parent
-                    eprintln!(
-                        "DEBUG Halt: returning from subprogram to parent, return_pc={}, parent ops len={}",
-                        return_pc, parent_ops.len()
-                    );
+                    // Note: exec_op reads ops[pc] THEN increments pc, so we set pc = return_pc
+                    // directly to execute the instruction at return_pc.
                     self.ops = parent_ops;
-                    self.pc = return_pc - 1; // -1 because it will be incremented
+                    self.pc = return_pc; // Execute instruction at return_pc next
                     self.trigger_depth = self.trigger_depth.saturating_sub(1);
 
                     // If halt was due to error, propagate it
@@ -5384,11 +5382,6 @@ impl Vdbe {
 
                 // Get the subprogram from P4
                 if let P4::Subprogram(ref subprog) = op.p4 {
-                    eprintln!(
-                        "DEBUG Program: entering subprogram ({} ops), return_pc(P2)={}, current_pc={}",
-                        subprog.ops.len(), op.p2, self.pc
-                    );
-
                     // Save current execution state
                     let return_pc = op.p2;
                     let current_ops = std::mem::take(&mut self.ops);

@@ -217,12 +217,6 @@ impl<'s> DeleteCompiler<'s> {
                 TriggerEvent::Delete,
                 None,
             );
-            eprintln!(
-                "DEBUG: Found {} BEFORE and {} AFTER DELETE triggers for {}",
-                self.before_triggers.len(),
-                self.after_triggers.len(),
-                delete.table.name
-            );
         }
 
         // Compile the DELETE body

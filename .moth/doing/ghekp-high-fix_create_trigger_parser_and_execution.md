@@ -17,22 +17,47 @@ The trigger1.test suite fails with syntax errors because:
   - File: `src/parser/grammar.rs`, `src/executor/prepare.rs`
 - **Test status**: trigger1.test 14/55 (25%) passing
 
-### Passing Tests
-- trigger1-1.1.2, 1.1.3: Basic syntax error detection
-- trigger1-1.2.0, 1.2.1: CREATE TRIGGER IF NOT EXISTS
-- trigger1-1.3, 1.4, 1.5, 1.6.1, 1.6.2, 1.7: Various trigger creation scenarios
-- trigger1-2.1, 2.2: Trigger schema queries
-- trigger1-3.3: DROP TRIGGER
-- trigger1-7.1: Transaction state check
-- trigger1-8.3, 8.4, 8.5, 8.6: sqlite_master queries
+### Completed (Session 2) - Trigger Execution Implementation
+- **TriggerBodyCompiler** in `src/executor/trigger.rs`:
+  - New struct that compiles trigger body statements to VDBE bytecode
+  - Handles INSERT statements in trigger body
+  - Handles expressions including OLD/NEW references via Param opcode
+  - Fixed `Expr::Parens` handling (was falling through to NULL)
+
+- **SetTriggerRow opcode** in `src/vdbe/ops.rs` and `src/vdbe/engine/mod.rs`:
+  - Stores OLD/NEW row values in VDBE state for Param opcode to access
+
+- **DeleteCompiler trigger integration** in `src/executor/delete.rs`:
+  - Finds matching BEFORE/AFTER DELETE triggers
+  - Emits SCopy opcodes to copy row data before Delete
+  - Emits SetTriggerRow to store trigger context
+  - Emits Program opcode to call trigger subprogram
+  - Uses label-based return address resolution
+
+- **Program opcode fixes** in `src/vdbe/engine/mod.rs`:
+  - Fixed pc to be set to 0 (not -1) when entering subprogram
+  - Added return Continue to properly transition to subprogram
+
+- **Halt opcode fix** in `src/vdbe/engine/mod.rs`:
+  - Fixed return from subprogram: pc = return_pc (not return_pc - 1)
+  - Because exec_op reads ops[pc] THEN increments
+
+- **Disabled runtime trigger firing** in Delete opcode:
+  - The `fire_after_delete_triggers` function was corrupting registers
+  - Now triggers are compiled into bytecode at compile time
+
+- **Test status**: trigger1.test 20/55 (36%) passing
+
+### Passing Tests (Session 2)
+- trigger1-1.10: DELETE trigger now fires correctly
+- Previous passing tests still work
 
 ### Remaining Work
 
 #### High Priority
-- **Trigger execution**: `generate_trigger_code()` returns empty bytecode
-  - Triggers create successfully but never fire
-  - Need to emit VDBE code that executes trigger body statements
-  - Files: `src/executor/trigger.rs`, `src/vdbe/engine/mod.rs`
+- INSERT trigger execution
+- UPDATE trigger execution
+- BEFORE triggers (currently only AFTER DELETE works)
 
 #### Medium Priority
 - **Error message format**: Some tests fail due to message differences
@@ -43,15 +68,11 @@ The trigger1.test suite fails with syntax errors because:
   - BEFORE/AFTER triggers only on tables
   - Cannot create triggers on sqlite_master
 
-## TCL Tests That Should Pass
-After trigger execution is implemented:
-- trigger1-1.10: DELETE trigger should remove rows
-- trigger1-6.x: Trigger body execution tests
-- trigger1-9.x: REPLACE with triggers
-
 ## Definition of Done
 - [x] Parser accepts optional timing keyword (defaults to BEFORE) - DONE
 - [x] Statement tail calculation handles BEGIN...END - DONE
-- [ ] trigger1.test pass rate: >=50% (need trigger execution)
-- [ ] Basic triggers (BEFORE/AFTER INSERT/DELETE/UPDATE) working
-- [ ] Triggers fire and execute body statements
+- [ ] trigger1.test pass rate: >=50% (currently 36%)
+- [x] Basic AFTER DELETE triggers fire and execute body statements - DONE
+- [ ] BEFORE triggers working
+- [ ] INSERT triggers working
+- [ ] UPDATE triggers working

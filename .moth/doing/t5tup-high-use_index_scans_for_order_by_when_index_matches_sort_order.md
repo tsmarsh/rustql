@@ -47,5 +47,34 @@ Modify the query planner to:
 
 ## Files to Modify
 
-- `src/vdbe/codegen.rs` or equivalent query planning code
+- `src/executor/select/mod.rs` - query planning and code generation
 - May need to implement/improve index scan opcodes
+
+## Progress
+
+### Done
+
+1. **Index detection** (commit b8a5713):
+   - Extended `check_order_by_satisfied_inner` to search ALL indexes on a table
+   - When ORDER BY column matches first column of an index, stores index name in `order_by_index` field
+   - Added `index_first_column_matches` helper method
+
+### TODO
+
+2. **Code generation changes**:
+   - When `order_by_index` is set, need to modify body compilation:
+     - Open INDEX cursor instead of (or in addition to) table cursor
+     - Use Rewind/Next on index cursor for iteration
+     - Use IdxRowid to get rowids from index entries
+     - Seek table cursor to rowid to fetch actual column data
+
+   Reference: Existing index scan code at line ~1023 in select/mod.rs shows the pattern for WHERE-based index scans
+
+3. **Handle JOINs**:
+   - Current detection only works for single-table queries
+   - For delete-9 tests (cross join), need to handle case where ORDER BY table has an index
+   - May need to restructure loop nesting to put index-ordered table as outer loop
+
+4. **DESC support**:
+   - Currently only ASC order is detected
+   - DESC would require backward index iteration (Prev opcode)

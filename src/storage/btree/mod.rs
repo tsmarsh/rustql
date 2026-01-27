@@ -115,6 +115,9 @@ pub struct BtShared {
     pub file_format: u8,
     pub free_pages: Vec<Pgno>,
     pub table_locks: Vec<BtTableLockEntry>,
+    /// Incremented on every write operation (insert/delete/update).
+    /// Used by cursors to detect when btree was modified.
+    pub shared_data_version: u32,
 }
 
 impl BtShared {
@@ -194,6 +197,8 @@ pub struct BtCursor {
     /// Result of last seek operation: -1 (cursor < key), 0 (exact match), +1 (cursor > key)
     /// Used by insert to skip redundant seeks for sequential inserts
     pub seek_result: i32,
+    /// Data version at time cursor was positioned - for detecting stale cursor
+    pub cursor_data_version: u32,
 }
 
 #[derive(Clone)]
@@ -887,6 +892,7 @@ pub fn fake_valid_cursor(btree: Arc<Btree>) -> BtCursor {
         page_stack: Vec::new(),
         preformat_cell: None,
         seek_result: 0,
+        cursor_data_version: 0,
     }
 }
 
@@ -3310,6 +3316,7 @@ impl Btree {
             file_format: 0,
             free_pages: Vec::new(),
             table_locks: Vec::new(),
+            shared_data_version: 0,
         };
 
         // Try to read existing database header from page 1
@@ -3780,6 +3787,7 @@ impl Btree {
             page_stack: Vec::new(),
             preformat_cell: None,
             seek_result: 0,
+            cursor_data_version: 0,
         })
     }
 
@@ -4074,6 +4082,8 @@ impl Btree {
         // n_free is already updated by allocate_space, but we used 2 more bytes for the pointer
         mem_page.n_free -= 2;
         _cursor.page = Some(mem_page);
+        // Increment data_version to signal that btree was modified
+        shared_guard.shared_data_version = shared_guard.shared_data_version.wrapping_add(1);
         Ok(())
     }
 
@@ -4271,6 +4281,9 @@ impl Btree {
         _cursor.skip_next = 1;
         // Keep cursor valid - next() will handle navigation if we've exhausted this page
         _cursor.state = CursorState::Valid;
+        // Increment data_version to signal that btree was modified
+        // This allows other cursors to detect staleness
+        shared_guard.shared_data_version = shared_guard.shared_data_version.wrapping_add(1);
         // Don't call collapse_root_if_empty during delete loop - it changes tree structure
         Ok(())
     }
@@ -4951,6 +4964,53 @@ impl BtCursor {
         self.seek_result = 0;
     }
 
+    /// Check if cursor is stale (btree was modified since cursor was positioned).
+    /// If stale, attempts to re-seek to the previously stored key.
+    /// Returns true if cursor is usable (either not stale, or successfully restored).
+    /// Returns false only if cursor WAS valid but became stale and couldn't be restored.
+    pub fn check_and_restore_if_stale(&mut self) -> Result<bool> {
+        if self.state != CursorState::Valid {
+            // Cursor isn't positioned - nothing to restore, let normal Column processing handle it
+            return Ok(true);
+        }
+
+        let shared = self
+            .bt_shared
+            .upgrade()
+            .ok_or(Error::new(ErrorCode::Internal))?;
+        let shared_guard = shared.read().map_err(|_| Error::new(ErrorCode::Internal))?;
+
+        // Check if data version has changed
+        if self.cursor_data_version == shared_guard.shared_data_version {
+            return Ok(true); // Cursor is still valid
+        }
+
+        drop(shared_guard);
+
+        // Btree was modified - need to re-seek
+        if self.cur_int_key {
+            // Integer key table - try to seek back to stored key
+            let saved_key = self.n_key;
+            match self.table_moveto(saved_key, false) {
+                Ok(0) => Ok(true), // Found exact key
+                Ok(_) => {
+                    // Key not found (row was deleted) - cursor is at a different row or invalid
+                    // Mark as invalid so Column opcode will return NULL
+                    self.state = CursorState::Invalid;
+                    Ok(false)
+                }
+                Err(_) => {
+                    self.state = CursorState::Invalid;
+                    Ok(false)
+                }
+            }
+        } else {
+            // Index cursor - for now, just mark as invalid
+            self.state = CursorState::Invalid;
+            Ok(false)
+        }
+    }
+
     /// sqlite3BtreeFirst
     pub fn first(&mut self) -> Result<bool> {
         let shared = self
@@ -4968,6 +5028,8 @@ impl BtCursor {
             return Ok(true);
         }
         self.set_to_cell(mem_page, limits, 0)?;
+        // Record data version at time of positioning
+        self.cursor_data_version = shared_guard.shared_data_version;
         Ok(false)
     }
 
@@ -4989,6 +5051,8 @@ impl BtCursor {
         }
         let last_index = mem_page.n_cell - 1;
         self.set_to_cell(mem_page, limits, last_index)?;
+        // Record data version at time of positioning
+        self.cursor_data_version = shared_guard.shared_data_version;
         Ok(false)
     }
 
@@ -5019,6 +5083,35 @@ impl BtCursor {
                 }
             }
             // ix >= n_cell: we've exhausted this page, fall through to navigate to next page
+        }
+
+        // Check for staleness and refresh page if needed
+        // This is important when other statements modify the btree
+        let shared = self
+            .bt_shared
+            .upgrade()
+            .ok_or(Error::new(ErrorCode::Internal))?;
+        {
+            let shared_guard = shared.read().map_err(|_| Error::new(ErrorCode::Internal))?;
+            if self.cursor_data_version != shared_guard.shared_data_version {
+                // Btree was modified - refresh our page from the pager
+                drop(shared_guard);
+                let mut shared_guard_mut = shared
+                    .write()
+                    .map_err(|_| Error::new(ErrorCode::Internal))?;
+                if let Some(ref page) = self.page {
+                    let pgno = page.pgno;
+                    let (fresh_page, _fresh_limits) =
+                        self.load_page(&mut shared_guard_mut, pgno)?;
+                    self.page = Some(fresh_page.clone());
+                    // If current index is now out of bounds, cursor is invalid
+                    if self.ix >= fresh_page.n_cell {
+                        self.state = CursorState::Invalid;
+                        return Ok(());
+                    }
+                }
+                self.cursor_data_version = shared_guard_mut.shared_data_version;
+            }
         }
 
         let page = self.page.as_ref().ok_or(Error::new(ErrorCode::Corrupt))?;
@@ -5320,7 +5413,12 @@ impl BtCursor {
         let mut shared_guard = shared
             .write()
             .map_err(|_| Error::new(ErrorCode::Internal))?;
-        self.table_moveto_with_shared(&mut shared_guard, _int_key, _bias)
+        let result = self.table_moveto_with_shared(&mut shared_guard, _int_key, _bias);
+        // Record the data_version at time of positioning
+        if self.state == CursorState::Valid {
+            self.cursor_data_version = shared_guard.shared_data_version;
+        }
+        result
     }
 
     /// Internal version that takes an already-acquired shared guard

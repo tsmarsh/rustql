@@ -2823,146 +2823,160 @@ unsafe fn db_eval(
     // Set the current interpreter for user function callbacks
     set_current_interp(interp);
 
-    // Check if we have array-name and script arguments
+    // Check if we have script arguments
+    // objc == 4: db eval SQL script (column names as variables)
+    // objc >= 5: db eval SQL array-name script (array elements)
     let (array_name, script) = if objc >= 5 {
         let arr = obj_to_string(*objv.offset(3));
         let scr = obj_to_string(*objv.offset(4));
         (Some(arr), Some(scr))
+    } else if objc == 4 {
+        // 4-argument form: no array, column names become direct variables
+        let scr = obj_to_string(*objv.offset(3));
+        (None, Some(scr))
     } else {
         (None, None)
     };
 
-    // For array-script form, we need to collect rows first, then release the
-    // connection borrow before calling Tcl_Eval (which may re-enter db_eval)
-    if let (Some(ref arr_name), Some(ref scr)) = (&array_name, &script) {
-        // Collect all rows with their column names and values
-        let collected_rows: Result<Vec<(Vec<String>, Vec<String>)>, String> =
-            CONNECTIONS.with(|connections| {
-                let mut conns = connections.borrow_mut();
-                let conn = match conns.get_mut(db_name) {
-                    Some(c) => c.as_mut(),
-                    None => {
-                        return Err(format!("no such database: {}", db_name));
-                    }
-                };
+    // For script form, use streaming execution so scripts can modify the database
+    // while iteration is in progress (cursor stability).
+    // Handles both: "db eval SQL script" and "db eval SQL array script"
+    if let Some(ref scr) = script {
+        let arr_c = array_name.as_ref().map(|arr_name| {
+            CString::new(arr_name.as_str()).unwrap_or_else(|_| CString::new("").unwrap())
+        });
+        let script_c = CString::new(scr.as_str()).unwrap_or_else(|_| CString::new("").unwrap());
 
-                let mut rows = Vec::new();
-                let mut remaining = sql.as_str();
+        const TCL_BREAK: c_int = 3;
+        const TCL_CONTINUE: c_int = 4;
 
-                while !remaining.trim().is_empty() {
-                    let trimmed = remaining.trim_start();
-                    if trimmed.starts_with("--") {
-                        if let Some(pos) = trimmed.find('\n') {
-                            remaining = &trimmed[pos + 1..];
-                            continue;
-                        } else {
-                            break;
+        let db_name_owned = db_name.to_string();
+        let mut remaining = sql.to_string();
+
+        while !remaining.trim().is_empty() {
+            let trimmed = remaining.trim_start();
+            if trimmed.starts_with("--") {
+                if let Some(pos) = trimmed.find('\n') {
+                    remaining = trimmed[pos + 1..].to_string();
+                    continue;
+                } else {
+                    break;
+                }
+            }
+
+            // Prepare statement inside the borrow, then move it out
+            let prepare_result: Result<(Box<PreparedStmt>, String), String> =
+                CONNECTIONS.with(|connections| {
+                    let mut conns = connections.borrow_mut();
+                    let conn = match conns.get_mut(&db_name_owned) {
+                        Some(c) => c.as_mut(),
+                        None => {
+                            return Err(format!("no such database: {}", db_name_owned));
                         }
-                    }
+                    };
 
-                    let (mut stmt, tail) = match sqlite3_prepare_v2(conn, remaining) {
+                    let (mut stmt, tail) = match sqlite3_prepare_v2(conn, &remaining) {
                         Ok(r) => r,
                         Err(e) => return Err(e.sqlite_errmsg()),
                     };
 
-                    if stmt.sql().is_empty() {
-                        remaining = tail;
-                        continue;
-                    }
-
                     // Bind TCL variables to SQL parameters
                     bind_tcl_variables(interp, &mut stmt);
 
-                    loop {
-                        match sqlite3_step(&mut stmt) {
-                            Ok(StepResult::Row) => {
-                                let col_count = sqlite3_column_count(&stmt);
-                                let mut col_names = Vec::new();
-                                let mut col_values = Vec::new();
+                    Ok((stmt, tail.to_string()))
+                });
 
-                                for i in 0..col_count {
-                                    let col_name =
-                                        sqlite3_column_name(&stmt, i).unwrap_or("").to_string();
-                                    col_names.push(col_name);
+            let (mut stmt, tail) = match prepare_result {
+                Ok(r) => r,
+                Err(msg) => {
+                    set_result_string(interp, &msg);
+                    update_search_count_var(interp);
+                    return TCL_ERROR;
+                }
+            };
 
-                                    let col_type = sqlite3_column_type(&stmt, i);
-                                    let value = match col_type {
-                                        ColumnType::Null => NULL_VALUES.with(|nv| {
-                                            nv.borrow().get(db_name).cloned().unwrap_or_default()
-                                        }),
-                                        _ => sqlite3_column_text(&stmt, i),
-                                    };
-                                    col_values.push(value);
-                                }
+            if stmt.sql().is_empty() {
+                let _ = sqlite3_finalize(stmt);
+                remaining = tail;
+                continue;
+            }
 
-                                rows.push((col_names, col_values));
-                            }
-                            Ok(StepResult::Done) => break,
-                            Err(e) => {
-                                let _ = sqlite3_finalize(stmt);
-                                return Err(e.sqlite_errmsg());
+            // Step through results with streaming execution - connection is NOT borrowed here
+            loop {
+                match sqlite3_step(&mut stmt) {
+                    Ok(StepResult::Row) => {
+                        let col_count = sqlite3_column_count(&stmt);
+                        let mut col_names = Vec::new();
+                        let mut col_values = Vec::new();
+
+                        for i in 0..col_count {
+                            let col_name = sqlite3_column_name(&stmt, i).unwrap_or("").to_string();
+                            col_names.push(col_name.clone());
+
+                            let col_type = sqlite3_column_type(&stmt, i);
+                            let value = match col_type {
+                                ColumnType::Null => NULL_VALUES.with(|nv| {
+                                    nv.borrow().get(&db_name_owned).cloned().unwrap_or_default()
+                                }),
+                                _ => sqlite3_column_text(&stmt, i),
+                            };
+                            col_values.push(value);
+
+                            // Set variable: either array(col) or just $col
+                            let col_c = CString::new(col_name.as_str())
+                                .unwrap_or_else(|_| CString::new("").unwrap());
+                            let val_obj = string_to_obj(&col_values.last().unwrap());
+                            if let Some(ref arr) = arr_c {
+                                // Array form: array(column)
+                                Tcl_SetVar2Ex(interp, arr.as_ptr(), col_c.as_ptr(), val_obj, 0);
+                            } else {
+                                // Direct variable form: set $column directly
+                                Tcl_SetVar2Ex(interp, col_c.as_ptr(), std::ptr::null(), val_obj, 0);
                             }
                         }
+
+                        // Set array(*) = list of column names (only for array form)
+                        if let Some(ref arr) = arr_c {
+                            let star = CString::new("*").unwrap();
+                            let names_list = Tcl_NewListObj(0, std::ptr::null());
+                            for name in &col_names {
+                                let name_obj = string_to_obj(name);
+                                Tcl_ListObjAppendElement(interp, names_list, name_obj);
+                            }
+                            Tcl_SetVar2Ex(interp, arr.as_ptr(), star.as_ptr(), names_list, 0);
+                        }
+
+                        // Evaluate the script - connection is NOT borrowed, so nested db_eval works
+                        let eval_result = Tcl_Eval(interp, script_c.as_ptr());
+
+                        if eval_result == TCL_BREAK {
+                            let _ = sqlite3_finalize(stmt);
+                            update_search_count_var(interp);
+                            return TCL_OK;
+                        } else if eval_result == TCL_ERROR {
+                            let _ = sqlite3_finalize(stmt);
+                            update_search_count_var(interp);
+                            return TCL_ERROR;
+                        }
+                        // TCL_CONTINUE and TCL_OK: continue to next row
                     }
-
-                    let _ = sqlite3_finalize(stmt);
-                    remaining = tail;
-                }
-
-                Ok(rows)
-            });
-
-        // Now process the collected rows outside the borrow
-        match collected_rows {
-            Ok(rows) => {
-                let arr_c =
-                    CString::new(arr_name.as_str()).unwrap_or_else(|_| CString::new("").unwrap());
-                let script_c =
-                    CString::new(scr.as_str()).unwrap_or_else(|_| CString::new("").unwrap());
-
-                const TCL_BREAK: c_int = 3;
-                const TCL_CONTINUE: c_int = 4;
-
-                for (col_names, col_values) in rows {
-                    // Set array elements
-                    for (name, value) in col_names.iter().zip(col_values.iter()) {
-                        let col_c = CString::new(name.as_str())
-                            .unwrap_or_else(|_| CString::new("").unwrap());
-                        let val_obj = string_to_obj(value);
-                        Tcl_SetVar2Ex(interp, arr_c.as_ptr(), col_c.as_ptr(), val_obj, 0);
-                    }
-
-                    // Set array(*) = list of column names
-                    let star = CString::new("*").unwrap();
-                    let names_list = Tcl_NewListObj(0, std::ptr::null());
-                    for name in &col_names {
-                        let name_obj = string_to_obj(name);
-                        Tcl_ListObjAppendElement(interp, names_list, name_obj);
-                    }
-                    Tcl_SetVar2Ex(interp, arr_c.as_ptr(), star.as_ptr(), names_list, 0);
-
-                    // Evaluate the script (now safe to call Tcl_Eval)
-                    let eval_result = Tcl_Eval(interp, script_c.as_ptr());
-
-                    if eval_result == TCL_BREAK {
-                        update_search_count_var(interp);
-                        return TCL_OK;
-                    } else if eval_result == TCL_ERROR {
+                    Ok(StepResult::Done) => break,
+                    Err(e) => {
+                        let msg = e.sqlite_errmsg();
+                        let _ = sqlite3_finalize(stmt);
+                        set_result_string(interp, &msg);
                         update_search_count_var(interp);
                         return TCL_ERROR;
                     }
-                    // TCL_CONTINUE and TCL_OK: continue to next row
                 }
+            }
 
-                update_search_count_var(interp);
-                TCL_OK
-            }
-            Err(msg) => {
-                set_result_string(interp, &msg);
-                update_search_count_var(interp);
-                TCL_ERROR
-            }
+            let _ = sqlite3_finalize(stmt);
+            remaining = tail;
         }
+
+        update_search_count_var(interp);
+        TCL_OK
     } else {
         // Simple form: execute SQL and collect results as a flat list
         let result_list = Tcl_NewListObj(0, std::ptr::null());

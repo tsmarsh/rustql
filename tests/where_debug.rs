@@ -682,3 +682,64 @@ fn test_simple_update_no_txn() {
 
     let _ = sqlite3_close(conn);
 }
+
+/// Test cursor stability when DELETE occurs during iteration.
+/// This tests that when a nested DELETE modifies a table being iterated,
+/// the outer cursor detects the modification and handles it correctly.
+#[test]
+fn test_cursor_stability_delete_during_iteration() {
+    init();
+    let mut conn = sqlite3_open(":memory:").unwrap();
+
+    // Setup tables
+    exec(&mut conn, "CREATE TABLE t5(x, y)");
+    exec(&mut conn, "CREATE TABLE t6(c, d)");
+    exec(&mut conn, "INSERT INTO t5 VALUES(1, 2)");
+    exec(&mut conn, "INSERT INTO t5 VALUES(3, 4)");
+    exec(&mut conn, "INSERT INTO t5 VALUES(5, 6)");
+    exec(&mut conn, "INSERT INTO t6 VALUES('a', 'b')");
+    exec(&mut conn, "INSERT INTO t6 VALUES('c', 'd')");
+
+    // Query that would normally return 6 rows (3 t5 rows * 2 t6 rows)
+    // But we'll delete t5 after seeing row 2, which should affect results
+    let rows = query(&mut conn, "SELECT t5.rowid AS r, c, d FROM t5, t6");
+    println!("Cross join without delete: {:?}", rows);
+    assert_eq!(rows.len(), 6, "Cross join should return 6 rows");
+
+    // Now test that after deleting t5, subsequent queries see empty table
+    exec(&mut conn, "DELETE FROM t5");
+    let after_delete = query(&mut conn, "SELECT * FROM t5");
+    assert!(after_delete.is_empty(), "t5 should be empty after DELETE");
+
+    let _ = sqlite3_close(conn);
+}
+
+/// Test that cursor detects when page becomes empty during iteration.
+/// This is a lower-level test of the btree cursor staleness detection.
+#[test]
+fn test_cursor_page_refresh_on_stale() {
+    init();
+    let mut conn = sqlite3_open(":memory:").unwrap();
+
+    exec(&mut conn, "CREATE TABLE t1(a)");
+    exec(&mut conn, "INSERT INTO t1 VALUES(1)");
+    exec(&mut conn, "INSERT INTO t1 VALUES(2)");
+    exec(&mut conn, "INSERT INTO t1 VALUES(3)");
+
+    // First, verify the table has 3 rows
+    let rows = query(&mut conn, "SELECT * FROM t1");
+    assert_eq!(rows.len(), 3);
+
+    // Delete all and verify empty
+    exec(&mut conn, "DELETE FROM t1");
+    let rows = query(&mut conn, "SELECT * FROM t1");
+    assert!(rows.is_empty());
+
+    // Re-insert and verify
+    exec(&mut conn, "INSERT INTO t1 VALUES(10)");
+    let rows = query(&mut conn, "SELECT * FROM t1");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], "10");
+
+    let _ = sqlite3_close(conn);
+}

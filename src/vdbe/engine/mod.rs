@@ -168,6 +168,14 @@ pub struct VdbeCursor {
     pub ephemeral_rows: Vec<(i64, Vec<u8>)>,
     /// Current index into ephemeral_rows during iteration
     pub ephemeral_index: usize,
+
+    // --- Cursor stability fields (for maintaining position during concurrent modifications) ---
+    /// Saved rowid for cursor position restoration after DELETE
+    pub saved_rowid: Option<i64>,
+    /// Saved key for index cursor position restoration
+    pub saved_key: Option<Vec<u8>>,
+    /// Whether the cursor position has been saved
+    pub position_saved: bool,
 }
 
 impl std::fmt::Debug for VdbeCursor {
@@ -229,7 +237,66 @@ impl VdbeCursor {
             ephemeral_set: std::collections::HashSet::new(),
             ephemeral_rows: Vec::new(),
             ephemeral_index: 0,
+            saved_rowid: None,
+            saved_key: None,
+            position_saved: false,
         }
+    }
+
+    /// Save cursor position for later restoration (used for cursor stability during DELETE)
+    pub fn save_position(&mut self) {
+        if self.state == CursorState::Valid {
+            self.saved_rowid = self.rowid;
+            self.saved_key = self.key.clone();
+            self.position_saved = true;
+        }
+    }
+
+    /// Restore cursor position after a write operation
+    /// Returns true if cursor was successfully restored to a valid position
+    pub fn restore_position(&mut self) -> bool {
+        if !self.position_saved {
+            return self.state == CursorState::Valid;
+        }
+
+        self.position_saved = false;
+
+        // For ephemeral tables, no special handling needed
+        if self.is_ephemeral {
+            return self.state == CursorState::Valid;
+        }
+
+        // Try to restore position using saved rowid
+        if let Some(ref mut bt_cursor) = self.btree_cursor {
+            if let Some(saved_rowid) = self.saved_rowid {
+                // Seek to the saved rowid or the next valid position
+                match bt_cursor.table_moveto(saved_rowid, false) {
+                    Ok(res) => {
+                        // res == 0 means exact match, -1 means cursor at entry > key, 1 means cursor at entry < key
+                        if bt_cursor.state == crate::storage::btree::CursorState::Valid {
+                            self.state = CursorState::Valid;
+                            self.rowid = Some(bt_cursor.integer_key());
+                            self.row_data = None;
+                            self.cached_columns = None;
+                            // If the row was deleted (res != 0), we're positioned at the next row
+                            // which is correct behavior for cursor stability
+                            return true;
+                        } else if res != 0 {
+                            // Seek landed outside table bounds, cursor is invalid
+                            // but this is expected if we deleted the last row
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+
+        // If restoration failed, cursor becomes invalid
+        self.state = CursorState::Invalid;
+        self.rowid = None;
+        self.row_data = None;
+        self.cached_columns = None;
+        false
     }
 
     /// Check if cursor is valid
@@ -1590,7 +1657,12 @@ impl Vdbe {
                             if let Some(ref btree) = btree {
                                 let flags = BtreeCursorFlags::empty();
                                 match btree.cursor(root_page, flags, None) {
-                                    Ok(bt_cursor) => cursor.btree_cursor = Some(bt_cursor),
+                                    Ok(mut bt_cursor) => {
+                                        // Set cur_int_key based on cursor type:
+                                        // Tables use intkey btrees, indexes use blobkey btrees
+                                        bt_cursor.cur_int_key = !is_index;
+                                        cursor.btree_cursor = Some(bt_cursor);
+                                    }
                                     Err(_) => {} // Failed to create cursor, use placeholder
                                 }
                             }
@@ -1697,7 +1769,11 @@ impl Vdbe {
                         if let Some(ref btree) = btree {
                             let flags = BtreeCursorFlags::WRCSR;
                             match btree.cursor(root_page, flags, None) {
-                                Ok(bt_cursor) => cursor.btree_cursor = Some(bt_cursor),
+                                Ok(mut bt_cursor) => {
+                                    // Set cur_int_key based on cursor type
+                                    bt_cursor.cur_int_key = !is_index;
+                                    cursor.btree_cursor = Some(bt_cursor);
+                                }
                                 Err(_) => {} // Failed to create cursor
                             }
                         }
@@ -2175,6 +2251,20 @@ impl Vdbe {
             Opcode::Column => {
                 // Read column P2 from cursor P1 into register P3
                 // If P4 is a column name and P2 is 0, look up index by name
+
+                // Check for cursor staleness (btree modified by another statement)
+                // If cursor is stale and can't be restored, return NULL
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                        if let Ok(false) = bt_cursor.check_and_restore_if_stale() {
+                            // Cursor was invalidated and couldn't be restored
+                            // Row was deleted - return NULL
+                            self.mem_mut(op.p3).set_null();
+                            return Ok(ExecResult::Continue);
+                        }
+                    }
+                }
+
                 if op.p2 < 0 {
                     if let Some(cursor) = self.cursor(op.p1) {
                         if let Some(rowid) = cursor.rowid {
@@ -2639,7 +2729,16 @@ impl Vdbe {
 
             Opcode::Rowid => {
                 // Get rowid from cursor P1 into register P2
-                if let Some(cursor) = self.cursor(op.p1) {
+                // Check for cursor staleness first (btree modified by another statement)
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                        if let Ok(false) = bt_cursor.check_and_restore_if_stale() {
+                            // Cursor was invalidated and couldn't be restored
+                            // Row was deleted - return NULL
+                            self.mem_mut(op.p2).set_null();
+                            return Ok(ExecResult::Continue);
+                        }
+                    }
                     if let Some(rowid) = cursor.rowid {
                         self.mem_mut(op.p2).set_int(rowid);
                     } else {
@@ -3756,6 +3855,32 @@ impl Vdbe {
 
                 let btree_arc = self.btree.clone();
 
+                // --- Cursor Stability: Save positions of other cursors on the same table ---
+                // This ensures that when DELETE modifies the table, other cursors
+                // iterating over it can restore their position after the modification.
+                let delete_cursor_id = op.p1 as usize;
+                let root_page = self
+                    .cursors
+                    .get(delete_cursor_id)
+                    .and_then(|c| c.as_ref())
+                    .map(|c| c.root_page);
+
+                // Save positions of all OTHER cursors on the same root page
+                if let Some(root) = root_page {
+                    for i in 0..self.cursors.len() {
+                        if i != delete_cursor_id {
+                            if let Some(ref mut c) = self.cursors[i] {
+                                if c.root_page == root
+                                    && !c.writable
+                                    && c.state == CursorState::Valid
+                                {
+                                    c.save_position();
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let btree = self.btree.clone();
                 let schema = self.schema.clone();
                 let mut deleted = false;
@@ -3864,6 +3989,23 @@ impl Vdbe {
                 //         self.fire_after_delete_triggers(table_name)?;
                 //     }
                 // }
+
+                // --- Cursor Stability: Restore positions of other cursors ---
+                if deleted {
+                    if let Some(root) = root_page {
+                        if let Some(ref btree) = btree_arc {
+                            for i in 0..self.cursors.len() {
+                                if i != delete_cursor_id {
+                                    if let Some(ref mut c) = self.cursors[i] {
+                                        if c.root_page == root && c.position_saved {
+                                            c.restore_position();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             Opcode::Last => {

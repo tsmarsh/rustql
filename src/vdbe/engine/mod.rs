@@ -3235,6 +3235,33 @@ impl Vdbe {
                 let mut replace_index_deletions: Vec<(usize, Vec<u8>)> = Vec::new();
                 let mut table_name_for_replace: Option<String> = None;
                 let mut replace_old_payload: Option<(Vec<u8>, i64)> = None;
+                let mut fire_delete_trigger_for: Option<String> = None;
+                let mut need_recheck_after_trigger = false;
+
+                // Pre-calculate the column name for rowid constraint errors
+                // For INTEGER PRIMARY KEY columns, use the column name instead of "rowid"
+                let ipk_column_name: Option<String> = {
+                    let tbl_name = match &op.p4 {
+                        P4::Text(s) | P4::Table(s) => Some(s.to_lowercase()),
+                        _ => None,
+                    };
+                    tbl_name.and_then(|tn| {
+                        schema.as_ref().and_then(|s| {
+                            s.read().ok().and_then(|guard| {
+                                guard.tables.get(&tn).and_then(|t| {
+                                    // INTEGER PRIMARY KEY is the rowid alias
+                                    t.columns
+                                        .iter()
+                                        .find(|c| {
+                                            c.is_primary_key
+                                                && c.affinity == crate::schema::Affinity::Integer
+                                        })
+                                        .map(|c| c.name.clone())
+                                })
+                            })
+                        })
+                    })
+                };
 
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     cursor.rowid = Some(rowid);
@@ -3345,6 +3372,13 @@ impl Vdbe {
                                                 replace_old_payload = Some((old_data, rowid));
                                             }
 
+                                            // Store table name for AFTER DELETE trigger
+                                            fire_delete_trigger_for = match &op.p4 {
+                                                P4::Text(s) | P4::Table(s) => Some(s.clone()),
+                                                _ => None,
+                                            };
+                                            need_recheck_after_trigger = true;
+
                                             // Delete from main table
                                             let del_flags = BtreeInsertFlags::empty();
                                             let _ = btree.delete(bt_cursor, del_flags);
@@ -3355,11 +3389,13 @@ impl Vdbe {
                                                 P4::Text(s) => s.as_str(),
                                                 _ => "table",
                                             };
+                                            let col_name =
+                                                ipk_column_name.as_deref().unwrap_or("rowid");
                                             return Err(Error::with_message(
                                                 ErrorCode::Constraint,
                                                 format!(
-                                                    "UNIQUE constraint failed: {}.rowid",
-                                                    table_name
+                                                    "UNIQUE constraint failed: {}.{}",
+                                                    table_name, col_name
                                                 ),
                                             ));
                                         }
@@ -3370,11 +3406,13 @@ impl Vdbe {
                                                 P4::Text(s) => s.as_str(),
                                                 _ => "table",
                                             };
+                                            let col_name =
+                                                ipk_column_name.as_deref().unwrap_or("rowid");
                                             return Err(Error::with_message(
                                                 ErrorCode::Constraint,
                                                 format!(
-                                                    "UNIQUE constraint failed: {}.rowid",
-                                                    table_name
+                                                    "UNIQUE constraint failed: {}.{}",
+                                                    table_name, col_name
                                                 ),
                                             ));
                                         }
@@ -3384,7 +3422,9 @@ impl Vdbe {
                                     }
                                 }
 
-                                if !skip_insert {
+                                // Skip insert here if we need to fire delete triggers first
+                                // (the insert will happen after triggers and recheck)
+                                if !skip_insert && !need_recheck_after_trigger {
                                     // Create payload with record data
                                     let payload = BtreePayload {
                                         key: None, // Table insert, not index
@@ -3516,6 +3556,65 @@ impl Vdbe {
                                         let _ =
                                             btree.delete(idx_bt_cursor, BtreeInsertFlags::empty());
                                     }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Fire AFTER DELETE triggers for REPLACE operations
+                // This must happen after index deletions but before the new insert
+                if let Some(ref table_name) = fire_delete_trigger_for {
+                    self.fire_after_delete_triggers(table_name)?;
+                }
+
+                // For REPLACE: re-check if rowid exists after trigger fired
+                // (trigger may have re-inserted a row with the same rowid)
+                if need_recheck_after_trigger {
+                    let mut row_still_exists = false;
+                    let mut skip_final_insert = false;
+
+                    // Check if rowid now exists (trigger may have inserted)
+                    if let Some(cursor) = self.cursor_mut(op.p1) {
+                        if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                            if let Ok(res) = bt_cursor.table_moveto(rowid, false) {
+                                row_still_exists = res == 0;
+                            }
+                        }
+                    }
+
+                    if row_still_exists {
+                        // Trigger re-inserted a row with the same rowid
+                        // This is a constraint violation
+                        let table_name = match &op.p4 {
+                            P4::Text(s) | P4::Table(s) => s.as_str(),
+                            _ => "table",
+                        };
+                        let col_name = ipk_column_name.as_deref().unwrap_or("rowid");
+                        return Err(Error::with_message(
+                            ErrorCode::Constraint,
+                            format!("UNIQUE constraint failed: {}.{}", table_name, col_name),
+                        ));
+                    }
+
+                    // Proceed with the insert now that we've verified no conflict
+                    if !skip_final_insert {
+                        if let Some(ref btree) = btree_arc {
+                            if let Some(cursor) = self.cursor_mut(op.p1) {
+                                if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                                    let payload = BtreePayload {
+                                        key: None,
+                                        n_key: rowid,
+                                        data: Some(record_data.clone()),
+                                        mem: Vec::new(),
+                                        n_data: record_data.len() as i32,
+                                        n_zero: 0,
+                                    };
+                                    let flags = BtreeInsertFlags::from_bits_truncate(
+                                        (op.p5 as u8) & !OE_MASK,
+                                    );
+                                    btree.insert(bt_cursor, &payload, flags, 0)?;
+                                    inserted = true;
                                 }
                             }
                         }
@@ -6298,6 +6397,8 @@ impl Vdbe {
         let saved_pc = self.pc;
         let saved_is_done = self.is_done;
         let saved_has_result = self.has_result;
+        // Save cursor array - trigger has its own cursors that shouldn't affect parent
+        let saved_cursors = std::mem::take(&mut self.cursors);
 
         // Reset state for subprogram execution
         self.pc = 0;
@@ -6319,6 +6420,8 @@ impl Vdbe {
         self.pc = saved_pc;
         self.is_done = saved_is_done;
         self.has_result = saved_has_result;
+        // Restore parent's cursors
+        self.cursors = saved_cursors;
 
         result
     }

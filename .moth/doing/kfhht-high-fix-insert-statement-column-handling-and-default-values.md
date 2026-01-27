@@ -3,11 +3,11 @@
 ## Problem
 INSERT statements fail to properly handle column specifications, defaults, triggers, and ordering.
 
-### Current Pass Rate: 61/83 (73%)
+### Current Pass Rate: 64/83 (77%)
 
-**Progress**: 59 → 61 tests (+2 tests this session)
+**Progress**: 59 → 64 tests (+5 tests this session)
 
-**Target**: 80% = 66/83 tests (need 5 more)
+**Target**: 80% = 66/83 tests (need 2 more)
 
 ---
 
@@ -19,7 +19,36 @@ INSERT statements fail to properly handle column specifications, defaults, trigg
    - **Bug**: Index seeks failed when comparing text literal against integer column (e.g., `WHERE f1='111'` wouldn't match integer 111)
    - **Root cause**: The index search key was built without applying column type affinities
    - **Fix**: Added emission of `Opcode::Affinity` before `MakeRecord` when building index seek keys
-   - **Impact**: Fixes insert-3.2 and insert-3.3 (SELECT after INSERT with DEFAULT values through index)
+   - **Impact**: Fixes insert-3.2 and insert-3.3 (+2 tests)
+
+2. **Scalar subquery register conflict** (`src/executor/insert.rs`, `src/executor/select/mod.rs`)
+   - **Bug**: `INSERT INTO t VALUES((SELECT x FROM t WHERE a=0),1,2)` produced wrong value when subquery returned no rows
+   - **Root cause**: SelectCompiler started registers at 1, conflicting with dest_reg
+   - **Fix**: Added `set_register_base()` to SelectCompiler; InsertCompiler sets subcompiler to start at dest_reg+1
+   - **Impact**: Fixes insert-4.4 and insert-4.5 (+2 tests, NULL correctly returned from empty subquery)
+
+3. **Column scope validation in INSERT VALUES** (`src/executor/insert.rs`)
+   - **Bug**: `INSERT INTO t VALUES(1,t.a,3)` silently used wrong value instead of erroring
+   - **Root cause**: `compile_expr` for Column didn't reject table-qualified columns in VALUES context
+   - **Fix**: Return "no such column: t.a" error for Expr::Column in INSERT VALUES
+   - **Impact**: Fixes insert-4.3 (+1 test)
+
+### Remaining Issues (19 tests)
+
+All remaining failures require significant architectural changes:
+
+1. **UNIQUE Index Constraint Enforcement** (insert-16.x, 17.x - 12 tests)
+   - IdxInsert opcode doesn't check for duplicate keys in UNIQUE indexes
+   - Requires: Add `is_unique` to VdbeCursor, check during IdxInsert, handle conflict modes
+   - Location: `src/vdbe/engine/mod.rs:4680` has TODO comment
+
+2. **UPDATE OR REPLACE Semantics** (insert-6.3, 6.4 - 2 tests)
+   - UPDATE with conflict resolution not properly deleting conflicting rows
+   - Requires: Fix UPDATE compiler to handle OR REPLACE mode
+
+3. **Blob-to-TEXT Coercion During REPLACE** (insert-15.1 - 1 test)
+   - Blobs inserted into TEXT columns via REPLACE get corrupted
+   - Requires: Fix type coercion in record serialization/deserialization
 
 ---
 
@@ -141,5 +170,9 @@ Results in `test-results/insert.log`
 
 ## Definition of Done
 - [x] insert.test pass rate: >=50% - ACHIEVED
-- [ ] insert.test pass rate: >=75% - Current: 73% (61/83)
-- [ ] insert.test pass rate: >=80% (66+ of 83) - Need 5 more tests
+- [x] insert.test pass rate: >=75% - ACHIEVED: 77% (64/83)
+- [ ] insert.test pass rate: >=80% (66+ of 83) - Need 2 more tests
+
+### Path to 80%
+The remaining 2 tests require implementing UNIQUE index constraint checking in IdxInsert.
+See detailed notes at top of file.

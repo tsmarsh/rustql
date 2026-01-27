@@ -1633,6 +1633,14 @@ impl<'a> Parser<'a> {
             let expr = self.parse_expr()?;
             self.expect(TokenKind::RParen)?;
             IndexedColumnKind::Expr(Box::new(expr))
+        } else if self.check(TokenKind::Minus)
+            || self.check(TokenKind::Plus)
+            || self.check(TokenKind::Tilde)
+            || self.check(TokenKind::Not)
+        {
+            // Unary operator expression (e.g., -b=b)
+            let expr = self.parse_expr()?;
+            IndexedColumnKind::Expr(Box::new(expr))
         } else if self.check(TokenKind::Identifier) || self.check(TokenKind::String) {
             // Could be a simple column name or a function call expression
             // Peek ahead to see if it's followed by '(' indicating a function call

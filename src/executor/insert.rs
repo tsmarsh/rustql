@@ -1599,6 +1599,11 @@ impl<'a> InsertCompiler<'a> {
             SelectCompiler::new()
         };
 
+        // Set starting register to avoid conflict with dest_reg
+        // The subcompiler needs registers for intermediate values (WHERE clause, etc.)
+        // Start after dest_reg to avoid overwriting it
+        sub_compiler.set_register_base(dest_reg + 1, self.next_cursor);
+
         // Compile with Set destination - copies first column to dest_reg
         let sub_dest = SelectDest::Set { reg: dest_reg };
         let sub_ops = sub_compiler.compile(select, &sub_dest)?;
@@ -1809,14 +1814,17 @@ impl<'a> InsertCompiler<'a> {
                 }
             },
             Expr::Column(col_ref) => {
-                // Column reference - would need to resolve from schema
-                self.emit(
-                    Opcode::Column,
-                    0,
-                    0,
-                    dest_reg,
-                    P4::Text(col_ref.column.clone()),
-                );
+                // Column references are not valid in INSERT VALUES context
+                // The only valid table references would be in subqueries, which are handled separately
+                let col_name = if let Some(ref table) = col_ref.table {
+                    format!("{}.{}", table, col_ref.column)
+                } else {
+                    col_ref.column.clone()
+                };
+                return Err(crate::error::Error::with_message(
+                    crate::error::ErrorCode::Error,
+                    format!("no such column: {}", col_name),
+                ));
             }
             Expr::Binary { op, left, right } => {
                 let left_reg = self.alloc_reg();

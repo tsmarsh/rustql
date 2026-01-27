@@ -217,6 +217,13 @@ impl<'s> SelectCompiler<'s> {
         self.full_column_names = full_column_names;
     }
 
+    /// Set the starting register and cursor numbers
+    /// Used when inlining subqueries to avoid register/cursor conflicts
+    pub fn set_register_base(&mut self, next_reg: i32, next_cursor: i32) {
+        self.next_reg = next_reg;
+        self.next_cursor = next_cursor;
+    }
+
     /// Get the expanded column names after compilation
     pub fn column_names(&self) -> &[String] {
         &self.result_column_names

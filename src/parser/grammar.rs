@@ -2970,10 +2970,19 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_qualified_name(&mut self) -> Result<QualifiedName> {
-        let first = self.expect_identifier()?;
+        // SQLite allows string literals as identifiers in some contexts (e.g., trigger names)
+        let first = if self.check(TokenKind::String) {
+            self.expect_string()?
+        } else {
+            self.expect_identifier()?
+        };
 
         if self.match_token(TokenKind::Dot) {
-            let second = self.expect_identifier()?;
+            let second = if self.check(TokenKind::String) {
+                self.expect_string()?
+            } else {
+                self.expect_identifier()?
+            };
             Ok(QualifiedName::with_schema(first, second))
         } else {
             Ok(QualifiedName::new(first))

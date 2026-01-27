@@ -108,6 +108,8 @@ pub struct SelectCompiler<'s> {
     next_unnamed_param: i32,
     /// LIKE case sensitivity (for LIKE index optimization)
     case_sensitive_like: bool,
+    /// Aliases currently being resolved (to detect infinite recursion)
+    resolving_aliases: HashSet<String>,
 }
 
 impl<'s> SelectCompiler<'s> {
@@ -151,6 +153,7 @@ impl<'s> SelectCompiler<'s> {
             param_names: Vec::new(),
             next_unnamed_param: 1,
             case_sensitive_like: false,
+            resolving_aliases: HashSet::new(),
         }
     }
 
@@ -199,6 +202,7 @@ impl<'s> SelectCompiler<'s> {
             param_names: Vec::new(),
             next_unnamed_param: 1,
             case_sensitive_like: false,
+            resolving_aliases: HashSet::new(),
         }
     }
 
@@ -3997,14 +4001,24 @@ impl<'s> SelectCompiler<'s> {
     }
 
     /// Pre-scan result columns to extract alias expressions for WHERE clause resolution
-    /// SQLite allows referencing result column aliases in WHERE as an extension
+    /// SQLite allows referencing result column aliases in WHERE as an extension,
+    /// but ONLY if the alias doesn't shadow an actual table column name.
     fn prescan_result_aliases(&mut self, columns: &[ResultColumn]) {
         self.alias_expressions.clear();
         for col in columns {
             if let ResultColumn::Expr { expr, alias } = col {
                 if let Some(alias_name) = alias {
-                    self.alias_expressions
-                        .insert(alias_name.to_lowercase(), expr.clone());
+                    let alias_lower = alias_name.to_lowercase();
+                    // Don't add alias if it shadows a table column name
+                    // SQLite's standard behavior is to use table columns in WHERE
+                    let shadows_column = self
+                        .tables
+                        .iter()
+                        .skip(self.outer_tables_boundary)
+                        .any(|tinfo| self.column_index_in_table(tinfo, &alias_lower).is_some());
+                    if !shadows_column {
+                        self.alias_expressions.insert(alias_lower, expr.clone());
+                    }
                 }
             }
         }
@@ -4973,12 +4987,20 @@ impl<'s> SelectCompiler<'s> {
                     }
                     // Then check alias_expressions (for WHERE clause before result columns)
                     // Avoid infinite recursion when alias name matches a column name
-                    if let Some(alias_expr) = self.alias_expressions.get(&alias_lower).cloned() {
-                        // Don't recurse if the alias expression is just the same column reference
-                        let is_same_column = matches!(&alias_expr, Expr::Column(c)
-                            if c.table.is_none() && c.column.eq_ignore_ascii_case(&col_ref.column));
-                        if !is_same_column {
-                            return self.compile_expr(&alias_expr, dest_reg);
+                    // or when we're already resolving this alias
+                    if !self.resolving_aliases.contains(&alias_lower) {
+                        if let Some(alias_expr) = self.alias_expressions.get(&alias_lower).cloned()
+                        {
+                            // Don't recurse if the alias expression is just the same column reference
+                            let is_same_column = matches!(&alias_expr, Expr::Column(c)
+                                if c.table.is_none() && c.column.eq_ignore_ascii_case(&col_ref.column));
+                            if !is_same_column {
+                                // Mark this alias as being resolved to prevent infinite recursion
+                                self.resolving_aliases.insert(alias_lower.clone());
+                                let result = self.compile_expr(&alias_expr, dest_reg);
+                                self.resolving_aliases.remove(&alias_lower);
+                                return result;
+                            }
                         }
                     }
                 }

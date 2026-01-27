@@ -139,6 +139,7 @@ pub fn execute_pragma(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Resul
         "cache_spill" => pragma_cache_spill(conn, pragma),
         "writable_schema" => pragma_writable_schema(conn, pragma),
         "automatic_index" => pragma_automatic_index(conn, pragma),
+        "trusted_schema" => pragma_trusted_schema(conn, pragma),
         _ => Err(Error::with_message(
             ErrorCode::Error,
             format!("unknown pragma: {}", pragma.name),
@@ -816,6 +817,18 @@ fn pragma_automatic_index(
     }
     if pragma.value.is_none() {
         return Ok(single_int_result(i64::from(conn.db_config.automatic_index)));
+    }
+    Ok(empty_result())
+}
+
+fn pragma_trusted_schema(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Result<PragmaResult> {
+    if let Some(value) = pragma_value_i64(pragma) {
+        conn.db_config.trusted_schema = value != 0;
+    } else if let Some(value) = pragma_value_string(pragma) {
+        conn.db_config.trusted_schema = parse_bool_value(&value);
+    }
+    if pragma.value.is_none() {
+        return Ok(single_int_result(i64::from(conn.db_config.trusted_schema)));
     }
     Ok(empty_result())
 }

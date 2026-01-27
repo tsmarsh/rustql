@@ -45,9 +45,9 @@ if ! cargo clippy --all-targets --all-features 2>&1; then
 fi
 echo -e "${GREEN}Clippy OK${NC}"
 
-# Step 3: Run tests
-echo -e "\n${YELLOW}[3/3] Running tests (cargo test)...${NC}"
-if ! cargo test 2>&1; then
+# Step 3: Run tests (with same features as CI)
+echo -e "\n${YELLOW}[3/3] Running tests (cargo test --features fts3,fts5,rtree,session,json)...${NC}"
+if ! cargo test --features fts3,fts5,rtree,session,json 2>&1; then
     echo -e "${RED}Tests failed!${NC}"
     echo -e "Fix failing tests before committing."
     exit 1

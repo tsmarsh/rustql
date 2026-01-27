@@ -12,6 +12,7 @@ use crate::schema::{Schema, Trigger, TriggerEvent, TriggerTiming};
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
 use super::column_mapping::ColumnMapper;
+use super::select::{SelectCompiler, SelectDest};
 use super::trigger::{find_matching_triggers, generate_trigger_code};
 
 const OPFLAG_NCHANGE: u16 = 0x01;
@@ -83,6 +84,16 @@ pub struct DeleteCompiler<'s> {
 
     /// AFTER DELETE triggers
     after_triggers: Vec<Arc<Trigger>>,
+
+    /// Name of table being deleted from (for subquery detection)
+    target_table: String,
+
+    /// Pre-computed subquery results (maps from subquery index to result register)
+    /// Subqueries that reference the target table are pre-evaluated before the loop
+    precomputed_subqueries: HashMap<usize, i32>,
+
+    /// Counter for assigning unique indices to subqueries during scan
+    subquery_counter: usize,
 }
 
 impl<'s> DeleteCompiler<'s> {
@@ -104,6 +115,9 @@ impl<'s> DeleteCompiler<'s> {
             index_cursors: Vec::new(),
             before_triggers: Vec::new(),
             after_triggers: Vec::new(),
+            target_table: String::new(),
+            precomputed_subqueries: HashMap::new(),
+            subquery_counter: 0,
         }
     }
 
@@ -125,6 +139,9 @@ impl<'s> DeleteCompiler<'s> {
             before_triggers: Vec::new(),
             after_triggers: Vec::new(),
             index_cursors: Vec::new(),
+            target_table: String::new(),
+            precomputed_subqueries: HashMap::new(),
+            subquery_counter: 0,
         }
     }
 
@@ -147,6 +164,9 @@ impl<'s> DeleteCompiler<'s> {
                 format!("table {} may not be modified", delete.table.name),
             ));
         }
+
+        // Store target table name for subquery reference detection
+        self.target_table = table_name_lower.clone();
 
         // Initialize
         self.emit(Opcode::Init, 0, 0, 0, P4::Unused);
@@ -253,6 +273,12 @@ impl<'s> DeleteCompiler<'s> {
             return self.compile_delete_with_limit(delete);
         }
 
+        // Precompute subqueries that reference the target table BEFORE the loop
+        // This ensures stable results even as rows are deleted
+        if let Some(where_expr) = &delete.where_clause {
+            self.precompute_subqueries(where_expr)?;
+        }
+
         let has_before_triggers = !self.before_triggers.is_empty();
         let has_after_triggers = !self.after_triggers.is_empty();
 
@@ -289,6 +315,8 @@ impl<'s> DeleteCompiler<'s> {
 
         // If we have a WHERE clause, check the condition
         if let Some(where_expr) = &delete.where_clause {
+            // Reset subquery counter so indices match precomputed values
+            self.subquery_counter = 0;
             let skip_label = self.alloc_label();
             self.compile_where_check(where_expr, skip_label)?;
 
@@ -651,6 +679,7 @@ impl<'s> DeleteCompiler<'s> {
                 self.validate_expr_columns(right)
             }
             Expr::Unary { expr: inner, .. } => self.validate_expr_columns(inner),
+            Expr::Parens(inner) => self.validate_expr_columns(inner),
             Expr::Function(func_call) => {
                 match &func_call.args {
                     crate::parser::ast::FunctionArgs::Exprs(exprs) => {
@@ -939,6 +968,10 @@ impl<'s> DeleteCompiler<'s> {
                     _ => {}
                 }
             }
+            Expr::Parens(inner) => {
+                // Parenthesized expression - just compile the inner
+                self.compile_expr(inner, dest_reg)?;
+            }
             Expr::Function(func_call) => {
                 // Validate function exists
                 let name = &func_call.name;
@@ -1008,6 +1041,89 @@ impl<'s> DeleteCompiler<'s> {
                 };
                 self.emit(Opcode::Variable, param_idx, dest_reg, 0, P4::Unused);
             }
+            Expr::Subquery(select) => {
+                // Check if this subquery references the target table and has been precomputed
+                if self.select_references_table(select) {
+                    // Look up precomputed value
+                    let idx = self.subquery_counter;
+                    self.subquery_counter += 1;
+                    if let Some(&precomputed_reg) = self.precomputed_subqueries.get(&idx) {
+                        // Use the precomputed value
+                        self.emit(Opcode::Copy, precomputed_reg, dest_reg, 0, P4::Unused);
+                        return Ok(());
+                    }
+                }
+
+                // Compile scalar subquery inline (not precomputed)
+                // Initialize dest_reg to NULL in case subquery returns no rows
+                self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+
+                // Use SelectCompiler to compile the subquery
+                let mut sub_compiler = if let Some(schema) = self.schema {
+                    SelectCompiler::with_schema(schema)
+                } else {
+                    SelectCompiler::new()
+                };
+
+                // Set starting register/cursor to avoid conflicts
+                sub_compiler.set_register_base(dest_reg + 1, self.next_cursor);
+
+                // Compile with Set destination - copies first column to dest_reg
+                let sub_dest = SelectDest::Set { reg: dest_reg };
+                let sub_ops = sub_compiler.compile(select, &sub_dest)?;
+
+                // Get offsets for adjusting cursor and register numbers
+                let cursor_offset = self.next_cursor;
+                let base_addr = self.ops.len() as i32;
+
+                // Inline the compiled ops, excluding Init/Halt
+                for mut op in sub_ops {
+                    if op.opcode == Opcode::Init || op.opcode == Opcode::Halt {
+                        continue;
+                    }
+
+                    // Adjust jump addresses
+                    if op.opcode.is_jump() && op.p2 > 0 {
+                        op.p2 += base_addr;
+                    }
+
+                    // Adjust cursor numbers for table operations
+                    if op.opcode == Opcode::OpenRead || op.opcode == Opcode::OpenWrite {
+                        op.p1 += cursor_offset;
+                    } else if matches!(
+                        op.opcode,
+                        Opcode::Rewind
+                            | Opcode::Next
+                            | Opcode::Column
+                            | Opcode::Close
+                            | Opcode::SeekGE
+                            | Opcode::SeekGT
+                            | Opcode::SeekLE
+                            | Opcode::SeekLT
+                            | Opcode::SeekRowid
+                            | Opcode::IdxGE
+                            | Opcode::IdxGT
+                            | Opcode::IdxLE
+                            | Opcode::IdxLT
+                            | Opcode::Found
+                            | Opcode::NotFound
+                            | Opcode::SorterConfig
+                            | Opcode::SorterInsert
+                            | Opcode::SorterSort
+                            | Opcode::SorterNext
+                            | Opcode::SorterData
+                            | Opcode::OpenEphemeral
+                            | Opcode::OpenAutoindex
+                    ) {
+                        op.p1 += cursor_offset;
+                    }
+
+                    self.ops.push(op);
+                }
+
+                // Update cursor count to account for cursors used by SelectCompiler
+                self.next_cursor += 5;
+            }
             _ => {
                 // Default to NULL for unsupported expressions
                 self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
@@ -1064,6 +1180,286 @@ impl<'s> DeleteCompiler<'s> {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Check if an expression contains a subquery that references the target table
+    fn expr_references_target_table(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Subquery(select) => self.select_references_table(select),
+            Expr::Binary { left, right, .. } => {
+                self.expr_references_target_table(left) || self.expr_references_target_table(right)
+            }
+            Expr::Unary { expr, .. } => self.expr_references_target_table(expr),
+            Expr::Parens(inner) => self.expr_references_target_table(inner),
+            Expr::IsNull { expr, .. } => self.expr_references_target_table(expr),
+            Expr::Function(func) => {
+                if let crate::parser::ast::FunctionArgs::Exprs(args) = &func.args {
+                    args.iter().any(|e| self.expr_references_target_table(e))
+                } else {
+                    false
+                }
+            }
+            Expr::In { expr, list, .. } => {
+                let list_refs = match list {
+                    crate::parser::ast::InList::Values(vals) => {
+                        vals.iter().any(|e| self.expr_references_target_table(e))
+                    }
+                    crate::parser::ast::InList::Subquery(select) => {
+                        self.select_references_table(select)
+                    }
+                    crate::parser::ast::InList::Table(_) => false,
+                };
+                self.expr_references_target_table(expr) || list_refs
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.expr_references_target_table(expr)
+                    || self.expr_references_target_table(low)
+                    || self.expr_references_target_table(high)
+            }
+            Expr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => {
+                operand
+                    .as_ref()
+                    .map(|e| self.expr_references_target_table(e))
+                    .unwrap_or(false)
+                    || when_clauses.iter().any(|wc| {
+                        self.expr_references_target_table(&wc.when)
+                            || self.expr_references_target_table(&wc.then)
+                    })
+                    || else_clause
+                        .as_ref()
+                        .map(|e| self.expr_references_target_table(e))
+                        .unwrap_or(false)
+            }
+            Expr::Exists { subquery, .. } => self.select_references_table(subquery),
+            Expr::Cast { expr, .. } => self.expr_references_target_table(expr),
+            _ => false,
+        }
+    }
+
+    /// Check if a SELECT statement references the target table
+    fn select_references_table(&self, select: &crate::parser::ast::SelectStmt) -> bool {
+        self.select_body_references_table(&select.body)
+    }
+
+    /// Check if a SELECT body references the target table
+    fn select_body_references_table(&self, body: &crate::parser::ast::SelectBody) -> bool {
+        match body {
+            crate::parser::ast::SelectBody::Select(core) => {
+                // Check FROM clause
+                if let Some(from) = &core.from {
+                    if self.from_clause_references_table(from) {
+                        return true;
+                    }
+                }
+                false
+            }
+            crate::parser::ast::SelectBody::Compound { left, right, .. } => {
+                self.select_body_references_table(left) || self.select_body_references_table(right)
+            }
+        }
+    }
+
+    /// Check if a FROM clause references the target table
+    fn from_clause_references_table(&self, from: &crate::parser::ast::FromClause) -> bool {
+        for table_ref in &from.tables {
+            if self.table_ref_references_table(table_ref) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if a table reference references the target table
+    fn table_ref_references_table(&self, table_ref: &crate::parser::ast::TableRef) -> bool {
+        match table_ref {
+            crate::parser::ast::TableRef::Table { name, .. } => {
+                name.name.eq_ignore_ascii_case(&self.target_table)
+            }
+            crate::parser::ast::TableRef::Subquery { query, .. } => {
+                self.select_references_table(query)
+            }
+            crate::parser::ast::TableRef::Join { left, right, .. } => {
+                self.table_ref_references_table(left) || self.table_ref_references_table(right)
+            }
+            crate::parser::ast::TableRef::TableFunction { .. } => false,
+            crate::parser::ast::TableRef::Parens(inner) => self.table_ref_references_table(inner),
+        }
+    }
+
+    /// Collect all subqueries from an expression that reference the target table
+    /// Returns a list of (subquery_index, subquery)
+    fn collect_target_table_subqueries<'a>(
+        &mut self,
+        expr: &'a Expr,
+    ) -> Vec<(usize, &'a crate::parser::ast::SelectStmt)> {
+        let mut result = Vec::new();
+        self.collect_subqueries_recursive(expr, &mut result);
+        result
+    }
+
+    fn collect_subqueries_recursive<'a>(
+        &mut self,
+        expr: &'a Expr,
+        result: &mut Vec<(usize, &'a crate::parser::ast::SelectStmt)>,
+    ) {
+        match expr {
+            Expr::Subquery(select) => {
+                if self.select_references_table(select) {
+                    let idx = self.subquery_counter;
+                    self.subquery_counter += 1;
+                    result.push((idx, select));
+                }
+            }
+            Expr::Binary { left, right, .. } => {
+                self.collect_subqueries_recursive(left, result);
+                self.collect_subqueries_recursive(right, result);
+            }
+            Expr::Unary { expr, .. } => {
+                self.collect_subqueries_recursive(expr, result);
+            }
+            Expr::Parens(inner) => {
+                self.collect_subqueries_recursive(inner, result);
+            }
+            Expr::IsNull { expr, .. } => {
+                self.collect_subqueries_recursive(expr, result);
+            }
+            Expr::Function(func) => {
+                if let crate::parser::ast::FunctionArgs::Exprs(args) = &func.args {
+                    for arg in args {
+                        self.collect_subqueries_recursive(arg, result);
+                    }
+                }
+            }
+            Expr::In { expr, list, .. } => {
+                self.collect_subqueries_recursive(expr, result);
+                match list {
+                    crate::parser::ast::InList::Values(vals) => {
+                        for e in vals {
+                            self.collect_subqueries_recursive(e, result);
+                        }
+                    }
+                    crate::parser::ast::InList::Subquery(_) => {
+                        // InSelect's select is handled differently (not as scalar subquery)
+                    }
+                    crate::parser::ast::InList::Table(_) => {}
+                }
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.collect_subqueries_recursive(expr, result);
+                self.collect_subqueries_recursive(low, result);
+                self.collect_subqueries_recursive(high, result);
+            }
+            Expr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => {
+                if let Some(e) = operand {
+                    self.collect_subqueries_recursive(e, result);
+                }
+                for wc in when_clauses {
+                    self.collect_subqueries_recursive(&wc.when, result);
+                    self.collect_subqueries_recursive(&wc.then, result);
+                }
+                if let Some(e) = else_clause {
+                    self.collect_subqueries_recursive(e, result);
+                }
+            }
+            Expr::Cast { expr, .. } => {
+                self.collect_subqueries_recursive(expr, result);
+            }
+            _ => {}
+        }
+    }
+
+    /// Precompute subqueries that reference the target table
+    /// This must be called BEFORE the main delete loop to ensure stable results
+    fn precompute_subqueries(&mut self, where_expr: &Expr) -> Result<()> {
+        // Reset counter for this compilation
+        self.subquery_counter = 0;
+
+        // Collect subqueries that reference the target table
+        let subqueries = self.collect_target_table_subqueries(where_expr);
+
+        for (idx, select) in subqueries {
+            // Allocate a register for the precomputed result
+            let dest_reg = self.alloc_reg();
+
+            // Initialize to NULL
+            self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+
+            // Compile the subquery
+            let mut sub_compiler = if let Some(schema) = self.schema {
+                SelectCompiler::with_schema(schema)
+            } else {
+                SelectCompiler::new()
+            };
+
+            sub_compiler.set_register_base(dest_reg + 1, self.next_cursor);
+
+            let sub_dest = SelectDest::Set { reg: dest_reg };
+            let sub_ops = sub_compiler.compile(select, &sub_dest)?;
+
+            let cursor_offset = self.next_cursor;
+            let base_addr = self.ops.len() as i32;
+
+            for mut op in sub_ops {
+                if op.opcode == Opcode::Init || op.opcode == Opcode::Halt {
+                    continue;
+                }
+
+                if op.opcode.is_jump() && op.p2 > 0 {
+                    op.p2 += base_addr;
+                }
+
+                if op.opcode == Opcode::OpenRead || op.opcode == Opcode::OpenWrite {
+                    op.p1 += cursor_offset;
+                } else if matches!(
+                    op.opcode,
+                    Opcode::Rewind
+                        | Opcode::Next
+                        | Opcode::Column
+                        | Opcode::Close
+                        | Opcode::SeekGE
+                        | Opcode::SeekGT
+                        | Opcode::SeekLE
+                        | Opcode::SeekLT
+                        | Opcode::SeekRowid
+                        | Opcode::IdxGE
+                        | Opcode::IdxGT
+                        | Opcode::IdxLE
+                        | Opcode::IdxLT
+                        | Opcode::Found
+                        | Opcode::NotFound
+                        | Opcode::SorterConfig
+                        | Opcode::SorterInsert
+                        | Opcode::SorterSort
+                        | Opcode::SorterNext
+                        | Opcode::SorterData
+                        | Opcode::OpenEphemeral
+                        | Opcode::OpenAutoindex
+                ) {
+                    op.p1 += cursor_offset;
+                }
+
+                self.ops.push(op);
+            }
+
+            self.next_cursor += 5;
+
+            // Store the mapping from subquery index to result register
+            self.precomputed_subqueries.insert(idx, dest_reg);
+        }
+
         Ok(())
     }
 

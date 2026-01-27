@@ -5521,6 +5521,10 @@ impl<'s> SelectCompiler<'s> {
                 let saved_has_agg = self.has_aggregates;
                 let saved_has_window = self.has_window_functions;
                 let saved_result_names_len = self.result_column_names.len();
+                let saved_order_by_terms = self.order_by_terms.take();
+                let saved_limit_counter_reg = self.limit_counter_reg.take();
+                let saved_offset_counter_reg = self.offset_counter_reg.take();
+                let saved_limit_done_label = self.limit_done_label.take();
 
                 // Set boundary so subquery only loops over its own tables, not outer tables
                 self.outer_tables_boundary = outer_tables_len;
@@ -5528,10 +5532,11 @@ impl<'s> SelectCompiler<'s> {
                 // Initialize result to NULL in case subquery returns no rows
                 self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
 
-                // Compile the subquery body with Set destination
+                // Compile the subquery with Set destination using compile_subselect
+                // which handles ORDER BY and LIMIT properly
                 // Outer tables remain available for correlated column references
                 let sub_dest = SelectDest::Set { reg: dest_reg };
-                self.compile_body(&select.body, &sub_dest)?;
+                self.compile_subselect(select, &sub_dest)?;
 
                 // Restore outer query state - remove subquery's tables and reset boundary
                 self.tables.truncate(outer_tables_len);
@@ -5539,6 +5544,10 @@ impl<'s> SelectCompiler<'s> {
                 self.has_aggregates = saved_has_agg;
                 self.has_window_functions = saved_has_window;
                 self.result_column_names.truncate(saved_result_names_len);
+                self.order_by_terms = saved_order_by_terms;
+                self.limit_counter_reg = saved_limit_counter_reg;
+                self.offset_counter_reg = saved_offset_counter_reg;
+                self.limit_done_label = saved_limit_done_label;
             }
             Expr::Exists { subquery, negated } => {
                 // Compile EXISTS subquery
@@ -6005,6 +6014,14 @@ impl<'s> SelectCompiler<'s> {
                 self.emit(Opcode::NewRowid, *cursor, rowid_reg, 0, P4::Unused);
                 self.emit(Opcode::Insert, *cursor, record_reg, rowid_reg, P4::Unused);
                 self.resolve_label(skip_label, self.current_addr());
+            }
+            SelectDest::Set { reg } => {
+                // Copy first result column to destination register (scalar subquery)
+                self.emit(Opcode::Copy, result_base_reg, *reg, 0, P4::Unused);
+            }
+            SelectDest::Exists { reg } => {
+                // Set result to 1 (EXISTS found a row)
+                self.emit(Opcode::Integer, 1, *reg, 0, P4::Unused);
             }
             _ => {
                 // Output as result row

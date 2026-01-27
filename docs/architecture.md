@@ -195,6 +195,21 @@ flowchart LR
 - FTS3 is present as an internal module, but not yet attached to a vtab.
 - DDL schema parsing is simplified and does not track all SQLite metadata.
 
+## Architect Readiness (Avoid Stovepipes)
+
+Use this checklist to keep cross-module work aligned and coverage moving:
+
+- Trace changes end-to-end (parser -> executor -> VDBE -> storage) and confirm
+  each layer has a test or a clear reason why it cannot be covered.
+- When adding or fixing an opcode, verify the compiler emits it in real plans
+  and add at least one integration test that exercises the full pipeline.
+- For schema/DDL work, validate both schema registration and runtime behavior
+  (e.g., prepared statement execution and data access).
+- Cross-check `docs/differences.md` for temporary gaps; open or update moths
+  when architecture or behavior diverges from SQLite.
+- Prefer system-level invariants (correctness, durability, concurrency) over
+  local optimizations unless the upstream C path mandates them.
+
 ## Glossary
 
 - **AST**: Abstract Syntax Tree. A structured representation of SQL.

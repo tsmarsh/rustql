@@ -309,6 +309,13 @@ impl<'s> TriggerBodyCompiler<'s> {
         r
     }
 
+    /// Allocate multiple consecutive registers, returns the first
+    fn alloc_regs(&mut self, count: i32) -> i32 {
+        let r = self.next_reg;
+        self.next_reg += count;
+        r
+    }
+
     /// Allocate a cursor
     fn alloc_cursor(&mut self) -> i32 {
         let c = self.next_cursor;
@@ -460,16 +467,331 @@ impl<'s> TriggerBodyCompiler<'s> {
     }
 
     /// Compile an UPDATE statement in a trigger body
-    fn compile_update(&mut self, _update: &crate::parser::ast::UpdateStmt) -> Result<()> {
-        // For now, emit a no-op - UPDATE in trigger is complex
+    fn compile_update(&mut self, update: &crate::parser::ast::UpdateStmt) -> Result<()> {
+        // Get table info
+        let table_name = &update.table.name;
+        let num_cols = if let Some(schema) = self.schema {
+            let table_lower = table_name.to_lowercase();
+            if let Some(table) = schema.tables.get(&table_lower) {
+                table.columns.len()
+            } else {
+                return Err(Error::with_message(
+                    ErrorCode::Error,
+                    format!("no such table: {}", table_name),
+                ));
+            }
+        } else {
+            self.num_columns
+        };
+
+        if num_cols == 0 {
+            return Ok(());
+        }
+
+        // Phase 1: Collect rowids of rows to update into an ephemeral table
+        // This avoids issues with modifying the table while iterating
+
+        // Open table for reading (to collect rowids)
+        let read_cursor = self.alloc_cursor();
         self.emit(
-            Opcode::Noop,
+            Opcode::OpenRead,
+            read_cursor,
             0,
             0,
-            0,
-            P4::Text("UPDATE in trigger".to_string()),
+            P4::Text(table_name.clone()),
         );
+
+        // Open ephemeral table to store rowids
+        let eph_cursor = self.alloc_cursor();
+        self.emit(Opcode::OpenEphemeral, eph_cursor, 1, 0, P4::Unused);
+
+        // Labels for the collection loop
+        let collect_start = self.alloc_label();
+        let collect_end = self.alloc_label();
+        let skip_collect = self.alloc_label();
+
+        // Rewind to start of table
+        self.emit(Opcode::Rewind, read_cursor, collect_end, 0, P4::Unused);
+
+        // Collection loop start
+        self.resolve_label(collect_start, self.current_addr() as i32);
+
+        let rowid_reg = self.alloc_reg();
+        self.emit(Opcode::Rowid, read_cursor, rowid_reg, 0, P4::Unused);
+
+        // If WHERE clause, evaluate and skip if false
+        if let Some(ref where_expr) = update.where_clause {
+            let cond_reg = self.alloc_reg();
+            self.compile_update_where(where_expr, read_cursor, cond_reg, table_name)?;
+            self.emit(Opcode::IfNot, cond_reg, skip_collect, 1, P4::Unused);
+        }
+
+        // Store rowid in ephemeral table using Insert (not IdxInsert)
+        // IdxInsert only adds to ephemeral_set, but Rewind/Next read from ephemeral_rows
+        let record_reg = self.alloc_reg();
+        let eph_rowid_reg = self.alloc_reg();
+        self.emit(Opcode::MakeRecord, rowid_reg, 1, record_reg, P4::Unused);
+        // Use rowid as the ephemeral table rowid too
+        self.emit(Opcode::SCopy, rowid_reg, eph_rowid_reg, 0, P4::Unused);
+        self.emit(
+            Opcode::Insert,
+            eph_cursor,
+            record_reg,
+            eph_rowid_reg,
+            P4::Unused,
+        );
+
+        self.resolve_label(skip_collect, self.current_addr() as i32);
+
+        // Move to next row
+        self.emit(Opcode::Next, read_cursor, collect_start, 0, P4::Unused);
+
+        // Collection loop end
+        self.resolve_label(collect_end, self.current_addr() as i32);
+
+        // Close read cursor
+        self.emit(Opcode::Close, read_cursor, 0, 0, P4::Unused);
+
+        // Phase 2: Update collected rows
+
+        // Open table for writing
+        let write_cursor = self.alloc_cursor();
+        self.emit(
+            Opcode::OpenWrite,
+            write_cursor,
+            0,
+            0,
+            P4::Text(table_name.clone()),
+        );
+
+        // Labels for the update loop
+        let update_start = self.alloc_label();
+        let update_end = self.alloc_label();
+
+        // Rewind ephemeral table
+        self.emit(Opcode::Rewind, eph_cursor, update_end, 0, P4::Unused);
+
+        // Update loop start
+        self.resolve_label(update_start, self.current_addr() as i32);
+
+        // Get rowid from ephemeral table
+        let eph_rowid_reg = self.alloc_reg();
+        self.emit(Opcode::Column, eph_cursor, 0, eph_rowid_reg, P4::Unused);
+
+        // Seek to the row in the main table
+        self.emit(
+            Opcode::SeekRowid,
+            write_cursor,
+            update_end,
+            eph_rowid_reg,
+            P4::Unused,
+        );
+
+        // Allocate registers for the row data
+        let base_reg = self.alloc_regs(num_cols as i32);
+
+        // Load current row values into registers
+        for i in 0..num_cols {
+            self.emit(
+                Opcode::Column,
+                write_cursor,
+                i as i32,
+                base_reg + i as i32,
+                P4::Unused,
+            );
+        }
+
+        // Apply SET clause assignments
+        for assignment in &update.assignments {
+            for col_name in &assignment.columns {
+                let col_lower = col_name.to_lowercase();
+
+                let col_idx = if let Some(schema) = self.schema {
+                    let table_lower = table_name.to_lowercase();
+                    if let Some(table) = schema.tables.get(&table_lower) {
+                        table
+                            .columns
+                            .iter()
+                            .position(|c| c.name.to_lowercase() == col_lower)
+                    } else {
+                        None
+                    }
+                } else {
+                    self.column_map.get(&col_lower).copied()
+                };
+
+                if let Some(idx) = col_idx {
+                    let dest_reg = base_reg + idx as i32;
+                    self.compile_update_expr(&assignment.expr, write_cursor, dest_reg, table_name)?;
+                }
+            }
+        }
+
+        // Make the updated record
+        let new_record_reg = self.alloc_reg();
+        self.emit(
+            Opcode::MakeRecord,
+            base_reg,
+            num_cols as i32,
+            new_record_reg,
+            P4::Unused,
+        );
+
+        // Delete old row and insert new one with same rowid
+        self.emit(Opcode::Delete, write_cursor, 0, 0, P4::Unused);
+        self.emit(
+            Opcode::Insert,
+            write_cursor,
+            new_record_reg,
+            eph_rowid_reg,
+            P4::Unused,
+        );
+
+        // Move to next ephemeral row
+        self.emit(Opcode::Next, eph_cursor, update_start, 0, P4::Unused);
+
+        // Update loop end
+        self.resolve_label(update_end, self.current_addr() as i32);
+
+        // Close cursors
+        self.emit(Opcode::Close, write_cursor, 0, 0, P4::Unused);
+        self.emit(Opcode::Close, eph_cursor, 0, 0, P4::Unused);
+
         Ok(())
+    }
+
+    /// Compile an expression for UPDATE SET clause, handling column references
+    fn compile_update_expr(
+        &mut self,
+        expr: &crate::parser::ast::Expr,
+        cursor: i32,
+        dest_reg: i32,
+        table_name: &str,
+    ) -> Result<()> {
+        use crate::parser::ast::{BinaryOp, Expr, Literal};
+
+        match expr {
+            Expr::Binary { op, left, right } => {
+                let left_reg = self.alloc_reg();
+                let right_reg = self.alloc_reg();
+
+                self.compile_update_expr(left, cursor, left_reg, table_name)?;
+                self.compile_update_expr(right, cursor, right_reg, table_name)?;
+
+                match op {
+                    BinaryOp::Add => {
+                        self.emit(Opcode::Add, right_reg, left_reg, dest_reg, P4::Unused);
+                    }
+                    BinaryOp::Sub => {
+                        self.emit(Opcode::Subtract, right_reg, left_reg, dest_reg, P4::Unused);
+                    }
+                    BinaryOp::Mul => {
+                        self.emit(Opcode::Multiply, right_reg, left_reg, dest_reg, P4::Unused);
+                    }
+                    BinaryOp::Div => {
+                        self.emit(Opcode::Divide, right_reg, left_reg, dest_reg, P4::Unused);
+                    }
+                    BinaryOp::Concat => {
+                        self.emit(Opcode::Concat, left_reg, right_reg, dest_reg, P4::Unused);
+                    }
+                    _ => {
+                        // For other ops, just use the left value
+                        self.emit(Opcode::SCopy, left_reg, dest_reg, 0, P4::Unused);
+                    }
+                }
+            }
+
+            Expr::Column(col_ref) => {
+                // Handle OLD/NEW references
+                if let Some(ref table) = col_ref.table {
+                    let table_upper = table.to_uppercase();
+                    if table_upper == "OLD" || table_upper == "NEW" {
+                        let p1 = if table_upper == "OLD" { 0 } else { 1 };
+                        let col_lower = col_ref.column.to_lowercase();
+                        let col_idx = self
+                            .column_map
+                            .get(&col_lower)
+                            .map(|&idx| idx as i32)
+                            .unwrap_or(-1);
+                        self.emit(Opcode::Param, p1, col_idx, dest_reg, P4::Unused);
+                        return Ok(());
+                    }
+                }
+
+                // Regular column reference - read from cursor
+                let col_lower = col_ref.column.to_lowercase();
+                let col_idx = if let Some(schema) = self.schema {
+                    let table_lower = table_name.to_lowercase();
+                    if let Some(table) = schema.tables.get(&table_lower) {
+                        table
+                            .columns
+                            .iter()
+                            .position(|c| c.name.to_lowercase() == col_lower)
+                            .map(|i| i as i32)
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    }
+                } else {
+                    self.column_map
+                        .get(&col_lower)
+                        .map(|&i| i as i32)
+                        .unwrap_or(0)
+                };
+
+                self.emit(Opcode::Column, cursor, col_idx, dest_reg, P4::Unused);
+            }
+
+            Expr::Literal(lit) => match lit {
+                Literal::Null => {
+                    self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                }
+                Literal::Integer(n) => {
+                    self.emit(Opcode::Integer, *n as i32, dest_reg, 0, P4::Unused);
+                }
+                Literal::Float(f) => {
+                    self.emit(Opcode::Real, 0, dest_reg, 0, P4::Real(*f));
+                }
+                Literal::String(s) => {
+                    self.emit(Opcode::String8, 0, dest_reg, 0, P4::Text(s.clone()));
+                }
+                Literal::Blob(b) => {
+                    self.emit(
+                        Opcode::Blob,
+                        b.len() as i32,
+                        dest_reg,
+                        0,
+                        P4::Blob(b.clone()),
+                    );
+                }
+                _ => {
+                    self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                }
+            },
+
+            Expr::Parens(inner) => {
+                self.compile_update_expr(inner, cursor, dest_reg, table_name)?;
+            }
+
+            _ => {
+                // For other expressions, use the generic expr compiler
+                self.compile_expr(expr, dest_reg)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Compile a WHERE clause for UPDATE, handling OLD/NEW references
+    fn compile_update_where(
+        &mut self,
+        expr: &crate::parser::ast::Expr,
+        cursor: i32,
+        dest_reg: i32,
+        table_name: &str,
+    ) -> Result<()> {
+        // Reuse the delete WHERE compiler - same logic applies
+        self.compile_delete_where(expr, cursor, dest_reg, table_name)
     }
 
     /// Compile a DELETE statement in a trigger body

@@ -110,6 +110,8 @@ pub struct SelectCompiler<'s> {
     case_sensitive_like: bool,
     /// Aliases currently being resolved (to detect infinite recursion)
     resolving_aliases: HashSet<String>,
+    /// Index name that can satisfy ORDER BY (set by check_order_by_satisfied)
+    order_by_index: Option<String>,
 }
 
 impl<'s> SelectCompiler<'s> {
@@ -154,6 +156,7 @@ impl<'s> SelectCompiler<'s> {
             next_unnamed_param: 1,
             case_sensitive_like: false,
             resolving_aliases: HashSet::new(),
+            order_by_index: None,
         }
     }
 
@@ -203,6 +206,7 @@ impl<'s> SelectCompiler<'s> {
             next_unnamed_param: 1,
             case_sensitive_like: false,
             resolving_aliases: HashSet::new(),
+            order_by_index: None,
         }
     }
 
@@ -3149,56 +3153,103 @@ impl<'s> SelectCompiler<'s> {
         where_clause: Option<&Expr>,
         order_col: &str,
     ) -> bool {
-        // Analyze the query plan
-        let plan_result = self.analyze_query_plan(where_clause);
-        let info = match plan_result {
-            Ok(Some(info)) => info,
-            _ => return false,
-        };
-
-        // Check if the plan uses an IndexScan on the ORDER BY column
-        if info.levels.is_empty() {
-            return false;
-        }
-
-        let level = &info.levels[0];
-        if let WherePlan::IndexScan {
-            index_name,
-            has_range,
-            ..
-        } = &level.plan
-        {
-            // For LIKE optimization with range scan, check if the index is on the ORDER BY column
-            if *has_range {
-                // Check schema's global indexes first
-                if let Some(schema) = self.schema {
-                    for (_name, idx) in schema.indexes.iter() {
-                        if idx.name.eq_ignore_ascii_case(index_name) {
-                            // Check if the first column of the index matches ORDER BY column
-                            if let Some(first_col) = idx.columns.first() {
-                                let col_idx = first_col.column_idx;
-                                if col_idx >= 0 && (col_idx as usize) < schema_table.columns.len() {
-                                    let idx_col_name = &schema_table.columns[col_idx as usize].name;
-                                    if idx_col_name.eq_ignore_ascii_case(order_col) {
-                                        return true;
-                                    }
-                                }
+        // First, check if WHERE clause analysis already uses an index that satisfies ORDER BY
+        if let Some(where_expr) = where_clause {
+            let plan_result = self.analyze_query_plan(Some(where_expr));
+            if let Ok(Some(info)) = plan_result {
+                if !info.levels.is_empty() {
+                    let level = &info.levels[0];
+                    if let WherePlan::IndexScan {
+                        index_name,
+                        has_range,
+                        ..
+                    } = &level.plan
+                    {
+                        if *has_range {
+                            // Check if index first column matches ORDER BY
+                            if self.index_first_column_matches(schema_table, index_name, order_col)
+                            {
+                                return true;
                             }
                         }
                     }
                 }
+            }
+        }
 
-                // Also check table's indexes
-                for index in &schema_table.indexes {
-                    if index.name.eq_ignore_ascii_case(index_name) {
-                        // Check if the first column of the index matches ORDER BY column
-                        if let Some(first_col) = index.columns.first() {
-                            let col_idx = first_col.column_idx;
-                            if col_idx >= 0 && (col_idx as usize) < schema_table.columns.len() {
-                                let idx_col_name = &schema_table.columns[col_idx as usize].name;
-                                if idx_col_name.eq_ignore_ascii_case(order_col) {
-                                    return true;
-                                }
+        // If no WHERE clause or WHERE doesn't use a suitable index,
+        // search ALL indexes on the table for one that matches ORDER BY
+        // This allows index scan to be used purely for ordering
+        for index in &schema_table.indexes {
+            if let Some(first_col) = index.columns.first() {
+                // Check if first index column matches ORDER BY column
+                let col_idx = first_col.column_idx;
+                if col_idx >= 0 && (col_idx as usize) < schema_table.columns.len() {
+                    let idx_col_name = &schema_table.columns[col_idx as usize].name;
+                    if idx_col_name.eq_ignore_ascii_case(order_col) {
+                        // Found an index that can satisfy ORDER BY
+                        // Store it for use during code generation
+                        self.order_by_index = Some(index.name.clone());
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Also check schema's global indexes
+        if let Some(schema) = self.schema {
+            let table_name_lower = schema_table.name.to_lowercase();
+            for (_name, idx) in schema.indexes.iter() {
+                if idx.table.to_lowercase() == table_name_lower {
+                    if let Some(first_col) = idx.columns.first() {
+                        let col_idx = first_col.column_idx;
+                        if col_idx >= 0 && (col_idx as usize) < schema_table.columns.len() {
+                            let idx_col_name = &schema_table.columns[col_idx as usize].name;
+                            if idx_col_name.eq_ignore_ascii_case(order_col) {
+                                self.order_by_index = Some(idx.name.clone());
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Helper to check if an index's first column matches the ORDER BY column
+    fn index_first_column_matches(
+        &self,
+        schema_table: &std::sync::Arc<Table>,
+        index_name: &str,
+        order_col: &str,
+    ) -> bool {
+        // Check table's indexes
+        for index in &schema_table.indexes {
+            if index.name.eq_ignore_ascii_case(index_name) {
+                if let Some(first_col) = index.columns.first() {
+                    let col_idx = first_col.column_idx;
+                    if col_idx >= 0 && (col_idx as usize) < schema_table.columns.len() {
+                        let idx_col_name = &schema_table.columns[col_idx as usize].name;
+                        if idx_col_name.eq_ignore_ascii_case(order_col) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check schema's global indexes
+        if let Some(schema) = self.schema {
+            for (_name, idx) in schema.indexes.iter() {
+                if idx.name.eq_ignore_ascii_case(index_name) {
+                    if let Some(first_col) = idx.columns.first() {
+                        let col_idx = first_col.column_idx;
+                        if col_idx >= 0 && (col_idx as usize) < schema_table.columns.len() {
+                            let idx_col_name = &schema_table.columns[col_idx as usize].name;
+                            if idx_col_name.eq_ignore_ascii_case(order_col) {
+                                return true;
                             }
                         }
                     }

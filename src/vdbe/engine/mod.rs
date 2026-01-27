@@ -304,6 +304,10 @@ pub struct Vdbe {
     /// Whether count_changes result row has been returned
     count_changes_returned: bool,
 
+    /// Whether this was a DML statement (INSERT/UPDATE/DELETE) that should report count_changes
+    /// This is set even when 0 rows are modified, to support `PRAGMA count_changes=on`
+    is_dml_statement: bool,
+
     /// Start time (for timeout)
     start_time: Option<Instant>,
 
@@ -408,6 +412,7 @@ impl Vdbe {
             error_msg: None,
             n_change: 0,
             count_changes_returned: false,
+            is_dml_statement: false,
             start_time: None,
             vars: Vec::new(),
             var_names: Vec::new(),
@@ -495,6 +500,22 @@ impl Vdbe {
     /// Create from a list of operations
     pub fn from_ops(ops: Vec<VdbeOp>) -> Self {
         let mut vdbe = Self::new();
+
+        // Scan for DML opcodes (Insert, Delete) with OPFLAG_NCHANGE to support count_changes pragma
+        // This needs to be detected at load time because the opcodes might be skipped during
+        // execution (e.g., DELETE on empty table skips the Delete opcode entirely)
+        for op in &ops {
+            match op.opcode {
+                Opcode::Insert | Opcode::InsertInt | Opcode::Delete => {
+                    if (op.p5 & OPFLAG_NCHANGE) != 0 {
+                        vdbe.is_dml_statement = true;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
         vdbe.ops = ops;
         vdbe
     }
@@ -696,6 +717,7 @@ impl Vdbe {
         self.error_msg = None;
         self.n_change = 0;
         self.count_changes_returned = false;
+        self.is_dml_statement = false;
         self.start_time = None;
         self.interrupted = false;
         self.magic = VDBE_MAGIC_INIT;
@@ -926,7 +948,7 @@ impl Vdbe {
                     // Top-level halt - check if we need to return count_changes result
                     // When count_changes pragma is enabled, return the number of modified rows
                     // as a result row before completing execution.
-                    if !self.count_changes_returned && self.n_change > 0 {
+                    if !self.count_changes_returned && self.is_dml_statement {
                         if let Some(conn_ptr) = self.conn_ptr {
                             let conn = unsafe { &*conn_ptr };
                             if conn.db_config.count_changes {
@@ -3116,6 +3138,12 @@ impl Vdbe {
                 // Insert record P2 with rowid P3 into cursor P1
                 // P4 = table name (for debug)
                 // P5 = flags (conflict resolution)
+
+                // Mark as DML statement for count_changes support
+                if (op.p5 & OPFLAG_NCHANGE) != 0 {
+                    self.is_dml_statement = true;
+                }
+
                 let record_data = self.mem(op.p2).to_blob();
                 let rowid = self.mem(op.p3).to_int();
 
@@ -3410,6 +3438,12 @@ impl Vdbe {
                 // P3 = register holding rowid for triggers
                 // P4 = table name
                 // P5 = flags (OPFLAG_* constants)
+
+                // Mark as DML statement for count_changes support
+                if (op.p5 & OPFLAG_NCHANGE) != 0 {
+                    self.is_dml_statement = true;
+                }
+
                 let btree_arc = self.btree.clone();
 
                 let btree = self.btree.clone();

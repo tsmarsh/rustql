@@ -2198,6 +2198,34 @@ impl<'s> StatementCompiler<'s> {
                 Variable::Numbered(None) => "?".to_string(),
             },
             Expr::Parens(inner) => format!("({})", self.expr_to_sql(inner)),
+            Expr::Like {
+                expr,
+                pattern,
+                escape,
+                op,
+                negated,
+            } => {
+                let op_str = match op {
+                    LikeOp::Like => "LIKE",
+                    LikeOp::Glob => "GLOB",
+                    LikeOp::Regexp => "REGEXP",
+                    LikeOp::Match => "MATCH",
+                };
+                let neg = if *negated { "NOT " } else { "" };
+                let esc = if let Some(esc_expr) = escape {
+                    format!(" ESCAPE {}", self.expr_to_sql(esc_expr))
+                } else {
+                    String::new()
+                };
+                format!(
+                    "({} {}{} {}{})",
+                    self.expr_to_sql(expr),
+                    neg,
+                    op_str,
+                    self.expr_to_sql(pattern),
+                    esc
+                )
+            }
             _ => "?".to_string(), // Fallback for complex expressions
         }
     }

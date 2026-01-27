@@ -506,8 +506,11 @@ impl<'a> InsertCompiler<'a> {
         let select_col_count = select_exprs.len();
 
         // Check if SELECT is complex and needs the full SelectCompiler
-        // Complex cases include: UNION, ORDER BY, GROUP BY, multiple tables, etc.
-        if Self::has_subquery(&select_exprs) || self.is_complex_select(select) {
+        // Complex cases include: UNION, ORDER BY, GROUP BY, multiple tables, WITH clause, etc.
+        if insert.with.is_some()
+            || Self::has_subquery(&select_exprs)
+            || self.is_complex_select(select)
+        {
             return self.compile_select_with_subqueries(
                 insert,
                 select,
@@ -758,6 +761,12 @@ impl<'a> InsertCompiler<'a> {
         } else {
             SelectCompiler::new()
         };
+
+        // Process INSERT's WITH clause before compiling the SELECT
+        // This is needed for INSERT...SELECT where the WITH clause defines CTEs used in SELECT
+        if let Some(with) = &insert.with {
+            sub_compiler.process_with_clause(with)?;
+        }
 
         // Use a high cursor number that won't conflict with SelectCompiler's allocations
         // SelectCompiler starts at cursor 0, so we use 100 to be safe

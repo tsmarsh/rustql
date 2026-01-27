@@ -224,6 +224,31 @@ impl<'s> SelectCompiler<'s> {
         self.next_cursor = next_cursor;
     }
 
+    /// Add an outer table for correlated subquery support in DELETE/UPDATE
+    /// The cursor must already be open and positioned on a row.
+    /// After calling this, the table will be available for column resolution
+    /// in subsequent compile() calls, but won't be looped over.
+    pub fn add_outer_table(
+        &mut self,
+        name: String,
+        table_name: String,
+        cursor: i32,
+        schema_table: Option<std::sync::Arc<crate::schema::Table>>,
+    ) {
+        self.tables.push(TableInfo {
+            name,
+            table_name,
+            cursor,
+            schema_table,
+            is_subquery: false,
+            join_type: crate::parser::ast::JoinType::empty(),
+            subquery_columns: None,
+        });
+        // All tables added via this method are outer tables (for correlation)
+        // Update boundary so these tables are used for column resolution but not looped
+        self.outer_tables_boundary = self.tables.len();
+    }
+
     /// Get the expanded column names after compilation
     pub fn column_names(&self) -> &[String] {
         &self.result_column_names
@@ -371,7 +396,7 @@ impl<'s> SelectCompiler<'s> {
     }
 
     /// Process WITH clause
-    fn process_with_clause(&mut self, with: &WithClause) -> Result<()> {
+    pub fn process_with_clause(&mut self, with: &WithClause) -> Result<()> {
         for cte in &with.ctes {
             let name_lower = cte.name.to_lowercase();
             if with.recursive {

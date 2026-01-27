@@ -94,6 +94,15 @@ pub struct DeleteCompiler<'s> {
 
     /// Counter for assigning unique indices to subqueries during scan
     subquery_counter: usize,
+
+    /// Table name for correlated subquery support
+    table_name: String,
+
+    /// Table alias (if specified in DELETE ... AS alias)
+    table_alias: Option<String>,
+
+    /// Schema table info for correlated subquery column resolution
+    schema_table: Option<Arc<crate::schema::Table>>,
 }
 
 impl<'s> DeleteCompiler<'s> {
@@ -118,6 +127,9 @@ impl<'s> DeleteCompiler<'s> {
             target_table: String::new(),
             precomputed_subqueries: HashMap::new(),
             subquery_counter: 0,
+            table_name: String::new(),
+            table_alias: None,
+            schema_table: None,
         }
     }
 
@@ -142,6 +154,9 @@ impl<'s> DeleteCompiler<'s> {
             target_table: String::new(),
             precomputed_subqueries: HashMap::new(),
             subquery_counter: 0,
+            table_name: String::new(),
+            table_alias: None,
+            schema_table: None,
         }
     }
 
@@ -216,6 +231,18 @@ impl<'s> DeleteCompiler<'s> {
                 0,    // source_count not used for DELETE validation
                 Some(schema),
             )?);
+        }
+
+        // Store table info for correlated subquery support
+        self.table_name = delete.table.name.clone();
+        self.table_alias = delete.alias.clone();
+        if let Some(schema) = self.schema {
+            // Try to get schema table (case-insensitive lookup)
+            self.schema_table = schema
+                .tables
+                .get(&delete.table.name)
+                .or_else(|| schema.tables.get(&delete.table.name.to_lowercase()))
+                .cloned();
         }
 
         // Open indexes for writing (for index maintenance)
@@ -1122,6 +1149,108 @@ impl<'s> DeleteCompiler<'s> {
                 }
 
                 // Update cursor count to account for cursors used by SelectCompiler
+                self.next_cursor += 5;
+            }
+            Expr::Exists { subquery, negated } => {
+                // EXISTS subquery - returns 1 if any rows, 0 otherwise
+                // For NOT EXISTS, returns 0 if any rows, 1 otherwise
+
+                // Initialize dest_reg based on negation
+                self.emit(
+                    Opcode::Integer,
+                    if *negated { 1 } else { 0 },
+                    dest_reg,
+                    0,
+                    P4::Unused,
+                );
+
+                // Use SelectCompiler to compile the EXISTS subquery
+                let mut sub_compiler = if let Some(schema) = self.schema {
+                    SelectCompiler::with_schema(schema)
+                } else {
+                    SelectCompiler::new()
+                };
+
+                // Add the table being deleted as an outer table for correlation
+                // This allows the subquery to reference columns from the current row
+                let table_alias = self
+                    .table_alias
+                    .clone()
+                    .unwrap_or_else(|| self.table_name.clone());
+                sub_compiler.add_outer_table(
+                    table_alias,
+                    self.table_name.clone(),
+                    self.table_cursor,
+                    self.schema_table.clone(),
+                );
+
+                // Set starting register/cursor to avoid conflicts
+                sub_compiler.set_register_base(dest_reg + 1, self.next_cursor);
+
+                // Compile with Exists destination
+                let sub_dest = SelectDest::Exists { reg: dest_reg };
+                let sub_ops = sub_compiler.compile(subquery, &sub_dest)?;
+
+                // Get offsets for adjusting cursor and register numbers
+                let cursor_offset = self.next_cursor;
+                let base_addr = self.ops.len() as i32;
+
+                // Inline the compiled ops, excluding Init/Halt
+                for mut op in sub_ops {
+                    if op.opcode == Opcode::Init || op.opcode == Opcode::Halt {
+                        continue;
+                    }
+
+                    // Adjust jump addresses
+                    if op.opcode.is_jump() && op.p2 > 0 {
+                        op.p2 += base_addr;
+                    }
+
+                    // Adjust cursor numbers for table operations
+                    // Don't adjust the outer table cursor (self.table_cursor)
+                    if op.opcode == Opcode::OpenRead || op.opcode == Opcode::OpenWrite {
+                        op.p1 += cursor_offset;
+                    } else if matches!(
+                        op.opcode,
+                        Opcode::Rewind
+                            | Opcode::Next
+                            | Opcode::Column
+                            | Opcode::Close
+                            | Opcode::Rowid
+                            | Opcode::SeekGE
+                            | Opcode::SeekGT
+                            | Opcode::SeekLE
+                            | Opcode::SeekLT
+                            | Opcode::SeekRowid
+                            | Opcode::IdxGE
+                            | Opcode::IdxGT
+                            | Opcode::IdxLE
+                            | Opcode::IdxLT
+                            | Opcode::Found
+                            | Opcode::NotFound
+                            | Opcode::SorterConfig
+                            | Opcode::SorterInsert
+                            | Opcode::SorterSort
+                            | Opcode::SorterNext
+                            | Opcode::SorterData
+                            | Opcode::OpenEphemeral
+                            | Opcode::OpenAutoindex
+                    ) {
+                        // Don't adjust if it's the outer table cursor
+                        if op.p1 != self.table_cursor {
+                            op.p1 += cursor_offset;
+                        }
+                    }
+
+                    self.ops.push(op);
+                }
+
+                // If negated, invert the result
+                if *negated {
+                    self.emit(Opcode::Not, dest_reg, dest_reg, 0, P4::Unused);
+                }
+
+                // Update cursor count
                 self.next_cursor += 5;
             }
             _ => {

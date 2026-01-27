@@ -2226,6 +2226,19 @@ impl<'s> StatementCompiler<'s> {
                     esc
                 )
             }
+            Expr::Raise { action, message } => {
+                let action_str = match action {
+                    RaiseAction::Ignore => "IGNORE",
+                    RaiseAction::Rollback => "ROLLBACK",
+                    RaiseAction::Abort => "ABORT",
+                    RaiseAction::Fail => "FAIL",
+                };
+                if let Some(msg) = message {
+                    format!("RAISE({}, '{}')", action_str, msg.replace('\'', "''"))
+                } else {
+                    format!("RAISE({})", action_str)
+                }
+            }
             _ => "?".to_string(), // Fallback for complex expressions
         }
     }

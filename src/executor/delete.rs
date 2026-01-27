@@ -410,6 +410,7 @@ impl<'s> DeleteCompiler<'s> {
             None, // No NEW row for DELETE
             num_cols,
             &mut self.next_reg,
+            &mut self.next_cursor,
             return_label, // Use label instead of fixed address
         )?;
 
@@ -444,6 +445,7 @@ impl<'s> DeleteCompiler<'s> {
             None, // No NEW row for DELETE
             num_cols,
             &mut self.next_reg,
+            &mut self.next_cursor,
             return_label, // Use label instead of fixed address
         )?;
 

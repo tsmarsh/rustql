@@ -256,8 +256,8 @@ pub struct TriggerBodyCompiler<'s> {
     ops: Vec<VdbeOp>,
     /// Next register to allocate
     next_reg: i32,
-    /// Next cursor to allocate
-    next_cursor: i32,
+    /// Next cursor to allocate (pub for caller to track cursor usage)
+    pub(crate) next_cursor: i32,
     /// Next label
     next_label: i32,
     /// Table name this trigger is on (for column resolution)
@@ -272,12 +272,15 @@ pub struct TriggerBodyCompiler<'s> {
 
 impl<'s> TriggerBodyCompiler<'s> {
     /// Create a new trigger body compiler
-    pub fn new(schema: Option<&'s Schema>, table_name: &str) -> Self {
+    ///
+    /// The cursor_offset parameter is used to avoid cursor number conflicts with the
+    /// parent program. Cursors in the subprogram will be numbered starting from cursor_offset.
+    pub fn new(schema: Option<&'s Schema>, table_name: &str, cursor_offset: i32) -> Self {
         let mut compiler = Self {
             schema,
             ops: Vec::new(),
             next_reg: 1,
-            next_cursor: 0,
+            next_cursor: cursor_offset,
             next_label: -1,
             table_name: table_name.to_string(),
             column_map: std::collections::HashMap::new(),
@@ -620,16 +623,19 @@ impl<'s> TriggerBodyCompiler<'s> {
     }
 
     /// Compile a SELECT statement in a trigger body
-    fn compile_select(&mut self, _select: &crate::parser::ast::SelectStmt) -> Result<()> {
+    fn compile_select(&mut self, select: &crate::parser::ast::SelectStmt) -> Result<()> {
+        use crate::parser::ast::{ResultColumn, SelectBody};
+
         // SELECT in trigger body is executed for side effects (like RAISE)
-        // For now, emit a no-op
-        self.emit(
-            Opcode::Noop,
-            0,
-            0,
-            0,
-            P4::Text("SELECT in trigger".to_string()),
-        );
+        // We need to evaluate each expression in the SELECT list
+        if let SelectBody::Select(core) = &select.body {
+            for col in &core.columns {
+                if let ResultColumn::Expr { expr, .. } = col {
+                    let dest_reg = self.alloc_reg();
+                    self.compile_expr(expr, dest_reg)?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -733,6 +739,27 @@ impl<'s> TriggerBodyCompiler<'s> {
                 }
             }
 
+            Expr::Raise { action, message } => {
+                // RAISE function in triggers
+                use crate::parser::ast::RaiseAction;
+
+                // P1 = error code, P2 = on-conflict action
+                // SQLITE_CONSTRAINT = 19
+                let (p1, p2) = match action {
+                    RaiseAction::Ignore => (0, 4),    // OE_IGNORE = 4
+                    RaiseAction::Rollback => (19, 1), // SQLITE_CONSTRAINT, OE_ROLLBACK = 1
+                    RaiseAction::Abort => (19, 2),    // SQLITE_CONSTRAINT, OE_ABORT = 2
+                    RaiseAction::Fail => (19, 3),     // SQLITE_CONSTRAINT, OE_FAIL = 3
+                };
+
+                let p4 = match message {
+                    Some(msg) => P4::Text(msg.clone()),
+                    None => P4::Unused,
+                };
+
+                self.emit(Opcode::Halt, p1, p2, 0, p4);
+            }
+
             _ => {
                 // For complex expressions, use NULL for now
                 self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
@@ -799,6 +826,7 @@ impl<'s> TriggerBodyCompiler<'s> {
 /// - new_base_reg: Base register containing NEW row values (or None for DELETE)
 /// - num_columns: Number of columns in the table
 /// - next_reg: Pointer to next register counter (updated)
+/// - next_cursor: Pointer to next cursor counter (updated)
 /// - return_label: Label to jump to after trigger execution
 pub fn generate_trigger_code(
     triggers: &[Arc<Trigger>],
@@ -808,6 +836,7 @@ pub fn generate_trigger_code(
     new_base_reg: Option<i32>,
     num_columns: i32,
     next_reg: &mut i32,
+    next_cursor: &mut i32,
     return_label: i32,
 ) -> Result<Vec<VdbeOp>> {
     let mut ops = Vec::new();
@@ -833,8 +862,12 @@ pub fn generate_trigger_code(
         }
 
         // Compile the trigger body to a SubProgram
-        let mut compiler = TriggerBodyCompiler::new(schema, table_name);
+        // Pass the current cursor counter to avoid conflicts with parent's cursors
+        let mut compiler = TriggerBodyCompiler::new(schema, table_name, *next_cursor);
         let subprogram = compiler.compile_body(&body_stmts)?;
+
+        // Update the cursor counter to account for cursors used by the trigger
+        *next_cursor = compiler.next_cursor;
 
         // Before calling the trigger, we need to set up OLD/NEW row values
         // This is done by emitting Copy opcodes to move values from the base registers

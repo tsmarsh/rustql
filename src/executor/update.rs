@@ -1921,6 +1921,7 @@ impl<'s> UpdateCompiler<'s> {
             Some(new_base_reg),
             self.num_columns as i32,
             &mut self.next_reg,
+            &mut self.next_cursor,
             return_label,
         )?;
 
@@ -1954,6 +1955,7 @@ impl<'s> UpdateCompiler<'s> {
             Some(new_base_reg),
             self.num_columns as i32,
             &mut self.next_reg,
+            &mut self.next_cursor,
             return_label,
         )?;
 

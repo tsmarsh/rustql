@@ -1,5 +1,11 @@
 # Repository Guidelines
 
+## Agent Role (Architect)
+- Own system-level design and cross-module integration for RustQL.
+- Review changes that span parser/executor/VDBE/storage to prevent stovepipes.
+- Keep architecture docs current and actionable (`docs/architecture.md`, `docs/vdbe.md`, `docs/btree.md`, `docs/differences.md`).
+- Drive end-to-end test coverage strategy and ensure gaps become moths.
+
 ## Project Structure & Module Organization
 - `sqlite3/` is the SQLite source tree. Core C sources live in `sqlite3/src/`.
 - Tests are primarily Tcl scripts under `sqlite3/test/` (plus `src/test*.c` helpers).

@@ -612,20 +612,12 @@ impl Table {
 
     /// Check if table has an INTEGER PRIMARY KEY (rowid alias)
     pub fn has_rowid_alias(&self) -> bool {
-        if self.without_rowid {
-            return false;
-        }
-        if let Some(ref pk) = self.primary_key {
-            if pk.len() == 1 {
-                let col = &self.columns[pk[0]];
-                return col.affinity == Affinity::Integer;
-            }
-        }
-        false
+        self.rowid_alias_column().is_some()
     }
 
     /// Get the INTEGER PRIMARY KEY column index, or None if no rowid alias
     /// Returns the column index (0-based) if the table has an INTEGER PRIMARY KEY
+    /// Note: Only exact "INTEGER" type creates a rowid alias, not "INT" or other types
     pub fn rowid_alias_column(&self) -> Option<usize> {
         if self.without_rowid {
             return None;
@@ -633,12 +625,21 @@ impl Table {
         if let Some(ref pk) = self.primary_key {
             if pk.len() == 1 {
                 let col = &self.columns[pk[0]];
-                if col.affinity == Affinity::Integer {
-                    return Some(pk[0]);
+                // Only exact "INTEGER" (case-insensitive) creates a rowid alias
+                // "INT", "BIGINT", etc. do NOT create rowid aliases
+                if let Some(ref type_name) = col.type_name {
+                    if type_name.eq_ignore_ascii_case("INTEGER") {
+                        return Some(pk[0]);
+                    }
                 }
             }
         }
         None
+    }
+
+    /// Check if a column is the rowid alias (INTEGER PRIMARY KEY)
+    pub fn is_rowid_alias(&self, col_idx: usize) -> bool {
+        self.rowid_alias_column() == Some(col_idx)
     }
 }
 
@@ -984,11 +985,25 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
         Some(pk_indices)
     };
 
-    // Create auto-indexes for columns with UNIQUE constraint
+    // Create auto-indexes for columns with UNIQUE or PRIMARY KEY constraints
     // (Column-level UNIQUE like "b UNIQUE" needs its own index)
+    // (PRIMARY KEY like "a INT PRIMARY KEY" also needs index unless it's INTEGER PRIMARY KEY)
     let mut auto_idx_count = indexes.len();
-    for (col_idx, col) in columns.iter().enumerate() {
-        if col.is_unique && !col.is_primary_key {
+    for (_col_idx, col) in columns.iter().enumerate() {
+        let needs_index = if col.is_unique && !col.is_primary_key {
+            // UNIQUE column (but not also PRIMARY KEY to avoid duplicates)
+            true
+        } else if col.is_primary_key {
+            // PRIMARY KEY column needs index unless it's INTEGER PRIMARY KEY (rowid alias)
+            // Only exact "INTEGER" type creates a rowid alias
+            !col.type_name
+                .as_ref()
+                .map(|t| t.eq_ignore_ascii_case("INTEGER"))
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if needs_index {
             auto_idx_count += 1;
             let index_name = format!("sqlite_autoindex_{}_{}", table_name, auto_idx_count);
             indexes.push((index_name, vec![col.name.clone()], true));
@@ -2899,6 +2914,7 @@ mod tests {
             name: "test".to_string(),
             columns: vec![Column {
                 name: "id".to_string(),
+                type_name: Some("INTEGER".to_string()),
                 affinity: Affinity::Integer,
                 is_primary_key: true,
                 ..Default::default()

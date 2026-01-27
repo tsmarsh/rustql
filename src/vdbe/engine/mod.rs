@@ -3208,6 +3208,12 @@ impl Vdbe {
                 let schema = self.schema.clone();
                 let record_mems = self.decode_record_mems(&record_data);
                 let mut inserted = false;
+
+                // For REPLACE: collect info to delete old index entries after main cursor work
+                let mut replace_index_deletions: Vec<(usize, Vec<u8>)> = Vec::new();
+                let mut table_name_for_replace: Option<String> = None;
+                let mut replace_old_payload: Option<(Vec<u8>, i64)> = None;
+
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     cursor.rowid = Some(rowid);
 
@@ -3302,7 +3308,22 @@ impl Vdbe {
                                             skip_insert = true;
                                         }
                                         OE_REPLACE => {
-                                            // Delete existing row first
+                                            // Read old row data for index deletion (store for later)
+                                            let old_payload =
+                                                bt_cursor.payload(0, bt_cursor.payload_size()).ok();
+
+                                            // Store the old payload and table name for index deletion after borrow ends
+                                            if let Some(old_data) = old_payload {
+                                                table_name_for_replace = match &op.p4 {
+                                                    P4::Text(s) | P4::Table(s) => {
+                                                        Some(s.to_lowercase())
+                                                    }
+                                                    _ => None,
+                                                };
+                                                replace_old_payload = Some((old_data, rowid));
+                                            }
+
+                                            // Delete from main table
                                             let del_flags = BtreeInsertFlags::empty();
                                             let _ = btree.delete(bt_cursor, del_flags);
                                         }
@@ -3365,6 +3386,120 @@ impl Vdbe {
                         }
                     }
                 }
+
+                // Build index deletion keys for REPLACE (after main cursor borrow ends)
+                if let (Some((old_data, old_rowid)), Some(ref tbl_name)) =
+                    (replace_old_payload, &table_name_for_replace)
+                {
+                    // Parse old row fields
+                    let old_fields = crate::storage::btree::parse_record_fields(&old_data);
+
+                    // Use the cloned schema to look up index info
+                    if let Some(ref schema_arc) = schema {
+                        if let Ok(schema_guard) = schema_arc.read() {
+                            // Collect index info: (index_name, column_indices)
+                            let mut index_infos: Vec<(String, Vec<i32>)> = Vec::new();
+
+                            // Check schema.indexes
+                            for (idx_name, idx) in schema_guard.indexes.iter() {
+                                if idx.table.to_lowercase().eq(tbl_name) {
+                                    let cols: Vec<i32> =
+                                        idx.columns.iter().map(|c| c.column_idx).collect();
+                                    index_infos.push((idx_name.clone(), cols));
+                                }
+                            }
+
+                            // Check table.indexes for auto-indexes
+                            if let Some(table) = schema_guard.tables.get(tbl_name) {
+                                for idx in &table.indexes {
+                                    if !index_infos
+                                        .iter()
+                                        .any(|(n, _)| n.eq_ignore_ascii_case(&idx.name))
+                                    {
+                                        let cols: Vec<i32> =
+                                            idx.columns.iter().map(|c| c.column_idx).collect();
+                                        index_infos.push((idx.name.clone(), cols));
+                                    }
+                                }
+                            }
+
+                            // Build old keys for each index and find matching cursor
+                            for (idx_name, col_indices) in index_infos {
+                                // Find the cursor for this index
+                                for i in 0..self.cursors.len() {
+                                    if i as i32 == op.p1 {
+                                        continue;
+                                    }
+                                    if let Some(ref idx_cursor) = self.cursors[i] {
+                                        if idx_cursor.is_index {
+                                            if let Some(ref cursor_name) = idx_cursor.index_name {
+                                                if cursor_name.eq_ignore_ascii_case(&idx_name) {
+                                                    // Build old key from old field values
+                                                    let mut key_mems: Vec<Mem> = Vec::new();
+                                                    for &col_idx in &col_indices {
+                                                        if col_idx >= 0
+                                                            && (col_idx as usize) < old_fields.len()
+                                                        {
+                                                            let mut m = Mem::new();
+                                                            match &old_fields[col_idx as usize] {
+                                                                crate::storage::btree::RecordField::Null => {
+                                                                    m.set_null()
+                                                                }
+                                                                crate::storage::btree::RecordField::Int(v) => {
+                                                                    m.set_int(*v)
+                                                                }
+                                                                crate::storage::btree::RecordField::Float(v) => {
+                                                                    m.set_real(*v)
+                                                                }
+                                                                crate::storage::btree::RecordField::Text(s) => {
+                                                                    m.set_str(s)
+                                                                }
+                                                                crate::storage::btree::RecordField::Blob(b) => {
+                                                                    m.set_blob(b)
+                                                                }
+                                                            }
+                                                            key_mems.push(m);
+                                                        }
+                                                    }
+                                                    // Add rowid to key
+                                                    let mut rowid_mem = Mem::new();
+                                                    rowid_mem.set_int(old_rowid);
+                                                    key_mems.push(rowid_mem);
+                                                    let old_key = crate::vdbe::auxdata::make_record(
+                                                        &key_mems,
+                                                        0,
+                                                        key_mems.len() as i32,
+                                                    );
+                                                    replace_index_deletions.push((i, old_key));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Perform index deletions for REPLACE
+                if !replace_index_deletions.is_empty() {
+                    if let Some(ref btree) = btree_arc {
+                        for (cursor_idx, old_key) in replace_index_deletions {
+                            if let Some(ref mut idx_cursor) = self.cursors[cursor_idx] {
+                                if let Some(ref mut idx_bt_cursor) = idx_cursor.btree_cursor {
+                                    let search_key =
+                                        crate::storage::btree::UnpackedRecord::new(old_key);
+                                    if let Ok(0) = idx_bt_cursor.index_moveto(&search_key) {
+                                        // Found exact match, delete it
+                                        let _ =
+                                            btree.delete(idx_bt_cursor, BtreeInsertFlags::empty());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if inserted && (op.p5 & OPFLAG_NCHANGE) != 0 {
                     self.n_change += 1;
                     if let Some(conn_ptr) = self.conn_ptr {

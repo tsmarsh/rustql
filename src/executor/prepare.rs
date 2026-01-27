@@ -904,13 +904,28 @@ impl<'s> StatementCompiler<'s> {
 
             let mut auto_idx_num = 0;
 
-            // Create indexes for column-level UNIQUE constraints
+            // Create indexes for column-level UNIQUE and PRIMARY KEY constraints
             for col_def in columns {
+                // Check column type for INTEGER PRIMARY KEY (rowid alias)
+                let col_type_upper = col_def
+                    .type_name
+                    .as_ref()
+                    .map(|t| t.name.to_uppercase())
+                    .unwrap_or_default();
+                let is_integer_type = col_type_upper == "INTEGER";
+
                 for constraint in &col_def.constraints {
-                    if matches!(
-                        constraint.kind,
-                        crate::parser::ast::ColumnConstraintKind::Unique { .. }
-                    ) {
+                    // Create index for UNIQUE constraint
+                    let needs_index = match &constraint.kind {
+                        crate::parser::ast::ColumnConstraintKind::Unique { .. } => true,
+                        crate::parser::ast::ColumnConstraintKind::PrimaryKey { .. } => {
+                            // PRIMARY KEY needs index unless it's INTEGER PRIMARY KEY (rowid alias)
+                            !is_integer_type
+                        }
+                        _ => false,
+                    };
+
+                    if needs_index {
                         auto_idx_num += 1;
                         let index_name =
                             format!("sqlite_autoindex_{}_{}", create.name.name, auto_idx_num);

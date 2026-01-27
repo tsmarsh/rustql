@@ -89,6 +89,9 @@ pub struct InsertCompiler<'a> {
 
     /// AFTER INSERT triggers
     after_triggers: Vec<Arc<Trigger>>,
+
+    /// Table name for trigger firing
+    table_name: String,
 }
 
 impl<'a> InsertCompiler<'a> {
@@ -109,6 +112,7 @@ impl<'a> InsertCompiler<'a> {
             next_unnamed_param: 1,
             before_triggers: Vec::new(),
             after_triggers: Vec::new(),
+            table_name: String::new(),
         }
     }
 
@@ -129,6 +133,7 @@ impl<'a> InsertCompiler<'a> {
             next_unnamed_param: 1,
             before_triggers: Vec::new(),
             after_triggers: Vec::new(),
+            table_name: String::new(),
         }
     }
 
@@ -151,6 +156,9 @@ impl<'a> InsertCompiler<'a> {
                 format!("table {} may not be modified", insert.table.name),
             ));
         }
+
+        // Store table name for trigger firing
+        self.table_name = insert.table.name.clone();
 
         // Initialize
         self.emit(Opcode::Init, 0, 0, 0, P4::Unused);
@@ -238,6 +246,20 @@ impl<'a> InsertCompiler<'a> {
     ) -> Result<()> {
         // Build column index map if columns specified
         let col_targets = self.build_column_map(&insert.table.name, &insert.columns)?;
+
+        // First check: all rows must have the same number of values
+        // SQLite checks this BEFORE comparing to table column count
+        if rows.len() > 1 {
+            let first_len = rows[0].len();
+            for row in rows.iter().skip(1) {
+                if row.len() != first_len {
+                    return Err(crate::error::Error::with_message(
+                        crate::error::ErrorCode::Error,
+                        "all VALUES must have the same number of terms".to_string(),
+                    ));
+                }
+            }
+        }
 
         // Validate column count for each row
         let expected_cols = col_targets.len();
@@ -391,14 +413,15 @@ impl<'a> InsertCompiler<'a> {
             );
 
             // Insert the record
-            let flags = self.conflict_flags(conflict_action);
+            // Use P4::Table for table name (for triggers), conflict flags in P5
+            let flags = self.conflict_flags(conflict_action) as u16;
             self.emit_with_p5(
                 Opcode::Insert,
                 self.table_cursor,
                 record_reg,
                 rowid_reg,
-                P4::Int64(flags),
-                OPFLAG_NCHANGE,
+                P4::Table(self.table_name.clone()),
+                OPFLAG_NCHANGE | flags,
             );
 
             // Insert into indexes
@@ -688,14 +711,15 @@ impl<'a> InsertCompiler<'a> {
             P4::Unused,
         );
 
-        let flags = self.conflict_flags(conflict_action);
+        // Use P4::Table for table name (for triggers), conflict flags in P5
+        let flags = self.conflict_flags(conflict_action) as u16;
         self.emit_with_p5(
             Opcode::Insert,
             self.table_cursor,
             record_reg,
             rowid_reg,
-            P4::Int64(flags),
-            OPFLAG_NCHANGE,
+            P4::Table(self.table_name.clone()),
+            OPFLAG_NCHANGE | flags,
         );
 
         // Insert into indexes
@@ -926,14 +950,15 @@ impl<'a> InsertCompiler<'a> {
             P4::Unused,
         );
 
-        let flags = self.conflict_flags(conflict_action);
+        // Use P4::Table for table name (for triggers), conflict flags in P5
+        let flags = self.conflict_flags(conflict_action) as u16;
         self.emit_with_p5(
             Opcode::Insert,
             self.table_cursor,
             record_reg,
             rowid_reg,
-            P4::Int64(flags),
-            OPFLAG_NCHANGE,
+            P4::Table(self.table_name.clone()),
+            OPFLAG_NCHANGE | flags,
         );
 
         // Insert into indexes
@@ -1429,14 +1454,15 @@ impl<'a> InsertCompiler<'a> {
             P4::Unused,
         );
 
-        let flags = self.conflict_flags(conflict_action);
+        // Use P4::Table for table name (for triggers), conflict flags in P5
+        let flags = self.conflict_flags(conflict_action) as u16;
         self.emit_with_p5(
             Opcode::Insert,
             self.table_cursor,
             record_reg,
             rowid_reg,
-            P4::Int64(flags),
-            OPFLAG_NCHANGE,
+            P4::Table(self.table_name.clone()),
+            OPFLAG_NCHANGE | flags,
         );
 
         // Insert into indexes

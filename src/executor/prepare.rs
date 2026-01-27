@@ -3539,32 +3539,92 @@ impl Default for StatementCompiler<'_> {
 // ============================================================================
 
 /// Find the remaining SQL after the first statement
+///
+/// This function handles:
+/// - String literals (single and double quoted)
+/// - BEGIN...END blocks (for triggers and compound statements)
+/// - Nested BEGIN...END blocks
 fn find_statement_tail(sql: &str) -> &str {
     let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
     let mut in_string = false;
     let mut string_char = b'\0';
+    let mut begin_depth = 0;
 
-    for (i, &c) in bytes.iter().enumerate() {
+    while i < len {
+        let c = bytes[i];
+
         if in_string {
             if c == string_char {
+                // Check for escaped quote (doubled)
+                if i + 1 < len && bytes[i + 1] == string_char {
+                    i += 2;
+                    continue;
+                }
                 in_string = false;
             }
-        } else {
-            match c {
-                b'\'' | b'"' => {
-                    in_string = true;
-                    string_char = c;
+            i += 1;
+            continue;
+        }
+
+        match c {
+            b'\'' | b'"' => {
+                in_string = true;
+                string_char = c;
+                i += 1;
+            }
+            b'B' | b'b' => {
+                // Check for BEGIN keyword
+                if i + 4 < len {
+                    let word = &sql[i..i + 5];
+                    if word.eq_ignore_ascii_case("BEGIN") {
+                        // Make sure it's a word boundary (not part of larger identifier)
+                        let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+                        let after_ok = i + 5 >= len
+                            || !bytes[i + 5].is_ascii_alphanumeric() && bytes[i + 5] != b'_';
+                        if before_ok && after_ok {
+                            begin_depth += 1;
+                            i += 5;
+                            continue;
+                        }
+                    }
                 }
-                b';' => {
+                i += 1;
+            }
+            b'E' | b'e' => {
+                // Check for END keyword
+                if begin_depth > 0 && i + 2 < len {
+                    let word = &sql[i..i + 3];
+                    if word.eq_ignore_ascii_case("END") {
+                        // Make sure it's a word boundary
+                        let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+                        let after_ok = i + 3 >= len
+                            || !bytes[i + 3].is_ascii_alphanumeric() && bytes[i + 3] != b'_';
+                        if before_ok && after_ok {
+                            begin_depth -= 1;
+                            i += 3;
+                            continue;
+                        }
+                    }
+                }
+                i += 1;
+            }
+            b';' => {
+                if begin_depth == 0 {
                     // Found statement end - return everything after
                     return &sql[i + 1..];
                 }
-                _ => {}
+                // Inside BEGIN...END block, semicolon is not statement separator
+                i += 1;
+            }
+            _ => {
+                i += 1;
             }
         }
     }
 
-    // No semicolon found
+    // No statement-ending semicolon found
     ""
 }
 

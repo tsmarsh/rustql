@@ -3196,11 +3196,11 @@ impl Vdbe {
                         // Actually insert into btree
                         if let Some(ref btree) = btree_arc {
                             if let Some(ref mut bt_cursor) = cursor.btree_cursor {
-                                // Extract conflict resolution mode from P4 (if Int64)
-                                // This allows P5 to be used for OPFLAG_NCHANGE and similar flags
+                                // Extract conflict resolution mode from P4 (if Int64) or P5
+                                // When P4 contains the table name (for triggers), conflict mode is in P5
                                 let on_error = match &op.p4 {
                                     P4::Int64(flags) => (*flags as u8) & OE_MASK,
-                                    _ => OE_NONE,
+                                    _ => (op.p5 as u8) & OE_MASK,
                                 };
 
                                 // Check if rowid already exists (for conflict detection)
@@ -3292,6 +3292,16 @@ impl Vdbe {
                         if (op.p5 & OPFLAG_LASTROWID) != 0 {
                             conn.last_insert_rowid.store(rowid, AtomicOrdering::SeqCst);
                         }
+                    }
+                }
+
+                // Fire AFTER INSERT triggers if a row was successfully inserted
+                if inserted {
+                    // Get table name from P4
+                    if let P4::Text(ref table_name) = op.p4 {
+                        self.fire_after_insert_triggers(table_name)?;
+                    } else if let P4::Table(ref table_name) = op.p4 {
+                        self.fire_after_insert_triggers(table_name)?;
                     }
                 }
             }
@@ -4671,6 +4681,16 @@ impl Vdbe {
                 // IdxInsert P1 P2 P3: Insert record P2 into index P1
                 // For ephemeral indexes: insert into set
                 // For btree indexes: insert into btree
+                //
+                // TODO(kfhht): UNIQUE index constraint checking is NOT implemented here.
+                // For UNIQUE indexes, before inserting we should:
+                // 1. Check if a record with the same key (excluding rowid) already exists
+                // 2. If it does, handle based on conflict resolution mode (P5):
+                //    - OE_ABORT: Return "UNIQUE constraint failed: index_name" error
+                //    - OE_REPLACE: Delete the existing row, then insert
+                //    - OE_IGNORE: Skip the insert silently
+                // This affects insert-16.x, insert-17.x tests.
+                // See also: cursor.is_unique flag and index schema for uniqueness info.
                 let record = self.mem(op.p2).to_blob();
                 let btree_arc = self.btree.clone();
 
@@ -5685,6 +5705,97 @@ impl Vdbe {
             data_offset = data_offset.saturating_add(size);
         }
         mems
+    }
+
+    /// Fire AFTER INSERT triggers for a table
+    ///
+    /// This is called after a successful row insertion to execute any
+    /// AFTER INSERT triggers defined on the table.
+    fn fire_after_insert_triggers(&mut self, table_name: &str) -> Result<()> {
+        // Check recursion depth
+        if self.trigger_depth >= self.max_trigger_depth {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                format!(
+                    "too many levels of trigger recursion (max {})",
+                    self.max_trigger_depth
+                ),
+            ));
+        }
+
+        // Get the schema to find triggers
+        let schema = match &self.schema {
+            Some(s) => s.clone(),
+            None => return Ok(()),
+        };
+
+        let schema_guard = match schema.read() {
+            Ok(g) => g,
+            Err(_) => return Ok(()),
+        };
+
+        // Find matching AFTER INSERT triggers
+        let triggers = find_matching_triggers(
+            &schema_guard,
+            table_name,
+            TriggerTiming::After,
+            TriggerEvent::Insert,
+            None,
+        );
+
+        if triggers.is_empty() {
+            return Ok(());
+        }
+
+        // Drop the schema guard before we potentially need to compile/execute SQL
+        drop(schema_guard);
+
+        // Execute each trigger's body
+        for trigger in triggers {
+            // Get the trigger's SQL
+            let sql = match &trigger.sql {
+                Some(s) => s.clone(),
+                None => continue, // No SQL stored, skip
+            };
+
+            // Parse the CREATE TRIGGER statement to get the body
+            let stmt = match crate::parser::grammar::parse(&sql) {
+                Ok(s) => s,
+                Err(_) => continue, // Parse error, skip this trigger
+            };
+
+            // Extract the body from CreateTriggerStmt
+            let body_stmts = match stmt {
+                crate::parser::ast::Stmt::CreateTrigger(create) => create.body,
+                _ => continue, // Not a CREATE TRIGGER, skip
+            };
+
+            // Compile and execute each body statement
+            for body_stmt in body_stmts {
+                let schema_guard = match schema.read() {
+                    Ok(g) => g,
+                    Err(_) => continue,
+                };
+
+                // Create a compiler and compile the statement
+                let compiled = match compile_trigger_body_stmt(&body_stmt, &schema_guard) {
+                    Ok(ops) => ops,
+                    Err(_) => continue,
+                };
+
+                drop(schema_guard);
+
+                // Execute the compiled ops
+                self.trigger_depth += 1;
+                let result = self.execute_trigger_subprogram(compiled);
+                self.trigger_depth = self.trigger_depth.saturating_sub(1);
+
+                // If trigger execution failed, propagate the error
+                result?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Fire AFTER DELETE triggers for a table

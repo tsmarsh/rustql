@@ -1027,6 +1027,45 @@ impl<'s> SelectCompiler<'s> {
                         }
                     }
 
+                    // Apply column affinities to key registers before MakeRecord
+                    // This ensures type coercion (e.g., '111' matches integer 111 in index)
+                    if *eq_cols > 0 {
+                        if let Some(table_info) = self.tables.get(from_idx) {
+                            if let Some(table) = &table_info.schema_table {
+                                if let Some(index) =
+                                    table.indexes.iter().find(|i| i.name == *index_name)
+                                {
+                                    let mut affinity_str = String::with_capacity(*eq_cols as usize);
+                                    for col in index.columns.iter().take(*eq_cols as usize) {
+                                        if col.column_idx >= 0 {
+                                            if let Some(col_info) =
+                                                table.columns.get(col.column_idx as usize)
+                                            {
+                                                let ch = match col_info.affinity {
+                                                    crate::schema::Affinity::Blob => 'A',
+                                                    crate::schema::Affinity::Text => 'B',
+                                                    crate::schema::Affinity::Numeric => 'C',
+                                                    crate::schema::Affinity::Integer => 'D',
+                                                    crate::schema::Affinity::Real => 'E',
+                                                };
+                                                affinity_str.push(ch);
+                                            }
+                                        }
+                                    }
+                                    if !affinity_str.is_empty() {
+                                        self.emit(
+                                            Opcode::Affinity,
+                                            key_base_reg,
+                                            *eq_cols,
+                                            0,
+                                            P4::Text(affinity_str),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Build seek key - includes range start value if present
                     let (seek_key_reg, seek_key_cols, seek_opcode) =
                         if let Some((_col_idx, op, term_idx)) = range_start {

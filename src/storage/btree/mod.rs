@@ -4116,20 +4116,12 @@ impl Btree {
         let mut shared_guard = shared;
         let root_pgno = _cursor.root_page;
 
-        // Use cursor's current page if available (cursor is already positioned at a leaf).
-        // This is critical for multi-level btrees where root_page is an internal node.
-        let (mut mem_page, limits) = if let Some(ref cursor_page) = _cursor.page {
-            let page_pgno = cursor_page.pgno;
-            let limits = if page_pgno == 1 {
-                PageLimits::for_page1(shared_guard.page_size, shared_guard.usable_size)
-            } else {
-                PageLimits::new(shared_guard.page_size, shared_guard.usable_size)
-            };
-            (cursor_page.clone(), limits)
-        } else {
-            // Fallback: load from root (only works for single-level btrees)
-            _cursor.load_page(&mut shared_guard, root_pgno)?
-        };
+        // For multi-level btrees, cursor is already positioned at a leaf.
+        // Get the page number from cursor.page but ALWAYS reload from pager
+        // to ensure we have the latest data (cursor.page might be stale if
+        // another cursor modified the page).
+        let page_pgno = _cursor.page.as_ref().map(|p| p.pgno).unwrap_or(root_pgno);
+        let (mut mem_page, limits) = _cursor.load_page(&mut shared_guard, page_pgno)?;
 
         if !mem_page.is_leaf {
             return Err(Error::new(ErrorCode::Internal));

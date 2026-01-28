@@ -969,6 +969,14 @@ impl Vdbe {
         let op = self.ops[pc as usize].clone();
         self.pc += 1;
 
+        // DEBUG trace
+        if std::env::var("VDBE_TRACE").is_ok() {
+            eprintln!(
+                "VDBE[{:3}] {:?} {} {} {} {:?}",
+                pc, op.opcode, op.p1, op.p2, op.p3, op.p4
+            );
+        }
+
         match op.opcode {
             // ================================================================
             // Control Flow
@@ -2725,6 +2733,10 @@ impl Vdbe {
                         self.mem_mut(op.p3).set_null();
                     }
                 }
+                // DEBUG: show what Column returned
+                if std::env::var("VDBE_TRACE").is_ok() {
+                    eprintln!("  -> reg[{}] = {:?}", op.p3, self.mem(op.p3));
+                }
             }
 
             Opcode::Rowid => {
@@ -2800,6 +2812,16 @@ impl Vdbe {
             Opcode::MakeRecord => {
                 // Make record from P1..P1+P2-1, store in P3
                 // Uses SQLite record format with varint header and serial types
+                // DEBUG: show input registers
+                if std::env::var("VDBE_TRACE").is_ok() {
+                    for i in 0..op.p2 {
+                        eprintln!(
+                            "  MakeRecord input reg[{}] = {:?}",
+                            op.p1 + i,
+                            self.mem(op.p1 + i)
+                        );
+                    }
+                }
                 let record = crate::vdbe::auxdata::make_record(&self.mem, op.p1, op.p2);
                 self.mem_mut(op.p3).set_blob(&record);
             }
@@ -3360,6 +3382,16 @@ impl Vdbe {
                 let record_data = self.mem(op.p2).to_blob();
                 let rowid = self.mem(op.p3).to_int();
 
+                // DEBUG: show what's being inserted
+                if std::env::var("VDBE_TRACE").is_ok() {
+                    eprintln!(
+                        "  Insert into cursor {}: rowid={}, record_len={}",
+                        op.p1,
+                        rowid,
+                        record_data.len()
+                    );
+                }
+
                 // Get btree Arc before cursor borrow
                 let btree_arc = self.btree.clone();
 
@@ -3843,6 +3875,14 @@ impl Vdbe {
                     }
                 }
 
+                // DEBUG: show NotExists result
+                if std::env::var("VDBE_TRACE").is_ok() {
+                    eprintln!(
+                        "  NotExists cursor={}: rowid={}, exists={}",
+                        op.p1, rowid, exists
+                    );
+                }
+
                 if !exists {
                     self.pc = op.p2;
                 }
@@ -3990,6 +4030,13 @@ impl Vdbe {
                         }
                     } else if let Some(ref btree) = btree_arc {
                         if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                            // DEBUG: show what's being deleted
+                            if std::env::var("VDBE_TRACE").is_ok() {
+                                eprintln!(
+                                    "  Delete from cursor {}: rowid={:?}",
+                                    op.p1, cursor.rowid
+                                );
+                            }
                             let flags = BtreeInsertFlags::from_bits_truncate(op.p5 as u8);
                             btree.delete(bt_cursor, flags)?;
                             deleted = true;

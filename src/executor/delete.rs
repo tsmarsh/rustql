@@ -814,6 +814,30 @@ impl<'s> DeleteCompiler<'s> {
         None
     }
 
+    /// Get column index for code generation, returning -1 for INTEGER PRIMARY KEY columns
+    fn get_column_index_for_codegen(&self, name: &str) -> Option<i32> {
+        // First check if it's a rowid alias
+        if is_rowid_alias(name) {
+            return Some(-1);
+        }
+
+        // Check if this is an INTEGER PRIMARY KEY column
+        if let Some(schema) = self.schema {
+            let table_name_lower = self.table_name.to_lowercase();
+            if let Some(table) = schema.tables.get(&table_name_lower) {
+                // Check if column is the INTEGER PRIMARY KEY
+                if let Some(ipk_idx) = table.rowid_alias_column() {
+                    if table.columns[ipk_idx].name.eq_ignore_ascii_case(name) {
+                        return Some(-1);
+                    }
+                }
+            }
+        }
+
+        // Otherwise return the column index
+        self.get_column_index(name).map(|i| i as i32)
+    }
+
     /// Compile RETURNING clause
     fn compile_returning(&mut self, returning: &[ResultColumn]) -> Result<()> {
         let base_reg = self.next_reg;
@@ -893,9 +917,10 @@ impl<'s> DeleteCompiler<'s> {
                     return Ok(());
                 }
                 // Try to get column index from explicit annotation, schema, or column_map
+                // Use get_column_index_for_codegen which handles IPK columns correctly
                 let col_idx = col_ref
                     .column_index
-                    .or_else(|| self.get_column_index(&col_ref.column).map(|i| i as i32));
+                    .or_else(|| self.get_column_index_for_codegen(&col_ref.column));
 
                 match col_idx {
                     Some(idx) if idx < 0 => {

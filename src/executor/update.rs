@@ -435,9 +435,16 @@ impl<'s> UpdateCompiler<'s> {
         let _data_regs = self.alloc_regs(self.num_columns);
 
         // Read all current column values from the positioned cursor
+        // For INTEGER PRIMARY KEY columns, use Rowid instead of Column
+        let ipk_col_idx = self.get_ipk_column_index();
         for i in 0..self.num_columns {
             let reg = data_base + i as i32;
-            self.emit(Opcode::Column, cursor, i as i32, reg, P4::Unused);
+            if Some(i) == ipk_col_idx {
+                // IPK column - get value from rowid
+                self.emit(Opcode::Rowid, cursor, reg, 0, P4::Unused);
+            } else {
+                self.emit(Opcode::Column, cursor, i as i32, reg, P4::Unused);
+            }
         }
 
         // If we have triggers, save OLD values before modifying data_base
@@ -465,9 +472,20 @@ impl<'s> UpdateCompiler<'s> {
         // Phase 2: Copy from temp registers to data registers
         // This ensures all expressions see the original values, not partially modified ones.
         let mut temp_assignments: Vec<(i32, i32)> = Vec::new(); // (dest_col_idx, temp_reg)
+        let mut new_rowid_reg: Option<i32> = None; // For INTEGER PRIMARY KEY updates
 
         for assignment in &update.assignments {
             for col_name in &assignment.columns {
+                // Check if this is an INTEGER PRIMARY KEY column (which is the rowid alias)
+                let is_ipk = self.get_column_index_for_codegen(col_name) == Some(-1);
+                if is_ipk {
+                    // INTEGER PRIMARY KEY update - compile expression and store for rowid
+                    let temp_reg = self.alloc_reg();
+                    self.compile_expr(&assignment.expr, temp_reg)?;
+                    new_rowid_reg = Some(temp_reg);
+                    continue; // Don't add to regular assignments
+                }
+
                 if let Some(col_idx) = self.get_column_index(col_name) {
                     // Column found in schema - compile to a temp register
                     let temp_reg = self.alloc_reg();
@@ -527,6 +545,14 @@ impl<'s> UpdateCompiler<'s> {
             updated_columns.push(col_idx as usize);
         }
 
+        // For IPK column updates, also copy the new rowid to the data register
+        // This is needed for MakeRecord to include the correct IPK value
+        if let (Some(ipk_idx), Some(rowid_reg)) = (ipk_col_idx, new_rowid_reg) {
+            let dest_reg = data_base + ipk_idx as i32;
+            self.emit(Opcode::SCopy, rowid_reg, dest_reg, 0, P4::Unused);
+            updated_columns.push(ipk_idx);
+        }
+
         // Clear column_data_base since we're done with expressions
         self.column_data_base = None;
 
@@ -555,14 +581,16 @@ impl<'s> UpdateCompiler<'s> {
             P4::Unused,
         );
 
-        // Insert the updated row with same rowid
+        // Insert the updated row
+        // Use new rowid if INTEGER PRIMARY KEY was updated, otherwise same rowid
         // Set OPFLAG_NCHANGE so the changes counter is updated
+        let insert_rowid_reg = new_rowid_reg.unwrap_or(rowid_reg);
         let flags = self.conflict_flags(conflict_action);
         self.emit_with_p5(
             Opcode::Insert,
             cursor,
             record_reg,
-            rowid_reg,
+            insert_rowid_reg,
             P4::Int64(flags),
             OPFLAG_NCHANGE,
         );
@@ -648,6 +676,17 @@ impl<'s> UpdateCompiler<'s> {
 
         // Otherwise return the column index
         self.get_column_index(name).map(|i| i as i32)
+    }
+
+    /// Get the index of the INTEGER PRIMARY KEY column, if any
+    fn get_ipk_column_index(&self) -> Option<usize> {
+        if let Some(schema) = self.schema {
+            let table_name_lower = self.table_name.to_lowercase();
+            if let Some(table) = schema.tables.get(&table_name_lower) {
+                return table.rowid_alias_column();
+            }
+        }
+        None
     }
 
     /// Validate that all column references in an expression exist
@@ -952,16 +991,22 @@ impl<'s> UpdateCompiler<'s> {
             // Check if all UNIQUE columns match
             // For single-column UNIQUE: just compare
             // For multi-column UNIQUE: all must match
+            let ipk_col = self.get_ipk_column_index();
             let mut all_match_label = conflict_label;
             for (i, &col_idx) in col_indices.iter().enumerate() {
                 let check_val_reg = self.alloc_reg();
-                self.emit(
-                    Opcode::Column,
-                    check_cursor,
-                    col_idx as i32,
-                    check_val_reg,
-                    P4::Unused,
-                );
+                // For IPK columns, use Rowid instead of Column
+                if Some(col_idx) == ipk_col {
+                    self.emit(Opcode::Rowid, check_cursor, check_val_reg, 0, P4::Unused);
+                } else {
+                    self.emit(
+                        Opcode::Column,
+                        check_cursor,
+                        col_idx as i32,
+                        check_val_reg,
+                        P4::Unused,
+                    );
+                }
 
                 // Compare with new value (in data_base + col_idx)
                 let new_val_reg = data_base + col_idx as i32;
@@ -1021,16 +1066,125 @@ impl<'s> UpdateCompiler<'s> {
                     // For now, we'll just skip to after_conflict
                 }
                 ConflictAction::Replace => {
-                    // Need to delete the conflicting row
-                    // This is complex - for now just abort
-                    let error_msg = format!("UNIQUE constraint failed: {}", error_col_name);
+                    // Delete the conflicting row and its index entries
+                    // First, we need to open a cursor for writing and position it
+                    let del_cursor = self.alloc_cursor();
                     self.emit(
-                        Opcode::Halt,
-                        crate::error::ErrorCode::Constraint as i32,
-                        2, // OE_Abort
-                        0,
-                        P4::Text(error_msg),
+                        Opcode::OpenWrite,
+                        del_cursor,
+                        root_page as i32,
+                        self.num_columns as i32,
+                        P4::Text(self.table_name.clone()),
                     );
+
+                    // Position the delete cursor at the conflicting rowid
+                    // check_rowid_reg holds the conflicting row's rowid
+                    self.emit(
+                        Opcode::NotExists,
+                        del_cursor,
+                        after_conflict,
+                        check_rowid_reg,
+                        P4::Unused,
+                    );
+
+                    // Read column values from conflicting row for index deletion
+                    // Allocate registers for column values
+                    let old_data_base = self.alloc_regs(self.num_columns);
+                    let ipk_col = self.get_ipk_column_index();
+                    for i in 0..self.num_columns {
+                        let reg = old_data_base + i as i32;
+                        if Some(i) == ipk_col {
+                            // IPK column - use rowid
+                            self.emit(Opcode::Rowid, del_cursor, reg, 0, P4::Unused);
+                        } else {
+                            self.emit(Opcode::Column, del_cursor, i as i32, reg, P4::Unused);
+                        }
+                    }
+
+                    // Delete from indexes before deleting the row
+                    // Open index cursors, build keys, and delete
+                    let mut index_cursors = Vec::new();
+                    for index in &table.indexes {
+                        // Get root page from index directly, or look up in schema.indexes
+                        let idx_page = if index.root_page > 0 {
+                            index.root_page
+                        } else {
+                            schema
+                                .indexes
+                                .get(&index.name.to_lowercase())
+                                .map(|i| i.root_page)
+                                .unwrap_or(0)
+                        };
+                        if idx_page == 0 {
+                            continue;
+                        }
+
+                        let idx_cursor = self.alloc_cursor();
+                        self.emit(
+                            Opcode::OpenWrite,
+                            idx_cursor,
+                            idx_page as i32,
+                            (index.columns.len() + 1) as i32,
+                            P4::Text(index.name.clone()),
+                        );
+                        index_cursors.push((
+                            idx_cursor,
+                            index
+                                .columns
+                                .iter()
+                                .map(|c| c.column_idx)
+                                .collect::<Vec<_>>(),
+                        ));
+                    }
+
+                    // Build and delete index keys
+                    for (idx_cursor, col_indices) in &index_cursors {
+                        let key_base = self.alloc_regs(col_indices.len() + 1);
+                        for (i, &col_idx) in col_indices.iter().enumerate() {
+                            let src_reg = old_data_base + col_idx;
+                            self.emit(Opcode::Copy, src_reg, key_base + i as i32, 0, P4::Unused);
+                        }
+                        // Add rowid as last key component
+                        self.emit(
+                            Opcode::Copy,
+                            check_rowid_reg,
+                            key_base + col_indices.len() as i32,
+                            0,
+                            P4::Unused,
+                        );
+                        // Make index key record
+                        let key_reg = self.alloc_reg();
+                        self.emit(
+                            Opcode::MakeRecord,
+                            key_base,
+                            (col_indices.len() + 1) as i32,
+                            key_reg,
+                            P4::Unused,
+                        );
+                        // Delete from index
+                        self.emit(Opcode::IdxDelete, *idx_cursor, key_reg, 0, P4::Unused);
+                    }
+
+                    // Close index cursors
+                    for (idx_cursor, _) in &index_cursors {
+                        self.emit(Opcode::Close, *idx_cursor, 0, 0, P4::Unused);
+                    }
+
+                    // Delete the conflicting row from table
+                    // Use OPFLAG_NCHANGE to update change counter
+                    self.emit_with_p5(
+                        Opcode::Delete,
+                        del_cursor,
+                        0,
+                        check_rowid_reg,
+                        P4::Text(self.table_name.clone()),
+                        OPFLAG_NCHANGE,
+                    );
+
+                    // Close the delete cursor
+                    self.emit(Opcode::Close, del_cursor, 0, 0, P4::Unused);
+
+                    // Continue to after_conflict to proceed with the update
                 }
             }
 
@@ -1041,13 +1195,15 @@ impl<'s> UpdateCompiler<'s> {
     }
 
     /// Get Insert opcode flags for conflict action
+    /// These must match the OE_* constants in vdbe/engine/state.rs:
+    /// OE_NONE=0, OE_ROLLBACK=1, OE_ABORT=2, OE_FAIL=3, OE_IGNORE=4, OE_REPLACE=5
     fn conflict_flags(&self, action: ConflictAction) -> i64 {
         match action {
-            ConflictAction::Abort => 0,
-            ConflictAction::Rollback => 1,
-            ConflictAction::Fail => 2,
-            ConflictAction::Ignore => 3,
-            ConflictAction::Replace => 4,
+            ConflictAction::Abort => 2,    // OE_ABORT (default)
+            ConflictAction::Rollback => 1, // OE_ROLLBACK
+            ConflictAction::Fail => 3,     // OE_FAIL
+            ConflictAction::Ignore => 4,   // OE_IGNORE
+            ConflictAction::Replace => 5,  // OE_REPLACE
         }
     }
 
@@ -2143,11 +2299,12 @@ mod tests {
     #[test]
     fn test_conflict_flags() {
         let compiler = UpdateCompiler::new();
-        assert_eq!(compiler.conflict_flags(ConflictAction::Abort), 0);
-        assert_eq!(compiler.conflict_flags(ConflictAction::Rollback), 1);
-        assert_eq!(compiler.conflict_flags(ConflictAction::Fail), 2);
-        assert_eq!(compiler.conflict_flags(ConflictAction::Ignore), 3);
-        assert_eq!(compiler.conflict_flags(ConflictAction::Replace), 4);
+        // These must match OE_* constants in vdbe/engine/state.rs
+        assert_eq!(compiler.conflict_flags(ConflictAction::Abort), 2); // OE_ABORT
+        assert_eq!(compiler.conflict_flags(ConflictAction::Rollback), 1); // OE_ROLLBACK
+        assert_eq!(compiler.conflict_flags(ConflictAction::Fail), 3); // OE_FAIL
+        assert_eq!(compiler.conflict_flags(ConflictAction::Ignore), 4); // OE_IGNORE
+        assert_eq!(compiler.conflict_flags(ConflictAction::Replace), 5); // OE_REPLACE
     }
 
     #[test]

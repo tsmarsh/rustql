@@ -5880,12 +5880,27 @@ impl Vdbe {
                                     .insert(index_name_lower, std::sync::Arc::new(index.clone()));
 
                                 // Also add to the parent table's index list
+                                // But first check if it already exists (from parse_create_sql)
                                 if let Some(table) = schema_guard.tables.get_mut(&table_name_lower)
                                 {
                                     // Use Arc::make_mut to get mutable access even if there are
                                     // other Arc references (will clone if needed)
                                     let table_mut = std::sync::Arc::make_mut(table);
-                                    table_mut.indexes.push(std::sync::Arc::new(index));
+
+                                    // Check if this index already exists in table.indexes
+                                    let existing_pos = table_mut
+                                        .indexes
+                                        .iter()
+                                        .position(|idx| idx.name.eq_ignore_ascii_case(&index.name));
+
+                                    if let Some(pos) = existing_pos {
+                                        // Replace the existing entry (which has root_page=0)
+                                        // with the new one (which has the correct root_page)
+                                        table_mut.indexes[pos] = std::sync::Arc::new(index);
+                                    } else {
+                                        // No duplicate, add normally
+                                        table_mut.indexes.push(std::sync::Arc::new(index));
+                                    }
                                 }
                             }
                         }

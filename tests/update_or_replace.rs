@@ -146,6 +146,81 @@ fn test_update_or_replace_ipk_conflict() {
     println!("\n=== test_update_or_replace_ipk_conflict PASSED ===\n");
 }
 
+/// Test insert-6.3: UPDATE OR REPLACE with WHERE on UNIQUE column (not IPK)
+/// This tests the scenario where:
+/// - t1(a INTEGER PRIMARY KEY, b UNIQUE) has rows (1, 4), (2, 3)
+/// - UPDATE OR REPLACE t1 SET a=2 WHERE b=4
+/// - Expected: row (1, 4) becomes (2, 4), row (2, 3) is deleted
+#[test]
+fn test_insert_6_3() {
+    init();
+    println!("\n=== test_insert_6_3 ===");
+
+    let mut conn = sqlite3_open(":memory:").expect("Failed to open database");
+
+    // Create table with INTEGER PRIMARY KEY and UNIQUE constraint
+    run_sql_no_result(
+        &mut conn,
+        "CREATE TABLE t1(a INTEGER PRIMARY KEY, b UNIQUE);",
+    )
+    .expect("Failed to create table");
+
+    // Insert initial data: (1, 2), (2, 3)
+    run_sql_no_result(&mut conn, "INSERT INTO t1 VALUES(1, 2);").expect("Failed to insert");
+    run_sql_no_result(&mut conn, "INSERT INTO t1 VALUES(2, 3);").expect("Failed to insert");
+
+    // Verify: SELECT b FROM t1 WHERE b=2 -> should return {2}
+    let result = run_sql(&mut conn, "SELECT b FROM t1 WHERE b=2;").expect("Failed to select");
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0][0], "2");
+
+    // REPLACE INTO t1 VALUES(1, 4) - replaces row with a=1
+    run_sql_no_result(&mut conn, "REPLACE INTO t1 VALUES(1, 4);").expect("Failed to replace");
+
+    // Verify: SELECT b FROM t1 WHERE b=2 -> should return {} (row was replaced)
+    let result = run_sql(&mut conn, "SELECT b FROM t1 WHERE b=2;").expect("Failed to select");
+    assert_eq!(result.len(), 0, "Row with b=2 should have been replaced");
+
+    // Verify state: t1 should have (1, 4), (2, 3)
+    println!("\n--- State before UPDATE OR REPLACE ---");
+    let state = run_sql(&mut conn, "SELECT * FROM t1 ORDER BY a;").expect("Failed to select");
+    assert_eq!(state.len(), 2);
+    assert_eq!(state[0], vec!["1", "4"]);
+    assert_eq!(state[1], vec!["2", "3"]);
+
+    // THE KEY TEST: UPDATE OR REPLACE t1 SET a=2 WHERE b=4
+    // This should:
+    // 1. Find row where b=4 (which is a=1, b=4)
+    // 2. Try to set a=2 (conflicts with existing row a=2, b=3)
+    // 3. Delete conflicting row (a=2, b=3)
+    // 4. Update (a=1, b=4) -> (a=2, b=4)
+    println!("\n--- After UPDATE OR REPLACE t1 SET a=2 WHERE b=4 ---");
+    run_sql_no_result(&mut conn, "UPDATE OR REPLACE t1 SET a=2 WHERE b=4;")
+        .expect("Failed to update");
+
+    // SELECT * FROM t1 WHERE b=4 should return (2, 4)
+    let result = run_sql(&mut conn, "SELECT * FROM t1 WHERE b=4;").expect("Failed to select");
+    println!("Result of SELECT * FROM t1 WHERE b=4: {:?}", result);
+
+    assert_eq!(result.len(), 1, "Should have exactly one row with b=4");
+    assert_eq!(
+        result[0],
+        vec!["2", "4"],
+        "Row with b=4 should have a=2 (updated from a=1)"
+    );
+
+    // Also verify row with b=3 was deleted
+    let result2 = run_sql(&mut conn, "SELECT * FROM t1 WHERE b=3;").expect("Failed to select");
+    assert_eq!(
+        result2.len(),
+        0,
+        "Row with b=3 should have been deleted due to conflict"
+    );
+
+    let _ = sqlite3_close(conn);
+    println!("\n=== test_insert_6_3 PASSED ===\n");
+}
+
 #[test]
 fn test_update_or_replace_with_unique_index() {
     init();

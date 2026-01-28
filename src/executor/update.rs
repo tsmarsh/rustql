@@ -447,8 +447,9 @@ impl<'s> UpdateCompiler<'s> {
             }
         }
 
-        // If we have triggers, save OLD values before modifying data_base
-        let old_save_base = if has_before_triggers || has_after_triggers {
+        // Always save OLD values before modifying data_base
+        // (needed for triggers AND index maintenance)
+        let old_save_base = {
             let old_base = self.alloc_regs(self.num_columns);
             for i in 0..self.num_columns {
                 self.emit(
@@ -459,9 +460,7 @@ impl<'s> UpdateCompiler<'s> {
                     P4::Unused,
                 );
             }
-            Some(old_base)
-        } else {
-            None
+            old_base
         };
 
         // Set column_data_base so compile_expr knows to use registers for column refs
@@ -532,8 +531,8 @@ impl<'s> UpdateCompiler<'s> {
         };
 
         // Fire BEFORE UPDATE triggers
-        if let (Some(old_base), Some(new_base)) = (old_save_base, new_for_before) {
-            self.emit_before_triggers(&table_name, old_base, new_base)?;
+        if let Some(new_base) = new_for_before {
+            self.emit_before_triggers(&table_name, old_save_base, new_base)?;
         }
 
         // Phase 2: Copy temp values to data registers
@@ -568,6 +567,10 @@ impl<'s> UpdateCompiler<'s> {
         // Handle conflict action
         self.emit_conflict_check(conflict_action)?;
 
+        // Delete old index entries BEFORE deleting the table row
+        // (while cursor is still positioned at the old row)
+        let index_cursors = self.emit_delete_old_index_entries(cursor, rowid_reg, old_save_base)?;
+
         // Delete the old row
         self.emit(Opcode::Delete, cursor, 0, 0, P4::Unused);
 
@@ -595,11 +598,12 @@ impl<'s> UpdateCompiler<'s> {
             OPFLAG_NCHANGE,
         );
 
+        // Insert new index entries AFTER inserting the table row
+        self.emit_insert_new_index_entries(&index_cursors, data_base, insert_rowid_reg)?;
+
         // Fire AFTER UPDATE triggers
-        if let Some(old_base) = old_save_base {
-            if has_after_triggers {
-                self.emit_after_triggers(&table_name, old_base, data_base)?;
-            }
+        if has_after_triggers {
+            self.emit_after_triggers(&table_name, old_save_base, data_base)?;
         }
 
         Ok(())
@@ -1205,6 +1209,139 @@ impl<'s> UpdateCompiler<'s> {
             ConflictAction::Ignore => 4,   // OE_IGNORE
             ConflictAction::Replace => 5,  // OE_REPLACE
         }
+    }
+
+    /// Delete old index entries for the row being updated
+    /// Returns a list of (cursor, column_indices) for each index, to be used for inserting new entries
+    fn emit_delete_old_index_entries(
+        &mut self,
+        _table_cursor: i32,
+        old_rowid_reg: i32,
+        old_data_base: i32,
+    ) -> Result<Vec<(i32, Vec<i32>)>> {
+        let schema = match self.schema {
+            Some(s) => s,
+            None => return Ok(Vec::new()), // No schema, no indexes
+        };
+
+        let table = match schema.tables.get(&self.table_name.to_lowercase()) {
+            Some(t) => t.clone(),
+            None => return Ok(Vec::new()), // Table not found
+        };
+
+        let mut index_cursors: Vec<(i32, Vec<i32>)> = Vec::new();
+
+        for index in &table.indexes {
+            // Get root page from index directly, or look up in schema.indexes
+            let idx_page = if index.root_page > 0 {
+                index.root_page
+            } else {
+                schema
+                    .indexes
+                    .get(&index.name.to_lowercase())
+                    .map(|i| i.root_page)
+                    .unwrap_or(0)
+            };
+            if idx_page == 0 {
+                continue;
+            }
+
+            // Collect column indices for this index
+            let col_indices: Vec<i32> = index.columns.iter().map(|c| c.column_idx).collect();
+
+            // Open write cursor for this index
+            let idx_cursor = self.alloc_cursor();
+            self.emit(
+                Opcode::OpenWrite,
+                idx_cursor,
+                idx_page as i32,
+                (col_indices.len() + 1) as i32,
+                P4::Text(index.name.clone()),
+            );
+
+            // Build the old index key: indexed columns + rowid
+            let key_base = self.alloc_regs(col_indices.len() + 1);
+            for (i, &col_idx) in col_indices.iter().enumerate() {
+                if col_idx >= 0 {
+                    // Get value from saved old data
+                    // For IPK columns, the value was already saved from Rowid
+                    let src_reg = old_data_base + col_idx;
+                    self.emit(Opcode::Copy, src_reg, key_base + i as i32, 0, P4::Unused);
+                } else {
+                    // Expression index - not supported yet, use null
+                    self.emit(Opcode::Null, 0, key_base + i as i32, 0, P4::Unused);
+                }
+            }
+
+            // Add old rowid as last key component
+            let rowid_pos = key_base + col_indices.len() as i32;
+            self.emit(Opcode::Copy, old_rowid_reg, rowid_pos, 0, P4::Unused);
+
+            // Make index key record
+            let key_reg = self.alloc_reg();
+            self.emit(
+                Opcode::MakeRecord,
+                key_base,
+                (col_indices.len() + 1) as i32,
+                key_reg,
+                P4::Unused,
+            );
+
+            // Delete from index
+            self.emit(Opcode::IdxDelete, idx_cursor, key_reg, 0, P4::Unused);
+
+            // Save cursor and column info for insert phase
+            index_cursors.push((idx_cursor, col_indices));
+        }
+
+        Ok(index_cursors)
+    }
+
+    /// Insert new index entries for the updated row
+    fn emit_insert_new_index_entries(
+        &mut self,
+        index_cursors: &[(i32, Vec<i32>)],
+        new_data_base: i32,
+        new_rowid_reg: i32,
+    ) -> Result<()> {
+        let ipk_col = self.get_ipk_column_index();
+
+        for (idx_cursor, col_indices) in index_cursors {
+            // Build the new index key: indexed columns + rowid
+            let key_base = self.alloc_regs(col_indices.len() + 1);
+            for (i, &col_idx) in col_indices.iter().enumerate() {
+                if col_idx >= 0 {
+                    // Get value from new data
+                    let src_reg = new_data_base + col_idx;
+                    self.emit(Opcode::Copy, src_reg, key_base + i as i32, 0, P4::Unused);
+                } else {
+                    // Expression index - not supported yet, use null
+                    self.emit(Opcode::Null, 0, key_base + i as i32, 0, P4::Unused);
+                }
+            }
+
+            // Add new rowid as last key component
+            let rowid_pos = key_base + col_indices.len() as i32;
+            self.emit(Opcode::Copy, new_rowid_reg, rowid_pos, 0, P4::Unused);
+
+            // Make index key record
+            let key_reg = self.alloc_reg();
+            self.emit(
+                Opcode::MakeRecord,
+                key_base,
+                (col_indices.len() + 1) as i32,
+                key_reg,
+                P4::Unused,
+            );
+
+            // Insert into index using IdxInsert
+            self.emit(Opcode::IdxInsert, *idx_cursor, key_reg, 0, P4::Unused);
+
+            // Close the index cursor
+            self.emit(Opcode::Close, *idx_cursor, 0, 0, P4::Unused);
+        }
+
+        Ok(())
     }
 
     /// Compile an expression

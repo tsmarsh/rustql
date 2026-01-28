@@ -150,3 +150,15 @@ make test-delete  # Should pass delete-9.2 through delete-9.5
 - SQLite source: `btree.c` functions `saveCursorPosition()`, `restoreCursorPosition()`
 - SQLite source: `vdbe.c` OP_Delete handling of BTREE_FORDELETE
 - SQLite docs: https://sqlite.org/isolation.html
+# Architectural Findings (Needs SQLite-Shape Alignment)
+- RustQL uses a global shared_data_version and VDBE-side save/restore. SQLite does not;
+  it marks cursors as moved in btree and restores them via sqlite3BtreeCursorRestore.
+  This is a divergence from SQLite’s cursor-movement model.
+- Index cursors are invalidated on staleness instead of restored, which can yield NULLs
+  during index scans. SQLite restores index cursors as well.
+- Cursor stability is wired only into DELETE and only for same-root read cursors. SQLite
+  applies cursor-movement handling for all write paths via saveAllCursors().
+
+References:
+- sqlite3/src/btree.c (cursor moved/restore, saveAllCursors)
+- sqlite3/src/vdbe.c / sqlite3/src/vdbeaux.c (CursorHasMoved/HandleMovedCursor)

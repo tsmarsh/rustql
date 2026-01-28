@@ -3651,7 +3651,8 @@ impl Vdbe {
                                                                     m.set_real(*v)
                                                                 }
                                                                 crate::storage::btree::RecordField::Text(s) => {
-                                                                    m.set_str(s)
+                                                                    let text = String::from_utf8_lossy(s);
+                                                                    m.set_str(&text)
                                                                 }
                                                                 crate::storage::btree::RecordField::Blob(b) => {
                                                                     m.set_blob(b)

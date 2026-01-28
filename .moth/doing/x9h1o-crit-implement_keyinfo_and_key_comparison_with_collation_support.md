@@ -184,3 +184,8 @@ fn test_index_seek_nocase() {
 - [ ] NULL handling matches SQLite (NULL < any value)
 - [ ] Index operations use KeyInfo for comparisons
 - [ ] All unit tests pass
+# SQLite Parity Fixes (2026-01-27)
+- Align RTRIM collation to trim ASCII spaces only (U+0020), not all whitespace.
+- Compare text as raw bytes to avoid UTF-8 lossy conversions in key comparison.
+- Apply KEYINFO_ORDER_BIGNULL (aka NULLS FIRST) behavior to KeyInfo comparisons.
+- Treat equal key fields as equal (search-key semantics), not by field count.

@@ -70,7 +70,8 @@ pub const SQLITE_FILE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 
 /// Sort order flags for KeyInfo columns
 pub const KEYINFO_ORDER_DESC: u8 = 0x01;
-pub const KEYINFO_ORDER_NULLS_FIRST: u8 = 0x02;
+pub const KEYINFO_ORDER_BIGNULL: u8 = 0x02;
+pub const KEYINFO_ORDER_NULLS_FIRST: u8 = KEYINFO_ORDER_BIGNULL;
 
 bitflags! {
     #[derive(Clone, Copy)]
@@ -168,22 +169,22 @@ pub enum CollSeq {
     Binary,
     /// Case-insensitive comparison for ASCII
     NoCase,
-    /// Ignore trailing spaces
+    /// Ignore trailing spaces (U+0020 only)
     RTrim,
     /// Custom collation with name and comparison function
     Custom {
         name: String,
-        cmp: Arc<dyn Fn(&str, &str) -> std::cmp::Ordering + Send + Sync>,
+        cmp: Arc<dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering + Send + Sync>,
     },
 }
 
 impl CollSeq {
-    /// Compare two strings using this collation
-    pub fn compare(&self, a: &str, b: &str) -> std::cmp::Ordering {
+    /// Compare two byte strings using this collation
+    pub fn compare_bytes(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
         match self {
             CollSeq::Binary => a.cmp(b),
-            CollSeq::NoCase => a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()),
-            CollSeq::RTrim => a.trim_end().cmp(b.trim_end()),
+            CollSeq::NoCase => ascii_nocase_cmp(a, b),
+            CollSeq::RTrim => ascii_rtrim_cmp(a, b),
             CollSeq::Custom { cmp, .. } => cmp(a, b),
         }
     }
@@ -211,6 +212,34 @@ impl Default for CollSeq {
     }
 }
 
+fn ascii_nocase_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let mut i = 0;
+    let n = a.len().min(b.len());
+    while i < n {
+        let ac = a[i];
+        let bc = b[i];
+        let al = if (b'A'..=b'Z').contains(&ac) { ac + 32 } else { ac };
+        let bl = if (b'A'..=b'Z').contains(&bc) { bc + 32 } else { bc };
+        if al != bl {
+            return al.cmp(&bl);
+        }
+        i += 1;
+    }
+    a.len().cmp(&b.len())
+}
+
+fn ascii_rtrim_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let mut a_end = a.len();
+    while a_end > 0 && a[a_end - 1] == b' ' {
+        a_end -= 1;
+    }
+    let mut b_end = b.len();
+    while b_end > 0 && b[b_end - 1] == b' ' {
+        b_end -= 1;
+    }
+    a[..a_end].cmp(&b[..b_end])
+}
+
 /// Represents a parsed field value from a SQLite record
 #[derive(Clone, Debug, PartialEq)]
 pub enum RecordField {
@@ -218,7 +247,7 @@ pub enum RecordField {
     Int(i64),
     Float(f64),
     Blob(Vec<u8>),
-    Text(String),
+    Text(Vec<u8>),
 }
 
 /// Page limits and offset calculations

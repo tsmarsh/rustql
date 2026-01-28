@@ -31,7 +31,7 @@ pub use types::{
     BTREE_FREE_PAGE_COUNT, BTREE_HINT_RANGE, BTREE_INCR_VACUUM, BTREE_INTKEY,
     BTREE_LARGEST_ROOT_PAGE, BTREE_PAGEFLAG_INTKEY, BTREE_PAGEFLAG_LEAF, BTREE_PAGEFLAG_LEAFDATA,
     BTREE_PAGEFLAG_ZERODATA, BTREE_SCHEMA_VERSION, BTREE_TEXT_ENCODING, BTREE_USER_VERSION,
-    BT_MAX_LOCAL, CELL_PTR_SIZE, DEFAULT_PAGE_SIZE, KEYINFO_ORDER_DESC, KEYINFO_ORDER_NULLS_FIRST,
+    BT_MAX_LOCAL, CELL_PTR_SIZE, DEFAULT_PAGE_SIZE, KEYINFO_ORDER_BIGNULL, KEYINFO_ORDER_DESC,
     MAX_EMBEDDED, MAX_PAGE_SIZE, MIN_EMBEDDED, MIN_PAGE_SIZE, PAGE_HEADER_SIZE_INTERIOR,
     PAGE_HEADER_SIZE_LEAF, PTF_INDEX_INTERIOR, PTF_INDEX_LEAF, PTF_INTKEY, PTF_LEAF, PTF_LEAFDATA,
     PTF_TABLE_INTERIOR, PTF_TABLE_LEAF, PTF_ZERODATA, PTRMAP_BTREE, PTRMAP_FREEPAGE,
@@ -256,7 +256,7 @@ pub struct KeyInfo {
     pub n_key_field: u16,
     /// Total columns including rowid
     pub n_all_field: u16,
-    /// Sort order flags for each column (KEYINFO_ORDER_DESC, KEYINFO_ORDER_NULLS_FIRST)
+    /// Sort order flags for each column (KEYINFO_ORDER_DESC, KEYINFO_ORDER_BIGNULL)
     pub sort_flags: Vec<u8>,
     /// Collation sequence for each column
     pub collations: Vec<CollSeq>,
@@ -311,21 +311,28 @@ impl KeyInfo {
             .min(fields_b.len());
 
         for i in 0..n_fields {
-            let desc = self
-                .sort_flags
-                .get(i)
-                .map_or(false, |f| f & KEYINFO_ORDER_DESC != 0);
+            let sort_flags = self.sort_flags.get(i).copied().unwrap_or(0);
+            let desc = sort_flags & KEYINFO_ORDER_DESC != 0;
+            let bignull = sort_flags & KEYINFO_ORDER_BIGNULL != 0;
             let collation = self.collations.get(i).cloned().unwrap_or(CollSeq::Binary);
 
-            let cmp = compare_record_fields(&fields_a[i], &fields_b[i], &collation);
-
+            let mut cmp = compare_record_fields(&fields_a[i], &fields_b[i], &collation);
             if cmp != std::cmp::Ordering::Equal {
-                return if desc { cmp.reverse() } else { cmp };
+                let null_involved =
+                    matches!(fields_a[i], RecordField::Null)
+                        || matches!(fields_b[i], RecordField::Null);
+                if sort_flags != 0 {
+                    let should_invert = !bignull || (desc != null_involved);
+                    if should_invert {
+                        cmp = cmp.reverse();
+                    }
+                }
+                return cmp;
             }
         }
 
-        // If all compared fields are equal, compare by number of fields
-        fields_a.len().cmp(&fields_b.len())
+        // If all compared fields are equal, treat as equal (search key match)
+        std::cmp::Ordering::Equal
     }
 }
 
@@ -484,10 +491,9 @@ fn deserialize_field(data: &[u8], serial_type: u32) -> (RecordField, usize) {
             // Text: (N-13)/2 bytes
             let len = ((n - 13) / 2) as usize;
             if data.len() < len {
-                return (RecordField::Text(String::new()), 0);
+                return (RecordField::Text(Vec::new()), 0);
             }
-            let s = String::from_utf8_lossy(&data[..len]).into_owned();
-            (RecordField::Text(s), len)
+            (RecordField::Text(data[..len].to_vec()), len)
         }
         _ => (RecordField::Null, 0),
     }
@@ -539,7 +545,7 @@ fn compare_record_fields(
             x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal)
         }
 
-        (RecordField::Text(x), RecordField::Text(y)) => collation.compare(x, y),
+        (RecordField::Text(x), RecordField::Text(y)) => collation.compare_bytes(x, y),
 
         (RecordField::Blob(x), RecordField::Blob(y)) => x.cmp(y),
 
@@ -6756,7 +6762,7 @@ mod tests {
         let fields = parse_record_fields(&record);
         assert_eq!(fields.len(), 1);
         match &fields[0] {
-            RecordField::Text(s) => assert_eq!(s, "hello"),
+            RecordField::Text(s) => assert_eq!(s, b"hello"),
             _ => panic!("Expected Text field"),
         }
     }

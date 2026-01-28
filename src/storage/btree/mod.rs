@@ -5095,18 +5095,43 @@ impl BtCursor {
             let shared_guard = shared.read().map_err(|_| Error::new(ErrorCode::Internal))?;
             if self.cursor_data_version != shared_guard.shared_data_version {
                 // Btree was modified - refresh our page from the pager
+                // Save identifiers to detect if our entry was deleted
+                // For table cursors: n_key is the rowid
+                // For index cursors: compare actual payload data (n_key is just payload size)
+                let old_rowid = self.n_key;
+                let old_payload = if !self.cur_int_key {
+                    self.info.payload.clone()
+                } else {
+                    None
+                };
                 drop(shared_guard);
                 let mut shared_guard_mut = shared
                     .write()
                     .map_err(|_| Error::new(ErrorCode::Internal))?;
                 if let Some(ref page) = self.page {
                     let pgno = page.pgno;
-                    let (fresh_page, _fresh_limits) =
-                        self.load_page(&mut shared_guard_mut, pgno)?;
+                    let (fresh_page, fresh_limits) = self.load_page(&mut shared_guard_mut, pgno)?;
                     self.page = Some(fresh_page.clone());
                     // If current index is now out of bounds, cursor is invalid
                     if self.ix >= fresh_page.n_cell {
                         self.state = CursorState::Invalid;
+                        return Ok(());
+                    }
+                    // Re-read cell info at current position
+                    self.set_to_cell(fresh_page, fresh_limits, self.ix)?;
+                    // Detect if our entry was deleted and cells shifted down
+                    // If the entry at current position is different from before,
+                    // we're already at the "next" entry, so don't advance.
+                    let entry_shifted = if !self.cur_int_key {
+                        // Index cursor: compare actual payload data
+                        self.info.payload != old_payload
+                    } else {
+                        // Table cursor: compare rowid
+                        self.n_key != old_rowid
+                    };
+                    if entry_shifted {
+                        // Entry shifted - we're already at "next", don't advance
+                        self.cursor_data_version = shared_guard_mut.shared_data_version;
                         return Ok(());
                     }
                 }

@@ -110,8 +110,8 @@ pub struct SelectCompiler<'s> {
     case_sensitive_like: bool,
     /// Aliases currently being resolved (to detect infinite recursion)
     resolving_aliases: HashSet<String>,
-    /// Index name that can satisfy ORDER BY (set by check_order_by_satisfied)
-    order_by_index: Option<String>,
+    /// (table_name, index_name) that can satisfy ORDER BY (set by check_order_by_satisfied)
+    order_by_index: Option<(String, String)>,
 }
 
 impl<'s> SelectCompiler<'s> {
@@ -1589,17 +1589,74 @@ impl<'s> SelectCompiler<'s> {
                     range_end_keys.push(None);
                 }
                 _ => {
-                    // Full scan (default)
-                    self.emit(Opcode::Rewind, cursor, skip_label, 0, P4::Unused);
-                    next_labels.push(skip_label);
+                    // Check if we can use ORDER BY index scan for this table
+                    // ORDER BY index scan only works for the outermost loop (loop_pos == 0)
+                    let table_info = self
+                        .tables
+                        .get(self.outer_tables_boundary + from_idx)
+                        .cloned();
+                    let use_order_by_index = loop_pos == 0
+                        && self
+                            .order_by_index
+                            .as_ref()
+                            .map(|(tbl, _idx)| {
+                                table_info
+                                    .as_ref()
+                                    .map(|t| t.table_name.to_lowercase() == tbl.to_lowercase())
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
 
-                    // Mark the loop start for this level
-                    let loop_label = self.alloc_label();
-                    self.resolve_label(loop_label, self.current_addr());
-                    loop_labels.push(loop_label);
+                    if use_order_by_index {
+                        // Use index scan for ORDER BY
+                        let index_name = self.order_by_index.as_ref().unwrap().1.clone();
+                        let index_cursor = self.alloc_cursor();
+                        self.index_cursors.insert(cursor, index_cursor);
 
-                    scan_info.push((false, None, 0, 0, false));
-                    range_end_keys.push(None);
+                        // Open the index
+                        self.emit(
+                            Opcode::OpenRead,
+                            index_cursor,
+                            0,
+                            0,
+                            P4::Text(index_name.clone()),
+                        );
+
+                        // Rewind on index cursor
+                        self.emit(Opcode::Rewind, index_cursor, skip_label, 0, P4::Unused);
+                        next_labels.push(skip_label);
+
+                        // Mark the loop start
+                        let loop_label = self.alloc_label();
+                        self.resolve_label(loop_label, self.current_addr());
+                        loop_labels.push(loop_label);
+
+                        // DeferredSeek sets up table cursor to read from index
+                        // Build alt-map for covering index optimization
+                        let alt_map_p4 =
+                            if let Some(alt_map) = self.build_index_alt_map(cursor, &index_name) {
+                                P4::IntArray(alt_map)
+                            } else {
+                                P4::Unused
+                            };
+                        self.emit(Opcode::DeferredSeek, cursor, 0, index_cursor, alt_map_p4);
+
+                        // Mark this as index scan so Next uses index_cursor
+                        scan_info.push((true, Some(index_cursor), 0, 0, false));
+                        range_end_keys.push(None);
+                    } else {
+                        // Full scan (default)
+                        self.emit(Opcode::Rewind, cursor, skip_label, 0, P4::Unused);
+                        next_labels.push(skip_label);
+
+                        // Mark the loop start for this level
+                        let loop_label = self.alloc_label();
+                        self.resolve_label(loop_label, self.current_addr());
+                        loop_labels.push(loop_label);
+
+                        scan_info.push((false, None, 0, 0, false));
+                        range_end_keys.push(None);
+                    }
                 }
             }
 
@@ -3095,7 +3152,7 @@ impl<'s> SelectCompiler<'s> {
             _ => return false,
         };
 
-        // Extract FROM clause - only handle simple single-table case
+        // Extract FROM clause
         let from = match &core.from {
             Some(from) => from,
             None => return false,
@@ -3103,53 +3160,87 @@ impl<'s> SelectCompiler<'s> {
 
         // Get the source items from FROM clause
         let src_list = from.to_src_list();
-        if src_list.items.len() != 1 {
+        if src_list.items.is_empty() {
             return false;
         }
 
-        let item = &src_list.items[0];
         use crate::parser::ast::TableSource;
-        let table_name = match &item.source {
-            TableSource::Table(name) => &name.name,
-            _ => return false, // Subqueries and table functions not supported
-        };
-        let table_name_lower = table_name.to_lowercase();
 
-        // Look up schema table
-        let schema_table = match self.lookup_table_schema(&table_name_lower) {
-            Some(t) => t,
-            None => return false,
+        // Get table qualifier from ORDER BY column reference if present
+        let order_table = match &order_term.expr {
+            Expr::Column(col_ref) => col_ref.table.as_ref().map(|t| t.to_lowercase()),
+            _ => None,
         };
 
-        // Temporarily add table info for query plan analysis
-        let display_name = item.alias.clone().unwrap_or_else(|| table_name.clone());
-        self.tables.push(TableInfo {
-            name: display_name,
-            table_name: table_name.clone(),
-            cursor: 0, // Placeholder - not used for analysis
-            schema_table: Some(schema_table.clone()),
-            is_subquery: false,
-            join_type: item.join_type,
-            subquery_columns: None,
-        });
+        // For multi-table queries, find the table that the ORDER BY column belongs to
+        // Then check if that table has an index on the ORDER BY column
+        for item in &src_list.items {
+            let table_name = match &item.source {
+                TableSource::Table(name) => &name.name,
+                _ => continue, // Skip subqueries and table functions
+            };
+            let table_name_lower = table_name.to_lowercase();
+            let alias = item.alias.as_ref().map(|a| a.to_lowercase());
 
-        // Analyze the query plan
-        let result = self.check_order_by_satisfied_inner(
-            &schema_table,
-            core.where_clause.as_deref(),
-            &order_col,
-        );
+            // If ORDER BY specifies a table, check if this is the right one
+            if let Some(ref order_tbl) = order_table {
+                if table_name_lower != *order_tbl && alias.as_ref().map_or(true, |a| a != order_tbl)
+                {
+                    continue; // Not the table we're looking for
+                }
+            }
 
-        // Clear temporary tables
-        self.tables.clear();
+            // Look up schema table
+            let schema_table = match self.lookup_table_schema(&table_name_lower) {
+                Some(t) => t,
+                None => continue,
+            };
 
-        result
+            // Check if this table has a column matching ORDER BY
+            let has_col = schema_table
+                .columns
+                .iter()
+                .any(|c| c.name.to_lowercase() == order_col);
+            if !has_col {
+                continue;
+            }
+
+            // Temporarily add table info for query plan analysis
+            let display_name = item.alias.clone().unwrap_or_else(|| table_name.clone());
+            self.tables.push(TableInfo {
+                name: display_name,
+                table_name: table_name.clone(),
+                cursor: 0, // Placeholder - not used for analysis
+                schema_table: Some(schema_table.clone()),
+                is_subquery: false,
+                join_type: item.join_type,
+                subquery_columns: None,
+            });
+
+            // Analyze the query plan for this table
+            let result = self.check_order_by_satisfied_inner(
+                &schema_table,
+                &table_name_lower,
+                core.where_clause.as_deref(),
+                &order_col,
+            );
+
+            // Clear temporary tables
+            self.tables.clear();
+
+            if result {
+                return true;
+            }
+        }
+
+        false
     }
 
     /// Inner helper for check_order_by_satisfied after tables are set up
     fn check_order_by_satisfied_inner(
         &mut self,
         schema_table: &std::sync::Arc<Table>,
+        table_name: &str,
         where_clause: Option<&Expr>,
         order_col: &str,
     ) -> bool {
@@ -3188,8 +3279,8 @@ impl<'s> SelectCompiler<'s> {
                     let idx_col_name = &schema_table.columns[col_idx as usize].name;
                     if idx_col_name.eq_ignore_ascii_case(order_col) {
                         // Found an index that can satisfy ORDER BY
-                        // Store it for use during code generation
-                        self.order_by_index = Some(index.name.clone());
+                        // Store table and index for use during code generation
+                        self.order_by_index = Some((table_name.to_string(), index.name.clone()));
                         return true;
                     }
                 }
@@ -3206,7 +3297,8 @@ impl<'s> SelectCompiler<'s> {
                         if col_idx >= 0 && (col_idx as usize) < schema_table.columns.len() {
                             let idx_col_name = &schema_table.columns[col_idx as usize].name;
                             if idx_col_name.eq_ignore_ascii_case(order_col) {
-                                self.order_by_index = Some(idx.name.clone());
+                                self.order_by_index =
+                                    Some((table_name.to_string(), idx.name.clone()));
                                 return true;
                             }
                         }

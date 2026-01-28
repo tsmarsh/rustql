@@ -45,36 +45,54 @@ Modify the query planner to:
 - delete-9.2, delete-9.3, delete-9.5 - require index scans for cursor stability to work
 - Likely other tests that depend on index-ordered iteration
 
-## Files to Modify
+## Files Modified
 
 - `src/executor/select/mod.rs` - query planning and code generation
-- May need to implement/improve index scan opcodes
+- `src/vdbe/engine/mod.rs` - Rowid opcode deferred seek handling
+- `src/storage/btree/mod.rs` - cursor staleness detection for index cursors
 
 ## Progress
 
 ### Done
 
-1. **Index detection** (commit b8a5713):
+1. **Index detection**:
    - Extended `check_order_by_satisfied_inner` to search ALL indexes on a table
-   - When ORDER BY column matches first column of an index, stores index name in `order_by_index` field
+   - When ORDER BY column matches first column of an index, stores (table_name, index_name) in `order_by_index` field
    - Added `index_first_column_matches` helper method
+   - Changed `order_by_index` from `Option<String>` to `Option<(String, String)>` to support multi-table queries
+
+2. **Code generation for ORDER BY index scans**:
+   - When `order_by_index` is set, generates index scan code:
+     - OpenRead on INDEX cursor
+     - Rewind/Next loop on index cursor (not table cursor)
+     - DeferredSeek to set up table cursor from index cursor's rowid
+   - Integrated with existing multi-table join compilation
+
+3. **Rowid opcode deferred seek handling**:
+   - Fixed Rowid opcode to properly handle deferred_moveto mode
+   - When in deferred seek mode, actually performs the seek to verify row exists
+   - Returns NULL if the target row was deleted
+
+4. **Cursor staleness detection for index cursors**:
+   - Fixed `BtCursor::next()` to detect entry shifts after DELETE
+   - For index cursors, compares actual payload DATA (not just n_key which is payload size)
+   - When entry at current position differs, doesn't advance (already at "next")
+
+### Test Results
+
+All delete-9.* tests now pass:
+- delete-9.1 - Ok
+- delete-9.2 - Ok (DELETE ALL during cross join)
+- delete-9.3 - Ok (DELETE single row during cross join)
+- delete-9.4 - Ok
+- delete-9.5 - Ok
 
 ### TODO
 
-2. **Code generation changes**:
-   - When `order_by_index` is set, need to modify body compilation:
-     - Open INDEX cursor instead of (or in addition to) table cursor
-     - Use Rewind/Next on index cursor for iteration
-     - Use IdxRowid to get rowids from index entries
-     - Seek table cursor to rowid to fetch actual column data
-
-   Reference: Existing index scan code at line ~1023 in select/mod.rs shows the pattern for WHERE-based index scans
-
-3. **Handle JOINs**:
-   - Current detection only works for single-table queries
-   - For delete-9 tests (cross join), need to handle case where ORDER BY table has an index
-   - May need to restructure loop nesting to put index-ordered table as outer loop
-
-4. **DESC support**:
+1. **DESC support**:
    - Currently only ASC order is detected
    - DESC would require backward index iteration (Prev opcode)
+
+2. **Multi-column index ORDER BY**:
+   - Currently only matches ORDER BY on first column of index
+   - Could be extended to match ORDER BY a, b when index is on (a, b)

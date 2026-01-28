@@ -743,3 +743,234 @@ fn test_cursor_page_refresh_on_stale() {
 
     let _ = sqlite3_close(conn);
 }
+
+/// Test ORDER BY uses index scan when index matches the ORDER BY column.
+/// This is important for cursor stability during DELETE operations.
+#[test]
+fn test_order_by_uses_index_scan() {
+    init();
+    let mut conn = sqlite3_open(":memory:").unwrap();
+
+    // Create table with index on column 'a'
+    exec(&mut conn, "CREATE TABLE t1(a, b)");
+    exec(&mut conn, "CREATE INDEX i1 ON t1(a)");
+
+    // Insert data in non-sorted order
+    exec(&mut conn, "INSERT INTO t1 VALUES(3, 'three')");
+    exec(&mut conn, "INSERT INTO t1 VALUES(1, 'one')");
+    exec(&mut conn, "INSERT INTO t1 VALUES(2, 'two')");
+
+    // Query with ORDER BY a - should use index scan
+    let rows = query(&mut conn, "SELECT a, b FROM t1 ORDER BY a");
+    println!("ORDER BY a results: {:?}", rows);
+
+    // Results should be in order by 'a'
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][0], "1");
+    assert_eq!(rows[1][0], "2");
+    assert_eq!(rows[2][0], "3");
+
+    let _ = sqlite3_close(conn);
+}
+
+/// Test ORDER BY with cross join uses index scan on the correct table.
+/// This mimics the delete-9 test structure.
+#[test]
+fn test_order_by_cross_join_index_scan() {
+    init();
+    let mut conn = sqlite3_open(":memory:").unwrap();
+
+    // Create tables like delete-9 tests
+    exec(&mut conn, "CREATE TABLE t5(a, b)");
+    exec(&mut conn, "CREATE TABLE t6(c, d)");
+    exec(&mut conn, "CREATE INDEX i5 ON t5(a)");
+
+    // Insert data (t5.a in non-sorted order)
+    exec(&mut conn, "INSERT INTO t5 VALUES(3, 'three')");
+    exec(&mut conn, "INSERT INTO t5 VALUES(1, 'one')");
+    exec(&mut conn, "INSERT INTO t5 VALUES(2, 'two')");
+    exec(&mut conn, "INSERT INTO t6 VALUES('x', 'X')");
+    exec(&mut conn, "INSERT INTO t6 VALUES('y', 'Y')");
+
+    // Cross join with ORDER BY a - should use index scan on t5
+    let rows = query(
+        &mut conn,
+        "SELECT t5.rowid AS r, a, c FROM t5, t6 ORDER BY a",
+    );
+    println!("Cross join ORDER BY a results: {:?}", rows);
+
+    // Results should be 6 rows (3 * 2), ordered by 'a'
+    // Each 'a' value should appear twice (once for each t6 row)
+    assert_eq!(rows.len(), 6);
+
+    // First two rows should have a=1
+    assert_eq!(rows[0][1], "1");
+    assert_eq!(rows[1][1], "1");
+    // Next two rows should have a=2
+    assert_eq!(rows[2][1], "2");
+    assert_eq!(rows[3][1], "2");
+    // Last two rows should have a=3
+    assert_eq!(rows[4][1], "3");
+    assert_eq!(rows[5][1], "3");
+
+    let _ = sqlite3_close(conn);
+}
+
+/// Test delete-9.2 scenario: DELETE ALL during cross join iteration with index scan
+/// This tests cursor stability with ORDER BY index scans
+#[test]
+fn test_delete_all_during_cross_join_index_scan() {
+    init();
+    let mut conn = sqlite3_open(":memory:").unwrap();
+
+    // Setup exactly like delete-9
+    exec(&mut conn, "CREATE TABLE t5(a, b)");
+    exec(&mut conn, "CREATE TABLE t6(c, d)");
+    exec(&mut conn, "INSERT INTO t5 VALUES(1, 2)");
+    exec(&mut conn, "INSERT INTO t5 VALUES(3, 4)");
+    exec(&mut conn, "INSERT INTO t5 VALUES(5, 6)");
+    exec(&mut conn, "INSERT INTO t6 VALUES('a', 'b')");
+    exec(&mut conn, "INSERT INTO t6 VALUES('c', 'd')");
+    exec(&mut conn, "CREATE INDEX i5 ON t5(a)");
+    exec(&mut conn, "CREATE INDEX i6 ON t6(c)");
+
+    // Run query with DELETE mid-iteration
+    // SELECT t5.rowid AS r, c, d FROM t5, t6 ORDER BY a
+    // When r==2, DELETE FROM t5
+    let (mut stmt, _) = sqlite3_prepare_v2(
+        &mut conn,
+        "SELECT t5.rowid AS r, c, d FROM t5, t6 ORDER BY a",
+    )
+    .unwrap();
+
+    let mut results = Vec::new();
+    loop {
+        match sqlite3_step(&mut stmt) {
+            Ok(StepResult::Row) => {
+                let r = sqlite3_column_text(&stmt, 0);
+                let c = sqlite3_column_text(&stmt, 1);
+                let d = sqlite3_column_text(&stmt, 2);
+                println!("Got row: r={}, c={}, d={}", r, c, d);
+
+                // When r==2, execute DELETE FROM t5
+                if r == "2" {
+                    println!("Deleting all from t5...");
+                    exec(&mut conn, "DELETE FROM t5");
+                }
+
+                results.push((r, c, d));
+            }
+            Ok(StepResult::Done) => break,
+            Err(e) => {
+                println!("Error: {:?}", e);
+                break;
+            }
+        }
+    }
+    let _ = sqlite3_finalize(stmt);
+
+    println!("Final results: {:?}", results);
+
+    // Expected: After DELETE, subsequent reads should return NULL for t5 columns
+    // Row 1: r=1, c=a, d=b (rowid 1, a=1)
+    // Row 2: r=1, c=c, d=d (rowid 1, a=1, second t6 row)
+    // Row 3: r=2, c=a, d=b (rowid 2, a=3) - DELETE happens here
+    // Row 4: r="", c=c, d=d (t5 empty, r should be NULL/empty)
+    assert_eq!(
+        results.len(),
+        4,
+        "Should have 4 rows (iteration stops after DELETE)"
+    );
+    assert_eq!(results[0].0, "1");
+    assert_eq!(results[1].0, "1");
+    assert_eq!(results[2].0, "2"); // DELETE happens after reading this
+                                   // After DELETE, the fourth row's r should be NULL (empty string in our output)
+    assert!(
+        results[3].0.is_empty() || results[3].0 == "",
+        "After DELETE, t5.rowid should be NULL but got: {}",
+        results[3].0
+    );
+
+    let _ = sqlite3_close(conn);
+}
+
+/// Test delete-9.3 scenario: DELETE single row during cross join iteration
+/// Should continue iterating to remaining rows after single-row delete
+#[test]
+fn test_delete_single_row_during_cross_join_index_scan() {
+    init();
+    let mut conn = sqlite3_open(":memory:").unwrap();
+
+    // Setup exactly like delete-9
+    exec(&mut conn, "CREATE TABLE t5(a, b)");
+    exec(&mut conn, "CREATE TABLE t6(c, d)");
+    exec(&mut conn, "INSERT INTO t5 VALUES(1, 2)");
+    exec(&mut conn, "INSERT INTO t5 VALUES(3, 4)");
+    exec(&mut conn, "INSERT INTO t5 VALUES(5, 6)");
+    exec(&mut conn, "INSERT INTO t6 VALUES('a', 'b')");
+    exec(&mut conn, "INSERT INTO t6 VALUES('c', 'd')");
+    exec(&mut conn, "CREATE INDEX i5 ON t5(a)");
+    exec(&mut conn, "CREATE INDEX i6 ON t6(c)");
+
+    // Run query with DELETE of single row mid-iteration
+    // SELECT t5.rowid AS r, c, d FROM t5, t6 ORDER BY a
+    // When r==2, DELETE FROM t5 WHERE rowid = 2
+    let (mut stmt, _) = sqlite3_prepare_v2(
+        &mut conn,
+        "SELECT t5.rowid AS r, c, d FROM t5, t6 ORDER BY a",
+    )
+    .unwrap();
+
+    let mut results = Vec::new();
+    loop {
+        match sqlite3_step(&mut stmt) {
+            Ok(StepResult::Row) => {
+                let r = sqlite3_column_text(&stmt, 0);
+                let c = sqlite3_column_text(&stmt, 1);
+                let d = sqlite3_column_text(&stmt, 2);
+                println!("Got row: r={}, c={}, d={}", r, c, d);
+
+                // When r==2, execute DELETE FROM t5 WHERE rowid = 2
+                if r == "2" {
+                    println!("Deleting rowid 2 from t5...");
+                    exec(&mut conn, "DELETE FROM t5 WHERE rowid = 2");
+                }
+
+                results.push((r, c, d));
+            }
+            Ok(StepResult::Done) => break,
+            Err(e) => {
+                println!("Error: {:?}", e);
+                break;
+            }
+        }
+    }
+    let _ = sqlite3_finalize(stmt);
+
+    println!("Final results: {:?}", results);
+
+    // Expected: 6 rows total
+    // Rows 1-2: r=1, c=a/c, d=b/d (rowid 1, a=1)
+    // Rows 3-4: r=2, c=a/c, d=b/d (rowid 2, a=3) - DELETE happens on row 3
+    //           Row 4 should have r=NULL since rowid 2 is deleted
+    // Rows 5-6: r=3, c=a/c, d=b/d (rowid 3, a=5) - should still iterate
+    assert_eq!(
+        results.len(),
+        6,
+        "Should have 6 rows (iteration continues after single delete)"
+    );
+    assert_eq!(results[0].0, "1");
+    assert_eq!(results[1].0, "1");
+    assert_eq!(results[2].0, "2"); // DELETE happens after reading this
+                                   // After DELETE, the fourth row's r should be NULL (deleted row)
+    assert!(
+        results[3].0.is_empty(),
+        "After DELETE, row 4 should have NULL rowid but got: {}",
+        results[3].0
+    );
+    // Rows 5-6 should be from rowid 3
+    assert_eq!(results[4].0, "3", "Row 5 should have rowid 3");
+    assert_eq!(results[5].0, "3", "Row 6 should have rowid 3");
+
+    let _ = sqlite3_close(conn);
+}

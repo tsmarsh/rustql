@@ -2731,18 +2731,56 @@ impl Vdbe {
                 // Get rowid from cursor P1 into register P2
                 // Check for cursor staleness first (btree modified by another statement)
                 if let Some(cursor) = self.cursor_mut(op.p1) {
-                    if let Some(ref mut bt_cursor) = cursor.btree_cursor {
-                        if let Ok(false) = bt_cursor.check_and_restore_if_stale() {
-                            // Cursor was invalidated and couldn't be restored
-                            // Row was deleted - return NULL
+                    // If cursor is in deferred seek mode, we need to verify the row
+                    // still exists by actually doing the seek
+                    if cursor.deferred_moveto {
+                        if let (Some(target), Some(ref mut bt_cursor)) =
+                            (cursor.moveto_target, cursor.btree_cursor.as_mut())
+                        {
+                            // Check staleness on btree
+                            if let Ok(false) = bt_cursor.check_and_restore_if_stale() {
+                                // Btree was modified - row may be deleted
+                                cursor.state = CursorState::Invalid;
+                                cursor.rowid = None;
+                                cursor.deferred_moveto = false;
+                                self.mem_mut(op.p2).set_null();
+                                return Ok(ExecResult::Continue);
+                            }
+                            // Do the actual seek to verify the row exists
+                            match bt_cursor.table_moveto(target, false) {
+                                Ok(0) => {
+                                    // Row exists
+                                    cursor.state = CursorState::Valid;
+                                    cursor.rowid = Some(target);
+                                    cursor.deferred_moveto = false;
+                                    self.mem_mut(op.p2).set_int(target);
+                                }
+                                Ok(_) | Err(_) => {
+                                    // Row was deleted
+                                    cursor.state = CursorState::Invalid;
+                                    cursor.rowid = None;
+                                    cursor.deferred_moveto = false;
+                                    self.mem_mut(op.p2).set_null();
+                                }
+                            }
+                        } else {
                             self.mem_mut(op.p2).set_null();
-                            return Ok(ExecResult::Continue);
                         }
-                    }
-                    if let Some(rowid) = cursor.rowid {
-                        self.mem_mut(op.p2).set_int(rowid);
                     } else {
-                        self.mem_mut(op.p2).set_null();
+                        // Regular case: check staleness and return rowid
+                        if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                            if let Ok(false) = bt_cursor.check_and_restore_if_stale() {
+                                // Cursor was invalidated and couldn't be restored
+                                // Row was deleted - return NULL
+                                self.mem_mut(op.p2).set_null();
+                                return Ok(ExecResult::Continue);
+                            }
+                        }
+                        if let Some(rowid) = cursor.rowid {
+                            self.mem_mut(op.p2).set_int(rowid);
+                        } else {
+                            self.mem_mut(op.p2).set_null();
+                        }
                     }
                 } else {
                     self.mem_mut(op.p2).set_null();

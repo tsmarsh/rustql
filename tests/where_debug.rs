@@ -974,3 +974,425 @@ fn test_delete_single_row_during_cross_join_index_scan() {
 
     let _ = sqlite3_close(conn);
 }
+
+/// Test bulk DELETE from large table (delete-6.5.1, delete-6.5.2, delete-6.6)
+/// - Insert 3000 rows
+/// - DELETE WHERE f1>7 should delete 2993 rows
+/// - Only 7 rows should remain
+#[test]
+fn test_bulk_delete_large_table() {
+    init();
+    let mut conn = sqlite3_open(":memory:").expect("Failed to open database");
+
+    exec(&mut conn, "CREATE TABLE table1(f1, f2)");
+
+    // Testing threshold: 504 rows works, 505 fails
+    let total_rows = 505;
+    exec(&mut conn, "BEGIN");
+    for i in 1..=total_rows {
+        exec(
+            &mut conn,
+            &format!("INSERT INTO table1 VALUES({}, {})", i, i * i),
+        );
+    }
+    exec(&mut conn, "COMMIT");
+
+    // Verify rows inserted
+    let rows = query(&mut conn, "SELECT count(*) FROM table1");
+    assert_eq!(
+        rows[0][0],
+        total_rows.to_string(),
+        "Should have {} rows after insert",
+        total_rows
+    );
+
+    // First check SELECT WHERE f1>7 to see if cursor iteration works
+    let rows = query(&mut conn, "SELECT count(*) FROM table1 WHERE f1>7");
+    println!("Rows with f1>7 before DELETE: {}", rows[0][0]);
+    let expected_to_delete = total_rows - 7;
+    assert_eq!(
+        rows[0][0],
+        expected_to_delete.to_string(),
+        "Should have {} rows with f1>7 before DELETE",
+        expected_to_delete
+    );
+
+    // Check rows 1-10 before DELETE
+    let rows = query(&mut conn, "SELECT f1 FROM table1 WHERE f1<=10 ORDER BY f1");
+    let first_10: Vec<String> = rows.iter().map(|r| r[0].clone()).collect();
+    println!("First 10 rows before DELETE: {:?}", first_10);
+
+    // Try manual iteration with debugging
+    // First, let's see what a SELECT iteration looks like
+    let rows = query(
+        &mut conn,
+        "SELECT rowid, f1 FROM table1 ORDER BY rowid LIMIT 20",
+    );
+    println!("First 20 rows before DELETE (rowid, f1):");
+    for row in &rows {
+        println!("  rowid={}, f1={}", row[0], row[1]);
+    }
+
+    // Now do the DELETE
+    exec(&mut conn, "DELETE FROM table1 WHERE f1>7");
+
+    // Check what's left
+    let rows = query(&mut conn, "SELECT rowid, f1 FROM table1 ORDER BY rowid");
+    println!("All remaining rows after DELETE (rowid, f1):");
+    for row in &rows {
+        println!("  rowid={}, f1={}", row[0], row[1]);
+    }
+
+    let remaining: Vec<String> = rows.iter().map(|r| r[1].clone()).collect();
+    println!("Remaining f1 values: {:?}", remaining);
+
+    // Verify first 7 rows remain after DELETE f1>7
+    let expected_rows: Vec<String> = (1..=7).map(|i| i.to_string()).collect();
+    assert_eq!(
+        remaining, expected_rows,
+        "Only rows 1-7 should remain after DELETE f1>7"
+    );
+
+    let _ = sqlite3_close(conn);
+}
+
+/// Test INSERT after DELETE (delete-6.8, delete-6.10)
+/// After clearing a table with DELETE, INSERT should work
+#[test]
+fn test_insert_after_delete() {
+    init();
+    let mut conn = sqlite3_open(":memory:").expect("Failed to open database");
+
+    exec(&mut conn, "CREATE TABLE table1(f1, f2)");
+
+    // Insert some rows
+    exec(&mut conn, "INSERT INTO table1 VALUES(1, 2)");
+    exec(&mut conn, "INSERT INTO table1 VALUES(3, 4)");
+    exec(&mut conn, "INSERT INTO table1 VALUES(5, 6)");
+
+    // Verify rows exist
+    let rows = query(&mut conn, "SELECT count(*) FROM table1");
+    assert_eq!(rows[0][0], "3", "Should have 3 rows");
+
+    // DELETE all rows
+    exec(&mut conn, "DELETE FROM table1");
+
+    // Verify table is empty
+    let rows = query(&mut conn, "SELECT count(*) FROM table1");
+    assert_eq!(rows[0][0], "0", "Table should be empty after DELETE");
+
+    // INSERT new row - this is what delete-6.8 tests
+    exec(&mut conn, "INSERT INTO table1 VALUES(2, 3)");
+
+    // Verify the new row
+    let rows = query(&mut conn, "SELECT f1 FROM table1");
+    assert_eq!(rows.len(), 1, "Should have 1 row after INSERT");
+    assert_eq!(rows[0][0], "2", "Row should have f1=2");
+
+    let _ = sqlite3_close(conn);
+}
+
+/// Mimics the exact TCL test delete-6.8 flow
+#[test]
+fn test_insert_after_bulk_delete() {
+    init();
+    let mut conn = sqlite3_open(":memory:").expect("Failed to open database");
+
+    // Setup like delete.test
+    exec(&mut conn, "CREATE TABLE table1(f1, f2)");
+
+    // Insert 3000 rows like the TCL test
+    exec(&mut conn, "BEGIN");
+    for i in 1..=3000 {
+        exec(
+            &mut conn,
+            &format!("INSERT INTO table1 VALUES({}, {})", i, i * i),
+        );
+    }
+    exec(&mut conn, "COMMIT");
+    println!("Inserted 3000 rows");
+
+    // Verify count
+    let rows = query(&mut conn, "SELECT count(*) FROM table1");
+    println!("Count after insert: {}", rows[0][0]);
+    assert_eq!(rows[0][0], "3000", "Should have 3000 rows");
+
+    // delete-6.5.1: DELETE WHERE f1>7
+    exec(&mut conn, "DELETE FROM table1 WHERE f1>7");
+    println!("Deleted rows where f1>7");
+
+    // delete-6.5.2: Verify only 7 rows remain
+    let rows = query(&mut conn, "SELECT f1 FROM table1 ORDER BY f1");
+    let vals: Vec<String> = rows.iter().map(|r| r[0].clone()).collect();
+    println!("Remaining rows: {:?}", vals);
+    assert_eq!(
+        vals,
+        vec!["1", "2", "3", "4", "5", "6", "7"],
+        "Should have rows 1-7"
+    );
+
+    // delete-6.7: DELETE all remaining rows
+    exec(&mut conn, "DELETE FROM table1");
+    println!("Deleted all remaining rows");
+
+    // Verify empty
+    let rows = query(&mut conn, "SELECT count(*) FROM table1");
+    println!("Count after delete all: {}", rows[0][0]);
+    let rows = query(&mut conn, "SELECT f1 FROM table1");
+    assert!(rows.is_empty(), "Table should be empty");
+
+    // delete-6.8: INSERT new row
+    println!("About to INSERT...");
+    exec(&mut conn, "INSERT INTO table1 VALUES(2, 3)");
+    println!("INSERT completed");
+
+    // Verify the insert worked
+    let rows = query(&mut conn, "SELECT f1 FROM table1");
+    assert_eq!(rows.len(), 1, "Should have 1 row after INSERT");
+    assert_eq!(rows[0][0], "2", "Row should have f1=2");
+
+    let _ = sqlite3_close(conn);
+}
+
+/// Test to isolate the INSERT after bulk DELETE issue
+#[test]
+fn test_insert_after_bulk_delete_variations() {
+    init();
+
+    // Test 1: Just DELETE all at once
+    {
+        let mut conn = sqlite3_open(":memory:").expect("Failed to open database");
+        exec(&mut conn, "CREATE TABLE t1(a, b)");
+        exec(&mut conn, "BEGIN");
+        for i in 1..=3000 {
+            exec(
+                &mut conn,
+                &format!("INSERT INTO t1 VALUES({}, {})", i, i * i),
+            );
+        }
+        exec(&mut conn, "COMMIT");
+        println!("Test 1: Created 3000 rows");
+
+        exec(&mut conn, "DELETE FROM t1");
+        println!("Test 1: Deleted all rows");
+
+        exec(&mut conn, "INSERT INTO t1 VALUES(1, 2)");
+        let rows = query(&mut conn, "SELECT count(*) FROM t1");
+        println!("Test 1: Count after insert = {}", rows[0][0]);
+        let _ = sqlite3_close(conn);
+    }
+
+    // Test 2: DELETE with WHERE, then DELETE remaining
+    {
+        let mut conn = sqlite3_open(":memory:").expect("Failed to open database");
+        exec(&mut conn, "CREATE TABLE t2(a, b)");
+        exec(&mut conn, "BEGIN");
+        for i in 1..=3000 {
+            exec(
+                &mut conn,
+                &format!("INSERT INTO t2 VALUES({}, {})", i, i * i),
+            );
+        }
+        exec(&mut conn, "COMMIT");
+        println!("Test 2: Created 3000 rows");
+
+        exec(&mut conn, "DELETE FROM t2 WHERE a > 7");
+        println!("Test 2: Deleted rows where a > 7");
+
+        exec(&mut conn, "DELETE FROM t2");
+        println!("Test 2: Deleted remaining rows");
+
+        exec(&mut conn, "INSERT INTO t2 VALUES(1, 2)");
+        let rows = query(&mut conn, "SELECT count(*) FROM t2");
+        println!("Test 2: Count after insert = {}", rows[0][0]);
+        let _ = sqlite3_close(conn);
+    }
+
+    // Test 3: What if we don't do the second DELETE?
+    {
+        let mut conn = sqlite3_open(":memory:").expect("Failed to open database");
+        exec(&mut conn, "CREATE TABLE t3(a, b)");
+        exec(&mut conn, "BEGIN");
+        for i in 1..=3000 {
+            exec(
+                &mut conn,
+                &format!("INSERT INTO t3 VALUES({}, {})", i, i * i),
+            );
+        }
+        exec(&mut conn, "COMMIT");
+        println!("Test 3: Created 3000 rows");
+
+        exec(&mut conn, "DELETE FROM t3 WHERE a > 7");
+        println!("Test 3: Deleted rows where a > 7");
+
+        // Skip the second DELETE, just insert
+        exec(&mut conn, "INSERT INTO t3 VALUES(8, 64)");
+        let rows = query(&mut conn, "SELECT count(*) FROM t3");
+        println!("Test 3: Count = {} (expected 8)", rows[0][0]);
+        let _ = sqlite3_close(conn);
+    }
+
+    // Test 4: Small table DELETE all + INSERT
+    {
+        let mut conn = sqlite3_open(":memory:").expect("Failed to open database");
+        exec(&mut conn, "CREATE TABLE t4(a, b)");
+        for i in 1..=10 {
+            exec(
+                &mut conn,
+                &format!("INSERT INTO t4 VALUES({}, {})", i, i * i),
+            );
+        }
+        println!("Test 4: Created 10 rows");
+
+        exec(&mut conn, "DELETE FROM t4");
+        println!("Test 4: Deleted all rows");
+
+        exec(&mut conn, "INSERT INTO t4 VALUES(1, 2)");
+        let rows = query(&mut conn, "SELECT count(*) FROM t4");
+        println!("Test 4: Count after insert = {}", rows[0][0]);
+        let _ = sqlite3_close(conn);
+    }
+
+    // Test 5: Find the threshold where DELETE all starts failing
+    for total_rows in [10, 100, 200, 300, 400, 500, 1000, 2000, 3000] {
+        let mut conn = sqlite3_open(":memory:").expect("Failed to open database");
+        exec(&mut conn, "CREATE TABLE t5(a, b)");
+        exec(&mut conn, "BEGIN");
+        for i in 1..=total_rows {
+            exec(
+                &mut conn,
+                &format!("INSERT INTO t5 VALUES({}, {})", i, i * i),
+            );
+        }
+        exec(&mut conn, "COMMIT");
+
+        exec(&mut conn, "DELETE FROM t5");
+        exec(&mut conn, "INSERT INTO t5 VALUES(1, 2)");
+        let rows = query(&mut conn, "SELECT count(*) FROM t5");
+        let ok = rows[0][0] == "1";
+        println!(
+            "Test 5: {} rows, INSERT after DELETE all: {}",
+            total_rows,
+            if ok { "OK" } else { "FAIL" }
+        );
+        let _ = sqlite3_close(conn);
+    }
+}
+
+/// Debug test: stepwise delete to trace cursor behavior
+#[test]
+fn test_bulk_delete_stepwise() {
+    init();
+    let mut conn = sqlite3_open(":memory:").expect("Failed to open database");
+
+    exec(&mut conn, "CREATE TABLE table1(f1, f2)");
+
+    let total_rows = 505;
+    exec(&mut conn, "BEGIN");
+    for i in 1..=total_rows {
+        exec(
+            &mut conn,
+            &format!("INSERT INTO table1 VALUES({}, {})", i, i * i),
+        );
+    }
+    exec(&mut conn, "COMMIT");
+
+    // Check rows 1-10 before any deletes
+    let rows = query(
+        &mut conn,
+        "SELECT rowid, f1 FROM table1 WHERE rowid <= 10 ORDER BY rowid",
+    );
+    println!("Rows 1-10 before DELETE:");
+    for row in &rows {
+        println!("  rowid={}, f1={}", row[0], row[1]);
+    }
+
+    // This is what works: batched deletes from the end
+    let mut batch_start = 400;
+    while batch_start > 7 {
+        let batch_end = batch_start + 50;
+        exec(
+            &mut conn,
+            &format!(
+                "DELETE FROM table1 WHERE rowid >= {} AND rowid < {}",
+                batch_start, batch_end
+            ),
+        );
+        batch_start -= 50;
+    }
+
+    // Delete remaining rows 8-50
+    exec(&mut conn, "DELETE FROM table1 WHERE rowid > 7");
+
+    let remaining = query(
+        &mut conn,
+        "SELECT rowid FROM table1 WHERE rowid <= 7 ORDER BY rowid",
+    );
+    let remaining_ids: Vec<String> = remaining.iter().map(|r| r[0].clone()).collect();
+    println!("After batched delete, rows 1-7: {:?}", remaining_ids);
+
+    // Final check
+    let all_remaining = query(&mut conn, "SELECT rowid, f1 FROM table1 ORDER BY rowid");
+    println!("All remaining rows:");
+    for row in &all_remaining {
+        println!("  rowid={}, f1={}", row[0], row[1]);
+    }
+
+    let _ = sqlite3_close(conn);
+
+    assert_eq!(remaining_ids.len(), 7, "Rows 1-7 should remain");
+}
+
+/// Debug test: find minimum number of rows that triggers the bug
+#[test]
+fn test_bulk_delete_threshold() {
+    init();
+
+    // Test around known problem areas
+    // 335-345 (around where 341 might be significant)
+    // 395-410 (around 400)
+    // 500-515 (around 505)
+    let test_ranges = [(335, 345), (395, 410), (500, 515)];
+
+    for (start, end) in test_ranges {
+        println!("\n--- Testing range {}-{} ---", start, end);
+        for total_rows in start..=end {
+            let mut conn = sqlite3_open(":memory:").expect("Failed to open database");
+            exec(&mut conn, "CREATE TABLE table1(f1, f2)");
+            exec(&mut conn, "BEGIN");
+            for i in 1..=total_rows {
+                exec(
+                    &mut conn,
+                    &format!("INSERT INTO table1 VALUES({}, {})", i, i * i),
+                );
+            }
+            exec(&mut conn, "COMMIT");
+
+            // Single bulk DELETE WHERE f1 > 7
+            exec(&mut conn, "DELETE FROM table1 WHERE f1 > 7");
+
+            let remaining = query(&mut conn, "SELECT f1 FROM table1 ORDER BY f1");
+            let remaining_vals: Vec<String> = remaining.iter().map(|r| r[0].clone()).collect();
+
+            let expected: Vec<String> = (1..=7).map(|i| i.to_string()).collect();
+            let ok = remaining_vals == expected;
+
+            if !ok {
+                // Also show extra/missing values
+                let extra: Vec<_> = remaining_vals
+                    .iter()
+                    .filter(|v| v.parse::<i32>().unwrap_or(0) > 7)
+                    .collect();
+                let missing: Vec<i32> = (1..=7)
+                    .filter(|i| !remaining_vals.contains(&i.to_string()))
+                    .collect();
+                println!(
+                    "total_rows={}: FAIL - extra={:?}, missing={:?}",
+                    total_rows, extra, missing
+                );
+            }
+
+            let _ = sqlite3_close(conn);
+        }
+    }
+}

@@ -318,9 +318,8 @@ impl KeyInfo {
 
             let mut cmp = compare_record_fields(&fields_a[i], &fields_b[i], &collation);
             if cmp != std::cmp::Ordering::Equal {
-                let null_involved =
-                    matches!(fields_a[i], RecordField::Null)
-                        || matches!(fields_b[i], RecordField::Null);
+                let null_involved = matches!(fields_a[i], RecordField::Null)
+                    || matches!(fields_b[i], RecordField::Null);
                 if sort_flags != 0 {
                     let should_invert = !bignull || (desc != null_involved);
                     if should_invert {
@@ -3829,6 +3828,21 @@ impl Btree {
             .map_err(|_| Error::new(ErrorCode::Internal))?;
         let mut shared_guard = shared;
         let root_pgno = _cursor.root_page;
+
+        // Collapse empty internal roots before inserting
+        // This can happen after bulk DELETE operations leave the tree in an invalid state
+        loop {
+            let (root_mem_page, root_limits) = _cursor.load_page(&mut shared_guard, root_pgno)?;
+            if root_mem_page.is_leaf {
+                break;
+            }
+            if root_mem_page.n_cell > 0 {
+                break;
+            }
+            // Internal node with no cells - collapse it
+            collapse_root_if_empty(&mut shared_guard, root_pgno)?;
+        }
+
         let mut mem_page = _cursor.load_page(&mut shared_guard, root_pgno)?.0;
         let mut limits = if root_pgno == 1 {
             PageLimits::for_page1(shared_guard.page_size, shared_guard.usable_size)
@@ -5082,6 +5096,8 @@ impl BtCursor {
                     } else {
                         PageLimits::new(shared_guard.page_size, shared_guard.usable_size)
                     };
+                    // Also update cursor_data_version to stay in sync
+                    self.cursor_data_version = shared_guard.shared_data_version;
                     drop(shared_guard);
                     // Update self.info to the new cell at current position
                     self.set_to_cell(page, limits, self.ix)?;
@@ -5089,6 +5105,15 @@ impl BtCursor {
                 }
             }
             // ix >= n_cell: we've exhausted this page, fall through to navigate to next page
+            // IMPORTANT: Update cursor_data_version here since we're about to enter
+            // the staleness check path, and we need current data version
+            let shared = self
+                .bt_shared
+                .upgrade()
+                .ok_or(Error::new(ErrorCode::Internal))?;
+            let shared_guard = shared.read().map_err(|_| Error::new(ErrorCode::Internal))?;
+            self.cursor_data_version = shared_guard.shared_data_version;
+            drop(shared_guard);
         }
 
         // Check for staleness and refresh page if needed
@@ -6695,27 +6720,48 @@ mod tests {
     #[test]
     fn test_collseq_binary() {
         let coll = CollSeq::Binary;
-        assert_eq!(coll.compare("abc", "abd"), std::cmp::Ordering::Less);
-        assert_eq!(coll.compare("ABC", "abc"), std::cmp::Ordering::Less); // A < a in ASCII
-        assert_eq!(coll.compare("abc", "abc"), std::cmp::Ordering::Equal);
-        assert_eq!(coll.compare("xyz", "abc"), std::cmp::Ordering::Greater);
+        assert_eq!(coll.compare_bytes(b"abc", b"abd"), std::cmp::Ordering::Less);
+        assert_eq!(coll.compare_bytes(b"ABC", b"abc"), std::cmp::Ordering::Less); // A < a in ASCII
+        assert_eq!(
+            coll.compare_bytes(b"abc", b"abc"),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            coll.compare_bytes(b"xyz", b"abc"),
+            std::cmp::Ordering::Greater
+        );
     }
 
     #[test]
     fn test_collseq_nocase() {
         let coll = CollSeq::NoCase;
-        assert_eq!(coll.compare("ABC", "abc"), std::cmp::Ordering::Equal);
-        assert_eq!(coll.compare("Hello", "HELLO"), std::cmp::Ordering::Equal);
-        assert_eq!(coll.compare("abc", "abd"), std::cmp::Ordering::Less);
-        assert_eq!(coll.compare("ABC", "ABD"), std::cmp::Ordering::Less);
+        assert_eq!(
+            coll.compare_bytes(b"ABC", b"abc"),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            coll.compare_bytes(b"Hello", b"HELLO"),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(coll.compare_bytes(b"abc", b"abd"), std::cmp::Ordering::Less);
+        assert_eq!(coll.compare_bytes(b"ABC", b"ABD"), std::cmp::Ordering::Less);
     }
 
     #[test]
     fn test_collseq_rtrim() {
         let coll = CollSeq::RTrim;
-        assert_eq!(coll.compare("abc   ", "abc"), std::cmp::Ordering::Equal);
-        assert_eq!(coll.compare("abc", "abc   "), std::cmp::Ordering::Equal);
-        assert_eq!(coll.compare("abc  ", "abd"), std::cmp::Ordering::Less);
+        assert_eq!(
+            coll.compare_bytes(b"abc   ", b"abc"),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            coll.compare_bytes(b"abc", b"abc   "),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            coll.compare_bytes(b"abc  ", b"abd"),
+            std::cmp::Ordering::Less
+        );
     }
 
     #[test]

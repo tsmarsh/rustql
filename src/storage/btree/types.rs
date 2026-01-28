@@ -218,8 +218,16 @@ fn ascii_nocase_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     while i < n {
         let ac = a[i];
         let bc = b[i];
-        let al = if (b'A'..=b'Z').contains(&ac) { ac + 32 } else { ac };
-        let bl = if (b'A'..=b'Z').contains(&bc) { bc + 32 } else { bc };
+        let al = if (b'A'..=b'Z').contains(&ac) {
+            ac + 32
+        } else {
+            ac
+        };
+        let bl = if (b'A'..=b'Z').contains(&bc) {
+            bc + 32
+        } else {
+            bc
+        };
         if al != bl {
             return al.cmp(&bl);
         }

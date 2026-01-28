@@ -12,7 +12,7 @@ use rustql::{
     sqlite3_step, PreparedStmt, SqliteConnection,
 };
 use std::env;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 
 /// Output mode for results
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -559,7 +559,7 @@ fn main() {
     }
 
     // Determine if we're interactive
-    let is_tty = atty::is(atty::Stream::Stdin);
+    let is_tty = std::io::stdin().is_terminal();
 
     let result = if is_tty {
         shell.run_interactive()

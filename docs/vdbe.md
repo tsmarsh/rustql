@@ -268,3 +268,4 @@ See `src/vdbe/engine.rs` for the runtime behavior.
 - `src/vdbe/engine.rs`: Runtime execution behavior.
 - `src/vdbe/mem.rs`: Register/value representation.
 - `src/storage/*`: B-tree and pager implementation.
+- `docs/opcodes.md`: Opcode architecture and SQLite parity map.

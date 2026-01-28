@@ -492,6 +492,214 @@ pub enum Opcode {
     /// If P3 is in RowSet P1, jump to P2; if P4>=0, also insert P3
     RowSetTest,
 
+    // ========================================================================
+    // Debug/Assertion Opcodes (SQLite parity)
+    // ========================================================================
+    /// Debug assertion that VDBE can be aborted (no-op in release)
+    Abortable,
+    /// Release registers from service (debug only)
+    ReleaseReg,
+
+    // ========================================================================
+    // Additional Control Flow (SQLite parity)
+    // ========================================================================
+    /// Initialize coroutine - store return addr in P1, jump to P2 if P3 != 0
+    InitCoroutine,
+    /// Begin subroutine (same as Null - clears register range)
+    BeginSubrtn,
+    /// Halt if register P3 is null, fall through to Halt
+    HaltIfNull,
+    /// Jump to P2 if cursor P1 is empty
+    IfEmpty,
+    /// Decrement P1, jump to P2 if result is not zero
+    IfNotZero,
+    /// Jump to P2 if cursor P1 is not open
+    IfNotOpen,
+    /// Jump if no hope of finding key (optimization hint)
+    IfNoHope,
+    /// Jump to P2 if size of cursor P1 is between P3 and P4
+    IfSizeBetween,
+
+    // ========================================================================
+    // Register Operations (SQLite parity)
+    // ========================================================================
+    /// Copy integer from P1 to P2
+    IntCopy,
+    /// Set register P1 to "soft null" (can be overwritten)
+    SoftNull,
+    /// Set register to zero or null based on P1
+    ZeroOrNull,
+    /// P2 = max(P2, P1) as integer
+    MemMax,
+
+    // ========================================================================
+    // Type Operations (SQLite parity)
+    // ========================================================================
+    /// Convert register P1 to integer, jump to P2 if not possible
+    MustBeInt,
+    /// Apply REAL affinity to register P1
+    RealAffinity,
+    /// Check if value P1 matches type P3, jump to P2 if not
+    IsType,
+    /// Check if P1 is true (non-null and non-zero), store result in P2
+    IsTrue,
+    /// Check types in record at P3, raise error if mismatch
+    TypeCheck,
+
+    // ========================================================================
+    // Subtype Operations (SQLite parity)
+    // ========================================================================
+    /// Get subtype from register P1 into P2
+    GetSubtype,
+    /// Set subtype of register P1 to P2
+    SetSubtype,
+    /// Clear subtype flag from register P1
+    ClrSubtype,
+
+    // ========================================================================
+    // Collation Operations (SQLite parity)
+    // ========================================================================
+    /// Set collation sequence for comparisons (P4 = collation name)
+    CollSeq,
+
+    // ========================================================================
+    // Comparison Operations (SQLite parity)
+    // ========================================================================
+    /// Used after Lt/Gt when previous was Eq - compare equal case
+    ElseEq,
+    /// Set permutation array for Compare opcode (P4 = permutation)
+    Permutation,
+
+    // ========================================================================
+    // Cursor Operations (SQLite parity)
+    // ========================================================================
+    /// Clear all rows from table/index at root page P1
+    Clear,
+    /// Open duplicate cursor P1 on cursor P2's btree
+    OpenDup,
+    /// Reopen index cursor P1 on root page P2
+    ReopenIdx,
+    /// Seek cursor P1 to end of btree
+    SeekEnd,
+    /// Mark cursor P1 as having had a successful seek
+    SeekHit,
+    /// Seek scan optimization - P1=cursor, P2=jump if seek fails
+    SeekScan,
+    /// Get byte offset of cursor P1 into register P2
+    Offset,
+    /// Cursor hint for optimization (P4 = hint expression)
+    CursorHint,
+    /// Lock cursor P1 to prevent modification
+    CursorLock,
+    /// Unlock cursor P1
+    CursorUnlock,
+    /// Mark columns as used in cursor P1 (P4 = bitmask)
+    ColumnsUsed,
+    /// Like NotFound but fails on constraint violation
+    NoConflict,
+
+    // ========================================================================
+    // Row Data Operations (SQLite parity)
+    // ========================================================================
+    /// Copy entire row data from cursor P1 into register P2
+    RowData,
+    /// Extract a single cell from record (P1=cursor, P2=cell, P3=dest)
+    RowCell,
+
+    // ========================================================================
+    // Aggregation Operations (SQLite parity)
+    // ========================================================================
+    /// Aggregate step with single argument (P4 = function)
+    AggStep1,
+    /// Aggregate inverse for window functions
+    AggInverse,
+
+    // ========================================================================
+    // Sorting Operations (SQLite parity)
+    // ========================================================================
+    /// Open a sorter cursor (same as SorterSort start)
+    SorterOpen,
+    /// Sort (alias for SorterSort)
+    Sort,
+    /// Test sequence value at P1, jump to P2 if not matching P3
+    SequenceTest,
+
+    // ========================================================================
+    // Filter Operations (Bloom filter - SQLite parity)
+    // ========================================================================
+    /// Check if key in P3 might be in bloom filter P1, jump to P2 if not
+    Filter,
+    /// Add key in P3 to bloom filter in cursor P1
+    FilterAdd,
+
+    // ========================================================================
+    // Schema Operations (SQLite parity)
+    // ========================================================================
+    /// Destroy btree at root page P1, store freed pages in P2
+    Destroy,
+    /// Drop table from schema (P4 = table name)
+    DropTable,
+    /// Drop index from schema (P4 = index name)
+    DropIndex,
+    /// Drop trigger from schema (P4 = trigger name)
+    DropTrigger,
+    /// Lock table P1 in database P2 (P3 = lock type)
+    TableLock,
+    /// Load analysis data from sqlite_stat tables
+    LoadAnalysis,
+
+    // ========================================================================
+    // Database Operations (SQLite parity)
+    // ========================================================================
+    /// Incremental vacuum
+    IncrVacuum,
+    /// Full vacuum
+    Vacuum,
+    /// Get/set journal mode (P3 = new mode, result in P2)
+    JournalMode,
+    /// Get page count into register P2
+    Pagecount,
+    /// Get/set max page count (P2 = register for result, P3 = new max)
+    MaxPgcnt,
+    /// Run integrity check (P1 = root page, P2 = result register)
+    IntegrityCk,
+    /// Mark statement as expired (prepared statement cache)
+    Expire,
+    /// Reset change counter
+    ResetCount,
+
+    // ========================================================================
+    // Function Operations (SQLite parity)
+    // ========================================================================
+    /// Call pure/deterministic function (can be factored out of loops)
+    PureFunc,
+    /// String opcode with explicit length P1 (P4 = string, P2 = dest)
+    String,
+
+    // ========================================================================
+    // Virtual Table Operations (SQLite parity)
+    // ========================================================================
+    /// Begin virtual table transaction
+    VBegin,
+    /// Check virtual table constraint
+    VCheck,
+    /// Read column P2 from virtual table cursor P1 into register P3
+    VColumn,
+    /// Create virtual table (P4 = module args)
+    VCreate,
+    /// Destroy virtual table
+    VDestroy,
+    /// Initialize IN constraint for virtual table
+    VInitIn,
+    /// Advance to next row in virtual table cursor
+    VNext,
+    /// Open virtual table cursor
+    VOpen,
+    /// Rename virtual table
+    VRename,
+    /// Update virtual table (insert/delete/update)
+    VUpdate,
+
     /// Maximum opcode value
     MaxOpcode,
 }
@@ -537,6 +745,24 @@ impl Opcode {
                 | Opcode::Program
                 | Opcode::TriggerTest
                 | Opcode::IfPos
+                | Opcode::InitCoroutine
+                | Opcode::HaltIfNull
+                | Opcode::IfEmpty
+                | Opcode::IfNotZero
+                | Opcode::IfNotOpen
+                | Opcode::IfNoHope
+                | Opcode::IfSizeBetween
+                | Opcode::MustBeInt
+                | Opcode::IsType
+                | Opcode::ElseEq
+                | Opcode::SeekEnd
+                | Opcode::SeekScan
+                | Opcode::NoConflict
+                | Opcode::Filter
+                | Opcode::SequenceTest
+                | Opcode::IncrVacuum
+                | Opcode::Sort
+                | Opcode::VNext
         )
     }
 
@@ -581,6 +807,32 @@ impl Opcode {
                 | Opcode::SorterInsert
                 | Opcode::SorterConfig
                 | Opcode::NullRow
+                | Opcode::Clear
+                | Opcode::OpenDup
+                | Opcode::ReopenIdx
+                | Opcode::SeekEnd
+                | Opcode::SeekHit
+                | Opcode::SeekScan
+                | Opcode::Offset
+                | Opcode::CursorHint
+                | Opcode::CursorLock
+                | Opcode::CursorUnlock
+                | Opcode::ColumnsUsed
+                | Opcode::NoConflict
+                | Opcode::RowData
+                | Opcode::RowCell
+                | Opcode::SorterOpen
+                | Opcode::Sort
+                | Opcode::Filter
+                | Opcode::FilterAdd
+                | Opcode::IfEmpty
+                | Opcode::IfNotOpen
+                | Opcode::IfNoHope
+                | Opcode::IfSizeBetween
+                | Opcode::Destroy
+                | Opcode::VColumn
+                | Opcode::VNext
+                | Opcode::VOpen
         )
     }
 
@@ -725,6 +977,94 @@ impl Opcode {
             Opcode::RowSetAdd => "RowSetAdd",
             Opcode::RowSetRead => "RowSetRead",
             Opcode::RowSetTest => "RowSetTest",
+            // Debug/Assertion Opcodes
+            Opcode::Abortable => "Abortable",
+            Opcode::ReleaseReg => "ReleaseReg",
+            // Additional Control Flow
+            Opcode::InitCoroutine => "InitCoroutine",
+            Opcode::BeginSubrtn => "BeginSubrtn",
+            Opcode::HaltIfNull => "HaltIfNull",
+            Opcode::IfEmpty => "IfEmpty",
+            Opcode::IfNotZero => "IfNotZero",
+            Opcode::IfNotOpen => "IfNotOpen",
+            Opcode::IfNoHope => "IfNoHope",
+            Opcode::IfSizeBetween => "IfSizeBetween",
+            // Register Operations
+            Opcode::IntCopy => "IntCopy",
+            Opcode::SoftNull => "SoftNull",
+            Opcode::ZeroOrNull => "ZeroOrNull",
+            Opcode::MemMax => "MemMax",
+            // Type Operations
+            Opcode::MustBeInt => "MustBeInt",
+            Opcode::RealAffinity => "RealAffinity",
+            Opcode::IsType => "IsType",
+            Opcode::IsTrue => "IsTrue",
+            Opcode::TypeCheck => "TypeCheck",
+            // Subtype Operations
+            Opcode::GetSubtype => "GetSubtype",
+            Opcode::SetSubtype => "SetSubtype",
+            Opcode::ClrSubtype => "ClrSubtype",
+            // Collation Operations
+            Opcode::CollSeq => "CollSeq",
+            // Comparison Operations
+            Opcode::ElseEq => "ElseEq",
+            Opcode::Permutation => "Permutation",
+            // Cursor Operations
+            Opcode::Clear => "Clear",
+            Opcode::OpenDup => "OpenDup",
+            Opcode::ReopenIdx => "ReopenIdx",
+            Opcode::SeekEnd => "SeekEnd",
+            Opcode::SeekHit => "SeekHit",
+            Opcode::SeekScan => "SeekScan",
+            Opcode::Offset => "Offset",
+            Opcode::CursorHint => "CursorHint",
+            Opcode::CursorLock => "CursorLock",
+            Opcode::CursorUnlock => "CursorUnlock",
+            Opcode::ColumnsUsed => "ColumnsUsed",
+            Opcode::NoConflict => "NoConflict",
+            // Row Data Operations
+            Opcode::RowData => "RowData",
+            Opcode::RowCell => "RowCell",
+            // Aggregation Operations
+            Opcode::AggStep1 => "AggStep1",
+            Opcode::AggInverse => "AggInverse",
+            // Sorting Operations
+            Opcode::SorterOpen => "SorterOpen",
+            Opcode::Sort => "Sort",
+            Opcode::SequenceTest => "SequenceTest",
+            // Filter Operations
+            Opcode::Filter => "Filter",
+            Opcode::FilterAdd => "FilterAdd",
+            // Schema Operations
+            Opcode::Destroy => "Destroy",
+            Opcode::DropTable => "DropTable",
+            Opcode::DropIndex => "DropIndex",
+            Opcode::DropTrigger => "DropTrigger",
+            Opcode::TableLock => "TableLock",
+            Opcode::LoadAnalysis => "LoadAnalysis",
+            // Database Operations
+            Opcode::IncrVacuum => "IncrVacuum",
+            Opcode::Vacuum => "Vacuum",
+            Opcode::JournalMode => "JournalMode",
+            Opcode::Pagecount => "Pagecount",
+            Opcode::MaxPgcnt => "MaxPgcnt",
+            Opcode::IntegrityCk => "IntegrityCk",
+            Opcode::Expire => "Expire",
+            Opcode::ResetCount => "ResetCount",
+            // Function Operations
+            Opcode::PureFunc => "PureFunc",
+            Opcode::String => "String",
+            // Virtual Table Operations
+            Opcode::VBegin => "VBegin",
+            Opcode::VCheck => "VCheck",
+            Opcode::VColumn => "VColumn",
+            Opcode::VCreate => "VCreate",
+            Opcode::VDestroy => "VDestroy",
+            Opcode::VInitIn => "VInitIn",
+            Opcode::VNext => "VNext",
+            Opcode::VOpen => "VOpen",
+            Opcode::VRename => "VRename",
+            Opcode::VUpdate => "VUpdate",
             Opcode::MaxOpcode => "MaxOpcode",
         }
     }

@@ -185,18 +185,6 @@ pub enum Opcode {
     /// Boolean result of P1 == P3
     Once,
 
-    /// Check if P1 matches pattern in P3
-    Like,
-
-    /// Check if P1 matches glob pattern in P3
-    Glob,
-
-    /// Check if P1 matches regexp in P3
-    Regexp,
-
-    /// Check if P1 matches pattern in P3 (user-defined match function)
-    Match,
-
     // ========================================================================
     // B-tree/Table Operations
     // ========================================================================
@@ -283,9 +271,6 @@ pub enum Opcode {
 
     /// Insert record into cursor P1
     Insert,
-
-    /// Insert record with int key into cursor P1
-    InsertInt,
 
     /// Start a new row for insert
     NewRowid,
@@ -760,7 +745,6 @@ impl Opcode {
                 | Opcode::Column
                 | Opcode::Rowid
                 | Opcode::Insert
-                | Opcode::InsertInt
                 | Opcode::NewRowid
                 | Opcode::IdxGE
                 | Opcode::IdxGT
@@ -861,10 +845,6 @@ impl Opcode {
             Opcode::Compare => "Compare",
             Opcode::Jump => "Jump",
             Opcode::Once => "Once",
-            Opcode::Like => "Like",
-            Opcode::Glob => "Glob",
-            Opcode::Regexp => "Regexp",
-            Opcode::Match => "Match",
             Opcode::OpenRead => "OpenRead",
             Opcode::OpenWrite => "OpenWrite",
             Opcode::OpenEphemeral => "OpenEphemeral",
@@ -892,7 +872,6 @@ impl Opcode {
             Opcode::DecodeRecord => "DecodeRecord",
             Opcode::ResultRow => "ResultRow",
             Opcode::Insert => "Insert",
-            Opcode::InsertInt => "InsertInt",
             Opcode::NewRowid => "NewRowid",
             Opcode::IdxGE => "IdxGE",
             Opcode::IdxGT => "IdxGT",

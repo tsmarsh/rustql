@@ -351,22 +351,44 @@ impl ExprCompiler {
                 self.compile_or(left, right, target)?;
             }
 
-            // Pattern matching
+            // Pattern matching - use Function opcode like SQLite
             BinaryOp::Glob => {
-                let r1 = self.compile_expr(left)?;
-                let r2 = self.compile_expr(right)?;
-                self.add_op(Opcode::Glob, r1, target, r2);
+                // Args: [pattern, text] in consecutive registers
+                let args_base = self.peek_reg();
+                self.compile_expr(right)?; // pattern
+                self.compile_expr(left)?; // text
+                self.add_op4(
+                    Opcode::Function,
+                    2,
+                    args_base,
+                    target,
+                    P4::FuncDef("glob".to_string()),
+                );
             }
             BinaryOp::Match => {
                 // MATCH can be used with FTS or with a user-defined match function
-                let r1 = self.compile_expr(left)?;
-                let r2 = self.compile_expr(right)?;
-                self.add_op(Opcode::Match, r1, target, r2);
+                let args_base = self.peek_reg();
+                self.compile_expr(right)?; // pattern
+                self.compile_expr(left)?; // text
+                self.add_op4(
+                    Opcode::Function,
+                    2,
+                    args_base,
+                    target,
+                    P4::FuncDef("match".to_string()),
+                );
             }
             BinaryOp::Regexp => {
-                let r1 = self.compile_expr(left)?;
-                let r2 = self.compile_expr(right)?;
-                self.add_op(Opcode::Regexp, r1, target, r2);
+                let args_base = self.peek_reg();
+                self.compile_expr(right)?; // pattern
+                self.compile_expr(left)?; // text
+                self.add_op4(
+                    Opcode::Function,
+                    2,
+                    args_base,
+                    target,
+                    P4::FuncDef("regexp".to_string()),
+                );
             }
         }
         Ok(())
@@ -669,25 +691,39 @@ impl ExprCompiler {
         negated: bool,
         target: i32,
     ) -> Result<()> {
-        let expr_reg = self.compile_expr(expr)?;
-        let pattern_reg = self.compile_expr(pattern)?;
+        // SQLite handles LIKE/GLOB/REGEXP/MATCH via the Function opcode
+        // Arguments are stored in consecutive registers: [pattern, text, optional_escape]
+        let args_base = self.peek_reg();
 
-        if escape.is_some() && op == crate::parser::ast::LikeOp::Like {
-            // LIKE with ESCAPE requires special handling
-            return Err(Error::with_message(
-                ErrorCode::Error,
-                "LIKE with ESCAPE not yet implemented",
-            ));
-        }
+        // Compile pattern into args_base
+        self.compile_expr(pattern)?;
+        // Compile expr (text) into args_base+1
+        self.compile_expr(expr)?;
 
-        // Generate appropriate opcode based on operator type
-        let opcode = match op {
-            crate::parser::ast::LikeOp::Like => Opcode::Like,
-            crate::parser::ast::LikeOp::Glob => Opcode::Glob,
-            crate::parser::ast::LikeOp::Regexp => Opcode::Regexp,
-            crate::parser::ast::LikeOp::Match => Opcode::Match,
+        let argc = if let Some(esc) = escape {
+            // Compile escape character into args_base+2
+            self.compile_expr(esc)?;
+            3
+        } else {
+            2
         };
-        self.add_op(opcode, expr_reg, target, pattern_reg);
+
+        // Get function name based on operator type
+        let func_name = match op {
+            crate::parser::ast::LikeOp::Like => "like",
+            crate::parser::ast::LikeOp::Glob => "glob",
+            crate::parser::ast::LikeOp::Regexp => "regexp",
+            crate::parser::ast::LikeOp::Match => "match",
+        };
+
+        // Emit Function opcode: P1=argc, P2=arg_base, P3=dest, P4=func_name
+        self.add_op4(
+            Opcode::Function,
+            argc,
+            args_base,
+            target,
+            P4::FuncDef(func_name.to_string()),
+        );
 
         if negated {
             // Negate the result

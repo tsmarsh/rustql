@@ -579,7 +579,7 @@ impl Vdbe {
         // execution (e.g., DELETE on empty table skips the Delete opcode entirely)
         for op in &ops {
             match op.opcode {
-                Opcode::Insert | Opcode::InsertInt | Opcode::Delete => {
+                Opcode::Insert | Opcode::Delete => {
                     if (op.p5 & OPFLAG_NCHANGE) != 0 {
                         vdbe.is_dml_statement = true;
                         break;
@@ -3134,6 +3134,96 @@ impl Vdbe {
                             0
                         };
                         self.mem_mut(op.p3).set_int(total);
+                    } else if name.eq_ignore_ascii_case("LIKE") {
+                        // LIKE requires special handling for case_sensitive_like pragma
+                        inc_like_count();
+                        let argc = op.p1.max(0) as usize;
+                        let arg_base = op.p2;
+                        if argc < 2 {
+                            self.mem_mut(op.p3).set_null();
+                        } else {
+                            let pattern = self.mem(arg_base).to_value();
+                            let text = self.mem(arg_base + 1).to_value();
+                            if matches!(pattern, Value::Null) || matches!(text, Value::Null) {
+                                self.mem_mut(op.p3).set_null();
+                            } else {
+                                let case_sensitive = self
+                                    .conn_ptr
+                                    .map(|ptr| unsafe { &*ptr }.db_config.case_sensitive_like)
+                                    .unwrap_or(false);
+                                let mut args = vec![pattern, text];
+                                if argc >= 3 {
+                                    args.push(self.mem(arg_base + 2).to_value());
+                                }
+                                match crate::functions::scalar::func_like_case_sensitive(
+                                    &args,
+                                    case_sensitive,
+                                ) {
+                                    Ok(Value::Integer(result)) => {
+                                        self.mem_mut(op.p3).set_int(result);
+                                    }
+                                    _ => {
+                                        self.mem_mut(op.p3).set_int(0);
+                                    }
+                                }
+                            }
+                        }
+                    } else if name.eq_ignore_ascii_case("REGEXP") {
+                        // REGEXP with optional TCL user-defined function support
+                        let argc = op.p1.max(0) as usize;
+                        let arg_base = op.p2;
+                        if argc < 2 {
+                            self.mem_mut(op.p3).set_null();
+                        } else {
+                            let pattern = self.mem(arg_base).to_value();
+                            let text = self.mem(arg_base + 1).to_value();
+                            if matches!(pattern, Value::Null) || matches!(text, Value::Null) {
+                                self.mem_mut(op.p3).set_null();
+                            } else {
+                                #[cfg(feature = "tcl")]
+                                let matched = {
+                                    if crate::tcl_ext::has_tcl_user_function("regexp") {
+                                        let args = vec![pattern.to_text(), text.to_text()];
+                                        crate::tcl_ext::call_tcl_user_function("regexp", &args)
+                                            .map(|r| r != "0" && !r.is_empty())
+                                            .unwrap_or(false)
+                                    } else {
+                                        regexp_match(&pattern.to_text(), &text.to_text())
+                                    }
+                                };
+                                #[cfg(not(feature = "tcl"))]
+                                let matched = regexp_match(&pattern.to_text(), &text.to_text());
+                                self.mem_mut(op.p3).set_int(if matched { 1 } else { 0 });
+                            }
+                        }
+                    } else if name.eq_ignore_ascii_case("MATCH") {
+                        // MATCH with optional TCL user-defined function support
+                        let argc = op.p1.max(0) as usize;
+                        let arg_base = op.p2;
+                        if argc < 2 {
+                            self.mem_mut(op.p3).set_null();
+                        } else {
+                            let pattern = self.mem(arg_base).to_value();
+                            let text = self.mem(arg_base + 1).to_value();
+                            if matches!(pattern, Value::Null) || matches!(text, Value::Null) {
+                                self.mem_mut(op.p3).set_null();
+                            } else {
+                                #[cfg(feature = "tcl")]
+                                let matched = {
+                                    if crate::tcl_ext::has_tcl_user_function("match") {
+                                        let args = vec![pattern.to_text(), text.to_text()];
+                                        crate::tcl_ext::call_tcl_user_function("match", &args)
+                                            .map(|r| r != "0" && !r.is_empty())
+                                            .unwrap_or(false)
+                                    } else {
+                                        false // No user-defined function - match always fails for non-FTS
+                                    }
+                                };
+                                #[cfg(not(feature = "tcl"))]
+                                let matched = false; // Without TCL, match always fails for non-FTS
+                                self.mem_mut(op.p3).set_int(if matched { 1 } else { 0 });
+                            }
+                        }
                     } else if let Some(func) = crate::functions::get_scalar_function(name) {
                         let argc = op.p1.max(0) as usize;
                         let arg_base = op.p2;
@@ -3362,7 +3452,7 @@ impl Vdbe {
                 }
             }
 
-            Opcode::Insert | Opcode::InsertInt => {
+            Opcode::Insert => {
                 // Insert P1 P2 P3
                 // Insert record P2 with rowid P3 into cursor P1
                 // P4 = table name (for debug)
@@ -4762,127 +4852,6 @@ impl Vdbe {
                     self.pc = op.p2;
                 } else {
                     self.once_flags.insert(once_id);
-                }
-            }
-
-            Opcode::Like => {
-                // LIKE P1 P2 P3 P4
-                // Compare text in P1 against pattern in P3
-                // Store result (1 for match, 0 for no match) in P2
-                // P4 may contain register with escape character
-                inc_like_count();
-                let text = self.mem(op.p1).to_value();
-                let pattern = self.mem(op.p3).to_value();
-
-                // Handle NULL - LIKE returns NULL if either operand is NULL
-                if matches!(text, Value::Null) || matches!(pattern, Value::Null) {
-                    self.mem_mut(op.p2).set_null();
-                } else {
-                    // Get case_sensitive_like setting from connection
-                    let case_sensitive = self
-                        .conn_ptr
-                        .map(|ptr| unsafe { &*ptr }.db_config.case_sensitive_like)
-                        .unwrap_or(false);
-
-                    // func_like expects [pattern, text, optional_escape] order
-                    let mut args = vec![pattern, text];
-
-                    // Check if P4 contains an escape register
-                    if let P4::Mem(esc_reg) = &op.p4 {
-                        let escape_val = self.mem(*esc_reg).to_value();
-                        args.push(escape_val);
-                    }
-
-                    match crate::functions::scalar::func_like_case_sensitive(&args, case_sensitive)
-                    {
-                        Ok(Value::Integer(result)) => {
-                            self.mem_mut(op.p2).set_int(result);
-                        }
-                        _ => {
-                            self.mem_mut(op.p2).set_int(0);
-                        }
-                    }
-                }
-            }
-
-            Opcode::Glob => {
-                // GLOB P1 P2 P3
-                // Compare text in P1 against glob pattern in P3
-                // Store result (1 for match, 0 for no match) in P2
-                let text = self.mem(op.p1).to_value();
-                let pattern = self.mem(op.p3).to_value();
-
-                if matches!(text, Value::Null) || matches!(pattern, Value::Null) {
-                    self.mem_mut(op.p2).set_null();
-                } else {
-                    // func_glob expects [pattern, text] order
-                    let args = vec![pattern, text];
-                    match crate::functions::scalar::func_glob(&args) {
-                        Ok(Value::Integer(result)) => {
-                            self.mem_mut(op.p2).set_int(result);
-                        }
-                        _ => {
-                            self.mem_mut(op.p2).set_int(0);
-                        }
-                    }
-                }
-            }
-
-            Opcode::Regexp => {
-                // Regexp P1 P2 P3: Compare text in P1 against regexp pattern in P3
-                let text = self.mem(op.p1).to_value();
-                let pattern = self.mem(op.p3).to_value();
-
-                if matches!(text, Value::Null) || matches!(pattern, Value::Null) {
-                    self.mem_mut(op.p2).set_null();
-                } else {
-                    // First check if there's a user-defined regexp function
-                    #[cfg(feature = "tcl")]
-                    let matched = {
-                        if crate::tcl_ext::has_tcl_user_function("regexp") {
-                            // Call the user-defined function
-                            let args = vec![pattern.to_text(), text.to_text()];
-                            crate::tcl_ext::call_tcl_user_function("regexp", &args)
-                                .map(|r| r != "0" && !r.is_empty())
-                                .unwrap_or(false)
-                        } else {
-                            regexp_match(&pattern.to_text(), &text.to_text())
-                        }
-                    };
-                    #[cfg(not(feature = "tcl"))]
-                    let matched = regexp_match(&pattern.to_text(), &text.to_text());
-
-                    self.mem_mut(op.p2).set_int(if matched { 1 } else { 0 });
-                }
-            }
-
-            Opcode::Match => {
-                // Match P1 P2 P3: Compare text in P1 against pattern in P3
-                // Uses user-defined match function if registered
-                let text = self.mem(op.p1).to_value();
-                let pattern = self.mem(op.p3).to_value();
-
-                if matches!(text, Value::Null) || matches!(pattern, Value::Null) {
-                    self.mem_mut(op.p2).set_null();
-                } else {
-                    // Check if there's a user-defined match function
-                    #[cfg(feature = "tcl")]
-                    let matched = {
-                        if crate::tcl_ext::has_tcl_user_function("match") {
-                            // Call the user-defined function
-                            let args = vec![pattern.to_text(), text.to_text()];
-                            crate::tcl_ext::call_tcl_user_function("match", &args)
-                                .map(|r| r != "0" && !r.is_empty())
-                                .unwrap_or(false)
-                        } else {
-                            // No user-defined function - match always fails for non-FTS tables
-                            false
-                        }
-                    };
-                    #[cfg(not(feature = "tcl"))]
-                    let matched = false; // Without TCL, match always fails for non-FTS
-
-                    self.mem_mut(op.p2).set_int(if matched { 1 } else { 0 });
                 }
             }
 
@@ -8169,27 +8138,32 @@ mod tests {
     }
 
     #[test]
-    fn test_op_regexp_matches() {
+    fn test_op_regexp_via_function() {
+        // Test regexp via Function opcode (SQLite style)
+        // Args at consecutive registers: [pattern, text]
         let mut vdbe = Vdbe::from_ops(vec![
-            VdbeOp {
-                opcode: Opcode::String8,
-                p1: 0,
-                p2: 2,
-                p3: 0,
-                p4: P4::Text("^a.*b$".to_string()),
-                p5: 0,
-                comment: None,
-            },
+            // Put pattern at reg 1
             VdbeOp {
                 opcode: Opcode::String8,
                 p1: 0,
                 p2: 1,
                 p3: 0,
+                p4: P4::Text("^a.*b$".to_string()),
+                p5: 0,
+                comment: None,
+            },
+            // Put text at reg 2
+            VdbeOp {
+                opcode: Opcode::String8,
+                p1: 0,
+                p2: 2,
+                p3: 0,
                 p4: P4::Text("acb".to_string()),
                 p5: 0,
                 comment: None,
             },
-            VdbeOp::new(Opcode::Regexp, 1, 3, 2),
+            // Function: argc=2, args_base=1, dest=3, func="regexp"
+            VdbeOp::with_p4(Opcode::Function, 2, 1, 3, P4::FuncDef("regexp".to_string())),
             VdbeOp::new(Opcode::ResultRow, 3, 1, 0),
             VdbeOp::new(Opcode::Halt, 0, 0, 0),
         ]);
@@ -8622,5 +8596,4 @@ mod tests {
             assert_eq!(schema_guard.schema_cookie, 100);
         }
     }
-
 }

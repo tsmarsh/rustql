@@ -1474,9 +1474,9 @@ impl<'s> SelectCompiler<'s> {
                                     let rec_reg = self.alloc_reg();
                                     self.emit(Opcode::MakeRecord, val_reg, 1, rec_reg, P4::Unused);
 
-                                    // Insert as row with explicit rowid
+                                    // Insert as row with explicit rowid (use Insert, same as SQLite)
                                     self.emit(
-                                        Opcode::InsertInt,
+                                        Opcode::Insert,
                                         eph_cursor,
                                         rec_reg,
                                         rowid_counter,
@@ -5831,29 +5831,36 @@ impl<'s> SelectCompiler<'s> {
                 negated,
                 escape,
             } => {
-                // Compile LIKE/GLOB expression
+                // Compile LIKE/GLOB expression using Function opcode (SQLite style)
+                // Args stored in consecutive registers: [pattern, text, optional_escape]
+                let args_base = self.alloc_reg();
+                self.compile_expr(pattern, args_base)?;
                 let text_reg = self.alloc_reg();
-                let pattern_reg = self.alloc_reg();
                 self.compile_expr(text_expr, text_reg)?;
-                self.compile_expr(pattern, pattern_reg)?;
 
-                let opcode = match op {
-                    crate::parser::ast::LikeOp::Like => Opcode::Like,
-                    crate::parser::ast::LikeOp::Glob => Opcode::Glob,
-                    crate::parser::ast::LikeOp::Regexp => Opcode::Regexp,
-                    crate::parser::ast::LikeOp::Match => Opcode::Match,
-                };
-
-                // Like opcode: P1=text, P2=result, P3=pattern, P4=escape reg (if any)
-                // Compile escape expression if present and store register in P4
-                let p4 = if let Some(esc_expr) = escape {
+                let argc = if let Some(esc_expr) = escape {
                     let esc_reg = self.alloc_reg();
                     self.compile_expr(esc_expr, esc_reg)?;
-                    P4::Mem(esc_reg as i32)
+                    3
                 } else {
-                    P4::Unused
+                    2
                 };
-                self.emit(opcode, text_reg, dest_reg, pattern_reg, p4);
+
+                let func_name = match op {
+                    crate::parser::ast::LikeOp::Like => "like",
+                    crate::parser::ast::LikeOp::Glob => "glob",
+                    crate::parser::ast::LikeOp::Regexp => "regexp",
+                    crate::parser::ast::LikeOp::Match => "match",
+                };
+
+                // Function opcode: P1=argc, P2=arg_base, P3=dest, P4=func_name
+                self.emit(
+                    Opcode::Function,
+                    argc,
+                    args_base,
+                    dest_reg,
+                    P4::FuncDef(func_name.to_string()),
+                );
 
                 if *negated {
                     // Negate the result

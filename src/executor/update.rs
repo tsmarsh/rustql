@@ -86,6 +86,12 @@ pub struct UpdateCompiler<'s> {
 
     /// AFTER UPDATE triggers to fire
     after_triggers: Vec<Arc<Trigger>>,
+
+    /// BEFORE DELETE triggers (for REPLACE conflict resolution)
+    before_delete_triggers: Vec<Arc<Trigger>>,
+
+    /// AFTER DELETE triggers (for REPLACE conflict resolution)
+    after_delete_triggers: Vec<Arc<Trigger>>,
 }
 
 impl<'s> UpdateCompiler<'s> {
@@ -109,6 +115,8 @@ impl<'s> UpdateCompiler<'s> {
             next_unnamed_param: 1,
             before_triggers: Vec::new(),
             after_triggers: Vec::new(),
+            before_delete_triggers: Vec::new(),
+            after_delete_triggers: Vec::new(),
         }
     }
 
@@ -132,6 +140,8 @@ impl<'s> UpdateCompiler<'s> {
             next_unnamed_param: 1,
             before_triggers: Vec::new(),
             after_triggers: Vec::new(),
+            before_delete_triggers: Vec::new(),
+            after_delete_triggers: Vec::new(),
         }
     }
 
@@ -189,6 +199,25 @@ impl<'s> UpdateCompiler<'s> {
                 TriggerEvent::Update,
                 Some(&update_columns),
             );
+
+            // If using REPLACE conflict action, also look up DELETE triggers
+            if update.or_action == Some(ConflictAction::Replace) {
+                self.before_delete_triggers = find_matching_triggers(
+                    schema,
+                    &update.table.name,
+                    TriggerTiming::Before,
+                    TriggerEvent::Delete,
+                    None, // DELETE triggers don't have column list
+                );
+
+                self.after_delete_triggers = find_matching_triggers(
+                    schema,
+                    &update.table.name,
+                    TriggerTiming::After,
+                    TriggerEvent::Delete,
+                    None, // DELETE triggers don't have column list
+                );
+            }
         }
 
         // Initialize ColumnMapper for validation
@@ -1091,7 +1120,7 @@ impl<'s> UpdateCompiler<'s> {
                         P4::Unused,
                     );
 
-                    // Read column values from conflicting row for index deletion
+                    // Read column values from conflicting row for index deletion and triggers
                     // Allocate registers for column values
                     let old_data_base = self.alloc_regs(self.num_columns);
                     let ipk_col = self.get_ipk_column_index();
@@ -1103,6 +1132,15 @@ impl<'s> UpdateCompiler<'s> {
                         } else {
                             self.emit(Opcode::Column, del_cursor, i as i32, reg, P4::Unused);
                         }
+                    }
+
+                    // Fire BEFORE DELETE triggers
+                    if !self.before_delete_triggers.is_empty() {
+                        self.emit_delete_triggers(
+                            &self.before_delete_triggers.clone(),
+                            Some(old_data_base),
+                            check_rowid_reg,
+                        )?;
                     }
 
                     // Delete from indexes before deleting the row
@@ -1184,6 +1222,15 @@ impl<'s> UpdateCompiler<'s> {
                         P4::Text(self.table_name.clone()),
                         OPFLAG_NCHANGE,
                     );
+
+                    // Fire AFTER DELETE triggers
+                    if !self.after_delete_triggers.is_empty() {
+                        self.emit_delete_triggers(
+                            &self.after_delete_triggers.clone(),
+                            Some(old_data_base),
+                            check_rowid_reg,
+                        )?;
+                    }
 
                     // Close the delete cursor
                     self.emit(Opcode::Close, del_cursor, 0, 0, P4::Unused);
@@ -2260,6 +2307,44 @@ impl<'s> UpdateCompiler<'s> {
         }
 
         self.resolve_label(return_label, self.current_addr() as i32);
+
+        Ok(())
+    }
+
+    /// Emit DELETE triggers (for REPLACE conflict resolution)
+    fn emit_delete_triggers(
+        &mut self,
+        triggers: &[Arc<Trigger>],
+        old_base_reg: Option<i32>,
+        rowid_reg: i32,
+    ) -> Result<()> {
+        if triggers.is_empty() {
+            return Ok(());
+        }
+
+        let return_label = self.alloc_label();
+
+        // For DELETE triggers, there's no NEW row, only OLD
+        let trigger_ops = generate_trigger_code(
+            triggers,
+            self.schema,
+            &self.table_name,
+            old_base_reg,
+            None, // No NEW for DELETE triggers
+            self.num_columns as i32,
+            &mut self.next_reg,
+            &mut self.next_cursor,
+            return_label,
+        )?;
+
+        for op in trigger_ops {
+            self.ops.push(op);
+        }
+
+        self.resolve_label(return_label, self.current_addr() as i32);
+
+        // Silence unused variable warning
+        let _ = rowid_reg;
 
         Ok(())
     }

@@ -112,6 +112,8 @@ pub struct SelectCompiler<'s> {
     resolving_aliases: HashSet<String>,
     /// (table_name, index_name) that can satisfy ORDER BY (set by check_order_by_satisfied)
     order_by_index: Option<(String, String)>,
+    /// Views currently being expanded (to detect circular view definitions)
+    expanding_views: HashSet<String>,
 }
 
 impl<'s> SelectCompiler<'s> {
@@ -157,6 +159,7 @@ impl<'s> SelectCompiler<'s> {
             case_sensitive_like: false,
             resolving_aliases: HashSet::new(),
             order_by_index: None,
+            expanding_views: HashSet::new(),
         }
     }
 
@@ -207,6 +210,7 @@ impl<'s> SelectCompiler<'s> {
             case_sensitive_like: false,
             resolving_aliases: HashSet::new(),
             order_by_index: None,
+            expanding_views: HashSet::new(),
         }
     }
 
@@ -509,6 +513,8 @@ impl<'s> SelectCompiler<'s> {
         subcompiler.ctes = self.ctes.clone();
         subcompiler.recursive_ctes = self.recursive_ctes.clone();
         subcompiler.cte_cursors = self.cte_cursors.clone();
+        // Propagate expanding_views for circular view detection
+        subcompiler.expanding_views = self.expanding_views.clone();
         if let Some(name) = exclude_cte {
             subcompiler.ctes.remove(name);
             subcompiler.recursive_ctes.remove(name);
@@ -2669,12 +2675,27 @@ impl<'s> SelectCompiler<'s> {
                 // Check if this is a view - expand views as subqueries
                 if let Some(schema) = self.schema {
                     if let Some(view) = schema.views.get(&table_name_lower) {
+                        // Check for circular view definition
+                        if self.expanding_views.contains(&table_name_lower) {
+                            return Err(Error::with_message(
+                                ErrorCode::Error,
+                                format!("view {} is circularly defined", view.name),
+                            ));
+                        }
+
+                        // Mark this view as being expanded
+                        self.expanding_views.insert(table_name_lower.clone());
+
                         let view_select = (*view.select).clone();
                         let view_alias = item.alias.clone().unwrap_or_else(|| table_name.clone());
 
                         // Compile view's SELECT as a subquery into ephemeral table
-                        let subquery_col_names =
-                            self.compile_subquery_to_ephemeral(&view_select, cursor, None)?;
+                        let result = self.compile_subquery_to_ephemeral(&view_select, cursor, None);
+
+                        // Remove from expanding set (whether success or failure)
+                        self.expanding_views.remove(&table_name_lower);
+
+                        let subquery_col_names = result?;
 
                         self.tables.push(TableInfo {
                             name: view_alias,
@@ -4100,6 +4121,17 @@ impl<'s> SelectCompiler<'s> {
                 } else if let Some(schema) = self.schema {
                     // First check if this is a view
                     if let Some(view) = schema.views.get(&table_name_lower) {
+                        // Check for circular view definition
+                        if self.expanding_views.contains(&table_name_lower) {
+                            return Err(Error::with_message(
+                                ErrorCode::Error,
+                                format!("view {} is circularly defined", view.name),
+                            ));
+                        }
+
+                        // Mark this view as being expanded
+                        self.expanding_views.insert(table_name_lower.clone());
+
                         // Expand view as subquery
                         let view_select = (*view.select).clone();
                         let view_alias = alias.clone().unwrap_or_else(|| table_name.clone());
@@ -4112,9 +4144,16 @@ impl<'s> SelectCompiler<'s> {
                         let mut subcompiler = SelectCompiler::with_schema(schema);
                         subcompiler.next_reg = self.next_reg;
                         subcompiler.next_cursor = self.next_cursor;
+                        // Propagate expanding_views for circular view detection
+                        subcompiler.expanding_views = self.expanding_views.clone();
                         subcompiler
                             .set_column_name_flags(self.short_column_names, self.full_column_names);
-                        let subquery_ops = subcompiler.compile(&view_select, &subquery_dest)?;
+                        let result = subcompiler.compile(&view_select, &subquery_dest);
+
+                        // Remove from expanding set (whether success or failure)
+                        self.expanding_views.remove(&table_name_lower);
+
+                        let subquery_ops = result?;
 
                         // Capture view's result column names for * expansion
                         let subquery_col_names = subcompiler.result_column_names.clone();

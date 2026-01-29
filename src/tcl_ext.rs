@@ -682,9 +682,7 @@ impl Md5Context {
 
         macro_rules! md5step {
             ($f:ident, $w:expr, $x:expr, $y:expr, $z:expr, $data:expr, $s:expr) => {
-                $w = $w
-                    .wrapping_add($f!($x, $y, $z))
-                    .wrapping_add($data);
+                $w = $w.wrapping_add($f!($x, $y, $z)).wrapping_add($data);
                 $w = ($w << $s) | ($w >> (32 - $s));
                 $w = $w.wrapping_add($x);
             };

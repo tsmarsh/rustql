@@ -342,11 +342,14 @@ pub enum Opcode {
     /// Parse a CREATE statement and add to schema
     ParseSchema,
 
-    /// Parse a CREATE INDEX statement and add to schema
-    ParseSchemaIndex,
+    /// Drop table from schema (SQLite: OP_DropTable)
+    DropTable,
 
-    /// Remove table/index from schema (DROP TABLE/INDEX)
-    DropSchema,
+    /// Drop index from schema (SQLite: OP_DropIndex)
+    DropIndex,
+
+    /// Drop trigger from schema (SQLite: OP_DropTrigger)
+    DropTrigger,
 
     // ========================================================================
     // Transaction Operations
@@ -592,12 +595,6 @@ pub enum Opcode {
     // ========================================================================
     /// Destroy btree at root page P1, store freed pages in P2
     Destroy,
-    /// Drop table from schema (P4 = table name)
-    DropTable,
-    /// Drop index from schema (P4 = index name)
-    DropIndex,
-    /// Drop trigger from schema (P4 = trigger name)
-    DropTrigger,
     /// Lock table P1 in database P2 (P3 = lock type)
     TableLock,
     /// Load analysis data from sqlite_stat tables
@@ -892,8 +889,9 @@ impl Opcode {
             Opcode::SorterConfig => "SorterConfig",
             Opcode::CreateBtree => "CreateBtree",
             Opcode::ParseSchema => "ParseSchema",
-            Opcode::ParseSchemaIndex => "ParseSchemaIndex",
-            Opcode::DropSchema => "DropSchema",
+            Opcode::DropTable => "DropTable",
+            Opcode::DropIndex => "DropIndex",
+            Opcode::DropTrigger => "DropTrigger",
             Opcode::Transaction => "Transaction",
             Opcode::AutoCommit => "AutoCommit",
             Opcode::Savepoint => "Savepoint",
@@ -976,9 +974,6 @@ impl Opcode {
             Opcode::FilterAdd => "FilterAdd",
             // Schema Operations
             Opcode::Destroy => "Destroy",
-            Opcode::DropTable => "DropTable",
-            Opcode::DropIndex => "DropIndex",
-            Opcode::DropTrigger => "DropTrigger",
             Opcode::TableLock => "TableLock",
             Opcode::LoadAnalysis => "LoadAnalysis",
             // Database Operations

@@ -5663,6 +5663,72 @@ impl Vdbe {
                             }
                         }
                         // Continue to next opcode (view handled)
+                    } else if sql_upper.contains("CREATE INDEX")
+                        || sql_upper.contains("CREATE UNIQUE INDEX")
+                    {
+                        // Handle CREATE INDEX (merged from ParseSchemaIndex)
+                        if let Some(ref schema) = self.schema {
+                            if let Ok(mut schema_guard) = schema.write() {
+                                // Determine if UNIQUE index from SQL text
+                                let is_unique = sql_upper.contains("UNIQUE INDEX");
+
+                                if let Some(mut index) =
+                                    crate::schema::parse_create_index_sql(sql, is_unique)
+                                {
+                                    // Set the root page from register P2
+                                    index.root_page = root_page;
+
+                                    let index_name_lower = index.name.to_lowercase();
+                                    let table_name_lower = index.table.to_lowercase();
+
+                                    // Resolve column indices from table schema
+                                    if let Some(table) = schema_guard.tables.get(&table_name_lower)
+                                    {
+                                        for ic in &mut index.columns {
+                                            if ic.column_idx < 0 {
+                                                if let Some(crate::schema::Expr::Column {
+                                                    column,
+                                                    ..
+                                                }) = &ic.expr
+                                                {
+                                                    if let Some(pos) =
+                                                        table.columns.iter().position(|c| {
+                                                            c.name.eq_ignore_ascii_case(column)
+                                                        })
+                                                    {
+                                                        ic.column_idx = pos as i32;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Insert into schema.indexes
+                                    schema_guard.indexes.insert(
+                                        index_name_lower,
+                                        std::sync::Arc::new(index.clone()),
+                                    );
+
+                                    // Also add to the parent table's index list
+                                    if let Some(table) =
+                                        schema_guard.tables.get_mut(&table_name_lower)
+                                    {
+                                        let table_mut = std::sync::Arc::make_mut(table);
+                                        let existing_pos =
+                                            table_mut.indexes.iter().position(|idx| {
+                                                idx.name.eq_ignore_ascii_case(&index.name)
+                                            });
+
+                                        if let Some(pos) = existing_pos {
+                                            table_mut.indexes[pos] = std::sync::Arc::new(index);
+                                        } else {
+                                            table_mut.indexes.push(std::sync::Arc::new(index));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Continue to next opcode (index handled)
                     } else if let Some(ref schema) = self.schema {
                         if let Ok(mut schema_guard) = schema.write() {
                             // Check if IF NOT EXISTS was specified
@@ -5716,136 +5782,65 @@ impl Vdbe {
                 }
             }
 
-            Opcode::ParseSchemaIndex => {
-                // ParseSchemaIndex P1 P2 P3 P4
-                // Parse a CREATE INDEX statement and add to schema
-                // P1 = 1 if UNIQUE index
-                // P2 = register containing root page number
-                // P4 = SQL text of the CREATE INDEX statement
-                if let P4::Text(sql) = &op.p4 {
-                    // Get root page from register P2
-                    let root_page = if op.p2 > 0 {
-                        self.mem(op.p2).to_int() as u32
-                    } else {
-                        0
-                    };
-
+            Opcode::DropTable => {
+                // DropTable P4
+                // Remove table from schema (SQLite: OP_DropTable)
+                // P4 = name of table to drop
+                // Also removes all indexes and triggers for this table
+                if let P4::Text(name) = &op.p4 {
                     if let Some(ref schema) = self.schema {
                         if let Ok(mut schema_guard) = schema.write() {
-                            // Parse CREATE INDEX SQL
-                            if let Some(mut index) =
-                                crate::schema::parse_create_index_sql(sql, op.p1 != 0)
-                            {
-                                // Set the root page from the register
-                                index.root_page = root_page;
-
-                                let index_name_lower = index.name.to_lowercase();
-                                let table_name_lower = index.table.to_lowercase();
-
-                                // Resolve column indices from table schema
-                                if let Some(table) = schema_guard.tables.get(&table_name_lower) {
-                                    for ic in &mut index.columns {
-                                        // If column_idx is unresolved (-1), try to resolve from expr
-                                        if ic.column_idx < 0 {
-                                            if let Some(crate::schema::Expr::Column {
-                                                column,
-                                                ..
-                                            }) = &ic.expr
-                                            {
-                                                if let Some(pos) =
-                                                    table.columns.iter().position(|c| {
-                                                        c.name.eq_ignore_ascii_case(column)
-                                                    })
-                                                {
-                                                    ic.column_idx = pos as i32;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Insert into schema.indexes
+                            let name_lower = name.to_lowercase();
+                            // Check if it's actually a view (DROP VIEW uses DropTable in SQLite)
+                            if schema_guard.views.contains_key(&name_lower) {
+                                schema_guard.views.remove(&name_lower);
+                            } else {
+                                // Drop table - also remove all indexes and triggers for this table
+                                schema_guard.tables.remove(&name_lower);
+                                // Remove indexes that reference this table from the global index map
                                 schema_guard
                                     .indexes
-                                    .insert(index_name_lower, std::sync::Arc::new(index.clone()));
-
-                                // Also add to the parent table's index list
-                                // But first check if it already exists (from parse_create_sql)
-                                if let Some(table) = schema_guard.tables.get_mut(&table_name_lower)
-                                {
-                                    // Use Arc::make_mut to get mutable access even if there are
-                                    // other Arc references (will clone if needed)
-                                    let table_mut = std::sync::Arc::make_mut(table);
-
-                                    // Check if this index already exists in table.indexes
-                                    let existing_pos = table_mut
-                                        .indexes
-                                        .iter()
-                                        .position(|idx| idx.name.eq_ignore_ascii_case(&index.name));
-
-                                    if let Some(pos) = existing_pos {
-                                        // Replace the existing entry (which has root_page=0)
-                                        // with the new one (which has the correct root_page)
-                                        table_mut.indexes[pos] = std::sync::Arc::new(index);
-                                    } else {
-                                        // No duplicate, add normally
-                                        table_mut.indexes.push(std::sync::Arc::new(index));
-                                    }
-                                }
+                                    .retain(|_, idx| idx.table.to_lowercase() != name_lower);
+                                // Remove triggers that reference this table
+                                schema_guard
+                                    .triggers
+                                    .retain(|_, trig| trig.table.to_lowercase() != name_lower);
                             }
                         }
                     }
                 }
             }
 
-            Opcode::DropSchema => {
-                // DropSchema P1 P2 P3 P4
-                // Remove object from schema
-                // P1 = type: 0=table, 1=index, 2=view, 3=trigger
-                // P4 = name of object to drop
+            Opcode::DropIndex => {
+                // DropIndex P4
+                // Remove index from schema (SQLite: OP_DropIndex)
+                // P4 = name of index to drop
                 if let P4::Text(name) = &op.p4 {
                     if let Some(ref schema) = self.schema {
                         if let Ok(mut schema_guard) = schema.write() {
                             let name_lower = name.to_lowercase();
-                            match op.p1 {
-                                0 => {
-                                    // Drop table - also remove all indexes and triggers for this table
-                                    schema_guard.tables.remove(&name_lower);
-                                    // Remove indexes that reference this table from the global index map
-                                    schema_guard
-                                        .indexes
-                                        .retain(|_, idx| idx.table.to_lowercase() != name_lower);
-                                    // Remove triggers that reference this table
-                                    schema_guard
-                                        .triggers
-                                        .retain(|_, trig| trig.table.to_lowercase() != name_lower);
-                                }
-                                1 => {
-                                    // Drop index
-                                    schema_guard.indexes.remove(&name_lower);
-                                    // Also remove from parent table's index list
-                                    for table in schema_guard.tables.values_mut() {
-                                        // Use Arc::make_mut to get mutable access even if there are
-                                        // other Arc references (will clone if needed)
-                                        let table_mut = std::sync::Arc::make_mut(table);
-                                        table_mut
-                                            .indexes
-                                            .retain(|idx| idx.name.to_lowercase() != name_lower);
-                                    }
-                                }
-                                2 => {
-                                    // Drop view
-                                    schema_guard.views.remove(&name_lower);
-                                }
-                                3 => {
-                                    // Drop trigger
-                                    schema_guard.triggers.remove(&name_lower);
-                                }
-                                _ => {
-                                    // Unknown type - try tables as fallback
-                                    schema_guard.tables.remove(&name_lower);
-                                }
+                            schema_guard.indexes.remove(&name_lower);
+                            // Also remove from parent table's index list
+                            for table in schema_guard.tables.values_mut() {
+                                let table_mut = std::sync::Arc::make_mut(table);
+                                table_mut
+                                    .indexes
+                                    .retain(|idx| idx.name.to_lowercase() != name_lower);
                             }
+                        }
+                    }
+                }
+            }
+
+            Opcode::DropTrigger => {
+                // DropTrigger P4
+                // Remove trigger from schema (SQLite: OP_DropTrigger)
+                // P4 = name of trigger to drop
+                if let P4::Text(name) = &op.p4 {
+                    if let Some(ref schema) = self.schema {
+                        if let Ok(mut schema_guard) = schema.write() {
+                            let name_lower = name.to_lowercase();
+                            schema_guard.triggers.remove(&name_lower);
                         }
                     }
                 }
@@ -6674,21 +6669,6 @@ impl Vdbe {
                 // Store number of freed pages in P2
                 // For now, just set result to 0
                 self.mem_mut(op.p2).set_int(0);
-            }
-
-            Opcode::DropTable => {
-                // Drop table from schema (P4 = table name)
-                // Handled by DropSchema in our implementation
-            }
-
-            Opcode::DropIndex => {
-                // Drop index from schema (P4 = index name)
-                // Handled by DropSchema in our implementation
-            }
-
-            Opcode::DropTrigger => {
-                // Drop trigger from schema (P4 = trigger name)
-                // Handled by DropSchema in our implementation
             }
 
             Opcode::TableLock => {

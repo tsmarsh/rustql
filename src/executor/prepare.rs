@@ -943,10 +943,10 @@ impl<'s> StatementCompiler<'s> {
                             P4::Unused,
                         ));
 
-                        // ParseSchemaIndex to register the index in schema cache
+                        // ParseSchema to register the index in schema cache
                         ops.push(Self::make_op(
-                            Opcode::ParseSchemaIndex,
-                            1, // unique = true
+                            Opcode::ParseSchema,
+                            0,
                             reg_index_page,
                             0,
                             P4::Text(index_sql.clone()),
@@ -1000,10 +1000,10 @@ impl<'s> StatementCompiler<'s> {
                         P4::Unused,
                     ));
 
-                    // ParseSchemaIndex to register the index
+                    // ParseSchema to register the index
                     ops.push(Self::make_op(
-                        Opcode::ParseSchemaIndex,
-                        1, // unique = true
+                        Opcode::ParseSchema,
+                        0,
                         reg_index_page,
                         0,
                         P4::Text(index_sql.clone()),
@@ -1815,10 +1815,10 @@ impl<'s> StatementCompiler<'s> {
             P4::Unused,
         ));
 
-        // ParseSchemaIndex to register the index in schema cache
+        // ParseSchema to register the index in schema cache
         ops.push(Self::make_op(
-            Opcode::ParseSchemaIndex,
-            if create.unique { 1 } else { 0 },
+            Opcode::ParseSchema,
+            0,
             reg_root_page,
             0,
             P4::Text(sql.clone()),
@@ -2648,22 +2648,14 @@ impl<'s> StatementCompiler<'s> {
         let mut ops = Vec::new();
         ops.push(Self::make_op(Opcode::Init, 0, 2, 0, P4::Unused));
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
-        // DropSchema opcode to remove from schema
-        // P1 encodes the type: 0=table, 1=index, 2=view, 3=trigger
-        let type_code = match kind {
-            "table" => 0,
-            "index" => 1,
-            "view" => 2,
-            "trigger" => 3,
-            _ => 0,
+        // Use appropriate Drop opcode based on type (SQLite: OP_DropTable/Index/Trigger)
+        let drop_opcode = match kind {
+            "table" | "view" => Opcode::DropTable, // SQLite uses DropTable for views too
+            "index" => Opcode::DropIndex,
+            "trigger" => Opcode::DropTrigger,
+            _ => Opcode::DropTable,
         };
-        ops.push(Self::make_op(
-            Opcode::DropSchema,
-            type_code,
-            0,
-            0,
-            P4::Text(name.clone()),
-        ));
+        ops.push(Self::make_op(drop_opcode, 0, 0, 0, P4::Text(name.clone())));
         ops.push(Self::make_op(Opcode::Goto, 0, 1, 0, P4::Unused));
         Ok(ops)
     }

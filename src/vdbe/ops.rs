@@ -185,9 +185,6 @@ pub enum Opcode {
     /// Boolean result of P1 == P3
     Once,
 
-    /// Check if P1 is between P2 and P3
-    Between,
-
     /// Check if P1 matches pattern in P3
     Like,
 
@@ -250,9 +247,6 @@ pub enum Opcode {
 
     /// Seek cursor P1 to key < P3
     SeekLT,
-
-    /// Check for null key in seek
-    SeekNull,
 
     /// Jump if cursor P1 not pointing to valid row
     NotExists,
@@ -387,26 +381,17 @@ pub enum Opcode {
     /// Write lock a table
     SetCookie,
 
-    /// Verify schema cookie
-    VerifyCookie,
-
     // ========================================================================
     // Function Operations
     // ========================================================================
     /// Call scalar function
     Function,
 
-    /// Call aggregate step function
-    Function0,
-
     // ========================================================================
     // Miscellaneous
     // ========================================================================
     /// Trace message (debug)
     Trace,
-
-    /// Explain query plan info
-    Explain,
 
     /// Execute nested SQL
     SqlExec,
@@ -419,9 +404,6 @@ pub enum Opcode {
 
     /// Complete deferred table seek
     FinishSeek,
-
-    /// Sort key comparison
-    SortKey,
 
     /// Sequence value for autoincrement
     Sequence,
@@ -463,15 +445,6 @@ pub enum Opcode {
     /// P2 = column index (-1 for rowid)
     /// P3 = destination register
     Param,
-
-    /// Test if trigger should fire and record affected rowid
-    /// P1 = register containing rowid
-    /// P2 = trigger flags (timing/event bits)
-    /// P3 = jump destination if trigger should not fire
-    TriggerTest,
-
-    /// Mark end of trigger prolog (where OLD/NEW setup ends)
-    TriggerProlog,
 
     /// Set OLD/NEW row values for trigger execution
     /// P1 = 0 for OLD row, 1 for NEW row
@@ -740,7 +713,6 @@ impl Opcode {
                 | Opcode::SorterSort
                 | Opcode::FkIfZero
                 | Opcode::Program
-                | Opcode::TriggerTest
                 | Opcode::IfPos
                 | Opcode::InitCoroutine
                 | Opcode::HaltIfNull
@@ -889,7 +861,6 @@ impl Opcode {
             Opcode::Compare => "Compare",
             Opcode::Jump => "Jump",
             Opcode::Once => "Once",
-            Opcode::Between => "Between",
             Opcode::Like => "Like",
             Opcode::Glob => "Glob",
             Opcode::Regexp => "Regexp",
@@ -909,7 +880,6 @@ impl Opcode {
             Opcode::SeekGT => "SeekGT",
             Opcode::SeekLE => "SeekLE",
             Opcode::SeekLT => "SeekLT",
-            Opcode::SeekNull => "SeekNull",
             Opcode::NotExists => "NotExists",
             Opcode::Found => "Found",
             Opcode::NotFound => "NotFound",
@@ -950,16 +920,12 @@ impl Opcode {
             Opcode::Savepoint => "Savepoint",
             Opcode::ReadCookie => "ReadCookie",
             Opcode::SetCookie => "SetCookie",
-            Opcode::VerifyCookie => "VerifyCookie",
             Opcode::Function => "Function",
-            Opcode::Function0 => "Function0",
             Opcode::Trace => "Trace",
-            Opcode::Explain => "Explain",
             Opcode::SqlExec => "SqlExec",
             Opcode::Checkpoint => "Checkpoint",
             Opcode::DeferredSeek => "DeferredSeek",
             Opcode::FinishSeek => "FinishSeek",
-            Opcode::SortKey => "SortKey",
             Opcode::Sequence => "Sequence",
             Opcode::Count => "Count",
             Opcode::FkCounter => "FkCounter",
@@ -967,8 +933,6 @@ impl Opcode {
             Opcode::FkCheck => "FkCheck",
             Opcode::Program => "Program",
             Opcode::Param => "Param",
-            Opcode::TriggerTest => "TriggerTest",
-            Opcode::TriggerProlog => "TriggerProlog",
             Opcode::SetTriggerRow => "SetTriggerRow",
             Opcode::RowSetAdd => "RowSetAdd",
             Opcode::RowSetRead => "RowSetRead",

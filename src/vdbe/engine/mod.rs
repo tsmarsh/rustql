@@ -3105,7 +3105,7 @@ impl Vdbe {
             // ================================================================
             // Function Call (placeholder)
             // ================================================================
-            Opcode::Function | Opcode::Function0 => {
+            Opcode::Function => {
                 let name = match &op.p4 {
                     P4::Text(text) => Some(text.as_str()),
                     P4::FuncDef(text) => Some(text.as_str()),
@@ -4253,20 +4253,6 @@ impl Vdbe {
                 }
             }
 
-            Opcode::SeekNull => {
-                // SeekNull P1 P2 P3 P4: Jump to P2 if any key register is NULL.
-                let count = match op.p4 {
-                    P4::Int64(v) => v as i32,
-                    _ => 1,
-                };
-                for i in 0..count.max(1) {
-                    if self.mem(op.p3 + i).is_null() {
-                        self.pc = op.p2;
-                        break;
-                    }
-                }
-            }
-
             Opcode::OpenAutoindex => {
                 self.open_cursor(op.p1, 0, true)?;
                 if let Some(cursor) = self.cursor_mut(op.p1) {
@@ -4550,42 +4536,6 @@ impl Vdbe {
                         let conn = unsafe { &*conn_ptr };
                         conn.increment_schema_generation();
                     }
-                }
-            }
-
-            Opcode::VerifyCookie => {
-                // VerifyCookie P1 P2 P3: ensure meta cookie P2 equals P3
-                // P1 = database index (0=main, 1=temp, >1=attached)
-                // P2 = cookie index to check (usually schema version)
-                // P3 = expected value
-                let db_index = op.p1 as usize;
-
-                // Get btree for the specified database
-                let btree = if db_index == 0 {
-                    self.btree.as_ref()
-                } else if let Some(conn_ptr) = self.conn_ptr {
-                    let conn = unsafe { &*conn_ptr };
-                    if db_index < conn.dbs.len() {
-                        conn.dbs[db_index].btree.as_ref()
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                let Some(btree) = btree else {
-                    return Err(Error::with_message(
-                        ErrorCode::Error,
-                        "missing btree for VerifyCookie",
-                    ));
-                };
-                let cookie = btree.get_meta(op.p2 as usize)? as i64;
-                if cookie != op.p3 as i64 {
-                    return Err(Error::with_message(
-                        ErrorCode::Schema,
-                        "database schema has changed",
-                    ));
                 }
             }
 
@@ -4875,29 +4825,6 @@ impl Vdbe {
                             self.mem_mut(op.p2).set_int(0);
                         }
                     }
-                }
-            }
-
-            Opcode::Between => {
-                // Between P1 P2 P3 P4: r[P2] = (r[P1] BETWEEN r[P3] AND r[P4])
-                let high_reg = match op.p4 {
-                    P4::Int64(v) => v as i32,
-                    _ => {
-                        self.mem_mut(op.p2).set_null();
-                        return Ok(ExecResult::Continue);
-                    }
-                };
-                let val = self.mem(op.p1);
-                let low = self.mem(op.p3);
-                let high = self.mem(high_reg);
-
-                if val.is_null() || low.is_null() || high.is_null() {
-                    self.mem_mut(op.p2).set_null();
-                } else {
-                    let below = val.compare(low) == Ordering::Less;
-                    let above = val.compare(high) == Ordering::Greater;
-                    self.mem_mut(op.p2)
-                        .set_int(if below || above { 0 } else { 1 });
                 }
             }
 
@@ -5955,7 +5882,7 @@ impl Vdbe {
                 }
             }
 
-            Opcode::Trace | Opcode::Explain | Opcode::SqlExec => {
+            Opcode::Trace | Opcode::SqlExec => {
                 // Debug/explain operations
             }
 
@@ -6088,36 +6015,6 @@ impl Vdbe {
                     let seq = cursor.seq_count;
                     cursor.seq_count = cursor.seq_count.wrapping_add(1);
                     self.mem_mut(op.p2).set_int(seq);
-                } else {
-                    self.mem_mut(op.p2).set_null();
-                }
-            }
-
-            Opcode::SortKey => {
-                // SortKey P1 P2: write sorter key into register P2
-                if let Some(cursor) = self.cursor(op.p1) {
-                    if cursor.sorter_index < cursor.sorter_data.len() {
-                        let record = &cursor.sorter_data[cursor.sorter_index];
-                        let key_cols = cursor.n_field.max(0) as usize;
-                        if key_cols == 0 {
-                            self.mem_mut(op.p2).set_null();
-                        } else {
-                            let mems = self.decode_record_mems(record);
-                            let mut key_mems = Vec::with_capacity(key_cols);
-                            for i in 0..key_cols {
-                                if let Some(mem) = mems.get(i) {
-                                    key_mems.push(mem.clone());
-                                } else {
-                                    key_mems.push(Mem::new());
-                                }
-                            }
-                            let key_record =
-                                crate::vdbe::auxdata::make_record(&key_mems, 0, key_cols as i32);
-                            self.mem_mut(op.p2).set_blob(&key_record);
-                        }
-                    } else {
-                        self.mem_mut(op.p2).set_null();
-                    }
                 } else {
                     self.mem_mut(op.p2).set_null();
                 }
@@ -6278,24 +6175,6 @@ impl Vdbe {
                     // No trigger context (not in a trigger) - return NULL
                     self.mem_mut(op.p3).set_null();
                 }
-            }
-
-            Opcode::TriggerTest => {
-                // TriggerTest P1 P2 P3
-                // Test if trigger should fire
-                // P1 = register containing rowid
-                // P2 = trigger flags (timing/event bits)
-                // P3 = jump destination if trigger should NOT fire
-                //
-                // For now, always skip (jump to P3) - triggers are disabled
-                // Note: pc was already incremented at start of exec_op, so no -1 needed
-                self.pc = op.p3;
-            }
-
-            Opcode::TriggerProlog => {
-                // TriggerProlog
-                // Marks end of trigger prolog (where OLD/NEW setup ends)
-                // This is a no-op marker used for debugging/tracing
             }
 
             Opcode::SetTriggerRow => {
@@ -7816,31 +7695,6 @@ mod tests {
     }
 
     #[test]
-    fn test_op_seeknull_jumps_on_null() {
-        let mut vdbe = Vdbe::from_ops(vec![
-            VdbeOp::new(Opcode::Null, 0, 1, 0),
-            VdbeOp {
-                opcode: Opcode::SeekNull,
-                p1: 0,
-                p2: 4,
-                p3: 1,
-                p4: P4::Int64(1),
-                p5: 0,
-                comment: None,
-            },
-            VdbeOp::new(Opcode::Integer, 0, 2, 0),
-            VdbeOp::new(Opcode::Goto, 0, 5, 0),
-            VdbeOp::new(Opcode::Integer, 1, 2, 0),
-            VdbeOp::new(Opcode::ResultRow, 2, 1, 0),
-            VdbeOp::new(Opcode::Halt, 0, 0, 0),
-        ]);
-
-        let result = vdbe.step().unwrap();
-        assert_eq!(result, ExecResult::Row);
-        assert_eq!(vdbe.column_int(0), 1);
-    }
-
-    #[test]
     fn test_op_finishseek_deferred_rowid() {
         let mut conn = open_test_connection();
         let conn_ptr = &mut *conn as *mut SqliteConnection;
@@ -8315,43 +8169,6 @@ mod tests {
     }
 
     #[test]
-    fn test_op_verifycookie_matches() {
-        let mut conn = open_test_connection();
-        let conn_ptr = &mut *conn as *mut SqliteConnection;
-        let btree = conn.main_db().btree.as_ref().unwrap().clone();
-
-        let mut vdbe = Vdbe::from_ops(vec![
-            VdbeOp {
-                opcode: Opcode::SetCookie,
-                p1: 0,
-                p2: crate::storage::btree::BTREE_USER_VERSION as i32,
-                p3: 321,
-                p4: P4::Unused,
-                p5: 0,
-                comment: None,
-            },
-            VdbeOp {
-                opcode: Opcode::VerifyCookie,
-                p1: 0,
-                p2: crate::storage::btree::BTREE_USER_VERSION as i32,
-                p3: 321,
-                p4: P4::Unused,
-                p5: 0,
-                comment: None,
-            },
-            VdbeOp::new(Opcode::Integer, 1, 1, 0),
-            VdbeOp::new(Opcode::ResultRow, 1, 1, 0),
-            VdbeOp::new(Opcode::Halt, 0, 0, 0),
-        ]);
-        vdbe.set_btree(btree);
-        vdbe.set_connection(conn_ptr);
-
-        let result = vdbe.step().unwrap();
-        assert_eq!(result, ExecResult::Row);
-        assert_eq!(vdbe.column_int(0), 1);
-    }
-
-    #[test]
     fn test_op_regexp_matches() {
         let mut vdbe = Vdbe::from_ops(vec![
             VdbeOp {
@@ -8396,49 +8213,6 @@ mod tests {
         assert_eq!(result, ExecResult::Row);
         assert_eq!(vdbe.column_int(0), 0);
         assert_eq!(vdbe.column_int(1), 1);
-    }
-
-    #[test]
-    fn test_op_sortkey_returns_key_record() {
-        let mut vdbe = Vdbe::from_ops(vec![
-            VdbeOp::new(Opcode::OpenEphemeral, 0, 1, 0),
-            VdbeOp::new(Opcode::Integer, 7, 1, 0),
-            VdbeOp::new(Opcode::MakeRecord, 1, 1, 2),
-            VdbeOp::new(Opcode::SorterInsert, 0, 2, 0),
-            VdbeOp::new(Opcode::SorterSort, 0, 8, 0),
-            VdbeOp::new(Opcode::SortKey, 0, 3, 0),
-            VdbeOp::new(Opcode::DecodeRecord, 3, 4, 1),
-            VdbeOp::new(Opcode::ResultRow, 4, 1, 0),
-            VdbeOp::new(Opcode::Halt, 0, 0, 0),
-        ]);
-
-        let result = vdbe.step().unwrap();
-        assert_eq!(result, ExecResult::Row);
-        assert_eq!(vdbe.column_int(0), 7);
-    }
-
-    #[test]
-    fn test_op_between_inclusive() {
-        let mut vdbe = Vdbe::from_ops(vec![
-            VdbeOp::new(Opcode::Integer, 5, 1, 0),
-            VdbeOp::new(Opcode::Integer, 3, 2, 0),
-            VdbeOp::new(Opcode::Integer, 7, 3, 0),
-            VdbeOp {
-                opcode: Opcode::Between,
-                p1: 1,
-                p2: 4,
-                p3: 2,
-                p4: P4::Int64(3),
-                p5: 0,
-                comment: None,
-            },
-            VdbeOp::new(Opcode::ResultRow, 4, 1, 0),
-            VdbeOp::new(Opcode::Halt, 0, 0, 0),
-        ]);
-
-        let result = vdbe.step().unwrap();
-        assert_eq!(result, ExecResult::Row);
-        assert_eq!(vdbe.column_int(0), 1);
     }
 
     #[test]
@@ -8849,61 +8623,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_verify_cookie_success() {
-        // Test VerifyCookie succeeds when cookie matches
-        let mut conn = open_test_connection();
-        let conn_ptr = &mut *conn as *mut SqliteConnection;
-        let btree = conn.main_db().btree.as_ref().unwrap().clone();
-
-        let mut vdbe = Vdbe::from_ops(vec![
-            // Read the current schema cookie
-            VdbeOp::new(Opcode::ReadCookie, 0, 1, BTREE_SCHEMA_VERSION as i32),
-            VdbeOp::new(Opcode::Halt, 0, 0, 0),
-        ]);
-
-        vdbe.set_btree(btree.clone());
-        vdbe.set_connection(conn_ptr);
-        let _ = vdbe.step().unwrap();
-        let current_cookie = vdbe.mem(1).to_int();
-
-        // Now verify with the correct value
-        let mut vdbe2 = Vdbe::from_ops(vec![
-            VdbeOp::new(
-                Opcode::VerifyCookie,
-                0,
-                BTREE_SCHEMA_VERSION as i32,
-                current_cookie as i32,
-            ),
-            VdbeOp::new(Opcode::Halt, 0, 0, 0),
-        ]);
-
-        vdbe2.set_btree(btree);
-        vdbe2.set_connection(conn_ptr);
-        let result = vdbe2.step().unwrap();
-        assert_eq!(result, ExecResult::Done);
-    }
-
-    #[test]
-    fn test_verify_cookie_mismatch() {
-        // Test VerifyCookie fails when cookie doesn't match
-        let mut conn = open_test_connection();
-        let conn_ptr = &mut *conn as *mut SqliteConnection;
-        let btree = conn.main_db().btree.as_ref().unwrap().clone();
-
-        let mut vdbe = Vdbe::from_ops(vec![
-            // VerifyCookie with wrong expected value
-            VdbeOp::new(Opcode::VerifyCookie, 0, BTREE_SCHEMA_VERSION as i32, 99999),
-            VdbeOp::new(Opcode::Halt, 0, 0, 0),
-        ]);
-
-        vdbe.set_btree(btree);
-        vdbe.set_connection(conn_ptr);
-
-        // Should fail with schema error
-        let result = vdbe.step();
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.code, ErrorCode::Schema);
-    }
 }

@@ -51,6 +51,22 @@ Multiple sub-tests in the `insert.test` TCL suite are failing due to incorrect o
 
 ## Progress Notes
 
+### 2025-01-29: Session 3
+- **Tests passing: 73/83 (87.9%)**
+- **Fixed issues:**
+  - UNIQUE constraint checking order: now checks later columns first (like SQLite)
+    - Fixed by sorting indexes by first column index descending in open_indexes_for_write
+    - Fixes insert-17.3 (now reports "t1.c" instead of "t1.b")
+  - AFTER DELETE triggers during REPLACE: triggers now fire for conflict-deleted rows
+    - Added before_delete_triggers and after_delete_triggers to UpdateCompiler
+    - Fires DELETE triggers in emit_unique_constraint_check during REPLACE handling
+    - Fixes insert-17.6 and insert-17.8
+
+- **Remaining failures (10 tests):**
+  - insert-5.5, insert-13.1, insert-15.1: Other issues (not insert-16/17 tests)
+  - insert-17.1: Rowid pre-computation before triggers (complex SQLite behavior)
+  - insert-17.10-17.15: Partial indexes and complex REPLACE scenarios
+
 ### 2025-01-28: Session 2
 - **Tests passing: 71/83 (85.5%)**
 - **Fixed issues:**

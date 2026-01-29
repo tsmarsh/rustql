@@ -2011,29 +2011,22 @@ impl<'a> InsertCompiler<'a> {
     }
 
     /// Open indexes for write access
+    /// SQLite checks UNIQUE constraints in reverse column order (later columns first)
     fn open_indexes_for_write(&mut self, table_name: &str) -> Result<()> {
         // Get indexes from schema
         if let Some(schema) = self.schema {
             let table_name_lower = table_name.to_lowercase();
 
+            // Collect all indexes for this table with their first column position
+            // (name, columns, first_col_idx)
+            let mut all_indexes: Vec<(String, Vec<i32>, i32)> = Vec::new();
+
             // First check schema.indexes for indexes on this table
             for (_name, idx) in schema.indexes.iter() {
                 if idx.table.eq_ignore_ascii_case(&table_name_lower) {
-                    let cursor = self.alloc_cursor();
-                    self.emit(
-                        Opcode::OpenWrite,
-                        cursor,
-                        0, // Root page comes from schema lookup at runtime
-                        0,
-                        P4::Text(idx.name.clone()),
-                    );
-
                     let columns: Vec<i32> = idx.columns.iter().map(|c| c.column_idx).collect();
-                    self.index_cursors.push(IndexCursor {
-                        cursor,
-                        columns,
-                        name: idx.name.clone(),
-                    });
+                    let first_col = columns.first().copied().unwrap_or(0);
+                    all_indexes.push((idx.name.clone(), columns, first_col));
                 }
             }
 
@@ -2041,24 +2034,33 @@ impl<'a> InsertCompiler<'a> {
             if let Some(table) = schema.tables.get(&table_name_lower) {
                 for idx in &table.indexes {
                     // Skip if already added
-                    if self
-                        .index_cursors
+                    if all_indexes
                         .iter()
-                        .any(|ic| ic.name.eq_ignore_ascii_case(&idx.name))
+                        .any(|(name, _, _)| name.eq_ignore_ascii_case(&idx.name))
                     {
                         continue;
                     }
 
-                    let cursor = self.alloc_cursor();
-                    self.emit(Opcode::OpenWrite, cursor, 0, 0, P4::Text(idx.name.clone()));
-
                     let columns: Vec<i32> = idx.columns.iter().map(|c| c.column_idx).collect();
-                    self.index_cursors.push(IndexCursor {
-                        cursor,
-                        columns,
-                        name: idx.name.clone(),
-                    });
+                    let first_col = columns.first().copied().unwrap_or(0);
+                    all_indexes.push((idx.name.clone(), columns, first_col));
                 }
+            }
+
+            // Sort by first column index DESCENDING (later columns first)
+            // This ensures SQLite-compatible constraint checking order
+            all_indexes.sort_by(|a, b| b.2.cmp(&a.2));
+
+            // Now emit the open operations in sorted order
+            for (name, columns, _) in all_indexes {
+                let cursor = self.alloc_cursor();
+                self.emit(Opcode::OpenWrite, cursor, 0, 0, P4::Text(name.clone()));
+
+                self.index_cursors.push(IndexCursor {
+                    cursor,
+                    columns,
+                    name,
+                });
             }
         }
         Ok(())

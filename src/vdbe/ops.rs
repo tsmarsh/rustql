@@ -143,9 +143,6 @@ pub enum Opcode {
     /// P2 = P1 || P3 (string concatenation)
     Concat,
 
-    /// P2 = -P1 (negate)
-    Negative,
-
     /// P2 = NOT P1 (boolean not)
     Not,
 
@@ -879,7 +876,6 @@ impl Opcode {
             Opcode::Divide => "Divide",
             Opcode::Remainder => "Remainder",
             Opcode::Concat => "Concat",
-            Opcode::Negative => "Negative",
             Opcode::Not => "Not",
             Opcode::BitNot => "BitNot",
             Opcode::BitAnd => "BitAnd",

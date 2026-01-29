@@ -489,18 +489,25 @@ impl ExprCompiler {
     fn compile_unary_expr(&mut self, op: &UnaryOp, operand: &Expr, target: i32) -> Result<()> {
         let r = self.compile_expr(operand)?;
 
-        let opcode = match op {
-            UnaryOp::Neg => Opcode::Negative,
-            UnaryOp::Not => Opcode::Not,
-            UnaryOp::BitNot => Opcode::BitNot,
+        match op {
+            UnaryOp::Neg => {
+                // SQLite handles negation as: 0 - value (using Subtract)
+                // Subtract P1 P2 P3: r[P3] = r[P2] - r[P1]
+                let zero_reg = self.alloc_reg();
+                self.add_op(Opcode::Integer, 0, zero_reg, 0);
+                self.add_op(Opcode::Subtract, r, zero_reg, target);
+            }
+            UnaryOp::Not => {
+                self.add_op(Opcode::Not, r, target, 0);
+            }
+            UnaryOp::BitNot => {
+                self.add_op(Opcode::BitNot, r, target, 0);
+            }
             UnaryOp::Plus => {
                 // Unary plus is a no-op, just copy
                 self.add_op(Opcode::Copy, r, target, 0);
-                return Ok(());
             }
-        };
-
-        self.add_op(opcode, r, target, 0);
+        }
         Ok(())
     }
 
@@ -873,9 +880,12 @@ mod tests {
         compiler.compile_expr(&expr).unwrap();
         let ops = compiler.take_ops();
 
-        assert_eq!(ops.len(), 2);
-        assert_eq!(ops[0].opcode, Opcode::Integer);
-        assert_eq!(ops[1].opcode, Opcode::Negative);
+        // SQLite-compatible: 0 - value using Subtract
+        // ops: Integer(42), Integer(0), Subtract
+        assert_eq!(ops.len(), 3);
+        assert_eq!(ops[0].opcode, Opcode::Integer); // operand (42)
+        assert_eq!(ops[1].opcode, Opcode::Integer); // zero
+        assert_eq!(ops[2].opcode, Opcode::Subtract);
     }
 
     #[test]

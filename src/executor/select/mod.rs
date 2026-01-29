@@ -5520,7 +5520,10 @@ impl<'s> SelectCompiler<'s> {
                 self.compile_expr(inner, dest_reg)?;
                 match op {
                     crate::parser::ast::UnaryOp::Neg => {
-                        self.emit(Opcode::Negative, dest_reg, dest_reg, 0, P4::Unused);
+                        // SQLite: 0 - value using Subtract
+                        let zero_reg = self.alloc_reg();
+                        self.emit(Opcode::Integer, 0, zero_reg, 0, P4::Unused);
+                        self.emit(Opcode::Subtract, dest_reg, zero_reg, dest_reg, P4::Unused);
                     }
                     crate::parser::ast::UnaryOp::Pos => {
                         // No-op

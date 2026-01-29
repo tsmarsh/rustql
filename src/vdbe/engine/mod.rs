@@ -1393,12 +1393,6 @@ impl Vdbe {
                 self.set_mem(op.p3, result);
             }
 
-            Opcode::Negative => {
-                let mut result = self.mem(op.p1).clone();
-                result.negate()?;
-                self.set_mem(op.p2, result);
-            }
-
             Opcode::Not => {
                 let mut result = self.mem(op.p1).clone();
                 result.logical_not();

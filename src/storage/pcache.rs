@@ -148,6 +148,8 @@ impl PCache {
                 return;
             }
             page_ref.flags.remove(PgFlags::DIRTY);
+            // Also remove WRITEABLE - page must be re-journaled in next transaction
+            page_ref.flags.remove(PgFlags::WRITEABLE);
         }
         self.manage_dirty_list(page, DirtyListOp::Remove);
         self.cache.make_clean(page);

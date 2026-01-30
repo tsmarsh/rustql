@@ -786,6 +786,8 @@ impl Pager {
                 } else {
                     // Existing page - copy from cache
                     page.data.copy_from_slice(&cache_page_ref.data);
+                    // Copy flags from cache so WRITEABLE is preserved across get() calls
+                    page.flags = cache_page_ref.flags;
                     self.n_hit += 1;
                 }
             }
@@ -875,8 +877,12 @@ impl Pager {
             page.flags.insert(PgFlags::DIRTY);
         }
 
-        if let Some(cache_page) = self.pcache.fetch(page.pgno, false) {
+        if let Some(mut cache_page) = self.pcache.fetch(page.pgno, false) {
             self.pcache.make_dirty(cache_page);
+            // Also update the cache page's WRITEABLE flag to match
+            unsafe {
+                cache_page.as_mut().flags.insert(PgFlags::WRITEABLE);
+            }
         }
 
         Ok(())

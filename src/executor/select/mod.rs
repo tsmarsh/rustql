@@ -536,6 +536,20 @@ impl<'s> SelectCompiler<'s> {
         // Adjust jump addresses by the current offset
         // Mark inlined jump ops so resolve_labels doesn't reprocess them
         let offset = self.ops.len() as i32;
+
+        // Count how many leading instructions we skip (typically just Init at addr 0)
+        // This is needed because jump targets in the subcompiler are absolute addresses
+        // that include Init, but we're not inlining Init.
+        let skipped_prefix = subquery_ops
+            .iter()
+            .take_while(|op| {
+                op.opcode == Opcode::Init
+                    || op.opcode == Opcode::Transaction
+                    || op.opcode == Opcode::Goto
+                    || op.opcode == Opcode::Halt
+            })
+            .count() as i32;
+
         for mut op in subquery_ops {
             // Skip the Init/Halt/Transaction/Goto control flow wrapper
             // These are added by compile() but shouldn't be inlined
@@ -546,9 +560,9 @@ impl<'s> SelectCompiler<'s> {
             {
                 // Adjust P2 for jump instructions
                 // The subcompiler already resolved labels, so P2 contains actual addresses
-                // We need to adjust by offset and mark as resolved
+                // We need to adjust by offset and subtract skipped prefix count
                 if op.opcode.is_jump() {
-                    op.p2 += offset;
+                    op.p2 = op.p2 - skipped_prefix + offset;
                     // Use P5 = 0xFFFF to mark as already resolved so resolve_labels skips it
                     op.p5 = 0xFFFF;
                 }

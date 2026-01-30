@@ -1,0 +1,1 @@
+Ensure compiler emits SQLite-equivalent opcode sequences. Add a comparison harness that runs a query corpus and diffs opcode streams (SQLite EXPLAIN vs RustQL VDBE), with documented normalization rules for acceptable differences. Define pass criteria and integrate into tests/ or scripts/.

@@ -252,9 +252,8 @@ See `AGENTS.md` for the required workflow steps before starting any implementati
 
 ### Pre-commit Hook
 
-RustQL uses a Git pre-commit hook to enforce formatting, clippy, and tests
-before each commit. It also kicks off the SQLite compatibility test in the
-background and writes results to `.compat-test-results.log`.
+RustQL uses a Git pre-commit hook to enforce formatting, clippy, and unit tests
+before each commit.
 
 Install the hook:
 

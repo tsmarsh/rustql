@@ -815,16 +815,22 @@ impl<'a> InsertCompiler<'a> {
         // Get the cursor offset for adjusting SelectCompiler's cursor numbers
         let cursor_offset = self.next_cursor;
 
-        // Filter out Init and Halt from the subquery ops and inline them
+        // Filter out Init/Halt/Transaction/Goto control flow wrapper from the subquery ops and inline them
         // Adjust jump addresses and cursor numbers
         let base_addr = self.ops.len() as i32;
         for mut op in sub_ops {
-            if op.opcode == Opcode::Init || op.opcode == Opcode::Halt {
+            if op.opcode == Opcode::Init
+                || op.opcode == Opcode::Halt
+                || op.opcode == Opcode::Transaction
+                || op.opcode == Opcode::Goto
+            {
                 continue;
             }
             // Adjust jump addresses
+            // Since we remove Init (at address 0), all internal addresses are shifted by 1
+            // So we need to adjust by (base_addr - 1) to account for this
             if op.opcode.is_jump() && op.p2 > 0 {
-                op.p2 += base_addr;
+                op.p2 += base_addr - 1;
             }
             // Adjust cursor numbers - p1 is usually the cursor for table operations
             // But we need to be careful: eph_cursor should NOT be adjusted since we
@@ -1652,16 +1658,22 @@ impl<'a> InsertCompiler<'a> {
         let cursor_offset = self.next_cursor;
         let base_addr = self.ops.len() as i32;
 
-        // Inline the compiled ops, excluding Init/Halt
+        // Inline the compiled ops, excluding Init/Halt/Transaction/Goto control flow wrapper
         // We need to offset both cursors AND registers (except dest_reg which is already correct)
         for mut op in sub_ops {
-            if op.opcode == Opcode::Init || op.opcode == Opcode::Halt {
+            if op.opcode == Opcode::Init
+                || op.opcode == Opcode::Halt
+                || op.opcode == Opcode::Transaction
+                || op.opcode == Opcode::Goto
+            {
                 continue;
             }
 
             // Adjust jump addresses
+            // Since we remove Init (at address 0), all internal addresses are shifted by 1
+            // So we need to adjust by (base_addr - 1) to account for this
             if op.opcode.is_jump() && op.p2 > 0 {
-                op.p2 += base_addr;
+                op.p2 += base_addr - 1;
             }
 
             // Adjust cursor numbers for table operations

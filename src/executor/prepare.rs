@@ -952,14 +952,14 @@ impl<'s> StatementCompiler<'s> {
                             P4::Text(index_sql.clone()),
                         ));
 
-                        // Insert into sqlite_master
+                        // Insert into sqlite_master (auto-index has NULL SQL)
                         self.append_sqlite_master_insert_index(
                             &mut ops,
                             cursor_id,
                             &index_name,
                             &create.name.name,
                             reg_index_page,
-                            &index_sql,
+                            None, // Auto-indexes have NULL SQL field
                         );
                     }
                 }
@@ -1009,14 +1009,14 @@ impl<'s> StatementCompiler<'s> {
                         P4::Text(index_sql.clone()),
                     ));
 
-                    // Insert into sqlite_master
+                    // Insert into sqlite_master (auto-index has NULL SQL)
                     self.append_sqlite_master_insert_index(
                         &mut ops,
                         cursor_id,
                         &index_name,
                         &create.name.name,
                         reg_index_page,
-                        &index_sql,
+                        None, // Auto-indexes have NULL SQL field
                     );
                 }
             }
@@ -1669,13 +1669,15 @@ impl<'s> StatementCompiler<'s> {
         reg_root_page: i32,
         create_sql: &str,
     ) {
-        let reg_type = 2;
-        let reg_name = 3;
-        let reg_tbl = 4;
-        let reg_root = 5;
-        let reg_sql = 6;
-        let reg_record = 7;
-        let reg_rowid = 8;
+        // Use high register numbers to avoid conflicts with caller's registers
+        // (e.g., reg_root_page=1, reg_index_page=2 in compile_create_table)
+        let reg_type = 20;
+        let reg_name = 21;
+        let reg_tbl = 22;
+        let reg_root = 23;
+        let reg_sql = 24;
+        let reg_record = 25;
+        let reg_rowid = 26;
         ops.push(Self::make_op(
             Opcode::String8,
             0,
@@ -1863,8 +1865,13 @@ impl<'s> StatementCompiler<'s> {
             let reg_col_base = 10;
             let reg_rowid = reg_col_base + num_key_cols as i32;
             let reg_record = reg_rowid + 1;
-            let loop_start = ops.len() as i32 + 1;
-            let loop_end_label = ops.len() as i32 + 10 + (num_key_cols * 2) as i32;
+
+            // Calculate after_loop: where to jump if table is empty
+            // Opcodes in the loop section:
+            //   OpenRead(1) + OpenWrite(1) + Rewind(1) + Column*n(n) +
+            //   Rowid(1) + MakeRecord(1) + IdxInsert(1) + Next(1) + Close(1) + Close(1)
+            // = 9 + num_key_cols
+            let after_loop = ops.len() as i32 + 9 + num_key_cols as i32;
 
             // OpenRead table cursor
             ops.push(Self::make_op(
@@ -1885,8 +1892,7 @@ impl<'s> StatementCompiler<'s> {
                 0x02, // P2 is register
             ));
 
-            // Rewind table cursor
-            let after_loop = loop_end_label + 2;
+            // Rewind table cursor - jump to after_loop if table is empty
             ops.push(Self::make_op(
                 Opcode::Rewind,
                 table_cursor,
@@ -1949,7 +1955,7 @@ impl<'s> StatementCompiler<'s> {
             ops.push(Self::make_op(Opcode::Close, table_cursor, 0, 0, P4::Unused));
         }
 
-        // Insert into sqlite_master
+        // Insert into sqlite_master (explicit CREATE INDEX has SQL)
         let cursor_id = 0;
         self.append_sqlite_master_open(&mut ops, cursor_id);
         self.append_sqlite_master_insert_index(
@@ -1958,7 +1964,7 @@ impl<'s> StatementCompiler<'s> {
             index_name,
             table_name,
             reg_root_page,
-            &sql,
+            Some(&sql), // Explicit indexes have their CREATE INDEX SQL
         );
         self.append_sqlite_master_close(&mut ops, cursor_id);
 
@@ -1968,6 +1974,7 @@ impl<'s> StatementCompiler<'s> {
     }
 
     /// Insert an index entry into sqlite_master
+    /// If `create_sql` is None, this is an auto-index and SQL field should be NULL
     fn append_sqlite_master_insert_index(
         &self,
         ops: &mut Vec<VdbeOp>,
@@ -1975,15 +1982,17 @@ impl<'s> StatementCompiler<'s> {
         index_name: &str,
         table_name: &str,
         reg_root_page: i32,
-        create_sql: &str,
+        create_sql: Option<&str>,
     ) {
-        let reg_type = 2;
-        let reg_name = 3;
-        let reg_tbl = 4;
-        let reg_root = 5;
-        let reg_sql = 6;
-        let reg_record = 7;
-        let reg_rowid = 8;
+        // Use high register numbers to avoid conflicts with caller's registers
+        // (e.g., reg_root_page=1, reg_index_page=2 in compile_create_table)
+        let reg_type = 20;
+        let reg_name = 21;
+        let reg_tbl = 22;
+        let reg_root = 23;
+        let reg_sql = 24;
+        let reg_record = 25;
+        let reg_rowid = 26;
 
         // type = 'index'
         ops.push(Self::make_op(
@@ -2017,14 +2026,19 @@ impl<'s> StatementCompiler<'s> {
             0,
             P4::Unused,
         ));
-        // sql = CREATE INDEX statement
-        ops.push(Self::make_op(
-            Opcode::String8,
-            0,
-            reg_sql,
-            0,
-            P4::Text(create_sql.to_string()),
-        ));
+        // sql = CREATE INDEX statement (or NULL for auto-indexes)
+        if let Some(sql) = create_sql {
+            ops.push(Self::make_op(
+                Opcode::String8,
+                0,
+                reg_sql,
+                0,
+                P4::Text(sql.to_string()),
+            ));
+        } else {
+            // Auto-indexes have NULL SQL field
+            ops.push(Self::make_op(Opcode::Null, 0, reg_sql, 0, P4::Unused));
+        }
         // Make record from columns
         ops.push(Self::make_op(
             Opcode::MakeRecord,
@@ -2089,13 +2103,14 @@ impl<'s> StatementCompiler<'s> {
     ) {
         // sqlite_master columns: type, name, tbl_name, rootpage, sql
         // Views have type='view', tbl_name=view_name, rootpage=0
-        let reg_type = 2;
-        let reg_name = 3;
-        let reg_tbl_name = 4;
-        let reg_rootpage = 5;
-        let reg_sql = 6;
-        let reg_record = 7;
-        let reg_rowid = 8;
+        // Use high register numbers to avoid conflicts with caller's registers
+        let reg_type = 20;
+        let reg_name = 21;
+        let reg_tbl_name = 22;
+        let reg_rootpage = 23;
+        let reg_sql = 24;
+        let reg_record = 25;
+        let reg_rowid = 26;
 
         // type = 'view'
         ops.push(Self::make_op(

@@ -1934,6 +1934,35 @@ impl Vdbe {
                 self.close_cursor(op.p1)?;
             }
 
+            Opcode::Count => {
+                // Count the number of rows in the table/index opened on cursor P1
+                // Store the result in register P2
+                let count = if let Some(cursor) = self.cursor_mut(op.p1) {
+                    if cursor.is_ephemeral {
+                        cursor.ephemeral_rows.len() as i64
+                    } else if cursor.is_sqlite_master {
+                        cursor
+                            .schema_entries
+                            .as_ref()
+                            .map(|e| e.len() as i64)
+                            .unwrap_or(0)
+                    } else if cursor.is_sqlite_stat1 {
+                        cursor
+                            .stat1_entries
+                            .as_ref()
+                            .map(|e| e.len() as i64)
+                            .unwrap_or(0)
+                    } else if let Some(ref mut btree_cursor) = cursor.btree_cursor {
+                        btree_cursor.count()?
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+                self.set_mem(op.p2, Mem::from_int(count));
+            }
+
             Opcode::Rewind => {
                 // Move cursor to first row, jump to P2 if empty
                 let mut is_empty = true;

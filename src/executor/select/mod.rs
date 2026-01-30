@@ -264,6 +264,11 @@ impl<'s> SelectCompiler<'s> {
 
     /// Compile a SELECT statement
     pub fn compile(&mut self, select: &SelectStmt, dest: &SelectDest) -> Result<Vec<VdbeOp>> {
+        // Emit Init opcode at address 0 - will jump to Goto at the end
+        // SQLite pattern: Init jumps past main code to setup section
+        let init_label = self.alloc_label();
+        self.emit(Opcode::Init, 0, init_label, 0, P4::Unused);
+
         // Handle WITH clause (CTEs)
         if let Some(with) = &select.with {
             self.process_with_clause(with)?;
@@ -390,6 +395,20 @@ impl<'s> SelectCompiler<'s> {
         // Add Halt opcode
         self.emit(Opcode::Halt, 0, 0, 0, P4::Unused);
 
+        // Add initialization section (SQLite pattern: after Halt, before Goto)
+        // Init's label points here
+        self.resolve_label(init_label, self.current_addr());
+
+        // Emit Transaction opcode only if the query accesses tables
+        // (next_cursor > 0 means cursors were allocated for tables)
+        if self.next_cursor > 0 {
+            self.emit(Opcode::Transaction, 0, 0, 0, P4::Unused);
+        }
+
+        // Goto jumps back to address 1 (first instruction after Init)
+        // Mark with p5=0xFFFF to skip label resolution (1 is a literal address, not a label)
+        self.emit_with_p5(Opcode::Goto, 0, 1, 0, P4::Unused, 0xFFFF);
+
         // Resolve all labels
         self.resolve_labels()?;
 
@@ -513,12 +532,18 @@ impl<'s> SelectCompiler<'s> {
         // Capture subquery result column names for * expansion
         let subquery_col_names = subcompiler.result_column_names.clone();
 
-        // Inline the subquery ops (skip Halt)
+        // Inline the subquery ops (skip Init, Halt, Transaction, Goto wrapper)
         // Adjust jump addresses by the current offset
         // Mark inlined jump ops so resolve_labels doesn't reprocess them
         let offset = self.ops.len() as i32;
         for mut op in subquery_ops {
-            if op.opcode != Opcode::Halt {
+            // Skip the Init/Halt/Transaction/Goto control flow wrapper
+            // These are added by compile() but shouldn't be inlined
+            if op.opcode != Opcode::Halt
+                && op.opcode != Opcode::Init
+                && op.opcode != Opcode::Transaction
+                && op.opcode != Opcode::Goto
+            {
                 // Adjust P2 for jump instructions
                 // The subcompiler already resolved labels, so P2 contains actual addresses
                 // We need to adjust by offset and mark as resolved
@@ -683,9 +708,13 @@ impl<'s> SelectCompiler<'s> {
 
         let offset = self.ops.len() as i32;
         for mut op in recursive_ops {
-            // Filter out Init and Halt - they're control flow for standalone queries,
+            // Filter out Init/Halt/Transaction/Goto - they're control flow for standalone queries,
             // not needed when inlining into the recursive loop
-            if op.opcode != Opcode::Halt && op.opcode != Opcode::Init {
+            if op.opcode != Opcode::Halt
+                && op.opcode != Opcode::Init
+                && op.opcode != Opcode::Transaction
+                && op.opcode != Opcode::Goto
+            {
                 if op.opcode.is_jump() {
                     op.p2 += offset;
                     op.p5 = 0xFFFF;
@@ -1850,22 +1879,11 @@ impl<'s> SelectCompiler<'s> {
             }
         }
 
-        // Close cursors (including index cursors)
-        for (i, cursor) in table_cursors.iter().enumerate() {
-            // Close index cursor first if we used an index scan
-            let (is_index_scan, index_cursor, _, _, _) = scan_info
-                .get(i)
-                .copied()
-                .unwrap_or((false, None, 0, 0, false));
-            if is_index_scan {
-                if let Some(idx_cursor) = index_cursor {
-                    self.emit(Opcode::Close, idx_cursor, 0, 0, P4::Unused);
-                }
-            }
-            // Close table cursor
-            self.emit(Opcode::Close, *cursor, 0, 0, P4::Unused);
-        }
+        // Note: SQLite does NOT emit Close for table/index cursors in SELECT queries
+        // Cursors are implicitly closed when the statement ends (after Halt)
+        // Only emit Close for ephemeral cursors used in compound queries
 
+        // Close distinct cursor if used (ephemeral table)
         if let Some(cursor) = distinct_cursor {
             self.emit(Opcode::Close, cursor, 0, 0, P4::Unused);
         }
@@ -2112,6 +2130,13 @@ impl<'s> SelectCompiler<'s> {
 
     /// Compile SELECT with aggregates but no GROUP BY
     fn compile_simple_aggregate(&mut self, core: &SelectCore, dest: &SelectDest) -> Result<()> {
+        // Optimization: Use Count opcode for simple COUNT(*) queries
+        // This matches SQLite's behavior of using the Count opcode instead of
+        // iterating through all rows when counting without a WHERE clause
+        if self.try_compile_count_star(core, dest)? {
+            return Ok(());
+        }
+
         // Initialize aggregate accumulators
         let agg_regs = self.init_aggregates(&core.columns)?;
 
@@ -2170,6 +2195,93 @@ impl<'s> SelectCompiler<'s> {
         }
 
         Ok(())
+    }
+
+    /// Try to compile using the Count opcode optimization
+    /// Returns true if the optimization was applied, false otherwise
+    fn try_compile_count_star(&mut self, core: &SelectCore, dest: &SelectDest) -> Result<bool> {
+        // Check conditions for Count opcode optimization:
+        // 1. No WHERE clause
+        // 2. Single table (no joins)
+        // 3. Result is just COUNT(*) (no other columns)
+        // 4. No DISTINCT
+
+        // Must have no WHERE clause
+        if core.where_clause.is_some() {
+            return Ok(false);
+        }
+
+        // Must not be DISTINCT
+        if core.distinct == Distinct::Distinct {
+            return Ok(false);
+        }
+
+        // Get the local tables (excluding outer scope)
+        let local_tables: Vec<_> = self
+            .tables
+            .iter()
+            .skip(self.outer_tables_boundary)
+            .collect();
+
+        // Must have exactly one table
+        if local_tables.len() != 1 {
+            return Ok(false);
+        }
+
+        // Check if all result columns are COUNT(*)
+        // Allow COUNT(*) or COUNT() with no arguments
+        let mut is_pure_count_star = true;
+        for col in &core.columns {
+            match col {
+                ResultColumn::Expr { expr, .. } => {
+                    if !self.is_count_star(expr) {
+                        is_pure_count_star = false;
+                        break;
+                    }
+                }
+                _ => {
+                    is_pure_count_star = false;
+                    break;
+                }
+            }
+        }
+
+        if !is_pure_count_star {
+            return Ok(false);
+        }
+
+        // Optimization applies! Use Count opcode
+        let cursor = local_tables[0].cursor;
+        let count_reg = self.alloc_reg();
+        let result_reg = self.alloc_reg();
+
+        // Count opcode: P1 = cursor, P2 = destination register
+        self.emit(Opcode::Count, cursor, count_reg, 0, P4::Unused);
+
+        // Close the cursor
+        self.emit(Opcode::Close, cursor, 0, 0, P4::Unused);
+
+        // Copy to result register (matches SQLite's pattern)
+        self.emit(Opcode::Copy, count_reg, result_reg, 0, P4::Unused);
+
+        // Output the result
+        self.output_row(dest, result_reg, 1)?;
+
+        Ok(true)
+    }
+
+    /// Check if an expression is COUNT(*) or COUNT()
+    fn is_count_star(&self, expr: &Expr) -> bool {
+        if let Expr::Function(func_call) = expr {
+            let name_upper = func_call.name.to_uppercase();
+            if name_upper == "COUNT" {
+                match &func_call.args {
+                    crate::parser::ast::FunctionArgs::Star => return true,
+                    crate::parser::ast::FunctionArgs::Exprs(exprs) => return exprs.is_empty(),
+                }
+            }
+        }
+        false
     }
 
     /// Compile SELECT with GROUP BY
@@ -4146,9 +4258,13 @@ impl<'s> SelectCompiler<'s> {
                         // Capture view's result column names for * expansion
                         let subquery_col_names = subcompiler.result_column_names.clone();
 
-                        // Inline the subquery ops
+                        // Inline the subquery ops (skip Init/Halt/Transaction/Goto wrapper)
                         for op in subquery_ops {
-                            if op.opcode != Opcode::Halt {
+                            if op.opcode != Opcode::Halt
+                                && op.opcode != Opcode::Init
+                                && op.opcode != Opcode::Transaction
+                                && op.opcode != Opcode::Goto
+                            {
                                 self.ops.push(op);
                             }
                         }
@@ -4216,9 +4332,13 @@ impl<'s> SelectCompiler<'s> {
                 // Capture subquery result column names for * expansion
                 let subquery_col_names = subcompiler.result_column_names.clone();
 
-                // Inline the subquery ops
+                // Inline the subquery ops (skip Init/Halt/Transaction/Goto wrapper)
                 for op in subquery_ops {
-                    if op.opcode != Opcode::Halt {
+                    if op.opcode != Opcode::Halt
+                        && op.opcode != Opcode::Init
+                        && op.opcode != Opcode::Transaction
+                        && op.opcode != Opcode::Goto
+                    {
                         self.ops.push(op);
                     }
                 }

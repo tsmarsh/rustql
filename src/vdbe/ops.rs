@@ -654,7 +654,8 @@ impl Opcode {
     pub fn is_jump(&self) -> bool {
         matches!(
             self,
-            Opcode::Goto
+            Opcode::Init
+                | Opcode::Goto
                 | Opcode::Jump
                 | Opcode::If
                 | Opcode::IfNot

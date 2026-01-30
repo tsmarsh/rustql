@@ -3,26 +3,34 @@
 //! This module compares the opcode sequences emitted by RustQL's compiler
 //! against SQLite's EXPLAIN output to ensure semantic equivalence.
 //!
-//! # Normalization Rules
+//! # Philosophy
+//!
+//! RustQL aims for **semantic equivalence** with SQLite, not bytecode identity.
+//! SQLite's VM uses C-style optimizations (register reuse, shared mutable state)
+//! that don't fit Rust idioms. RustQL prefers explicit, readable code over
+//! micro-optimizations that complicate reasoning about correctness.
+//!
+//! # Acceptable Differences
 //!
 //! The following differences are considered acceptable:
 //!
-//! 1. **Address values (p2)**: Jump targets may differ due to different
+//! 1. **Constant loading location**: SQLite loads literals in the init section
+//!    and reuses registers for duplicate constants. RustQL loads constants
+//!    inline where needed - more explicit, easier to reason about.
+//!
+//! 2. **Address values (p2)**: Jump targets may differ due to different
 //!    instruction ordering, but the control flow structure should match.
 //!
-//! 2. **Register allocation (p1, p3)**: RustQL may use different register
+//! 3. **Register allocation (p1, p3)**: RustQL may use different register
 //!    numbers than SQLite, but the data flow should be equivalent.
 //!
-//! 3. **Trace opcode**: SQLite includes Trace opcodes for debugging which
+//! 4. **Trace opcode**: SQLite includes Trace opcodes for debugging which
 //!    RustQL omits in normal compilation.
 //!
-//! 4. **Explain opcode**: Present in EXPLAIN output but not executed.
+//! 5. **Explain opcode**: Present in EXPLAIN output but not executed.
 //!
-//! 5. **AggStep vs AggStep1**: SQLite uses AggStep1 for single-argument
+//! 6. **AggStep vs AggStep1**: SQLite uses AggStep1 for single-argument
 //!    aggregates; RustQL may use AggStep with appropriate flags.
-//!
-//! 6. **Init jump target**: The Init opcode's jump target (p2) varies based
-//!    on the total instruction count.
 //!
 //! # Pass Criteria
 //!
@@ -30,9 +38,9 @@
 //! - The normalized opcode sequence matches, OR
 //! - The opcodes are semantically equivalent (same operations in same order)
 //!
-//! # Known Differences
+//! # Known Intentional Differences
 //!
-//! Document any intentional differences here:
+//! - Constant loading: RustQL loads inline, SQLite loads in init section
 //! - RustQL includes `AggStep0` for aggregate initialization
 //! - RustQL includes `MaxOpcode` and `Unused` as sentinel values
 
@@ -87,24 +95,9 @@ fn extract_sqlite_opcodes(sql: &str, db_path: &str) -> Vec<String> {
 }
 
 /// Normalize opcode name for comparison
+/// All differences from SQLite are bugs - no normalization applied
 fn normalize_opcode(opcode: &str) -> &str {
-    match opcode {
-        // Trace is debug-only
-        "Trace" => "",
-        // Explain is meta-opcode
-        "Explain" => "",
-        // AggStep1 is equivalent to AggStep for single-arg
-        "AggStep1" => "AggStep",
-        // Init and Goto are control flow that RustQL handles differently
-        // RustQL starts execution directly at the first instruction
-        "Init" => "",
-        "Goto" => "",
-        // Transaction is SQLite's read-lock opcode, handled implicitly by RustQL
-        "Transaction" => "",
-        // Close is cursor cleanup, may be placed differently or implicitly handled
-        "Close" => "",
-        _ => opcode,
-    }
+    opcode
 }
 
 /// Normalize opcode sequence for comparison

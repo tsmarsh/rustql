@@ -1139,15 +1139,20 @@ impl<'s> DeleteCompiler<'s> {
                 let cursor_offset = self.next_cursor;
                 let base_addr = self.ops.len() as i32;
 
-                // Inline the compiled ops, excluding Init/Halt
+                // Inline the compiled ops, excluding Init/Halt/Transaction/Goto control flow wrapper
                 for mut op in sub_ops {
-                    if op.opcode == Opcode::Init || op.opcode == Opcode::Halt {
+                    if op.opcode == Opcode::Init
+                        || op.opcode == Opcode::Halt
+                        || op.opcode == Opcode::Transaction
+                        || op.opcode == Opcode::Goto
+                    {
                         continue;
                     }
 
                     // Adjust jump addresses
+                    // Since we remove Init (at address 0), all internal addresses are shifted by 1
                     if op.opcode.is_jump() && op.p2 > 0 {
-                        op.p2 += base_addr;
+                        op.p2 += base_addr - 1;
                     }
 
                     // Adjust cursor numbers for table operations
@@ -1230,15 +1235,20 @@ impl<'s> DeleteCompiler<'s> {
                 let cursor_offset = self.next_cursor;
                 let base_addr = self.ops.len() as i32;
 
-                // Inline the compiled ops, excluding Init/Halt
+                // Inline the compiled ops, excluding Init/Halt/Transaction/Goto control flow wrapper
                 for mut op in sub_ops {
-                    if op.opcode == Opcode::Init || op.opcode == Opcode::Halt {
+                    if op.opcode == Opcode::Init
+                        || op.opcode == Opcode::Halt
+                        || op.opcode == Opcode::Transaction
+                        || op.opcode == Opcode::Goto
+                    {
                         continue;
                     }
 
                     // Adjust jump addresses
+                    // Since we remove Init (at address 0), all internal addresses are shifted by 1
                     if op.opcode.is_jump() && op.p2 > 0 {
-                        op.p2 += base_addr;
+                        op.p2 += base_addr - 1;
                     }
 
                     // Adjust cursor numbers for table operations
@@ -1376,16 +1386,21 @@ impl<'s> DeleteCompiler<'s> {
                         let sub_dest = SelectDest::EphemTable { cursor: 0 };
                         let sub_ops = sub_compiler.compile(subquery, &sub_dest)?;
 
-                        // Inline the compiled ops, excluding Init/Halt
+                        // Inline the compiled ops, excluding Init/Halt/Transaction/Goto control flow wrapper
                         let base_addr = self.ops.len() as i32;
                         for mut op in sub_ops {
-                            if op.opcode == Opcode::Init || op.opcode == Opcode::Halt {
+                            if op.opcode == Opcode::Init
+                                || op.opcode == Opcode::Halt
+                                || op.opcode == Opcode::Transaction
+                                || op.opcode == Opcode::Goto
+                            {
                                 continue;
                             }
 
                             // Adjust jump addresses
+                            // Since we remove Init (at address 0), all internal addresses are shifted by 1
                             if op.opcode.is_jump() && op.p2 > 0 {
-                                op.p2 += base_addr;
+                                op.p2 += base_addr - 1;
                             }
 
                             // Adjust cursor numbers for all cursor operations
@@ -1768,12 +1783,18 @@ impl<'s> DeleteCompiler<'s> {
             let base_addr = self.ops.len() as i32;
 
             for mut op in sub_ops {
-                if op.opcode == Opcode::Init || op.opcode == Opcode::Halt {
+                if op.opcode == Opcode::Init
+                    || op.opcode == Opcode::Halt
+                    || op.opcode == Opcode::Transaction
+                    || op.opcode == Opcode::Goto
+                {
                     continue;
                 }
 
+                // Adjust jump addresses
+                // Since we remove Init (at address 0), all internal addresses are shifted by 1
                 if op.opcode.is_jump() && op.p2 > 0 {
-                    op.p2 += base_addr;
+                    op.p2 += base_addr - 1;
                 }
 
                 if op.opcode == Opcode::OpenRead || op.opcode == Opcode::OpenWrite {

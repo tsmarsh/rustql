@@ -4,6 +4,7 @@
 //! executes all SQL statements. This module implements the main execution
 //! loop and manages the virtual machine state.
 
+pub mod handlers;
 mod state;
 
 use std::cmp::Ordering;

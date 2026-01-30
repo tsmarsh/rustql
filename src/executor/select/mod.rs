@@ -1077,11 +1077,13 @@ impl<'s> SelectCompiler<'s> {
                                                 table.columns.get(col.column_idx as usize)
                                             {
                                                 let ch = match col_info.affinity {
+                                                    crate::schema::Affinity::None => '@',
                                                     crate::schema::Affinity::Blob => 'A',
                                                     crate::schema::Affinity::Text => 'B',
                                                     crate::schema::Affinity::Numeric => 'C',
                                                     crate::schema::Affinity::Integer => 'D',
                                                     crate::schema::Affinity::Real => 'E',
+                                                    crate::schema::Affinity::Flexnum => 'F',
                                                 };
                                                 affinity_str.push(ch);
                                             }

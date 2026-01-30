@@ -800,11 +800,13 @@ fn type_name_to_affinity(type_name: &str) -> u8 {
     use crate::schema::Affinity;
 
     match type_affinity(type_name) {
+        Affinity::None => 0,
         Affinity::Integer => 1,
         Affinity::Real => 2,
         Affinity::Text => 3,
         Affinity::Blob => 4,
         Affinity::Numeric => 5,
+        Affinity::Flexnum => 6,
     }
 }
 

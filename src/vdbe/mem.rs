@@ -508,7 +508,8 @@ impl Mem {
                     }
                 }
             }
-            Affinity::Numeric => {
+            Affinity::Numeric | Affinity::Flexnum => {
+                // NUMERIC and FLEXNUM both prefer integer, then real
                 if self.is_str() {
                     let s = self.to_str();
                     let trimmed = s.trim();
@@ -526,8 +527,8 @@ impl Mem {
                     self.set_str(&s);
                 }
             }
-            Affinity::Blob => {
-                // No conversion needed for BLOB affinity
+            Affinity::Blob | Affinity::None => {
+                // No conversion needed for BLOB or NONE affinity
             }
         }
     }

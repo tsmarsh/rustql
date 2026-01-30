@@ -35,19 +35,32 @@ pub enum Encoding {
 }
 
 /// Column type affinity (Section 3.1 of SQLite docs)
+///
+/// SQLite affinity characters:
+/// - '@' (0x40) = NONE - no type preference
+/// - 'A' (0x41) = BLOB - no type coercion
+/// - 'B' (0x42) = TEXT - prefers string
+/// - 'C' (0x43) = NUMERIC - prefers integer/real
+/// - 'D' (0x44) = INTEGER - prefers integer
+/// - 'E' (0x45) = REAL - prefers real
+/// - 'F' (0x46) = FLEXNUM - numeric with flexible storage
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Affinity {
-    /// BLOB affinity (no type coercion)
+    /// NONE affinity - no type preference (0x40 '@')
+    None,
+    /// BLOB affinity (no type coercion) (0x41 'A')
     #[default]
     Blob,
-    /// TEXT affinity
+    /// TEXT affinity (0x42 'B')
     Text,
-    /// NUMERIC affinity (prefers integer, then real)
+    /// NUMERIC affinity (prefers integer, then real) (0x43 'C')
     Numeric,
-    /// INTEGER affinity
+    /// INTEGER affinity (0x44 'D')
     Integer,
-    /// REAL affinity
+    /// REAL affinity (0x45 'E')
     Real,
+    /// FLEXNUM affinity - numeric with flexible storage (0x46 'F')
+    Flexnum,
 }
 
 /// Sort order for columns/indexes

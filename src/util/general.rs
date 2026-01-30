@@ -363,7 +363,8 @@ pub fn sqlite3_apply_affinity(value: &mut Value, affinity: Affinity) {
                 *value = Value::Real(*i as f64);
             }
         }
-        Affinity::Numeric => {
+        Affinity::Numeric | Affinity::Flexnum => {
+            // NUMERIC and FLEXNUM both prefer integer, then real
             if let Value::Text(s) = value {
                 if let Ok(i) = sqlite3_atoi64(s) {
                     *value = Value::Integer(i);
@@ -378,7 +379,9 @@ pub fn sqlite3_apply_affinity(value: &mut Value, affinity: Affinity) {
             Value::Blob(b) => *value = Value::Text(String::from_utf8_lossy(b).into_owned()),
             _ => {}
         },
-        Affinity::Blob => {}
+        Affinity::Blob | Affinity::None => {
+            // No conversion needed for BLOB or NONE affinity
+        }
     }
 }
 

@@ -3234,9 +3234,21 @@ impl<'s> StatementCompiler<'s> {
                 .collect();
         }
 
+        // Check for ORDER BY index satisfaction
+        // If a table has FullScan but there's an ORDER BY that can use an index,
+        // update the output to show the index being used for scanning
+        let order_by_index = self.detect_order_by_index(select, schema, &table_infos);
+
         plan.levels
             .iter()
-            .map(|level| self.format_plan_detail(level, &plan.terms, &table_infos))
+            .map(|level| {
+                self.format_plan_detail_with_order(
+                    level,
+                    &plan.terms,
+                    &table_infos,
+                    &order_by_index,
+                )
+            })
             .collect()
     }
 
@@ -3401,6 +3413,140 @@ impl<'s> StatementCompiler<'s> {
             super::where_clause::TermOp::Ge => ">=",
             super::where_clause::TermOp::In => " IN ",
             _ => "",
+        }
+    }
+
+    /// Detect if ORDER BY can be satisfied by an index.
+    /// Returns a map from table index to (index_name, is_covering).
+    fn detect_order_by_index(
+        &self,
+        select: &SelectStmt,
+        schema: &crate::schema::Schema,
+        table_infos: &[ExplainTableInfo],
+    ) -> HashMap<usize, (String, bool)> {
+        let mut result = HashMap::new();
+
+        // Get ORDER BY clause
+        let order_by = match &select.order_by {
+            Some(order_by) if !order_by.is_empty() => order_by,
+            _ => return result,
+        };
+
+        // Only handle simple cases: single ORDER BY column, ASC order
+        if order_by.len() != 1 {
+            return result;
+        }
+        let order_term = &order_by[0];
+        if order_term.order == SortOrder::Desc {
+            return result;
+        }
+
+        // Get the ORDER BY column
+        let core = match &select.body {
+            SelectBody::Select(core) => core,
+            _ => return result,
+        };
+
+        let order_col = match &order_term.expr {
+            Expr::Column(col_ref) => col_ref.column.to_lowercase(),
+            Expr::Literal(Literal::Integer(n)) => {
+                // ORDER BY 1 means first column in SELECT list
+                let idx = (*n as usize).saturating_sub(1);
+                if idx < core.columns.len() {
+                    match &core.columns[idx] {
+                        ResultColumn::Expr { expr, .. } => match expr {
+                            Expr::Column(col_ref) => col_ref.column.to_lowercase(),
+                            _ => return result,
+                        },
+                        _ => return result,
+                    }
+                } else {
+                    return result;
+                }
+            }
+            _ => return result,
+        };
+
+        // For each table, check if there's an index that can satisfy ORDER BY
+        for (table_idx, table_info) in table_infos.iter().enumerate() {
+            // Check if table has the ORDER BY column
+            let has_col = table_info
+                .columns
+                .iter()
+                .any(|c| c.to_lowercase() == order_col);
+            if !has_col {
+                continue;
+            }
+
+            // Check each index to see if its first column matches ORDER BY
+            for index in &table_info.indexes {
+                if let Some(&first_col_idx) = index.columns.first() {
+                    if first_col_idx >= 0 && (first_col_idx as usize) < table_info.columns.len() {
+                        let idx_col_name = &table_info.columns[first_col_idx as usize];
+                        if idx_col_name.to_lowercase() == order_col {
+                            // Found matching index
+                            result.insert(table_idx, (index.name.clone(), index.is_covering));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Also check schema's global indexes if not found in table_info.indexes
+            if !result.contains_key(&table_idx) {
+                if let Some(schema_table) = schema.table(&table_info.name) {
+                    for index in &schema_table.indexes {
+                        if let Some(first_col) = index.columns.first() {
+                            let col_idx = first_col.column_idx;
+                            if col_idx >= 0 && (col_idx as usize) < schema_table.columns.len() {
+                                let idx_col_name = &schema_table.columns[col_idx as usize].name;
+                                if idx_col_name.to_lowercase() == order_col {
+                                    // Check if covering
+                                    let is_covering = table_info.indexes.iter().any(|i| {
+                                        i.name.eq_ignore_ascii_case(&index.name) && i.is_covering
+                                    });
+                                    result.insert(table_idx, (index.name.clone(), is_covering));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Format plan detail with ORDER BY index consideration.
+    fn format_plan_detail_with_order(
+        &self,
+        level: &super::where_clause::WhereLevel,
+        terms: &[WhereTerm],
+        table_infos: &[ExplainTableInfo],
+        order_by_index: &HashMap<usize, (String, bool)>,
+    ) -> String {
+        let table_idx = level.from_idx as usize;
+        let table_info = table_infos.get(table_idx);
+        let display_name = table_info
+            .map(|t| t.display_name.as_str())
+            .unwrap_or("table");
+
+        match &level.plan {
+            WherePlan::FullScan => {
+                // Check if ORDER BY uses an index for this table
+                if let Some((index_name, is_covering)) = order_by_index.get(&table_idx) {
+                    if *is_covering {
+                        format!("SCAN {} USING COVERING INDEX {}", display_name, index_name)
+                    } else {
+                        format!("SCAN {} USING INDEX {}", display_name, index_name)
+                    }
+                } else {
+                    format!("SCAN {}", display_name)
+                }
+            }
+            // For other plans, delegate to the original format_plan_detail
+            _ => self.format_plan_detail(level, terms, table_infos),
         }
     }
 

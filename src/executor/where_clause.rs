@@ -63,6 +63,9 @@ bitflags! {
         const OUTER_REF = 0x0800;
         /// LIKE term has a usable prefix
         const LIKE_PREFIX = 0x1000;
+        /// LIKE term is fully satisfied by index optimization (no runtime verification needed)
+        /// This is set when pattern ends with % and has no other wildcards after the prefix
+        const LIKE_OPT_COMPLETE = 0x2000;
     }
 }
 
@@ -838,8 +841,19 @@ impl QueryPlanner {
             .collect();
 
         // Generate virtual range terms for each LIKE term
-        for (_like_idx, col_expr, pattern_expr, op, left_col, mask) in like_terms {
+        for (like_idx, col_expr, pattern_expr, op, left_col, mask) in like_terms {
             if let Some((prefix, upper_bound)) = Self::extract_like_bounds(&pattern_expr, op) {
+                // Check if the LIKE pattern is fully satisfied by the range bounds
+                // This is true when the pattern is "prefix%" with no other wildcards
+                let is_complete = Self::like_pattern_complete(&pattern_expr, op);
+
+                // Mark the original LIKE term as fully optimized if complete
+                if is_complete {
+                    if let Some(term) = self.where_clause.terms.get_mut(like_idx) {
+                        term.flags |= WhereTermFlags::LIKE_OPT_COMPLETE;
+                    }
+                }
+
                 // Create lower bound term: col >= 'prefix'
                 let lower_idx = self.where_clause.terms.len() as i32;
                 let lower_expr = Expr::Binary {
@@ -1160,6 +1174,44 @@ impl QueryPlanner {
             LikeOp::Like | LikeOp::Regexp | LikeOp::Match => first != '%' && first != '_',
             LikeOp::Glob => first != '*' && first != '?',
         }
+    }
+
+    /// Check if a LIKE/GLOB pattern is fully satisfied by index range bounds.
+    /// Returns true when pattern is "prefix%" (or "prefix*" for GLOB) with no wildcards
+    /// in the prefix. In this case, the index range scan is sufficient and no runtime
+    /// LIKE verification is needed.
+    fn like_pattern_complete(pattern: &Expr, op: LikeOp) -> bool {
+        let text = match pattern {
+            Expr::Literal(Literal::String(text)) => text,
+            _ => return false,
+        };
+
+        let (multi_wild, single_wild) = match op {
+            LikeOp::Like => ('%', '_'),
+            LikeOp::Glob => ('*', '?'),
+            _ => return false,
+        };
+
+        // Pattern must end with multi-wildcard (% or *)
+        if !text.ends_with(multi_wild) {
+            return false;
+        }
+
+        // Check if there are any wildcards before the final one
+        // The pattern "abc%" is complete, but "a_c%" or "a%bc%" is not
+        let prefix = &text[..text.len() - 1];
+
+        for ch in prefix.chars() {
+            if ch == multi_wild || ch == single_wild {
+                return false;
+            }
+            // For GLOB, [ starts a character class
+            if ch == '[' && op == LikeOp::Glob {
+                return false;
+            }
+        }
+
+        true
     }
 
     /// Extract the literal prefix from a LIKE/GLOB pattern for index optimization

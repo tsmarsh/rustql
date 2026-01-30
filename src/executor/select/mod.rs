@@ -4842,12 +4842,40 @@ impl<'s> SelectCompiler<'s> {
             .flat_map(|level| level.used_terms.iter().copied())
             .collect();
 
+        // Check if any level is using an index scan with range bounds
+        // This indicates LIKE index optimization is active
+        let using_index_range = where_info.levels.iter().any(|level| {
+            matches!(
+                &level.plan,
+                WherePlan::IndexScan {
+                    range_start: Some(_),
+                    ..
+                } | WherePlan::IndexScan {
+                    range_end: Some(_),
+                    ..
+                }
+            )
+        });
+
         // Collect non-consumed, non-virtual terms
+        // Also skip LIKE terms that are fully satisfied by index optimization
         let mut filter_terms: Vec<&WhereTerm> = where_info
             .terms
             .iter()
             .filter(|term| {
-                !consumed_terms.contains(&term.idx) && !term.flags.contains(WhereTermFlags::VIRTUAL)
+                // Skip consumed terms
+                if consumed_terms.contains(&term.idx) {
+                    return false;
+                }
+                // Skip virtual terms
+                if term.flags.contains(WhereTermFlags::VIRTUAL) {
+                    return false;
+                }
+                // Skip LIKE terms that are fully satisfied by index range bounds
+                if using_index_range && term.flags.contains(WhereTermFlags::LIKE_OPT_COMPLETE) {
+                    return false;
+                }
+                true
             })
             .collect();
 

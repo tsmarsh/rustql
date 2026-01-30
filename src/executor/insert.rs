@@ -94,6 +94,12 @@ pub struct InsertCompiler<'a> {
     /// AFTER INSERT triggers
     after_triggers: Vec<Arc<Trigger>>,
 
+    /// BEFORE DELETE triggers (for REPLACE conflict resolution)
+    before_delete_triggers: Vec<Arc<Trigger>>,
+
+    /// AFTER DELETE triggers (for REPLACE conflict resolution)
+    after_delete_triggers: Vec<Arc<Trigger>>,
+
     /// Table name for trigger firing
     table_name: String,
 }
@@ -116,6 +122,8 @@ impl<'a> InsertCompiler<'a> {
             next_unnamed_param: 1,
             before_triggers: Vec::new(),
             after_triggers: Vec::new(),
+            before_delete_triggers: Vec::new(),
+            after_delete_triggers: Vec::new(),
             table_name: String::new(),
         }
     }
@@ -137,6 +145,8 @@ impl<'a> InsertCompiler<'a> {
             next_unnamed_param: 1,
             before_triggers: Vec::new(),
             after_triggers: Vec::new(),
+            before_delete_triggers: Vec::new(),
+            after_delete_triggers: Vec::new(),
             table_name: String::new(),
         }
     }
@@ -196,6 +206,21 @@ impl<'a> InsertCompiler<'a> {
                 &insert.table.name,
                 TriggerTiming::After,
                 TriggerEvent::Insert,
+                None,
+            );
+            // DELETE triggers for REPLACE conflict resolution
+            self.before_delete_triggers = find_matching_triggers(
+                schema,
+                &insert.table.name,
+                TriggerTiming::Before,
+                TriggerEvent::Delete,
+                None,
+            );
+            self.after_delete_triggers = find_matching_triggers(
+                schema,
+                &insert.table.name,
+                TriggerTiming::After,
+                TriggerEvent::Delete,
                 None,
             );
         }
@@ -399,8 +424,8 @@ impl<'a> InsertCompiler<'a> {
                 }
             }
 
-            // Handle conflict action
-            self.emit_conflict_check(conflict_action)?;
+            // Handle conflict action (REPLACE deletes conflicting rows)
+            self.emit_conflict_check(conflict_action, data_base, rowid_reg)?;
 
             // Fire BEFORE INSERT triggers
             let table_name = insert.table.name.clone();
@@ -429,7 +454,7 @@ impl<'a> InsertCompiler<'a> {
             );
 
             // Insert into indexes
-            self.emit_index_inserts(data_base, rowid_reg);
+            self.emit_index_inserts(data_base, rowid_reg, conflict_action);
 
             // Fire AFTER INSERT triggers
             self.emit_after_triggers(&table_name, data_base)?;
@@ -701,8 +726,8 @@ impl<'a> InsertCompiler<'a> {
             }
         }
 
-        // Handle conflict
-        self.emit_conflict_check(conflict_action)?;
+        // Handle conflict (REPLACE deletes conflicting rows)
+        self.emit_conflict_check(conflict_action, data_base, rowid_reg)?;
 
         // Fire BEFORE INSERT triggers
         let table_name = insert.table.name.clone();
@@ -730,7 +755,7 @@ impl<'a> InsertCompiler<'a> {
         );
 
         // Insert into indexes
-        self.emit_index_inserts(data_base, rowid_reg);
+        self.emit_index_inserts(data_base, rowid_reg, conflict_action);
 
         // Fire AFTER INSERT triggers
         self.emit_after_triggers(&table_name, data_base)?;
@@ -945,8 +970,8 @@ impl<'a> InsertCompiler<'a> {
             }
         }
 
-        // Handle conflict
-        self.emit_conflict_check(conflict_action)?;
+        // Handle conflict (REPLACE deletes conflicting rows)
+        self.emit_conflict_check(conflict_action, data_base, rowid_reg)?;
 
         // Fire BEFORE INSERT triggers
         let table_name = insert.table.name.clone();
@@ -974,7 +999,7 @@ impl<'a> InsertCompiler<'a> {
         );
 
         // Insert into indexes
-        self.emit_index_inserts(data_base, rowid_reg);
+        self.emit_index_inserts(data_base, rowid_reg, conflict_action);
 
         // Fire AFTER INSERT triggers
         self.emit_after_triggers(&table_name, data_base)?;
@@ -1452,8 +1477,8 @@ impl<'a> InsertCompiler<'a> {
             self.emit(Opcode::Null, 0, reg, 0, P4::Unused);
         }
 
-        // Handle conflict
-        self.emit_conflict_check(conflict_action)?;
+        // Handle conflict (REPLACE deletes conflicting rows)
+        self.emit_conflict_check(conflict_action, data_base, rowid_reg)?;
 
         // Fire BEFORE INSERT triggers
         let table_name = insert.table.name.clone();
@@ -1481,7 +1506,7 @@ impl<'a> InsertCompiler<'a> {
         );
 
         // Insert into indexes
-        self.emit_index_inserts(data_base, rowid_reg);
+        self.emit_index_inserts(data_base, rowid_reg, conflict_action);
 
         // Fire AFTER INSERT triggers
         self.emit_after_triggers(&table_name, data_base)?;
@@ -1681,8 +1706,15 @@ impl<'a> InsertCompiler<'a> {
         Ok(())
     }
 
-    /// Emit conflict checking code
-    fn emit_conflict_check(&mut self, action: ConflictAction) -> Result<()> {
+    /// Emit conflict checking code for REPLACE
+    /// data_base: register containing first column value
+    /// rowid_reg: register containing the rowid for the new row
+    fn emit_conflict_check(
+        &mut self,
+        action: ConflictAction,
+        data_base: i32,
+        _rowid_reg: i32,
+    ) -> Result<()> {
         match action {
             ConflictAction::Abort => {
                 // Default behavior - abort on constraint violation
@@ -1695,16 +1727,349 @@ impl<'a> InsertCompiler<'a> {
             }
             ConflictAction::Ignore => {
                 // Skip row on conflict - needs special handling
-                // In a real implementation, would emit constraint checks
-                // and jump past Insert if violated
             }
             ConflictAction::Replace => {
-                // Delete existing row with same key
-                // In a real implementation, would emit:
-                // 1. Check for existing row with same unique key
-                // 2. Delete if found
+                // For REPLACE: check each unique index for conflicts and delete if found
+                self.emit_replace_conflict_handling(data_base)?;
             }
         }
+        Ok(())
+    }
+
+    /// Emit code to handle REPLACE conflicts
+    /// Checks each unique index for conflicts and deletes conflicting rows
+    fn emit_replace_conflict_handling(&mut self, data_base: i32) -> Result<()> {
+        let schema = match self.schema {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        let table = match schema.tables.get(&self.table_name.to_lowercase()) {
+            Some(t) => t.clone(),
+            None => return Ok(()),
+        };
+
+        // Check if there are DELETE triggers on this table
+        // If so, skip our early delete optimization because:
+        // 1. DELETE triggers might insert conflicting rows
+        // 2. The VDBE's OE_REPLACE would delete trigger-inserted rows (wrong behavior)
+        // Instead, let VDBE handle it, which will fail on trigger-created conflicts
+        let has_delete_triggers =
+            !self.before_delete_triggers.is_empty() || !self.after_delete_triggers.is_empty();
+
+        if has_delete_triggers {
+            // Skip early delete - let VDBE handle REPLACE
+            // VDBE will fail with constraint error if trigger creates conflict
+            return Ok(());
+        }
+
+        // Get the root page for the table
+        let table_root = table.root_page;
+        if table_root == 0 {
+            return Ok(());
+        }
+
+        // For each unique index, check for conflicts
+        for index in &table.indexes {
+            if !index.unique {
+                continue;
+            }
+
+            // For partial indexes, evaluate the WHERE condition for the new row
+            // Skip conflict check if new row doesn't satisfy the condition
+            let partial_skip_label = if let Some(ref partial_expr) = index.partial {
+                let skip_label = self.alloc_label();
+                let cond_reg = self.alloc_reg();
+                if self
+                    .compile_partial_index_expr(partial_expr, cond_reg, data_base)
+                    .is_ok()
+                {
+                    // If condition is false/null, skip this index's conflict check
+                    self.emit(
+                        Opcode::IfNot,
+                        cond_reg,
+                        skip_label,
+                        1, // P3=1: also skip if NULL
+                        P4::Unused,
+                    );
+                }
+                Some(skip_label)
+            } else {
+                None
+            };
+
+            let idx_root = if index.root_page > 0 {
+                index.root_page
+            } else {
+                schema
+                    .indexes
+                    .get(&index.name.to_lowercase())
+                    .map(|i| i.root_page)
+                    .unwrap_or(0)
+            };
+
+            if idx_root == 0 {
+                // Resolve partial skip label before continuing to avoid dangling label
+                if let Some(skip_label) = partial_skip_label {
+                    self.resolve_label(skip_label, self.current_addr() as i32);
+                }
+                continue;
+            }
+
+            // Open a read cursor on the index to check for conflicts
+            let idx_cursor = self.alloc_cursor();
+            self.emit(
+                Opcode::OpenRead,
+                idx_cursor,
+                idx_root as i32,
+                (index.columns.len() + 1) as i32,
+                P4::Text(index.name.clone()),
+            );
+
+            // Build the search key from new row values
+            let key_base = self.alloc_regs(index.columns.len());
+            for (i, col) in index.columns.iter().enumerate() {
+                if col.column_idx >= 0 {
+                    self.emit(
+                        Opcode::Copy,
+                        data_base + col.column_idx,
+                        key_base + i as i32,
+                        0,
+                        P4::Unused,
+                    );
+                } else {
+                    // Expression index column - use NULL
+                    self.emit(Opcode::Null, 0, key_base + i as i32, 0, P4::Unused);
+                }
+            }
+
+            // Make index search key (without rowid - we want to find any match)
+            let search_key_reg = self.alloc_reg();
+            self.emit(
+                Opcode::MakeRecord,
+                key_base,
+                index.columns.len() as i32,
+                search_key_reg,
+                P4::Unused,
+            );
+
+            // Labels for control flow
+            let no_conflict_label = self.alloc_label();
+            let found_conflict_label = self.alloc_label();
+
+            // Seek to the key in the index
+            // SeekGE: position at first entry >= key, jump if not found
+            self.emit(
+                Opcode::SeekGE,
+                idx_cursor,
+                no_conflict_label,
+                search_key_reg,
+                P4::Int64(index.columns.len() as i64),
+            );
+
+            // Check if the found entry matches our key prefix
+            // IdxGT: jump if cursor key > search key (no match)
+            self.emit(
+                Opcode::IdxGT,
+                idx_cursor,
+                no_conflict_label,
+                search_key_reg,
+                P4::Int64(index.columns.len() as i64),
+            );
+
+            // Found a conflict - get the rowid from the index
+            self.resolve_label(found_conflict_label, self.current_addr() as i32);
+            let conflict_rowid_reg = self.alloc_reg();
+            self.emit(
+                Opcode::IdxRowid,
+                idx_cursor,
+                conflict_rowid_reg,
+                0,
+                P4::Unused,
+            );
+
+            // Close index cursor before delete
+            self.emit(Opcode::Close, idx_cursor, 0, 0, P4::Unused);
+
+            // Open write cursor on table to delete conflicting row
+            let del_cursor = self.alloc_cursor();
+            self.emit(
+                Opcode::OpenWrite,
+                del_cursor,
+                table_root as i32,
+                self.num_columns as i32,
+                P4::Text(self.table_name.clone()),
+            );
+
+            // Position at the conflicting row
+            let not_found_label = self.alloc_label();
+            self.emit(
+                Opcode::NotExists,
+                del_cursor,
+                not_found_label,
+                conflict_rowid_reg,
+                P4::Unused,
+            );
+
+            // Delete from all indexes first
+            self.emit_delete_from_indexes(del_cursor, conflict_rowid_reg, &table)?;
+
+            // Delete the conflicting row
+            self.emit_with_p5(
+                Opcode::Delete,
+                del_cursor,
+                0,
+                conflict_rowid_reg,
+                P4::Text(self.table_name.clone()),
+                OPFLAG_NCHANGE,
+            );
+
+            self.resolve_label(not_found_label, self.current_addr() as i32);
+            self.emit(Opcode::Close, del_cursor, 0, 0, P4::Unused);
+
+            // Jump past this - no_conflict path
+            let end_label = self.alloc_label();
+            self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+
+            // No conflict path - just close the index cursor
+            self.resolve_label(no_conflict_label, self.current_addr() as i32);
+            self.emit(Opcode::Close, idx_cursor, 0, 0, P4::Unused);
+
+            self.resolve_label(end_label, self.current_addr() as i32);
+
+            // Resolve partial index skip label (if this was a partial index)
+            if let Some(skip_label) = partial_skip_label {
+                self.resolve_label(skip_label, self.current_addr() as i32);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Emit code to delete a row's entries from all indexes
+    fn emit_delete_from_indexes(
+        &mut self,
+        table_cursor: i32,
+        rowid_reg: i32,
+        table: &crate::schema::Table,
+    ) -> Result<()> {
+        let schema = match self.schema {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        for index in &table.indexes {
+            let idx_root = if index.root_page > 0 {
+                index.root_page
+            } else {
+                schema
+                    .indexes
+                    .get(&index.name.to_lowercase())
+                    .map(|i| i.root_page)
+                    .unwrap_or(0)
+            };
+
+            if idx_root == 0 {
+                continue;
+            }
+
+            // Read column values from the row being deleted
+            let col_values_base = self.alloc_regs(index.columns.len());
+            for (i, col) in index.columns.iter().enumerate() {
+                if col.column_idx >= 0 {
+                    self.emit(
+                        Opcode::Column,
+                        table_cursor,
+                        col.column_idx,
+                        col_values_base + i as i32,
+                        P4::Unused,
+                    );
+                } else {
+                    self.emit(Opcode::Null, 0, col_values_base + i as i32, 0, P4::Unused);
+                }
+            }
+
+            // Build index key: columns + rowid
+            let key_base = self.alloc_regs(index.columns.len() + 1);
+            for i in 0..index.columns.len() {
+                self.emit(
+                    Opcode::Copy,
+                    col_values_base + i as i32,
+                    key_base + i as i32,
+                    0,
+                    P4::Unused,
+                );
+            }
+            self.emit(
+                Opcode::Copy,
+                rowid_reg,
+                key_base + index.columns.len() as i32,
+                0,
+                P4::Unused,
+            );
+
+            // Make index key record
+            let key_reg = self.alloc_reg();
+            self.emit(
+                Opcode::MakeRecord,
+                key_base,
+                (index.columns.len() + 1) as i32,
+                key_reg,
+                P4::Unused,
+            );
+
+            // Open index cursor and delete
+            let idx_cursor = self.alloc_cursor();
+            self.emit(
+                Opcode::OpenWrite,
+                idx_cursor,
+                idx_root as i32,
+                (index.columns.len() + 1) as i32,
+                P4::Text(index.name.clone()),
+            );
+
+            self.emit(Opcode::IdxDelete, idx_cursor, key_reg, 0, P4::Unused);
+            self.emit(Opcode::Close, idx_cursor, 0, 0, P4::Unused);
+        }
+
+        Ok(())
+    }
+
+    /// Emit DELETE triggers (for REPLACE conflict resolution)
+    fn emit_delete_triggers(
+        &mut self,
+        triggers: &[Arc<Trigger>],
+        old_base_reg: Option<i32>,
+        rowid_reg: i32,
+    ) -> Result<()> {
+        if triggers.is_empty() {
+            return Ok(());
+        }
+
+        let return_label = self.alloc_label();
+
+        // For DELETE triggers, there's no NEW row, only OLD
+        let trigger_ops = generate_trigger_code(
+            triggers,
+            self.schema,
+            &self.table_name,
+            old_base_reg,
+            None, // No NEW for DELETE triggers
+            self.num_columns as i32,
+            &mut self.next_reg,
+            &mut self.next_cursor,
+            return_label,
+        )?;
+
+        for op in trigger_ops {
+            self.ops.push(op);
+        }
+
+        self.resolve_label(return_label, self.current_addr() as i32);
+
+        // Silence unused variable warning
+        let _ = rowid_reg;
+
         Ok(())
     }
 
@@ -2086,7 +2451,13 @@ impl<'a> InsertCompiler<'a> {
     /// Emit index insert operations after inserting a row
     /// data_base is the register containing the first column value
     /// rowid_reg is the register containing the rowid
-    fn emit_index_inserts(&mut self, data_base: i32, rowid_reg: i32) {
+    /// conflict_action determines what to do on UNIQUE constraint violation
+    fn emit_index_inserts(
+        &mut self,
+        data_base: i32,
+        rowid_reg: i32,
+        conflict_action: ConflictAction,
+    ) {
         // Clone index_cursors to avoid borrow issues
         let index_cursors: Vec<_> = self
             .index_cursors
@@ -2152,6 +2523,10 @@ impl<'a> InsertCompiler<'a> {
             );
 
             // Insert into index
+            // Note: We don't pass conflict flags here because VDBE's IdxInsert OE_REPLACE
+            // handling is incomplete (it just skips instead of deleting the conflicting row).
+            // For REPLACE, our emit_replace_conflict_handling does the pre-delete.
+            // If that was skipped (due to DELETE triggers), we want OE_NONE to fail on conflict.
             self.emit(Opcode::IdxInsert, cursor, record_reg, 0, P4::Unused);
 
             // Resolve skip label for partial indexes

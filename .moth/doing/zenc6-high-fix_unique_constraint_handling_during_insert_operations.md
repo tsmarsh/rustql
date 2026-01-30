@@ -51,6 +51,37 @@ Multiple sub-tests in the `insert.test` TCL suite are failing due to incorrect o
 
 ## Progress Notes
 
+### 2026-01-29: Session 5
+- **Tests passing: 75/83 (90.4%)**
+- **Analysis and attempted fixes:**
+  - **Partial index REPLACE handling**: Added partial index condition evaluation in `emit_replace_conflict_handling`
+    - For partial indexes, evaluates WHERE condition for the new row
+    - Only checks for conflicts if the new row satisfies the partial condition
+    - This is correct behavior - new row won't go into partial index if condition is false
+  - **DELETE triggers and REPLACE**: Investigated fix but reverted
+    - Attempted to fire DELETE triggers during REPLACE conflict resolution in InsertCompiler
+    - This caused regressions because trigger-inserted conflicting rows weren't caught
+    - SQLite expects constraint error when trigger inserts conflicting row during REPLACE
+    - Root issue: VDBE's IdxInsert with OE_REPLACE just skips insert instead of deleting
+    - Proper fix would require significant VDBE changes or complex multi-pass checking
+  - **IdxInsert conflict flags**: Attempted passing conflict_action to IdxInsert
+    - This made things worse (dropped from 75 to 71 tests)
+    - Because VDBE's OE_REPLACE handling in IdxInsert is broken (just skips)
+    - Reverted to not passing flags - OE_NONE properly fails on conflicts
+
+- **Known limitations (won't fix in this session):**
+  - REPLACE + DELETE triggers + unique indexes: VDBE can't properly handle
+  - Tests insert-16.6, insert-17.1, insert-17.10-17.12 all have this pattern
+  - Would require implementing full REPLACE delete in VDBE's IdxInsert opcode
+
+- **Remaining failures (8 tests):**
+  - insert-5.5: Temp table rootpage issue (returns 8 instead of 2)
+  - insert-13.1: Expression index with REPLACE
+  - insert-15.1: Blob truncation (31205 instead of 33000) - overflow page issue
+  - insert-16.6: Foreign keys + DELETE triggers (VDBE limitation)
+  - insert-17.1: Rowid constraint with DELETE triggers (VDBE limitation)
+  - insert-17.10, insert-17.11, insert-17.12: Partial index + DELETE triggers (VDBE limitation)
+
 ### 2025-01-29: Session 4
 - **Tests passing: 76/83 (91.6%)**
 - **Fixed issues:**

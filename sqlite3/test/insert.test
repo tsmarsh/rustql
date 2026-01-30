@@ -515,7 +515,7 @@ do_catchsql_test insert-16.6 {
   END;
   INSERT INTO p1 VALUES(1, 1);
   INSERT INTO c1 VALUES(2, 1);
-  REPLACE INTO p1 VALUES(3, 1);2
+  REPLACE INTO p1 VALUES(3, 1);
 } {1 {UNIQUE constraint failed: p1.b}}
 integrity_check insert-16.7
 

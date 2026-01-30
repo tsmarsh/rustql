@@ -44,6 +44,10 @@ struct IndexCursor {
     columns: Vec<i32>,
     /// Index name
     name: String,
+    /// Partial index condition (WHERE clause), if any
+    partial: Option<crate::schema::Expr>,
+    /// Whether this is a UNIQUE index
+    is_unique: bool,
 }
 
 /// Compiles INSERT statements to VDBE opcodes
@@ -2018,15 +2022,22 @@ impl<'a> InsertCompiler<'a> {
             let table_name_lower = table_name.to_lowercase();
 
             // Collect all indexes for this table with their first column position
-            // (name, columns, first_col_idx)
-            let mut all_indexes: Vec<(String, Vec<i32>, i32)> = Vec::new();
+            // (name, columns, first_col_idx, partial, is_unique)
+            let mut all_indexes: Vec<(String, Vec<i32>, i32, Option<crate::schema::Expr>, bool)> =
+                Vec::new();
 
             // First check schema.indexes for indexes on this table
             for (_name, idx) in schema.indexes.iter() {
                 if idx.table.eq_ignore_ascii_case(&table_name_lower) {
                     let columns: Vec<i32> = idx.columns.iter().map(|c| c.column_idx).collect();
                     let first_col = columns.first().copied().unwrap_or(0);
-                    all_indexes.push((idx.name.clone(), columns, first_col));
+                    all_indexes.push((
+                        idx.name.clone(),
+                        columns,
+                        first_col,
+                        idx.partial.clone(),
+                        idx.unique,
+                    ));
                 }
             }
 
@@ -2036,14 +2047,20 @@ impl<'a> InsertCompiler<'a> {
                     // Skip if already added
                     if all_indexes
                         .iter()
-                        .any(|(name, _, _)| name.eq_ignore_ascii_case(&idx.name))
+                        .any(|(name, _, _, _, _)| name.eq_ignore_ascii_case(&idx.name))
                     {
                         continue;
                     }
 
                     let columns: Vec<i32> = idx.columns.iter().map(|c| c.column_idx).collect();
                     let first_col = columns.first().copied().unwrap_or(0);
-                    all_indexes.push((idx.name.clone(), columns, first_col));
+                    all_indexes.push((
+                        idx.name.clone(),
+                        columns,
+                        first_col,
+                        idx.partial.clone(),
+                        idx.unique,
+                    ));
                 }
             }
 
@@ -2052,7 +2069,7 @@ impl<'a> InsertCompiler<'a> {
             all_indexes.sort_by(|a, b| b.2.cmp(&a.2));
 
             // Now emit the open operations in sorted order
-            for (name, columns, _) in all_indexes {
+            for (name, columns, _, partial, is_unique) in all_indexes {
                 let cursor = self.alloc_cursor();
                 self.emit(Opcode::OpenWrite, cursor, 0, 0, P4::Text(name.clone()));
 
@@ -2060,6 +2077,8 @@ impl<'a> InsertCompiler<'a> {
                     cursor,
                     columns,
                     name,
+                    partial,
+                    is_unique,
                 });
             }
         }
@@ -2074,10 +2093,32 @@ impl<'a> InsertCompiler<'a> {
         let index_cursors: Vec<_> = self
             .index_cursors
             .iter()
-            .map(|ic| (ic.cursor, ic.columns.clone()))
+            .map(|ic| (ic.cursor, ic.columns.clone(), ic.partial.clone()))
             .collect();
 
-        for (cursor, columns) in index_cursors {
+        for (cursor, columns, partial) in index_cursors {
+            // For partial indexes, check if the row satisfies the WHERE condition
+            let skip_label = if partial.is_some() {
+                Some(self.alloc_label())
+            } else {
+                None
+            };
+
+            if let Some(ref partial_expr) = partial {
+                // Evaluate partial index condition using column values in data registers
+                let cond_reg = self.alloc_reg();
+                if let Ok(()) = self.compile_partial_index_expr(partial_expr, cond_reg, data_base) {
+                    // If condition is false/null, skip index insert
+                    self.emit(
+                        Opcode::IfNot,
+                        cond_reg,
+                        skip_label.unwrap(),
+                        1, // P3=1: also skip if NULL
+                        P4::Unused,
+                    );
+                }
+            }
+
             // Build index key: indexed columns + rowid
             let key_base = self.alloc_regs(columns.len() + 1);
 
@@ -2114,7 +2155,138 @@ impl<'a> InsertCompiler<'a> {
 
             // Insert into index
             self.emit(Opcode::IdxInsert, cursor, record_reg, 0, P4::Unused);
+
+            // Resolve skip label for partial indexes
+            if let Some(label) = skip_label {
+                self.resolve_label(label, self.current_addr() as i32);
+            }
         }
+    }
+
+    /// Compile a partial index expression (evaluates column references against data registers)
+    /// Uses schema::Expr type (different from ast::Expr)
+    fn compile_partial_index_expr(
+        &mut self,
+        expr: &crate::schema::Expr,
+        dest_reg: i32,
+        data_base: i32,
+    ) -> Result<()> {
+        use crate::schema::Expr as SchemaExpr;
+        use crate::schema::{BinaryOp as SchemaBinaryOp, UnaryOp as SchemaUnaryOp};
+
+        match expr {
+            SchemaExpr::Column { column, .. } => {
+                // Map column name to index in data registers
+                if let Some(col_idx) = self.find_column_index(column) {
+                    self.emit(
+                        Opcode::Copy,
+                        data_base + col_idx as i32,
+                        dest_reg,
+                        0,
+                        P4::Unused,
+                    );
+                } else {
+                    self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                }
+            }
+            SchemaExpr::Null => {
+                self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+            }
+            SchemaExpr::Integer(n) => {
+                if *n >= i32::MIN as i64 && *n <= i32::MAX as i64 {
+                    self.emit(Opcode::Integer, *n as i32, dest_reg, 0, P4::Unused);
+                } else {
+                    self.emit(Opcode::Int64, 0, dest_reg, 0, P4::Int64(*n));
+                }
+            }
+            SchemaExpr::Real(f) => {
+                self.emit(Opcode::Real, 0, dest_reg, 0, P4::Real(*f));
+            }
+            SchemaExpr::String(s) => {
+                self.emit(Opcode::String8, 0, dest_reg, 0, P4::Text(s.clone()));
+            }
+            SchemaExpr::BinaryOp { left, op, right } => {
+                let left_reg = self.alloc_reg();
+                let right_reg = self.alloc_reg();
+                self.compile_partial_index_expr(left, left_reg, data_base)?;
+                self.compile_partial_index_expr(right, right_reg, data_base)?;
+
+                let opcode = match op {
+                    SchemaBinaryOp::Le => Opcode::Le,
+                    SchemaBinaryOp::Lt => Opcode::Lt,
+                    SchemaBinaryOp::Ge => Opcode::Ge,
+                    SchemaBinaryOp::Gt => Opcode::Gt,
+                    SchemaBinaryOp::Eq => Opcode::Eq,
+                    SchemaBinaryOp::Ne => Opcode::Ne,
+                    SchemaBinaryOp::Add => Opcode::Add,
+                    SchemaBinaryOp::Sub => Opcode::Subtract,
+                    SchemaBinaryOp::Mul => Opcode::Multiply,
+                    SchemaBinaryOp::Div => Opcode::Divide,
+                    _ => {
+                        // For unsupported ops, return true (don't skip the insert)
+                        self.emit(Opcode::Integer, 1, dest_reg, 0, P4::Unused);
+                        return Ok(());
+                    }
+                };
+
+                // For comparison operators, use jump-based evaluation
+                if matches!(
+                    op,
+                    SchemaBinaryOp::Le
+                        | SchemaBinaryOp::Lt
+                        | SchemaBinaryOp::Ge
+                        | SchemaBinaryOp::Gt
+                        | SchemaBinaryOp::Eq
+                        | SchemaBinaryOp::Ne
+                ) {
+                    // Set result to 1 (true)
+                    self.emit(Opcode::Integer, 1, dest_reg, 0, P4::Unused);
+                    let true_label = self.alloc_label();
+                    // Jump if comparison is true
+                    self.emit(opcode, right_reg, true_label, left_reg, P4::Unused);
+                    // Comparison was false, set result to 0
+                    self.emit(Opcode::Integer, 0, dest_reg, 0, P4::Unused);
+                    self.resolve_label(true_label, self.current_addr() as i32);
+                } else {
+                    // Arithmetic operators: store result
+                    self.emit(opcode, left_reg, dest_reg, right_reg, P4::Unused);
+                }
+            }
+            SchemaExpr::UnaryOp { op, operand } => match op {
+                SchemaUnaryOp::Not => {
+                    self.compile_partial_index_expr(operand, dest_reg, data_base)?;
+                    self.emit(Opcode::Not, dest_reg, dest_reg, 0, P4::Unused);
+                }
+                SchemaUnaryOp::Neg => {
+                    self.compile_partial_index_expr(operand, dest_reg, data_base)?;
+                    let zero_reg = self.alloc_reg();
+                    self.emit(Opcode::Integer, 0, zero_reg, 0, P4::Unused);
+                    self.emit(Opcode::Subtract, zero_reg, dest_reg, dest_reg, P4::Unused);
+                }
+                _ => {
+                    self.emit(Opcode::Integer, 1, dest_reg, 0, P4::Unused);
+                }
+            },
+            _ => {
+                // For unsupported expressions, return true (don't skip the insert)
+                self.emit(Opcode::Integer, 1, dest_reg, 0, P4::Unused);
+            }
+        }
+        Ok(())
+    }
+
+    /// Find column index by name in target table
+    fn find_column_index(&self, name: &str) -> Option<usize> {
+        if let Some(schema) = self.schema {
+            if let Some(table) = schema.tables.get(&self.table_name.to_lowercase()) {
+                for (idx, col) in table.columns.iter().enumerate() {
+                    if col.name.eq_ignore_ascii_case(name) {
+                        return Some(idx);
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn alloc_label(&mut self) -> i32 {

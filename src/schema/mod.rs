@@ -1082,7 +1082,7 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
 
 /// Parse a CREATE INDEX SQL string into an Index struct.
 pub fn parse_create_index_sql(sql: &str, _is_unique: bool) -> Option<Index> {
-    // Parse: CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table(col1, col2, ...)
+    // Parse: CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table(col1, col2, ...) [WHERE expr]
     let sql_upper = sql.to_uppercase();
 
     // Find the index name
@@ -1105,8 +1105,26 @@ pub fn parse_create_index_sql(sql: &str, _is_unique: bool) -> Option<Index> {
     // Find table name and columns
     let paren_pos = after_on.find('(')?;
     let table_name = after_on[..paren_pos].trim().to_string();
-    let columns_str = after_on[paren_pos + 1..].trim();
-    let columns_str = columns_str.strip_suffix(')')?;
+
+    // Find the matching closing paren - need to handle nested parens
+    let mut paren_depth = 0;
+    let mut close_paren_pos = None;
+    for (i, c) in after_on[paren_pos..].chars().enumerate() {
+        match c {
+            '(' => paren_depth += 1,
+            ')' => {
+                paren_depth -= 1;
+                if paren_depth == 0 {
+                    close_paren_pos = Some(paren_pos + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close_paren_pos = close_paren_pos?;
+    let columns_str = after_on[paren_pos + 1..close_paren_pos].trim();
+    let after_columns = after_on[close_paren_pos + 1..].trim();
 
     // Parse column list
     let mut columns = Vec::new();
@@ -1140,18 +1158,106 @@ pub fn parse_create_index_sql(sql: &str, _is_unique: bool) -> Option<Index> {
 
     let is_unique = sql_upper.contains("UNIQUE");
 
+    // Parse WHERE clause for partial index
+    let partial = parse_partial_index_where(after_columns);
+
     Some(Index {
         name: index_name,
         table: table_name,
         db_idx: 0, // TODO: parse from schema context
         columns,
         unique: is_unique,
-        partial: None,
+        partial,
         is_primary_key: false,
         root_page: 0, // Will be set when actual btree is created
         sql: Some(sql.to_string()),
         stats: None,
     })
+}
+
+/// Parse the WHERE clause of a partial index
+fn parse_partial_index_where(s: &str) -> Option<Expr> {
+    let s_upper = s.trim().to_uppercase();
+    if !s_upper.starts_with("WHERE") {
+        return None;
+    }
+
+    let where_expr_str = s.trim()[5..].trim(); // Skip "WHERE"
+
+    // Parse the expression using a simple expression parser
+    // For common cases like "c <= d", "a = b", etc.
+    parse_simple_expr(where_expr_str)
+}
+
+/// Parse a simple expression (comparison operators)
+fn parse_simple_expr(s: &str) -> Option<Expr> {
+    let s = s.trim();
+
+    // Remove outer parens if present
+    let s = if s.starts_with('(') && s.ends_with(')') {
+        &s[1..s.len() - 1].trim()
+    } else {
+        s
+    };
+
+    // Try comparison operators
+    for (op_str, op) in &[
+        ("<=", BinaryOp::Le),
+        (">=", BinaryOp::Ge),
+        ("<>", BinaryOp::Ne),
+        ("!=", BinaryOp::Ne),
+        ("=", BinaryOp::Eq),
+        ("<", BinaryOp::Lt),
+        (">", BinaryOp::Gt),
+    ] {
+        if let Some(pos) = s.find(op_str) {
+            let left = s[..pos].trim();
+            let right = s[pos + op_str.len()..].trim();
+
+            let left_expr = parse_simple_operand(left)?;
+            let right_expr = parse_simple_operand(right)?;
+
+            return Some(Expr::BinaryOp {
+                left: Box::new(left_expr),
+                op: *op,
+                right: Box::new(right_expr),
+            });
+        }
+    }
+
+    // If no operator found, try to parse as a single operand
+    parse_simple_operand(s)
+}
+
+/// Parse a simple operand (column name, integer, or string)
+fn parse_simple_operand(s: &str) -> Option<Expr> {
+    let s = s.trim();
+
+    // Try integer
+    if let Ok(n) = s.parse::<i64>() {
+        return Some(Expr::Integer(n));
+    }
+
+    // Try float
+    if let Ok(f) = s.parse::<f64>() {
+        return Some(Expr::Real(f));
+    }
+
+    // Try string literal
+    if (s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')) {
+        let content = &s[1..s.len() - 1];
+        return Some(Expr::String(content.to_string()));
+    }
+
+    // Column reference
+    if !s.is_empty() && (s.chars().next()?.is_alphabetic() || s.starts_with('_')) {
+        return Some(Expr::Column {
+            table: None,
+            column: s.to_string(),
+        });
+    }
+
+    None
 }
 
 // ============================================================================

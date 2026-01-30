@@ -51,6 +51,28 @@ Multiple sub-tests in the `insert.test` TCL suite are failing due to incorrect o
 
 ## Progress Notes
 
+### 2025-01-29: Session 4
+- **Tests passing: 76/83 (91.6%)**
+- **Fixed issues:**
+  - **Partial index support**: Added support for WHERE clause on indexes
+    - Updated `IndexCursor` struct to include partial condition and is_unique flag
+    - Modified `open_indexes_for_write` to extract partial condition from schema
+    - Updated `emit_index_inserts` to skip index insertion when partial condition is false
+    - Added `compile_partial_index_expr` to evaluate partial index WHERE conditions
+    - Fixed `parse_create_index_sql` to parse and store WHERE clause for partial indexes
+    - Added `parse_partial_index_where` and `parse_simple_expr` helper functions
+    - Fixed `compile_create_index` in prepare.rs to include WHERE clause in SQL string
+    - Fixes insert-17.13, insert-17.14, insert-17.15 (partial index constraint checking)
+
+- **Remaining failures (7 tests):**
+  - insert-5.5: Rootpage issue (temp table returns 8 instead of 2)
+  - insert-13.1: Expression index with REPLACE (extra rows)
+  - insert-15.1: Blob truncation (31153 instead of 33000) - overflow page issue
+  - insert-17.1: Rowid vs secondary index constraint ordering
+  - insert-17.10, insert-17.11, insert-17.12: REPLACE not deleting conflicting rows
+    - The VDBE engine's OE_REPLACE handling just skips insert instead of deleting conflicts
+    - Need to implement proper REPLACE conflict resolution in InsertCompiler
+
 ### 2025-01-29: Session 3
 - **Tests passing: 73/83 (87.9%)**
 - **Fixed issues:**

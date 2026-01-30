@@ -1789,13 +1789,20 @@ impl<'s> StatementCompiler<'s> {
                 }
             })
             .collect();
+        // Build WHERE clause for partial indexes
+        let where_str = if let Some(ref where_clause) = create.where_clause {
+            format!(" WHERE {}", self.expr_to_sql(where_clause))
+        } else {
+            String::new()
+        };
         let sql = format!(
-            "CREATE {}INDEX {}{} ON {}({})",
+            "CREATE {}INDEX {}{} ON {}({}){}",
             unique_str,
             if_not_exists_str,
             index_name,
             table_name,
-            columns_str.join(", ")
+            columns_str.join(", "),
+            where_str
         );
 
         let mut ops = Vec::new();

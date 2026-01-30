@@ -861,10 +861,12 @@ impl<'s> StatementCompiler<'s> {
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
 
         // 2: CreateBtree - create the table's root page
-        // P1=0 (main database), P2=register for root page, P3=BTREE_INTKEY for table
+        // P1 = database index (0 for main, 1 for temp)
+        // P2 = register for root page, P3 = BTREE_INTKEY for table
+        let db_idx = if create.temporary { 1 } else { 0 };
         ops.push(Self::make_op(
             Opcode::CreateBtree,
-            0,
+            db_idx,
             reg_root_page,
             BTREE_INTKEY as i32,
             P4::Unused,
@@ -935,9 +937,10 @@ impl<'s> StatementCompiler<'s> {
                         );
 
                         // CreateBtree for the index (BLOBKEY for index btrees)
+                        // Use same db_idx as the table
                         ops.push(Self::make_op(
                             Opcode::CreateBtree,
-                            0,
+                            db_idx,
                             reg_index_page,
                             BTREE_BLOBKEY as i32,
                             P4::Unused,
@@ -991,10 +994,10 @@ impl<'s> StatementCompiler<'s> {
                         col_names.join(", ")
                     );
 
-                    // CreateBtree for the index
+                    // CreateBtree for the index (use same db_idx as the table)
                     ops.push(Self::make_op(
                         Opcode::CreateBtree,
-                        0,
+                        db_idx,
                         reg_index_page,
                         BTREE_BLOBKEY as i32,
                         P4::Unused,
@@ -1003,7 +1006,7 @@ impl<'s> StatementCompiler<'s> {
                     // ParseSchema to register the index
                     ops.push(Self::make_op(
                         Opcode::ParseSchema,
-                        0,
+                        db_idx,
                         reg_index_page,
                         0,
                         P4::Text(index_sql.clone()),

@@ -13,14 +13,14 @@ use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-use crate::api::{SqliteConnection, TransactionState};
+use crate::api::{SqliteConnection, StubVfs, TransactionState};
 use crate::error::{Error, ErrorCode, Result};
 use crate::executor::trigger::{find_matching_triggers, TriggerMask};
 use crate::functions::aggregate::AggregateState;
 use crate::schema::{Schema, TriggerEvent, TriggerTiming};
 use crate::storage::btree::{
-    BtCursor, Btree, BtreeCursorFlags, BtreeInsertFlags, BtreePayload, UnpackedRecord,
-    BTREE_FILE_FORMAT, BTREE_SCHEMA_VERSION,
+    BtCursor, Btree, BtreeCursorFlags, BtreeInsertFlags, BtreeOpenFlags, BtreePayload,
+    UnpackedRecord, BTREE_FILE_FORMAT, BTREE_SCHEMA_VERSION,
 };
 use crate::storage::pager::SavepointOp;
 use crate::types::{ColumnType, OpenFlags, Pgno, Value};
@@ -123,6 +123,8 @@ pub struct VdbeCursor {
     pub alt_map: Option<Vec<i32>>,
     /// B-tree cursor for actual storage operations
     pub btree_cursor: Option<BtCursor>,
+    /// B-tree this cursor belongs to (for Insert/Delete operations)
+    pub btree: Option<Arc<Btree>>,
     /// Table name (for looking up column indices at runtime)
     pub table_name: Option<String>,
     /// Is this a sqlite_master virtual cursor?
@@ -214,6 +216,7 @@ impl VdbeCursor {
             alt_cursor: None,
             alt_map: None,
             btree_cursor: None,
+            btree: None,
             table_name: None,
             is_sqlite_master: false,
             is_sqlite_stat1: false,
@@ -412,6 +415,9 @@ pub struct Vdbe {
     /// B-tree for main database (for storage operations)
     btree: Option<Arc<Btree>>,
 
+    /// B-tree for temp database (in-memory, for TEMP tables)
+    temp_btree: Option<Arc<Btree>>,
+
     /// Schema for main database (for DDL operations)
     schema: Option<Arc<RwLock<Schema>>>,
 
@@ -498,6 +504,7 @@ impl Vdbe {
             result_count: 0,
             column_names: Vec::new(),
             btree: None,
+            temp_btree: None,
             schema: None,
             conn_ptr: None,
             deferred_fk_counter: 0,
@@ -550,6 +557,11 @@ impl Vdbe {
     /// Set the database btree for storage operations
     pub fn set_btree(&mut self, btree: Arc<Btree>) {
         self.btree = Some(btree);
+    }
+
+    /// Set the temp database btree for storage operations
+    pub fn set_temp_btree(&mut self, btree: Arc<Btree>) {
+        self.temp_btree = Some(btree);
     }
 
     /// Set the schema for DDL operations
@@ -1654,8 +1666,13 @@ impl Vdbe {
                             cursor.vtab_name = table_name;
                         }
                     } else {
-                        // Clone btree Arc to avoid borrow issues
-                        let btree = self.btree.clone();
+                        // Determine which btree to use: temp tables use temp_btree
+                        let is_temp = table_meta.as_ref().map(|t| t.db_idx == 1).unwrap_or(false);
+                        let btree = if is_temp {
+                            self.temp_btree.clone()
+                        } else {
+                            self.btree.clone()
+                        };
                         self.open_cursor(op.p1, root_page, false)?;
                         if let Some(cursor) = self.cursor_mut(op.p1) {
                             cursor.n_field = op.p3;
@@ -1663,7 +1680,8 @@ impl Vdbe {
                             cursor.is_index = is_index; // Mark as index cursor if opening an index
                             cursor.is_unique = index_unique;
                             cursor.index_name = if is_index { table_name } else { None };
-                            // Create a real BtCursor if we have a btree
+                            cursor.btree = btree.clone(); // Store btree reference for Insert/Delete
+                                                          // Create a real BtCursor if we have a btree
                             if let Some(ref btree) = btree {
                                 let flags = BtreeCursorFlags::empty();
                                 match btree.cursor(root_page, flags, None) {
@@ -1697,6 +1715,7 @@ impl Vdbe {
                 let mut table_name = None;
                 let mut table_columns = None;
                 let mut table_found = false;
+                let mut is_temp_table = false;
                 if let P4::Text(name) = &op.p4 {
                     table_name = Some(name.clone());
                     if let Some(ref schema) = self.schema {
@@ -1705,6 +1724,7 @@ impl Vdbe {
                             if let Some(table) = schema_guard.tables.get(&name.to_lowercase()) {
                                 table_found = true;
                                 is_virtual = table.is_virtual;
+                                is_temp_table = table.db_idx == 1;
                                 table_columns = Some(table.columns.len() as i32);
                                 if root_page == 0 {
                                     root_page = table.root_page;
@@ -1717,6 +1737,7 @@ impl Vdbe {
                                     table_found = true;
                                     is_index = true;
                                     index_unique = index.unique;
+                                    is_temp_table = index.db_idx == 1;
                                     root_page = index.root_page;
                                 }
                             }
@@ -1730,6 +1751,7 @@ impl Vdbe {
                                             table_found = true;
                                             is_index = true;
                                             index_unique = idx.unique;
+                                            is_temp_table = tbl.db_idx == 1;
                                             root_page = idx.root_page;
                                             break;
                                         }
@@ -1764,8 +1786,12 @@ impl Vdbe {
                         cursor.vtab_name = table_name;
                     }
                 } else {
-                    // Clone btree Arc to avoid borrow issues
-                    let btree = self.btree.clone();
+                    // Determine which btree to use: temp tables use temp_btree
+                    let btree = if is_temp_table {
+                        self.temp_btree.clone()
+                    } else {
+                        self.btree.clone()
+                    };
                     if let Some(ref btree) = btree {
                         btree.lock_table(root_page as i32, true)?;
                     }
@@ -1775,7 +1801,8 @@ impl Vdbe {
                         cursor.is_index = is_index;
                         cursor.is_unique = index_unique;
                         cursor.index_name = if is_index { table_name.clone() } else { None };
-                        // Create a writable BtCursor if we have a btree
+                        cursor.btree = btree.clone(); // Store btree reference for Insert/Delete
+                                                      // Create a writable BtCursor if we have a btree
                         if let Some(ref btree) = btree {
                             let flags = BtreeCursorFlags::WRCSR;
                             match btree.cursor(root_page, flags, None) {
@@ -3483,10 +3510,13 @@ impl Vdbe {
                     );
                 }
 
-                // Get btree Arc before cursor borrow
-                let btree_arc = self.btree.clone();
+                // Get btree Arc from cursor (supports temp tables), fall back to main btree for virtual tables
+                let btree_arc = self
+                    .cursor(op.p1)
+                    .and_then(|c| c.btree.clone())
+                    .or_else(|| self.btree.clone());
 
-                let btree = self.btree.clone();
+                let btree = btree_arc.clone();
                 let schema = self.schema.clone();
                 let record_mems = self.decode_record_mems(&record_data);
                 let mut inserted = false;
@@ -4023,7 +4053,11 @@ impl Vdbe {
                     self.is_dml_statement = true;
                 }
 
-                let btree_arc = self.btree.clone();
+                // Get btree Arc from cursor (supports temp tables), fall back to main btree for virtual tables
+                let btree_arc = self
+                    .cursor(op.p1)
+                    .and_then(|c| c.btree.clone())
+                    .or_else(|| self.btree.clone());
 
                 // --- Cursor Stability: Save positions of other cursors on the same table ---
                 // This ensures that when DELETE modifies the table, other cursors
@@ -4051,7 +4085,7 @@ impl Vdbe {
                     }
                 }
 
-                let btree = self.btree.clone();
+                let btree = btree_arc.clone();
                 let schema = self.schema.clone();
                 let mut deleted = false;
                 if let Some(cursor) = self.cursor_mut(op.p1) {
@@ -5460,12 +5494,43 @@ impl Vdbe {
             Opcode::CreateBtree => {
                 // CreateBtree P1 P2 P3
                 // Create a new btree root page, store page number in register P2
-                // P1 = database index (0 for main)
+                // P1 = database index (0 for main, 1 for temp)
                 // P3 = flags (BTREE_INTKEY for tables, 0 for indexes)
+                let db_idx = op.p1;
                 let flags = op.p3 as u8;
-                if let Some(ref btree) = self.btree {
-                    let root_pgno = btree.create_table(flags)?;
-                    self.mem_mut(op.p2).set_int(root_pgno as i64);
+
+                if db_idx == 1 {
+                    // Temp database - create in-memory btree if needed
+                    if self.temp_btree.is_none() {
+                        // Create in-memory btree for temp database
+                        let vfs = StubVfs;
+                        if let Ok(btree) = Btree::open(
+                            &vfs,
+                            "",
+                            None,
+                            BtreeOpenFlags::MEMORY,
+                            OpenFlags::CREATE | OpenFlags::READWRITE,
+                        ) {
+                            // Store in connection so subsequent statements can access it
+                            if let Some(conn_ptr) = self.conn_ptr {
+                                let conn = unsafe { &mut *conn_ptr };
+                                if conn.dbs.len() > 1 {
+                                    conn.dbs[1].btree = Some(btree.clone());
+                                }
+                            }
+                            self.temp_btree = Some(btree);
+                        }
+                    }
+                    if let Some(ref btree) = self.temp_btree {
+                        let root_pgno = btree.create_table(flags)?;
+                        self.mem_mut(op.p2).set_int(root_pgno as i64);
+                    }
+                } else {
+                    // Main database
+                    if let Some(ref btree) = self.btree {
+                        let root_pgno = btree.create_table(flags)?;
+                        self.mem_mut(op.p2).set_int(root_pgno as i64);
+                    }
                 }
             }
 

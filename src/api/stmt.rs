@@ -495,6 +495,16 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
                     vdbe.set_schema(schema.clone());
                 }
             }
+            // Also set temp btree if it exists (for TEMP tables)
+            if conn.dbs.len() > 1 {
+                if let Some(ref btree) = conn.dbs[1].btree {
+                    vdbe.set_temp_btree(btree.clone());
+                    // Start transaction on temp btree for write statements
+                    if !stmt.read_only && conn.get_autocommit() {
+                        let _ = btree.begin_trans(true);
+                    }
+                }
+            }
             vdbe.set_connection(conn_ptr);
         }
 
@@ -535,6 +545,12 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
                                 let _ = btree.commit();
                             }
                         }
+                        // Also commit temp btree if it exists
+                        if conn.dbs.len() > 1 {
+                            if let Some(ref btree) = conn.dbs[1].btree {
+                                let _ = btree.commit();
+                            }
+                        }
                     }
                 }
             }
@@ -553,6 +569,12 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
                 let conn = unsafe { &*conn_ptr };
                 if let Some(main_db) = conn.find_db("main") {
                     if let Some(ref btree) = main_db.btree {
+                        let _ = btree.rollback(0, false);
+                    }
+                }
+                // Also rollback temp btree if it exists
+                if conn.dbs.len() > 1 {
+                    if let Some(ref btree) = conn.dbs[1].btree {
                         let _ = btree.rollback(0, false);
                     }
                 }

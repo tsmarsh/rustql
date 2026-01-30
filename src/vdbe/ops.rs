@@ -263,9 +263,6 @@ pub enum Opcode {
     /// Make a record from P1..P1+P2-1 registers, store in P3
     MakeRecord,
 
-    /// Decode record in P1, store columns starting at P2, P3 columns total
-    DecodeRecord,
-
     /// Output result row from P1..P1+P2-1 registers
     ResultRow,
 
@@ -329,9 +326,6 @@ pub enum Opcode {
 
     /// Compare sorter keys
     SorterCompare,
-
-    /// Configure sorter sort order - P1=cursor, P4=blob of sort directions (0=ASC, 1=DESC)
-    SorterConfig,
 
     // ========================================================================
     // Schema Operations
@@ -430,15 +424,10 @@ pub enum Opcode {
 
     /// Access parameter from parent VDBE (for trigger body)
     /// P1 = which parameter (0 = OLD row, 1 = NEW row)
-    /// P2 = column index (-1 for rowid)
-    /// P3 = destination register
+    /// P2 = destination register
+    /// Uses SQLite formula: P1 = table * (nCol+1) + column + 1
+    /// where table=0 for OLD, table=1 for NEW
     Param,
-
-    /// Set OLD/NEW row values for trigger execution
-    /// P1 = 0 for OLD row, 1 for NEW row
-    /// P2 = base register containing row values
-    /// P3 = number of columns
-    SetTriggerRow,
 
     // ========================================================================
     // RowSet Operations (for IN clause optimization)
@@ -755,7 +744,6 @@ impl Opcode {
                 | Opcode::SorterNext
                 | Opcode::SorterData
                 | Opcode::SorterInsert
-                | Opcode::SorterConfig
                 | Opcode::NullRow
                 | Opcode::Clear
                 | Opcode::OpenDup
@@ -866,7 +854,6 @@ impl Opcode {
             Opcode::Column => "Column",
             Opcode::Rowid => "Rowid",
             Opcode::MakeRecord => "MakeRecord",
-            Opcode::DecodeRecord => "DecodeRecord",
             Opcode::ResultRow => "ResultRow",
             Opcode::Insert => "Insert",
             Opcode::NewRowid => "NewRowid",
@@ -886,7 +873,6 @@ impl Opcode {
             Opcode::SorterNext => "SorterNext",
             Opcode::SorterData => "SorterData",
             Opcode::SorterCompare => "SorterCompare",
-            Opcode::SorterConfig => "SorterConfig",
             Opcode::CreateBtree => "CreateBtree",
             Opcode::ParseSchema => "ParseSchema",
             Opcode::DropTable => "DropTable",
@@ -910,7 +896,6 @@ impl Opcode {
             Opcode::FkCheck => "FkCheck",
             Opcode::Program => "Program",
             Opcode::Param => "Param",
-            Opcode::SetTriggerRow => "SetTriggerRow",
             Opcode::RowSetAdd => "RowSetAdd",
             Opcode::RowSetRead => "RowSetRead",
             Opcode::RowSetTest => "RowSetTest",

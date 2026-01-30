@@ -825,7 +825,6 @@ impl<'a> InsertCompiler<'a> {
                     | Opcode::IdxLT
                     | Opcode::Found
                     | Opcode::NotFound
-                    | Opcode::SorterConfig
                     | Opcode::SorterInsert
                     | Opcode::SorterSort
                     | Opcode::SorterNext
@@ -1660,7 +1659,6 @@ impl<'a> InsertCompiler<'a> {
                     | Opcode::IdxLT
                     | Opcode::Found
                     | Opcode::NotFound
-                    | Opcode::SorterConfig
                     | Opcode::SorterInsert
                     | Opcode::SorterSort
                     | Opcode::SorterNext

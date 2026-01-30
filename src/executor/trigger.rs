@@ -703,18 +703,23 @@ impl<'s> TriggerBodyCompiler<'s> {
             }
 
             Expr::Column(col_ref) => {
-                // Handle OLD/NEW references
+                // Handle OLD/NEW references (SQLite-aligned Param opcode)
                 if let Some(ref table) = col_ref.table {
                     let table_upper = table.to_uppercase();
                     if table_upper == "OLD" || table_upper == "NEW" {
-                        let p1 = if table_upper == "OLD" { 0 } else { 1 };
+                        let table_type = if table_upper == "OLD" { 0 } else { 1 };
                         let col_lower = col_ref.column.to_lowercase();
                         let col_idx = self
                             .column_map
                             .get(&col_lower)
                             .map(|&idx| idx as i32)
                             .unwrap_or(-1);
-                        self.emit(Opcode::Param, p1, col_idx, dest_reg, P4::Unused);
+
+                        // SQLite formula: P1 = table * (nCol+1) + col + 1
+                        // For rowid (col=-1): P1 = table * (nCol+1)
+                        let row_size = self.num_columns as i32 + 1;
+                        let offset = table_type * row_size + col_idx + 1;
+                        self.emit(Opcode::Param, offset, dest_reg, 0, P4::Unused);
                         return Ok(());
                     }
                 }
@@ -886,17 +891,22 @@ impl<'s> TriggerBodyCompiler<'s> {
             }
 
             Expr::Column(col_ref) => {
+                // Handle OLD/NEW references (SQLite-aligned Param opcode)
                 if let Some(ref table) = col_ref.table {
                     let table_upper = table.to_uppercase();
                     if table_upper == "OLD" || table_upper == "NEW" {
-                        let p1 = if table_upper == "OLD" { 0 } else { 1 };
+                        let table_type = if table_upper == "OLD" { 0 } else { 1 };
                         let col_lower = col_ref.column.to_lowercase();
                         let col_idx = self
                             .column_map
                             .get(&col_lower)
                             .map(|&idx| idx as i32)
                             .unwrap_or(-1);
-                        self.emit(Opcode::Param, p1, col_idx, dest_reg, P4::Unused);
+
+                        // SQLite formula: P1 = table * (nCol+1) + col + 1
+                        let row_size = self.num_columns as i32 + 1;
+                        let offset = table_type * row_size + col_idx + 1;
+                        self.emit(Opcode::Param, offset, dest_reg, 0, P4::Unused);
                         return Ok(());
                     }
                 }
@@ -1095,7 +1105,7 @@ impl<'s> TriggerBodyCompiler<'s> {
         Ok(())
     }
 
-    /// Compile a column reference, handling OLD/NEW pseudo-tables
+    /// Compile a column reference, handling OLD/NEW pseudo-tables (SQLite-aligned)
     fn compile_column_ref(
         &mut self,
         col_ref: &crate::parser::ast::ColumnRef,
@@ -1106,8 +1116,8 @@ impl<'s> TriggerBodyCompiler<'s> {
             let table_upper = table.to_uppercase();
 
             if table_upper == "OLD" || table_upper == "NEW" {
-                // This is an OLD/NEW reference - use Param opcode
-                let p1 = if table_upper == "OLD" { 0 } else { 1 };
+                // This is an OLD/NEW reference - use Param opcode with SQLite formula
+                let table_type = if table_upper == "OLD" { 0 } else { 1 };
 
                 // Find column index
                 let col_lower = col_ref.column.to_lowercase();
@@ -1117,16 +1127,21 @@ impl<'s> TriggerBodyCompiler<'s> {
                     .map(|&idx| idx as i32)
                     .unwrap_or(-1); // -1 for rowid
 
+                // SQLite formula: P1 = table * (nCol+1) + col + 1
+                // For rowid (col=-1): P1 = table * (nCol+1)
+                let row_size = self.num_columns as i32 + 1;
+
                 // Special case: check for rowid aliases
-                if col_ref.column.eq_ignore_ascii_case("rowid")
+                let offset = if col_ref.column.eq_ignore_ascii_case("rowid")
                     || col_ref.column.eq_ignore_ascii_case("_rowid_")
                     || col_ref.column.eq_ignore_ascii_case("oid")
                 {
-                    self.emit(Opcode::Param, p1, -1, dest_reg, P4::Unused);
+                    table_type * row_size // rowid at offset 0 within row
                 } else {
-                    self.emit(Opcode::Param, p1, col_idx, dest_reg, P4::Unused);
-                }
+                    table_type * row_size + col_idx + 1
+                };
 
+                self.emit(Opcode::Param, offset, dest_reg, 0, P4::Unused);
                 return Ok(());
             }
         }
@@ -1195,67 +1210,62 @@ pub fn generate_trigger_code(
         // Update the cursor counter to account for cursors used by the trigger
         *next_cursor = compiler.next_cursor;
 
-        // Before calling the trigger, we need to set up OLD/NEW row values
-        // This is done by emitting Copy opcodes to move values from the base registers
-        // to the trigger's expected locations
+        // SQLite-aligned trigger row setup:
+        // Allocate contiguous registers for OLD and NEW row values
+        // Layout: [OLD.rowid, OLD.col0, ..., OLD.colN, NEW.rowid, NEW.col0, ..., NEW.colN]
+        //
+        // Param opcode uses offset formula: table * (nCol+1) + column + 1
+        // where table=0 for OLD, table=1 for NEW, column=-1 for rowid
 
-        // For OLD values (DELETE/UPDATE triggers)
+        let base_reg = *next_reg;
+        let row_size = num_columns + 1; // +1 for rowid slot
+
+        // Allocate space for both OLD and NEW (even if only one is used)
+        *next_reg += (row_size * 2) as i32;
+
+        // Copy OLD values if present (DELETE/UPDATE triggers)
         if let Some(old_reg) = old_base_reg {
-            // Emit opcodes to copy OLD row to trigger_old_row in VDBE
-            // The SetTriggerRow opcode stores the row values
-            let copy_reg = *next_reg;
-            *next_reg += num_columns;
+            // OLD.rowid at base_reg + 0 (use rowid_reg if available, else use 0)
+            // For now, we use the first column value as a placeholder for rowid
+            // TODO: Pass actual rowid separately if needed
 
+            // OLD columns at base_reg + 1 through base_reg + num_columns
             for i in 0..num_columns {
                 ops.push(make_op(
                     Opcode::SCopy,
                     old_reg + i,
-                    copy_reg + i,
+                    base_reg + 1 + i, // +1 to skip rowid slot
                     0,
                     P4::Unused,
                 ));
             }
-
-            // SetTriggerRow stores the row for Param opcode to read
-            ops.push(make_op(
-                Opcode::SetTriggerRow,
-                0, // 0 = OLD row
-                copy_reg,
-                num_columns,
-                P4::Unused,
-            ));
         }
 
-        // For NEW values (INSERT/UPDATE triggers)
+        // Copy NEW values if present (INSERT/UPDATE triggers)
         if let Some(new_reg) = new_base_reg {
-            let copy_reg = *next_reg;
-            *next_reg += num_columns;
-
+            // NEW.rowid at base_reg + row_size (offset for NEW section)
+            // NEW columns at base_reg + row_size + 1 through base_reg + row_size + num_columns
+            let new_base = base_reg + row_size as i32;
             for i in 0..num_columns {
                 ops.push(make_op(
                     Opcode::SCopy,
                     new_reg + i,
-                    copy_reg + i,
+                    new_base + 1 + i, // +1 to skip rowid slot
                     0,
                     P4::Unused,
                 ));
             }
-
-            ops.push(make_op(
-                Opcode::SetTriggerRow,
-                1, // 1 = NEW row
-                copy_reg,
-                num_columns,
-                P4::Unused,
-            ));
         }
 
-        // Emit Program opcode to execute the trigger
+        // Emit Program opcode to execute the trigger (SQLite-aligned)
+        // P1 = base register for OLD/NEW values
+        // P2 = return address
+        // P3 = number of columns (for Param offset calculation)
         ops.push(make_op(
             Opcode::Program,
-            0,
+            base_reg,
             return_label,
-            0,
+            num_columns,
             P4::Subprogram(Arc::new(subprogram)),
         ));
     }

@@ -4121,13 +4121,34 @@ impl Btree {
         // to ensure we have the latest data (cursor.page might be stale if
         // another cursor modified the page).
         let page_pgno = _cursor.page.as_ref().map(|p| p.pgno).unwrap_or(root_pgno);
-        let (mut mem_page, limits) = _cursor.load_page(&mut shared_guard, page_pgno)?;
+        let (mut mem_page, mut limits) = _cursor.load_page(&mut shared_guard, page_pgno)?;
+
+        if _cursor.state != CursorState::Valid {
+            return Ok(());
+        }
 
         if !mem_page.is_leaf {
             return Err(Error::new(ErrorCode::Internal));
         }
         if _cursor.ix >= mem_page.n_cell {
-            return Err(Error::new(ErrorCode::Range));
+            if _cursor.cur_int_key {
+                let saved_key = _cursor.n_key;
+                let res = _cursor.table_moveto_with_shared(&mut shared_guard, saved_key, false)?;
+                if res != 0 {
+                    _cursor.state = CursorState::Invalid;
+                    return Ok(());
+                }
+                let page_pgno = _cursor.page.as_ref().map(|p| p.pgno).unwrap_or(root_pgno);
+                let (fresh_page, fresh_limits) = _cursor.load_page(&mut shared_guard, page_pgno)?;
+                mem_page = fresh_page;
+                limits = fresh_limits;
+                if _cursor.ix >= mem_page.n_cell {
+                    _cursor.state = CursorState::Invalid;
+                    return Ok(());
+                }
+            } else {
+                return Err(Error::new(ErrorCode::Range));
+            }
         }
 
         let header_start = limits.header_start();
@@ -4172,7 +4193,7 @@ impl Btree {
             *cursor_page = mem_page.clone();
         }
 
-        if mem_page.is_underfull(limits).unwrap_or(false) {
+        if mem_page.n_cell == 0 && mem_page.is_underfull(limits).unwrap_or(false) {
             if let (Some(parent), Some(child_index)) =
                 (_cursor.page_stack.last(), _cursor.idx_stack.last())
             {

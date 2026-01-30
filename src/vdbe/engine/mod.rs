@@ -990,8 +990,13 @@ impl Vdbe {
                 }
 
                 // Check if we're in a subprogram (trigger)
-                if let Some((parent_ops, return_pc, _parent_pc, parent_param_base, parent_num_cols)) =
-                    self.subprogram_stack.pop()
+                if let Some((
+                    parent_ops,
+                    return_pc,
+                    _parent_pc,
+                    parent_param_base,
+                    parent_num_cols,
+                )) = self.subprogram_stack.pop()
                 {
                     // Return from subprogram to parent
                     // Note: exec_op reads ops[pc] THEN increments pc, so we set pc = return_pc

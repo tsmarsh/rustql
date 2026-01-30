@@ -1908,10 +1908,17 @@ impl Vdbe {
             }
 
             Opcode::OpenEphemeral => {
+                // OpenEphemeral P1 P2 P3 P4
+                // Open ephemeral cursor P1 with P2 columns
+                // P4 may contain sort directions blob (SQLite: uses KeyInfo)
                 self.open_cursor(op.p1, 0, true)?;
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     cursor.is_ephemeral = true;
                     cursor.n_field = op.p2;
+                    // Parse sort directions from P4 if present (SQLite-style)
+                    if let P4::Blob(dirs) = &op.p4 {
+                        cursor.sort_desc = dirs.iter().map(|&b| b != 0).collect();
+                    }
                 }
             }
 
@@ -4519,16 +4526,6 @@ impl Vdbe {
                                 }
                             }
                         }
-                    }
-                }
-            }
-
-            Opcode::SorterConfig => {
-                // SorterConfig P1: Set sort directions for cursor P1
-                // P4 contains a blob where each byte is 0 (ASC) or 1 (DESC)
-                if let Some(cursor) = self.cursor_mut(op.p1) {
-                    if let P4::Blob(dirs) = &op.p4 {
-                        cursor.sort_desc = dirs.iter().map(|&b| b != 0).collect();
                     }
                 }
             }

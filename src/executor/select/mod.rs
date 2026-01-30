@@ -316,23 +316,16 @@ impl<'s> SelectCompiler<'s> {
                 } else {
                     let sorter_cursor = self.alloc_cursor();
                     let num_cols = order_by.len();
-                    // Open ephemeral table for sorting
-                    self.emit(
-                        Opcode::OpenEphemeral,
-                        sorter_cursor,
-                        num_cols as i32,
-                        0,
-                        P4::Unused,
-                    );
-                    // Configure sort directions (0=ASC, 1=DESC)
+                    // Sort directions (0=ASC, 1=DESC) passed in P4 (SQLite-style)
                     let sort_dirs: Vec<u8> = order_by
                         .iter()
                         .map(|t| if t.order == SortOrder::Desc { 1 } else { 0 })
                         .collect();
+                    // Open ephemeral table for sorting with sort directions
                     self.emit(
-                        Opcode::SorterConfig,
+                        Opcode::OpenEphemeral,
                         sorter_cursor,
-                        0,
+                        num_cols as i32,
                         0,
                         P4::Blob(sort_dirs),
                     );
@@ -437,23 +430,16 @@ impl<'s> SelectCompiler<'s> {
         let (actual_dest, sorter_cursor, order_by_cols) = if let Some(order_by) = &select.order_by {
             let sorter_cursor = self.alloc_cursor();
             let num_cols = order_by.len();
-            // Open ephemeral table for sorting
-            self.emit(
-                Opcode::OpenEphemeral,
-                sorter_cursor,
-                num_cols as i32,
-                0,
-                P4::Unused,
-            );
-            // Configure sort directions (0=ASC, 1=DESC)
+            // Sort directions (0=ASC, 1=DESC) passed in P4 (SQLite-style)
             let sort_dirs: Vec<u8> = order_by
                 .iter()
                 .map(|t| if t.order == SortOrder::Desc { 1 } else { 0 })
                 .collect();
+            // Open ephemeral table for sorting with sort directions
             self.emit(
-                Opcode::SorterConfig,
+                Opcode::OpenEphemeral,
                 sorter_cursor,
-                0,
+                num_cols as i32,
                 0,
                 P4::Blob(sort_dirs),
             );

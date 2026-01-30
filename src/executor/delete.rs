@@ -1170,7 +1170,6 @@ impl<'s> DeleteCompiler<'s> {
                             | Opcode::IdxLT
                             | Opcode::Found
                             | Opcode::NotFound
-                            | Opcode::SorterConfig
                             | Opcode::SorterInsert
                             | Opcode::SorterSort
                             | Opcode::SorterNext
@@ -1264,7 +1263,6 @@ impl<'s> DeleteCompiler<'s> {
                             | Opcode::IdxLT
                             | Opcode::Found
                             | Opcode::NotFound
-                            | Opcode::SorterConfig
                             | Opcode::SorterInsert
                             | Opcode::SorterSort
                             | Opcode::SorterNext
@@ -1797,7 +1795,6 @@ impl<'s> DeleteCompiler<'s> {
                         | Opcode::IdxLT
                         | Opcode::Found
                         | Opcode::NotFound
-                        | Opcode::SorterConfig
                         | Opcode::SorterInsert
                         | Opcode::SorterSort
                         | Opcode::SorterNext

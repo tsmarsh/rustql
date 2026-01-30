@@ -427,15 +427,10 @@ pub enum Opcode {
 
     /// Access parameter from parent VDBE (for trigger body)
     /// P1 = which parameter (0 = OLD row, 1 = NEW row)
-    /// P2 = column index (-1 for rowid)
-    /// P3 = destination register
+    /// P2 = destination register
+    /// Uses SQLite formula: P1 = table * (nCol+1) + column + 1
+    /// where table=0 for OLD, table=1 for NEW
     Param,
-
-    /// Set OLD/NEW row values for trigger execution
-    /// P1 = 0 for OLD row, 1 for NEW row
-    /// P2 = base register containing row values
-    /// P3 = number of columns
-    SetTriggerRow,
 
     // ========================================================================
     // RowSet Operations (for IN clause optimization)
@@ -905,7 +900,6 @@ impl Opcode {
             Opcode::FkCheck => "FkCheck",
             Opcode::Program => "Program",
             Opcode::Param => "Param",
-            Opcode::SetTriggerRow => "SetTriggerRow",
             Opcode::RowSetAdd => "RowSetAdd",
             Opcode::RowSetRead => "RowSetRead",
             Opcode::RowSetTest => "RowSetTest",

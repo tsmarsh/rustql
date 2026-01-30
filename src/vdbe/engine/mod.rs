@@ -433,11 +433,12 @@ pub struct Vdbe {
     // ========================================================================
     // Trigger Context
     // ========================================================================
-    /// OLD row values for DELETE/UPDATE triggers
-    trigger_old_row: Option<Vec<Mem>>,
+    /// Base register for Param opcode to access OLD/NEW values (SQLite-style)
+    /// Set by Program P1, used by Param to read parent registers
+    trigger_param_base: Option<i32>,
 
-    /// NEW row values for INSERT/UPDATE triggers
-    trigger_new_row: Option<Vec<Mem>>,
+    /// Number of columns in trigger table (for Param offset calculation)
+    trigger_num_columns: i32,
 
     /// Trigger recursion depth
     trigger_depth: u32,
@@ -446,8 +447,8 @@ pub struct Vdbe {
     max_trigger_depth: u32,
 
     /// Saved program state for subprogram execution
-    /// (parent ops, parent pc) - allows returning from trigger
-    subprogram_stack: Vec<(Vec<VdbeOp>, i32, i32)>, // (ops, pc, mem_base)
+    /// (parent ops, return pc, parent param_base, parent num_columns)
+    subprogram_stack: Vec<(Vec<VdbeOp>, i32, i32, Option<i32>, i32)>,
 
     /// Aggregate function contexts, keyed by accumulator register
     agg_contexts: HashMap<i32, AggregateState>,
@@ -503,8 +504,8 @@ impl Vdbe {
             vtab_query: None,
             vtab_context_name: None,
             vtab_context_rowid: None,
-            trigger_old_row: None,
-            trigger_new_row: None,
+            trigger_param_base: None,
+            trigger_num_columns: 0,
             trigger_depth: 0,
             max_trigger_depth: 1000,
             subprogram_stack: Vec::new(),
@@ -529,20 +530,10 @@ impl Vdbe {
     // Trigger Context Methods
     // ========================================================================
 
-    /// Set OLD row for DELETE/UPDATE triggers
-    pub fn set_trigger_old_row(&mut self, row: Vec<Mem>) {
-        self.trigger_old_row = Some(row);
-    }
-
-    /// Set NEW row for INSERT/UPDATE triggers
-    pub fn set_trigger_new_row(&mut self, row: Vec<Mem>) {
-        self.trigger_new_row = Some(row);
-    }
-
     /// Clear trigger context
     pub fn clear_trigger_context(&mut self) {
-        self.trigger_old_row = None;
-        self.trigger_new_row = None;
+        self.trigger_param_base = None;
+        self.trigger_num_columns = 0;
     }
 
     /// Get trigger recursion depth
@@ -999,13 +990,19 @@ impl Vdbe {
                 }
 
                 // Check if we're in a subprogram (trigger)
-                if let Some((parent_ops, return_pc, _parent_pc)) = self.subprogram_stack.pop() {
+                if let Some((parent_ops, return_pc, _parent_pc, parent_param_base, parent_num_cols)) =
+                    self.subprogram_stack.pop()
+                {
                     // Return from subprogram to parent
                     // Note: exec_op reads ops[pc] THEN increments pc, so we set pc = return_pc
                     // directly to execute the instruction at return_pc.
                     self.ops = parent_ops;
                     self.pc = return_pc; // Execute instruction at return_pc next
                     self.trigger_depth = self.trigger_depth.saturating_sub(1);
+
+                    // Restore parent's trigger context (SQLite-aligned)
+                    self.trigger_param_base = parent_param_base;
+                    self.trigger_num_columns = parent_num_cols;
 
                     // If halt was due to error, propagate it
                     if self.rc != ErrorCode::Ok {
@@ -6061,10 +6058,10 @@ impl Vdbe {
             // ================================================================
             Opcode::Program => {
                 // Program P1 P2 P3 P4
-                // Execute a trigger subprogram
-                // P1 = subprogram context register (unused currently)
+                // Execute a trigger subprogram (SQLite-aligned)
+                // P1 = base register for OLD/NEW row values
                 // P2 = return address (jump here when subprogram finishes)
-                // P3 = trigger mask/flags
+                // P3 = number of columns in the table
                 // P4 = SubProgram containing trigger bytecode
 
                 // Check recursion depth
@@ -6080,21 +6077,30 @@ impl Vdbe {
 
                 // Get the subprogram from P4
                 if let P4::Subprogram(ref subprog) = op.p4 {
-                    // Save current execution state
+                    // Save current execution state including trigger context
                     let return_pc = op.p2;
                     let current_ops = std::mem::take(&mut self.ops);
                     let current_pc = self.pc;
+                    let parent_param_base = self.trigger_param_base;
+                    let parent_num_columns = self.trigger_num_columns;
 
                     // Push state onto subprogram stack
-                    self.subprogram_stack
-                        .push((current_ops, return_pc, current_pc));
+                    self.subprogram_stack.push((
+                        current_ops,
+                        return_pc,
+                        current_pc,
+                        parent_param_base,
+                        parent_num_columns,
+                    ));
+
+                    // Set trigger context for Param opcode (SQLite-style)
+                    // P1 is the base register where OLD/NEW values are stored
+                    self.trigger_param_base = Some(op.p1);
+                    self.trigger_num_columns = op.p3;
 
                     // Load subprogram
                     self.ops = subprog.ops.clone();
                     // Set pc to 0 to start at first instruction
-                    // (exec_op will increment it after executing each opcode)
-                    // Note: We return Continue here, and step() will call exec_op()
-                    // which will execute ops[0] and then increment pc to 1.
                     self.pc = 0;
 
                     // Increment trigger depth
@@ -6109,56 +6115,27 @@ impl Vdbe {
             }
 
             Opcode::Param => {
-                // Param P1 P2 P3
-                // Access parameter from parent VDBE (for trigger body)
-                // P1 = which parameter (0 = OLD row, 1 = NEW row)
-                // P2 = column index (-1 for rowid)
-                // P3 = destination register
+                // Param P1 P2 * (SQLite-aligned)
+                // Access parameter from parent frame registers for trigger body
+                // P1 = offset into register array (SQLite formula: table * (nCol+1) + col + 1)
+                // P2 = destination register
+                //
+                // The register layout set by Program opcode:
+                //   base+0:          OLD.rowid
+                //   base+1..base+N:  OLD column values
+                //   base+N+1:        NEW.rowid
+                //   base+N+2..base+2N+1: NEW column values
 
-                let row_type = if op.p1 == 0 { "OLD" } else { "NEW" };
-                let row = if op.p1 == 0 {
-                    &self.trigger_old_row
+                if let Some(base_reg) = self.trigger_param_base {
+                    // Calculate the source register: base + P1 offset
+                    let src_reg = base_reg + op.p1;
+
+                    // Copy value from parent register to destination
+                    let value = self.mem(src_reg).clone();
+                    *self.mem_mut(op.p2) = value;
                 } else {
-                    &self.trigger_new_row
-                };
-
-                if let Some(ref row_data) = row {
-                    let col_idx = op.p2;
-                    if col_idx >= 0 && (col_idx as usize) < row_data.len() {
-                        // Copy value from trigger row to destination register
-                        let value = row_data[col_idx as usize].clone();
-                        *self.mem_mut(op.p3) = value;
-                    } else {
-                        // Column index out of range - return NULL
-                        self.mem_mut(op.p3).set_null();
-                    }
-                } else {
-                    // No trigger context (not in a trigger) - return NULL
-                    self.mem_mut(op.p3).set_null();
-                }
-            }
-
-            Opcode::SetTriggerRow => {
-                // SetTriggerRow P1 P2 P3
-                // Set OLD/NEW row values for trigger execution
-                // P1 = 0 for OLD row, 1 for NEW row
-                // P2 = base register containing row values
-                // P3 = number of columns
-                let base_reg = op.p2;
-                let num_cols = op.p3 as usize;
-
-                // Collect values from registers
-                let mut row = Vec::with_capacity(num_cols);
-                for i in 0..num_cols {
-                    let val = self.mem(base_reg + i as i32).clone();
-                    row.push(val);
-                }
-
-                // Store in trigger context
-                if op.p1 == 0 {
-                    self.trigger_old_row = Some(row);
-                } else {
-                    self.trigger_new_row = Some(row);
+                    // No trigger context - return NULL
+                    self.mem_mut(op.p2).set_null();
                 }
             }
 

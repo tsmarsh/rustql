@@ -929,6 +929,9 @@ impl Mem {
         if self.is_int() && other.is_int() {
             if other.i == 0 {
                 self.set_null();
+            } else if self.i == i64::MIN && other.i == -1 {
+                // Overflow case: MIN / -1 would overflow, convert to float like SQLite
+                self.set_real(self.to_real() / other.to_real());
             } else {
                 self.set_int(self.i / other.i);
             }
@@ -954,6 +957,9 @@ impl Mem {
         let b = other.to_int();
         if b == 0 {
             self.set_null();
+        } else if a == i64::MIN && b == -1 {
+            // Overflow case: MIN % -1 would overflow, but the result is 0
+            self.set_int(0);
         } else {
             self.set_int(a % b);
         }

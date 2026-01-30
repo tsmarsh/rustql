@@ -276,11 +276,18 @@ impl<'s> TriggerBodyCompiler<'s> {
     ///
     /// The cursor_offset parameter is used to avoid cursor number conflicts with the
     /// parent program. Cursors in the subprogram will be numbered starting from cursor_offset.
-    pub fn new(schema: Option<&'s Schema>, table_name: &str, cursor_offset: i32) -> Self {
+    /// The reg_offset parameter is used to avoid register conflicts with the parent program.
+    /// Registers in the subprogram will be numbered starting from reg_offset.
+    pub fn new(
+        schema: Option<&'s Schema>,
+        table_name: &str,
+        cursor_offset: i32,
+        reg_offset: i32,
+    ) -> Self {
         let mut compiler = Self {
             schema,
             ops: Vec::new(),
-            next_reg: 1,
+            next_reg: reg_offset.max(1), // Start from reg_offset, but at least 1
             next_cursor: cursor_offset,
             next_label: -1,
             table_name: table_name.to_string(),
@@ -414,6 +421,14 @@ impl<'s> TriggerBodyCompiler<'s> {
     fn compile_insert(&mut self, insert: &crate::parser::ast::InsertStmt) -> Result<()> {
         use crate::parser::ast::InsertSource;
 
+        let table_name = insert.table.name.clone();
+        let table_name_lower = table_name.to_lowercase();
+
+        // Get table info from schema
+        let table_info = self
+            .schema
+            .and_then(|s| s.tables.get(&table_name_lower).cloned());
+
         // Open target table for writing
         let cursor = self.alloc_cursor();
         self.emit(
@@ -421,8 +436,25 @@ impl<'s> TriggerBodyCompiler<'s> {
             cursor,
             0,
             0,
-            P4::Text(insert.table.name.clone()),
+            P4::Text(table_name.clone()),
         );
+
+        // Collect indexes for this table and open write cursors
+        let mut index_cursors: Vec<(i32, Vec<i32>)> = Vec::new();
+        if let Some(ref table) = table_info {
+            for index in &table.indexes {
+                let idx_cursor = self.alloc_cursor();
+                self.emit(
+                    Opcode::OpenWrite,
+                    idx_cursor,
+                    index.root_page as i32,
+                    (index.columns.len() + 1) as i32,
+                    P4::Text(index.name.clone()),
+                );
+                let col_indices: Vec<i32> = index.columns.iter().map(|c| c.column_idx).collect();
+                index_cursors.push((idx_cursor, col_indices));
+            }
+        }
 
         // Handle INSERT ... VALUES
         if let InsertSource::Values(rows) = &insert.source {
@@ -456,12 +488,61 @@ impl<'s> TriggerBodyCompiler<'s> {
                     P4::Unused,
                 );
 
-                // Insert
+                // Insert into main table
                 self.emit(Opcode::Insert, cursor, record_reg, rowid_reg, P4::Unused);
+
+                // Insert into all indexes
+                for (idx_cursor, col_indices) in &index_cursors {
+                    // Build index key: indexed columns + rowid
+                    let key_base = self.alloc_regs((col_indices.len() + 1) as i32);
+
+                    // Copy indexed columns to key registers
+                    for (i, &col_idx) in col_indices.iter().enumerate() {
+                        if col_idx >= 0 && (col_idx as usize) < num_cols {
+                            self.emit(
+                                Opcode::Copy,
+                                base_reg + col_idx,
+                                key_base + i as i32,
+                                0,
+                                P4::Unused,
+                            );
+                        } else {
+                            self.emit(Opcode::Null, 0, key_base + i as i32, 0, P4::Unused);
+                        }
+                    }
+
+                    // Copy rowid as the last key component
+                    let rowid_pos = key_base + col_indices.len() as i32;
+                    self.emit(Opcode::Copy, rowid_reg, rowid_pos, 0, P4::Unused);
+
+                    // Make the index record
+                    let idx_record_reg = self.alloc_reg();
+                    self.emit(
+                        Opcode::MakeRecord,
+                        key_base,
+                        (col_indices.len() + 1) as i32,
+                        idx_record_reg,
+                        P4::Unused,
+                    );
+
+                    // Insert into index
+                    self.emit(
+                        Opcode::IdxInsert,
+                        *idx_cursor,
+                        idx_record_reg,
+                        0,
+                        P4::Unused,
+                    );
+                }
             }
         }
 
-        // Close cursor
+        // Close index cursors
+        for (idx_cursor, _) in &index_cursors {
+            self.emit(Opcode::Close, *idx_cursor, 0, 0, P4::Unused);
+        }
+
+        // Close main cursor
         self.emit(Opcode::Close, cursor, 0, 0, P4::Unused);
 
         Ok(())
@@ -1203,12 +1284,15 @@ pub fn generate_trigger_code(
         }
 
         // Compile the trigger body to a SubProgram
-        // Pass the current cursor counter to avoid conflicts with parent's cursors
-        let mut compiler = TriggerBodyCompiler::new(schema, table_name, *next_cursor);
+        // Pass the current cursor and register counters to avoid conflicts with parent's cursors/registers
+        // IMPORTANT: Trigger body must use registers starting from *next_reg to avoid
+        // overwriting parent's registers (like rowid_reg) during trigger execution.
+        let mut compiler = TriggerBodyCompiler::new(schema, table_name, *next_cursor, *next_reg);
         let subprogram = compiler.compile_body(&body_stmts)?;
 
-        // Update the cursor counter to account for cursors used by the trigger
+        // Update the cursor and register counters to account for resources used by the trigger
         *next_cursor = compiler.next_cursor;
+        *next_reg = compiler.next_reg;
 
         // SQLite-aligned trigger row setup:
         // Allocate contiguous registers for OLD and NEW row values

@@ -1737,7 +1737,11 @@ impl<'a> InsertCompiler<'a> {
     }
 
     /// Emit code to handle REPLACE conflicts
-    /// Checks each unique index for conflicts and deletes conflicting rows
+    /// Checks each unique index for conflicts and deletes conflicting rows.
+    /// Follows SQLite's pattern:
+    /// 1. Check all unique constraints and delete conflicting rows (fire triggers)
+    /// 2. If any DELETE triggers fired, recheck all constraints
+    /// 3. If recheck fails, abort (don't try to REPLACE again)
     fn emit_replace_conflict_handling(&mut self, data_base: i32) -> Result<()> {
         let schema = match self.schema {
             Some(s) => s,
@@ -1749,32 +1753,36 @@ impl<'a> InsertCompiler<'a> {
             None => return Ok(()),
         };
 
-        // Check if there are DELETE triggers on this table
-        // If so, skip our early delete optimization because:
-        // 1. DELETE triggers might insert conflicting rows
-        // 2. The VDBE's OE_REPLACE would delete trigger-inserted rows (wrong behavior)
-        // Instead, let VDBE handle it, which will fail on trigger-created conflicts
-        let has_delete_triggers =
-            !self.before_delete_triggers.is_empty() || !self.after_delete_triggers.is_empty();
-
-        if has_delete_triggers {
-            // Skip early delete - let VDBE handle REPLACE
-            // VDBE will fail with constraint error if trigger creates conflict
-            return Ok(());
-        }
-
         // Get the root page for the table
         let table_root = table.root_page;
         if table_root == 0 {
             return Ok(());
         }
 
-        // For each unique index, check for conflicts
-        for index in &table.indexes {
-            if !index.unique {
-                continue;
-            }
+        // Check if there are DELETE triggers - we need to track if they fire
+        let has_delete_triggers =
+            !self.before_delete_triggers.is_empty() || !self.after_delete_triggers.is_empty();
 
+        // Allocate trigger counter register (like SQLite's regTrigCnt)
+        // Initialize to 0 - will be incremented each time a DELETE trigger fires
+        let trigger_cnt_reg = if has_delete_triggers {
+            let reg = self.alloc_reg();
+            self.emit(Opcode::Integer, 0, reg, 0, P4::Unused);
+            Some(reg)
+        } else {
+            None
+        };
+
+        // Collect unique indexes for potential recheck
+        let unique_indexes: Vec<_> = table
+            .indexes
+            .iter()
+            .filter(|idx| idx.unique)
+            .cloned()
+            .collect();
+
+        // Phase 1: Check all unique constraints and delete conflicting rows
+        for index in &unique_indexes {
             // For partial indexes, evaluate the WHERE condition for the new row
             // Skip conflict check if new row doesn't satisfy the condition
             let partial_skip_label = if let Some(ref partial_expr) = index.partial {
@@ -1784,7 +1792,6 @@ impl<'a> InsertCompiler<'a> {
                     .compile_partial_index_expr(partial_expr, cond_reg, data_base)
                     .is_ok()
                 {
-                    // If condition is false/null, skip this index's conflict check
                     self.emit(
                         Opcode::IfNot,
                         cond_reg,
@@ -1809,7 +1816,6 @@ impl<'a> InsertCompiler<'a> {
             };
 
             if idx_root == 0 {
-                // Resolve partial skip label before continuing to avoid dangling label
                 if let Some(skip_label) = partial_skip_label {
                     self.resolve_label(skip_label, self.current_addr() as i32);
                 }
@@ -1817,11 +1823,13 @@ impl<'a> InsertCompiler<'a> {
             }
 
             // Open a read cursor on the index to check for conflicts
+            // IMPORTANT: Pass root_page=0 so VDBE does schema lookup by name
+            // This ensures is_index is set correctly and bt_cursor.cur_int_key = false (blob key mode)
             let idx_cursor = self.alloc_cursor();
             self.emit(
                 Opcode::OpenRead,
                 idx_cursor,
-                idx_root as i32,
+                0, // Use 0 to trigger schema lookup
                 (index.columns.len() + 1) as i32,
                 P4::Text(index.name.clone()),
             );
@@ -1838,12 +1846,10 @@ impl<'a> InsertCompiler<'a> {
                         P4::Unused,
                     );
                 } else {
-                    // Expression index column - use NULL
                     self.emit(Opcode::Null, 0, key_base + i as i32, 0, P4::Unused);
                 }
             }
 
-            // Make index search key (without rowid - we want to find any match)
             let search_key_reg = self.alloc_reg();
             self.emit(
                 Opcode::MakeRecord,
@@ -1853,11 +1859,8 @@ impl<'a> InsertCompiler<'a> {
                 P4::Unused,
             );
 
-            // Labels for control flow
             let no_conflict_label = self.alloc_label();
-            let found_conflict_label = self.alloc_label();
 
-            // Seek to the key in the index
             // SeekGE: position at first entry >= key, jump if not found
             self.emit(
                 Opcode::SeekGE,
@@ -1867,7 +1870,6 @@ impl<'a> InsertCompiler<'a> {
                 P4::Int64(index.columns.len() as i64),
             );
 
-            // Check if the found entry matches our key prefix
             // IdxGT: jump if cursor key > search key (no match)
             self.emit(
                 Opcode::IdxGT,
@@ -1878,7 +1880,6 @@ impl<'a> InsertCompiler<'a> {
             );
 
             // Found a conflict - get the rowid from the index
-            self.resolve_label(found_conflict_label, self.current_addr() as i32);
             let conflict_rowid_reg = self.alloc_reg();
             self.emit(
                 Opcode::IdxRowid,
@@ -1911,6 +1912,43 @@ impl<'a> InsertCompiler<'a> {
                 P4::Unused,
             );
 
+            // Load old row data for DELETE triggers (if any)
+            let old_data_base = if has_delete_triggers {
+                let base = self.alloc_regs(self.num_columns);
+                for i in 0..self.num_columns {
+                    let col = table.columns.get(i);
+                    let is_ipk = col.map_or(false, |c| {
+                        c.is_primary_key
+                            && c.type_name
+                                .as_ref()
+                                .map_or(false, |t| t.eq_ignore_ascii_case("INTEGER"))
+                    });
+                    if is_ipk {
+                        self.emit(Opcode::Rowid, del_cursor, base + i as i32, 0, P4::Unused);
+                    } else {
+                        self.emit(
+                            Opcode::Column,
+                            del_cursor,
+                            i as i32,
+                            base + i as i32,
+                            P4::Unused,
+                        );
+                    }
+                }
+                Some(base)
+            } else {
+                None
+            };
+
+            // Fire BEFORE DELETE triggers
+            if !self.before_delete_triggers.is_empty() {
+                self.emit_delete_triggers(
+                    &self.before_delete_triggers.clone(),
+                    old_data_base,
+                    conflict_rowid_reg,
+                )?;
+            }
+
             // Delete from all indexes first
             self.emit_delete_from_indexes(del_cursor, conflict_rowid_reg, &table)?;
 
@@ -1924,10 +1962,25 @@ impl<'a> InsertCompiler<'a> {
                 OPFLAG_NCHANGE,
             );
 
+            // Fire AFTER DELETE triggers
+            if !self.after_delete_triggers.is_empty() {
+                self.emit_delete_triggers(
+                    &self.after_delete_triggers.clone(),
+                    old_data_base,
+                    conflict_rowid_reg,
+                )?;
+            }
+
+            // Increment trigger counter if we have triggers
+            if let Some(cnt_reg) = trigger_cnt_reg {
+                // AddImm: reg += P2
+                self.emit(Opcode::AddImm, cnt_reg, 1, 0, P4::Unused);
+            }
+
             self.resolve_label(not_found_label, self.current_addr() as i32);
             self.emit(Opcode::Close, del_cursor, 0, 0, P4::Unused);
 
-            // Jump past this - no_conflict path
+            // Jump past no_conflict path
             let end_label = self.alloc_label();
             self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
 
@@ -1937,10 +1990,139 @@ impl<'a> InsertCompiler<'a> {
 
             self.resolve_label(end_label, self.current_addr() as i32);
 
-            // Resolve partial index skip label (if this was a partial index)
             if let Some(skip_label) = partial_skip_label {
                 self.resolve_label(skip_label, self.current_addr() as i32);
             }
+        }
+
+        // Phase 2: If DELETE triggers fired, recheck all uniqueness constraints
+        // If recheck fails, abort with constraint error (don't try REPLACE again)
+        if let Some(cnt_reg) = trigger_cnt_reg {
+            let skip_recheck_label = self.alloc_label();
+
+            // If trigger count is 0, skip the recheck
+            self.emit(Opcode::IfNot, cnt_reg, skip_recheck_label, 0, P4::Unused);
+
+            // Recheck all unique indexes
+            for index in &unique_indexes {
+                // For partial indexes, check condition
+                let partial_skip_label = if let Some(ref partial_expr) = index.partial {
+                    let skip_label = self.alloc_label();
+                    let cond_reg = self.alloc_reg();
+                    if self
+                        .compile_partial_index_expr(partial_expr, cond_reg, data_base)
+                        .is_ok()
+                    {
+                        self.emit(Opcode::IfNot, cond_reg, skip_label, 1, P4::Unused);
+                    }
+                    Some(skip_label)
+                } else {
+                    None
+                };
+
+                let idx_root = if index.root_page > 0 {
+                    index.root_page
+                } else {
+                    schema
+                        .indexes
+                        .get(&index.name.to_lowercase())
+                        .map(|i| i.root_page)
+                        .unwrap_or(0)
+                };
+
+                if idx_root == 0 {
+                    if let Some(skip_label) = partial_skip_label {
+                        self.resolve_label(skip_label, self.current_addr() as i32);
+                    }
+                    continue;
+                }
+
+                // IMPORTANT: Pass root_page=0 so VDBE does schema lookup by name
+                let idx_cursor = self.alloc_cursor();
+                self.emit(
+                    Opcode::OpenRead,
+                    idx_cursor,
+                    0, // Use 0 to trigger schema lookup
+                    (index.columns.len() + 1) as i32,
+                    P4::Text(index.name.clone()),
+                );
+
+                // Build search key
+                let key_base = self.alloc_regs(index.columns.len());
+                for (i, col) in index.columns.iter().enumerate() {
+                    if col.column_idx >= 0 {
+                        self.emit(
+                            Opcode::Copy,
+                            data_base + col.column_idx,
+                            key_base + i as i32,
+                            0,
+                            P4::Unused,
+                        );
+                    } else {
+                        self.emit(Opcode::Null, 0, key_base + i as i32, 0, P4::Unused);
+                    }
+                }
+
+                let search_key_reg = self.alloc_reg();
+                self.emit(
+                    Opcode::MakeRecord,
+                    key_base,
+                    index.columns.len() as i32,
+                    search_key_reg,
+                    P4::Unused,
+                );
+
+                let no_conflict_label = self.alloc_label();
+
+                self.emit(
+                    Opcode::SeekGE,
+                    idx_cursor,
+                    no_conflict_label,
+                    search_key_reg,
+                    P4::Int64(index.columns.len() as i64),
+                );
+
+                self.emit(
+                    Opcode::IdxGT,
+                    idx_cursor,
+                    no_conflict_label,
+                    search_key_reg,
+                    P4::Int64(index.columns.len() as i64),
+                );
+
+                // Found a conflict during recheck - ABORT (not REPLACE)
+                // Get the column name for the error message
+                let col_name = if !index.columns.is_empty() && index.columns[0].column_idx >= 0 {
+                    table
+                        .columns
+                        .get(index.columns[0].column_idx as usize)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_else(|| index.name.clone())
+                } else {
+                    index.name.clone()
+                };
+
+                // Emit Halt with constraint error
+                self.emit(
+                    Opcode::Halt,
+                    19, // SQLITE_CONSTRAINT
+                    2,  // OE_ABORT
+                    0,
+                    P4::Text(format!(
+                        "UNIQUE constraint failed: {}.{}",
+                        self.table_name, col_name
+                    )),
+                );
+
+                self.resolve_label(no_conflict_label, self.current_addr() as i32);
+                self.emit(Opcode::Close, idx_cursor, 0, 0, P4::Unused);
+
+                if let Some(skip_label) = partial_skip_label {
+                    self.resolve_label(skip_label, self.current_addr() as i32);
+                }
+            }
+
+            self.resolve_label(skip_recheck_label, self.current_addr() as i32);
         }
 
         Ok(())
@@ -2019,11 +2201,13 @@ impl<'a> InsertCompiler<'a> {
             );
 
             // Open index cursor and delete
+            // IMPORTANT: Pass root_page=0 so VDBE does schema lookup and sets is_index=true
+            // This ensures bt_cursor.cur_int_key is set correctly for index operations
             let idx_cursor = self.alloc_cursor();
             self.emit(
                 Opcode::OpenWrite,
                 idx_cursor,
-                idx_root as i32,
+                0, // Use 0 to trigger schema lookup by name
                 (index.columns.len() + 1) as i32,
                 P4::Text(index.name.clone()),
             );

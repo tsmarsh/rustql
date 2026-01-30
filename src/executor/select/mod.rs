@@ -6190,15 +6190,28 @@ impl<'s> SelectCompiler<'s> {
         let num_result_cols = self.result_column_names.len();
         let total_cols = num_order_by_cols + num_result_cols;
 
-        // Decode all columns into registers
-        let all_base_reg = self.alloc_regs(total_cols);
+        // Use OpenPseudo + Column to decode (SQLite-aligned approach)
+        // OpenPseudo creates a pseudo-cursor from record in P2 with P3 columns
+        let pseudo_cursor = self.alloc_cursor();
         self.emit(
-            Opcode::DecodeRecord,
+            Opcode::OpenPseudo,
+            pseudo_cursor,
             record_reg,
-            all_base_reg,
             total_cols as i32,
             P4::Unused,
         );
+
+        // Extract each column using Column opcode
+        let all_base_reg = self.alloc_regs(total_cols);
+        for i in 0..total_cols {
+            self.emit(
+                Opcode::Column,
+                pseudo_cursor,
+                i as i32,
+                all_base_reg + i as i32,
+                P4::Unused,
+            );
+        }
 
         // Result columns start after ORDER BY keys
         let result_base_reg = all_base_reg + num_order_by_cols as i32;
@@ -7828,15 +7841,27 @@ impl<'s> SelectCompiler<'s> {
             P4::Unused,
         );
 
-        // Decode the record
-        let out_base_reg = self.alloc_regs(col_count);
+        // Use OpenPseudo + Column to decode (SQLite-aligned approach)
+        let pseudo_cursor = self.alloc_cursor();
         self.emit(
-            Opcode::DecodeRecord,
+            Opcode::OpenPseudo,
+            pseudo_cursor,
             sorter_data_reg,
-            out_base_reg,
             col_count as i32,
             P4::Unused,
         );
+
+        // Extract each column using Column opcode
+        let out_base_reg = self.alloc_regs(col_count);
+        for i in 0..col_count {
+            self.emit(
+                Opcode::Column,
+                pseudo_cursor,
+                i as i32,
+                out_base_reg + i as i32,
+                P4::Unused,
+            );
+        }
 
         // Output the row
         self.output_row(dest, out_base_reg, col_count)?;

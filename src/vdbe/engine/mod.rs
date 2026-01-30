@@ -2824,43 +2824,6 @@ impl Vdbe {
                 self.mem_mut(op.p3).set_blob(&record);
             }
 
-            Opcode::DecodeRecord => {
-                // Decode record in P1, store columns starting at P2, P3 columns total
-                let record_data = self.mem(op.p1).to_blob();
-                if !record_data.is_empty() {
-                    match crate::vdbe::auxdata::decode_record_header(&record_data) {
-                        Ok((types, header_size)) => {
-                            let num_cols = op.p3.min(types.len() as i32) as usize;
-                            let mut data_offset = header_size;
-                            for i in 0..num_cols {
-                                if i < types.len() {
-                                    let col_data = &record_data[data_offset..];
-                                    match crate::vdbe::auxdata::deserialize_value(
-                                        col_data, &types[i],
-                                    ) {
-                                        Ok(mem) => {
-                                            *self.mem_mut(op.p2 + i as i32) = mem;
-                                        }
-                                        Err(_) => {
-                                            self.mem_mut(op.p2 + i as i32).set_null();
-                                        }
-                                    }
-                                    data_offset += types[i].size();
-                                } else {
-                                    self.mem_mut(op.p2 + i as i32).set_null();
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            // Failed to decode, set all columns to null
-                            for i in 0..op.p3 {
-                                self.mem_mut(op.p2 + i).set_null();
-                            }
-                        }
-                    }
-                }
-            }
-
             // ================================================================
             // Transaction (placeholder)
             // ================================================================

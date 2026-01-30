@@ -263,9 +263,6 @@ pub enum Opcode {
     /// Make a record from P1..P1+P2-1 registers, store in P3
     MakeRecord,
 
-    /// Decode record in P1, store columns starting at P2, P3 columns total
-    DecodeRecord,
-
     /// Output result row from P1..P1+P2-1 registers
     ResultRow,
 
@@ -857,7 +854,6 @@ impl Opcode {
             Opcode::Column => "Column",
             Opcode::Rowid => "Rowid",
             Opcode::MakeRecord => "MakeRecord",
-            Opcode::DecodeRecord => "DecodeRecord",
             Opcode::ResultRow => "ResultRow",
             Opcode::Insert => "Insert",
             Opcode::NewRowid => "NewRowid",

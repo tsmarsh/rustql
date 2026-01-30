@@ -641,6 +641,10 @@ pub enum Opcode {
     /// Update virtual table (insert/delete/update)
     VUpdate,
 
+    /// Explain opcode - used for EXPLAIN QUERY PLAN output
+    /// This is a no-op during normal execution but carries metadata for explain mode
+    Explain,
+
     /// Maximum opcode value
     MaxOpcode,
 }
@@ -984,6 +988,7 @@ impl Opcode {
             Opcode::VOpen => "VOpen",
             Opcode::VRename => "VRename",
             Opcode::VUpdate => "VUpdate",
+            Opcode::Explain => "Explain",
             Opcode::MaxOpcode => "MaxOpcode",
         }
     }

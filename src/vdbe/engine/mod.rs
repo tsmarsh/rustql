@@ -1105,6 +1105,11 @@ impl Vdbe {
                 // Do nothing
             }
 
+            Opcode::Explain => {
+                // Explain is a no-op during normal execution
+                // It carries metadata for EXPLAIN QUERY PLAN output
+            }
+
             Opcode::IfPos => {
                 // IfPos P1 P2 P3: If r[P1] > 0 then r[P1] -= P3, jump to P2
                 let val = self.mem(op.p1).to_int();

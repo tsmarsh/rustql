@@ -44,6 +44,12 @@ thread_local! {
     static USER_FUNCTIONS: RefCell<HashMap<(String, String), String>> = RefCell::new(HashMap::new());
 }
 
+// Force the linker to keep the init functions - they're called by TCL, not Rust code
+// Without this, dead code elimination would remove them from the shared library
+#[used]
+static KEEP_TCL_INIT_FUNCTIONS: [extern "C" fn(*mut Tcl_Interp) -> c_int; 3] =
+    [Rustql_Init, Tclsqlite3_Init, Sqlite3_Init];
+
 /// Initialize the extension - called by TCL when loading
 #[no_mangle]
 pub extern "C" fn Rustql_Init(interp: *mut Tcl_Interp) -> c_int {

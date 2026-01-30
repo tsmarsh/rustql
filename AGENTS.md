@@ -37,6 +37,7 @@ Run commands from a separate build directory when possible:
 - Preserve SQLite’s observable behavior, performance intent, and architectural shape unless a change is explicitly agreed.
 - Favor mechanical translations over refactors; keep control flow and error handling closely aligned to upstream C.
 - For FTS and other extensions, **do not** implement placeholder or approximate behavior. Port directly from the SQLite C sources in `sqlite3/ext/` and keep semantics aligned.
+- Until opcode and behavior parity are achieved, do not assume RustQL should “improve” or optimize beyond SQLite. Premature optimizations that diverge from SQLite are not allowed.
 
 ## Testing Guidelines
 - The primary framework is Tcl via the `testfixture` binary.

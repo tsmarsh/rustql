@@ -2,9 +2,19 @@
 
 ## Progress
 
-Started at 41% pass rate, now at **69%** (109/159 tests passing, 50 errors).
+Started at 41% pass rate, now at **71%** (113/159 tests passing, 46 errors).
 
-### Session Progress (2026-01-31)
+### Session Progress (2026-01-31) - continued
+
+- **NOCASE collation handling for CREATE INDEX and LIKE optimization** - Major fix for case-insensitive LIKE with indexes
+  - Fixed CREATE INDEX SQL storage to include COLLATE clause
+  - Fixed schema::parse_create_index_sql to extract COLLATE from SQL
+  - Fixed ParseSchema to inherit collation from table columns when creating index
+  - Fixed index population during CREATE INDEX to use proper KeyInfo with collations
+  - Fixed LIKE optimization to not skip LIKE function for NOCASE (range scan captures false positives)
+  - Result: LIKE test errors reduced from 53 to 46 (7 more tests passing)
+
+### Earlier Session Progress (2026-01-31)
 
 - **ORDER BY on INTEGER PRIMARY KEY optimization** - Added check to skip sorter when ORDER BY is on rowid column
   - Fixed like-11.1 and like-11.2 tests
@@ -31,34 +41,31 @@ Started at 41% pass rate, now at **69%** (109/159 tests passing, 50 errors).
 
 4. **sqlite_like_count tracking** (previous work) - Global counter for LIKE function calls exposed via TCL
 
-### Remaining Failures (~50 tests)
+### Remaining Failures (~46 tests)
 
-1. **NOCASE collation LIKE optimization** (~20 tests)
-   - Tests like-5.x expect LIKE to use NOCASE collation index
-   - When case_sensitive_like=OFF and index has COLLATE NOCASE, SQLite uses index for case-insensitive LIKE
-   - Our implementation doesn't yet handle collation-aware LIKE optimization
+1. **INSERT...SELECT...ORDER BY issue** (~15 tests)
+   - Tests like-5.x use `INSERT INTO t2 SELECT * FROM t1 ORDER BY rowid` which fails silently
+   - This is a pre-existing issue separate from LIKE optimization
 
 2. **Custom LIKE functions** (like-8.3, like-8.4)
    - Tests use `db function like -argcount 2 newlike` to override built-in LIKE
    - Requires user-defined function support for LIKE
 
-3. **ORDER BY without sorting on natural table scan** (~10 tests)
-   - like-11.x tests expect `nosort t11 *` when ORDER BY column is in natural rowid order
-   - SQLite detects ORDER BY can be satisfied by natural table scan order
-   - We're currently using a sorter for these cases
-
-4. **Scan/step count instrumentation** (like-9.x, like-10.x)
+3. **Scan/step count instrumentation** (like-9.x, like-10.x)
    - Tests use `db status step` and `db status sort` for instrumentation
    - We don't fully support this API yet
 
-5. **QPSG feature** (like-3.3.104, like-3.3.105)
+4. **QPSG feature** (like-3.3.104, like-3.3.105)
    - Query Planner Stability Guarantee not implemented
 
-6. **Unicode LIKE matching** (like-13.4)
+5. **Unicode LIKE matching** (like-13.4)
    - Character comparison for non-ASCII characters
 
-7. **Missing sqlite_options** (like-14.x)
+6. **Missing sqlite_options** (like-14.x)
    - Tests require `::sqlite_options(configslower)` variable
+
+7. **EQP output differences** (like-15.x, like-12.x)
+   - SEARCH vs SCAN expected in EXPLAIN QUERY PLAN output
 
 ### Files Modified
 
@@ -66,6 +73,7 @@ Started at 41% pass rate, now at **69%** (109/159 tests passing, 50 errors).
   - Added `LIKE_OPT_COMPLETE` flag
   - Added `like_pattern_complete()` helper
   - Modified `generate_like_range_terms()` to mark complete patterns
+  - Fixed NOCASE collation: only skip LIKE function for BINARY collation (not NOCASE)
 
 - src/executor/select/mod.rs
   - Modified `compile_runtime_filter_terms()` to skip LIKE_OPT_COMPLETE terms
@@ -75,6 +83,20 @@ Started at 41% pass rate, now at **69%** (109/159 tests passing, 50 errors).
 - src/executor/prepare.rs
   - Added `detect_order_by_index()` for ORDER BY index detection
   - Added `format_plan_detail_with_order()` for EQP output with ORDER BY index
+  - Fixed CREATE INDEX SQL generation to include COLLATE clause
+  - Fixed index column name extraction for Collate expressions
+  - Build KeyInfo with collations for index population during CREATE INDEX
+
+- src/schema/mod.rs
+  - Fixed parse_create_index_sql to extract COLLATE from column specs
+
+- src/vdbe/engine/mod.rs
+  - OpenRead: fixed collation capture from schema indexes
+  - OpenWrite: handle P4::KeyInfo for directly provided collations
+  - ParseSchema: inherit collation from table columns when creating index
+
+- src/api/connection.rs
+  - Fixed parse_create_index_sql to inherit collation from table columns
 
 - src/functions/scalar.rs
   - Fixed SUBSTR function name case in error message (for func2 fix)

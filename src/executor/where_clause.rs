@@ -859,6 +859,7 @@ impl QueryPlanner {
                 {
                     if matches!(op, LikeOp::Like | LikeOp::Glob) {
                         // Extract escape character if it's a single-character literal
+                        // Return None for invalid ESCAPE (empty or multi-char) which will disable optimization
                         let escape_char = escape.as_ref().and_then(|e| {
                             if let Expr::Literal(Literal::String(s)) = e.as_ref() {
                                 let mut chars = s.chars();
@@ -873,6 +874,14 @@ impl QueryPlanner {
                                 None
                             }
                         });
+
+                        // Skip optimization if ESCAPE is explicitly provided but invalid
+                        // (empty string or multi-char)
+                        if escape.is_some() && escape_char.is_none() {
+                            // Invalid ESCAPE clause - don't optimize, use full table scan
+                            return None;
+                        }
+
                         return Some((
                             idx,
                             expr.clone(),

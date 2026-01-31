@@ -2134,11 +2134,16 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Integer => {
                 let text = token.text(self.source);
-                let val = text
-                    .parse::<i64>()
-                    .map_err(|_| self.error("invalid integer"))?;
+                // Try parsing as i64 first, fall back to f64 for overflow (SQLite behavior)
                 self.advance();
-                Ok(Expr::Literal(Literal::Integer(val)))
+                if let Ok(val) = text.parse::<i64>() {
+                    Ok(Expr::Literal(Literal::Integer(val)))
+                } else if let Ok(val) = text.parse::<f64>() {
+                    // Integer overflow - treat as float (SQLite behavior)
+                    Ok(Expr::Literal(Literal::Float(val)))
+                } else {
+                    Err(self.error("invalid integer"))
+                }
             }
             TokenKind::Float => {
                 let text = token.text(self.source);
@@ -2754,14 +2759,19 @@ impl<'a> Parser<'a> {
             TokenKind::False => Ok(Literal::Integer(0)),
             TokenKind::Integer => {
                 let text = token.text(self.source);
-                let value = if text.starts_with("0x") || text.starts_with("0X") {
-                    i64::from_str_radix(&text[2..], 16)
-                        .map_err(|_| Error::with_message(ErrorCode::Error, "invalid hex integer"))?
+                if text.starts_with("0x") || text.starts_with("0X") {
+                    let value = i64::from_str_radix(&text[2..], 16).map_err(|_| {
+                        Error::with_message(ErrorCode::Error, "invalid hex integer")
+                    })?;
+                    Ok(Literal::Integer(value))
+                } else if let Ok(value) = text.parse::<i64>() {
+                    Ok(Literal::Integer(value))
+                } else if let Ok(value) = text.parse::<f64>() {
+                    // Integer overflow - treat as float (SQLite behavior)
+                    Ok(Literal::Float(value))
                 } else {
-                    text.parse()
-                        .map_err(|_| Error::with_message(ErrorCode::Error, "invalid integer"))?
-                };
-                Ok(Literal::Integer(value))
+                    Err(Error::with_message(ErrorCode::Error, "invalid integer"))
+                }
             }
             TokenKind::Float => {
                 let value = token

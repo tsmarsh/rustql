@@ -2011,6 +2011,7 @@ impl Schema {
                 }
 
                 let mut pk_indices = Vec::new();
+                let mut index_columns = Vec::new();
                 for col in columns {
                     if let Some(name) = &col.name {
                         let idx = table.find_column(name)?;
@@ -2020,9 +2021,51 @@ impl Schema {
                         if let Some(c) = conflict {
                             table.columns[idx as usize].not_null_conflict = Some(*c);
                         }
+                        // Build index column - inherit collation from table column
+                        let table_col = &table.columns[idx as usize];
+                        index_columns.push(IndexColumn {
+                            column_idx: idx,
+                            expr: col.expr.clone(),
+                            sort_order: col.order.unwrap_or(SortOrder::Asc),
+                            collation: col.collation.clone().unwrap_or_else(|| {
+                                if table_col.collation.is_empty() {
+                                    "BINARY".to_string()
+                                } else {
+                                    table_col.collation.clone()
+                                }
+                            }),
+                        });
                     }
                 }
-                table.primary_key = Some(pk_indices);
+                table.primary_key = Some(pk_indices.clone());
+
+                // Create autoindex for PRIMARY KEY enforcement
+                // Skip if it's a single INTEGER PRIMARY KEY (rowid alias handled differently)
+                let is_single_integer_pk = pk_indices.len() == 1
+                    && table.columns.get(pk_indices[0]).map_or(false, |c| {
+                        c.affinity == Affinity::Integer
+                            && c.type_name
+                                .as_ref()
+                                .map(|t| t.eq_ignore_ascii_case("INTEGER"))
+                                .unwrap_or(false)
+                    });
+
+                if !is_single_integer_pk && !index_columns.is_empty() {
+                    let auto_idx_num = table.indexes.len() + 1;
+                    let index_name = format!("sqlite_autoindex_{}_{}", table.name, auto_idx_num);
+                    table.indexes.push(std::sync::Arc::new(Index {
+                        name: index_name,
+                        table: table.name.clone(),
+                        db_idx: table.db_idx,
+                        columns: index_columns,
+                        root_page: 0,
+                        unique: true,
+                        partial: None,
+                        is_primary_key: true,
+                        sql: None,
+                        stats: None,
+                    }));
+                }
             }
             TableConstraint::Unique {
                 columns,
@@ -2180,20 +2223,10 @@ impl Schema {
 
         // Process indexed columns
         for indexed_col in &stmt.columns {
-            eprintln!(
-                "DEBUG create_index: processing indexed_col name={:?}, expr={:?}",
-                indexed_col.name,
-                indexed_col.expr.is_some()
-            );
             let col_idx = if indexed_col.expr.is_some() {
                 -1 // Expression index
             } else if let Some(name) = &indexed_col.name {
-                let idx = table.find_column(name)?;
-                eprintln!(
-                    "DEBUG create_index: found column '{}' at index {}",
-                    name, idx
-                );
-                idx
+                table.find_column(name)?
             } else {
                 return Err(Error::with_message(
                     ErrorCode::Error,
@@ -2212,15 +2245,6 @@ impl Schema {
             });
         }
 
-        eprintln!(
-            "DEBUG create_index: inserting index {} with cols {:?}",
-            stmt.name.name,
-            index
-                .columns
-                .iter()
-                .map(|c| c.column_idx)
-                .collect::<Vec<_>>()
-        );
         self.indexes.insert(name_lower, Arc::new(index));
         Ok(())
     }

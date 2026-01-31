@@ -5529,9 +5529,16 @@ impl Vdbe {
                                     // A record with matching prefix would be at PREVIOUS position
                                     // (because it would have same prefix but smaller rowid)
                                     // Move back, check, then move forward again
-                                    if let Ok(()) = bt_cursor.previous(0) {
-                                        let existing_payload =
-                                            if let Some(data) = bt_cursor.payload_fetch() {
+                                    // Save cursor state before moving
+                                    let saved_state = bt_cursor.state;
+                                    let saved_ix = bt_cursor.ix;
+
+                                    if bt_cursor.ix > 0 {
+                                        // Only check previous if there is one
+                                        if let Ok(()) = bt_cursor.previous(0) {
+                                            let existing_payload = if let Some(data) =
+                                                bt_cursor.payload_fetch()
+                                            {
                                                 Some(data.to_vec())
                                             } else if bt_cursor.payload_size() > 0 {
                                                 bt_cursor.payload(0, bt_cursor.payload_size()).ok()
@@ -5539,13 +5546,19 @@ impl Vdbe {
                                                 None
                                             };
 
-                                        if let Some(existing) = existing_payload {
-                                            has_duplicate = check_prefix(&existing, &new_fields);
-                                        }
+                                            if let Some(existing) = existing_payload {
+                                                has_duplicate =
+                                                    check_prefix(&existing, &new_fields);
+                                            }
 
-                                        // Move back to original position for insert
-                                        let _ = bt_cursor.next(0);
+                                            // Move back to original position for insert
+                                            let _ = bt_cursor.next(0);
+                                        }
                                     }
+
+                                    // Restore cursor state in case it was corrupted
+                                    bt_cursor.state = saved_state;
+                                    bt_cursor.ix = saved_ix;
                                 } else {
                                     // move_res == 1: cursor is at or after last cell
                                     // Check current position - might have matching prefix with smaller rowid

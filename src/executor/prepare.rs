@@ -992,60 +992,126 @@ impl<'s> StatementCompiler<'s> {
                 }
             }
 
-            // Create indexes for table-level UNIQUE constraints
+            // Create indexes for table-level UNIQUE and PRIMARY KEY constraints
             for constraint in constraints {
-                if let crate::parser::ast::TableConstraintKind::Unique {
-                    columns: idx_cols, ..
-                } = &constraint.kind
-                {
-                    auto_idx_num += 1;
-                    let index_name =
-                        format!("sqlite_autoindex_{}_{}", create.name.name, auto_idx_num);
-                    let col_names: Vec<String> = idx_cols
-                        .iter()
-                        .filter_map(|c| {
-                            if let crate::parser::ast::IndexedColumnKind::Name(name) = &c.column {
-                                Some(name.clone())
+                // Get column names from constraint
+                let (idx_cols, is_pk) = match &constraint.kind {
+                    crate::parser::ast::TableConstraintKind::Unique { columns: cols, .. } => {
+                        (cols.clone(), false)
+                    }
+                    crate::parser::ast::TableConstraintKind::PrimaryKey {
+                        columns: cols, ..
+                    } => {
+                        // Skip if it's a single INTEGER PRIMARY KEY (rowid alias)
+                        let col_names: Vec<String> = cols
+                            .iter()
+                            .filter_map(|c| {
+                                if let crate::parser::ast::IndexedColumnKind::Name(name) = &c.column
+                                {
+                                    Some(name.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        if col_names.len() == 1 {
+                            // Check if the single column is INTEGER type
+                            let col_name = &col_names[0];
+                            let is_integer_pk = columns.iter().any(|cd| {
+                                cd.name.eq_ignore_ascii_case(col_name)
+                                    && cd
+                                        .type_name
+                                        .as_ref()
+                                        .map(|t| t.name.eq_ignore_ascii_case("INTEGER"))
+                                        .unwrap_or(false)
+                            });
+                            if is_integer_pk {
+                                continue; // Skip, rowid alias doesn't need separate index
+                            }
+                        }
+                        (cols.clone(), true)
+                    }
+                    _ => continue,
+                };
+
+                auto_idx_num += 1;
+                let index_name = format!("sqlite_autoindex_{}_{}", create.name.name, auto_idx_num);
+                let col_names: Vec<String> = idx_cols
+                    .iter()
+                    .filter_map(|c| {
+                        if let crate::parser::ast::IndexedColumnKind::Name(name) = &c.column {
+                            Some(name.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                // Build index SQL with collation from column definitions
+                let col_specs: Vec<String> = col_names
+                    .iter()
+                    .map(|col_name| {
+                        // Find column definition to get collation
+                        let collation = columns.iter().find_map(|cd| {
+                            if cd.name.eq_ignore_ascii_case(col_name) {
+                                // Check for COLLATE constraint
+                                cd.constraints.iter().find_map(|c| {
+                                    if let crate::parser::ast::ColumnConstraintKind::Collate(seq) =
+                                        &c.kind
+                                    {
+                                        Some(seq.clone())
+                                    } else {
+                                        None
+                                    }
+                                })
                             } else {
                                 None
                             }
-                        })
-                        .collect();
-                    let index_sql = format!(
-                        "CREATE UNIQUE INDEX {} ON {}({})",
-                        index_name,
-                        create.name.name,
-                        col_names.join(", ")
-                    );
+                        });
+                        if let Some(coll) = collation {
+                            format!("{} COLLATE {}", col_name, coll)
+                        } else {
+                            col_name.clone()
+                        }
+                    })
+                    .collect();
+                let index_sql = format!(
+                    "CREATE UNIQUE INDEX {} ON {}({})",
+                    index_name,
+                    create.name.name,
+                    col_specs.join(", ")
+                );
 
-                    // CreateBtree for the index (use same db_idx as the table)
-                    ops.push(Self::make_op(
-                        Opcode::CreateBtree,
-                        db_idx,
-                        reg_index_page,
-                        BTREE_BLOBKEY as i32,
-                        P4::Unused,
-                    ));
+                // CreateBtree for the index (use same db_idx as the table)
+                ops.push(Self::make_op(
+                    Opcode::CreateBtree,
+                    db_idx,
+                    reg_index_page,
+                    BTREE_BLOBKEY as i32,
+                    P4::Unused,
+                ));
 
-                    // ParseSchema to register the index
-                    ops.push(Self::make_op(
-                        Opcode::ParseSchema,
-                        db_idx,
-                        reg_index_page,
-                        0,
-                        P4::Text(index_sql.clone()),
-                    ));
+                // ParseSchema to register the index
+                ops.push(Self::make_op(
+                    Opcode::ParseSchema,
+                    db_idx,
+                    reg_index_page,
+                    0,
+                    P4::Text(index_sql.clone()),
+                ));
 
-                    // Insert into sqlite_master (auto-index has NULL SQL)
-                    self.append_sqlite_master_insert_index(
-                        &mut ops,
-                        cursor_id,
-                        &index_name,
-                        &create.name.name,
-                        reg_index_page,
-                        None, // Auto-indexes have NULL SQL field
-                    );
-                }
+                // Insert into sqlite_master (auto-index has NULL SQL)
+                self.append_sqlite_master_insert_index(
+                    &mut ops,
+                    cursor_id,
+                    &index_name,
+                    &create.name.name,
+                    reg_index_page,
+                    None, // Auto-indexes have NULL SQL field
+                );
+
+                // Mark as primary key index if it's a PK constraint
+                let _ = is_pk; // Used in the match above to filter INTEGER PK
             }
         }
 

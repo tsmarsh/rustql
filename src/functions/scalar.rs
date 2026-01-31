@@ -499,7 +499,7 @@ pub fn func_substr(args: &[Value]) -> Result<Value> {
     if args.len() < 2 || args.len() > 3 {
         return Err(Error::with_message(
             crate::error::ErrorCode::Error,
-            "wrong number of arguments to function substr()",
+            "wrong number of arguments to function SUBSTR()",
         ));
     }
 

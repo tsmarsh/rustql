@@ -1952,7 +1952,20 @@ impl<'a> Parser<'a> {
 
         self.match_token(TokenKind::Transaction);
 
-        Ok(Stmt::Begin(BeginStmt { mode }))
+        // Parse optional transaction name (SQLite allows: BEGIN TRANSACTION 'name')
+        let name = if self.check(TokenKind::String) || self.check(TokenKind::Identifier) {
+            let text = self
+                .current()
+                .text(self.source)
+                .trim_matches('\'')
+                .to_string();
+            self.advance();
+            Some(text)
+        } else {
+            None
+        };
+
+        Ok(Stmt::Begin(BeginStmt { mode, name }))
     }
 
     fn parse_rollback(&mut self) -> Result<Stmt> {

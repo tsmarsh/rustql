@@ -962,6 +962,8 @@ pub enum AlterTableAction {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BeginStmt {
     pub mode: Option<TransactionMode>,
+    /// Optional transaction name/label (SQLite allows: BEGIN TRANSACTION 'name')
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

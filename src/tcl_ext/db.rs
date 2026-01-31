@@ -523,12 +523,18 @@ pub unsafe extern "C" fn db_method_cmd(
             // Usage: db func name ?-argcount N? proc
             if objc >= 4 {
                 let func_name = obj_to_string(*objv.offset(2));
-                // Find the proc name, skipping any options like -argcount
+                // Parse options including -argcount
                 let mut proc_idx = 3;
+                let mut argcount: i32 = -1; // -1 means any number of args
                 while proc_idx < objc as isize {
                     let arg = obj_to_string(*objv.offset(proc_idx));
-                    if arg.starts_with('-') {
-                        // Skip the option and its value
+                    if arg == "-argcount" && proc_idx + 1 < objc as isize {
+                        // Parse argcount value
+                        let count_str = obj_to_string(*objv.offset(proc_idx + 1));
+                        argcount = count_str.parse().unwrap_or(-1);
+                        proc_idx += 2;
+                    } else if arg.starts_with('-') {
+                        // Skip other options and their values
                         proc_idx += 2;
                     } else {
                         break;
@@ -537,9 +543,10 @@ pub unsafe extern "C" fn db_method_cmd(
                 if proc_idx < objc as isize {
                     let proc_name = obj_to_string(*objv.offset(proc_idx));
                     USER_FUNCTIONS.with(|funcs| {
-                        funcs
-                            .borrow_mut()
-                            .insert((db_name.to_string(), func_name.to_lowercase()), proc_name);
+                        funcs.borrow_mut().insert(
+                            (db_name.to_string(), func_name.to_lowercase(), argcount),
+                            proc_name,
+                        );
                     });
                 }
             }
@@ -1103,6 +1110,10 @@ pub unsafe fn db_close(db_name: &str, interp: *mut Tcl_Interp) -> c_int {
     NULL_VALUES.with(|nv| {
         nv.borrow_mut().remove(db_name);
     });
+    // Clean up user-defined functions for this connection
+    USER_FUNCTIONS.with(|uf| {
+        uf.borrow_mut().retain(|(name, _, _), _| name != db_name);
+    });
 
     // Delete the command
     let cmd_name = CString::new(db_name).unwrap();
@@ -1119,6 +1130,14 @@ pub unsafe extern "C" fn db_delete_cmd(client_data: *mut std::ffi::c_void) {
             if let Some(conn) = connections.borrow_mut().remove(&*db_name) {
                 let _ = sqlite3_close(conn);
             }
+        });
+        // Clean up null value setting
+        NULL_VALUES.with(|nv| {
+            nv.borrow_mut().remove(&*db_name);
+        });
+        // Clean up user-defined functions for this connection
+        USER_FUNCTIONS.with(|uf| {
+            uf.borrow_mut().retain(|(name, _, _), _| name != &*db_name);
         });
     }
 }

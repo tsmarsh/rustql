@@ -145,7 +145,7 @@ array set sqlite_options {
     direct_read 0
     legacyformat 0
     autoinc 1
-    configslower 0
+    configslower 1
     rowid32 0
     maxexpr 1
     cast 1

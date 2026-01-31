@@ -1420,6 +1420,14 @@ impl QueryPlanner {
             return None;
         }
 
+        // Disable LIKE optimization for non-ASCII prefix characters in NOCASE mode.
+        // NOCASE collation only handles ASCII case folding reliably, and incrementing
+        // non-ASCII characters can produce invalid upper bounds. SQLite also disables
+        // the optimization in these cases.
+        if !is_case_sensitive && !prefix.chars().all(|c| c.is_ascii()) {
+            return None;
+        }
+
         // For NOCASE comparisons, normalize to lowercase for proper range bounds.
         // This is necessary because NOCASE collation folds uppercase to lowercase,
         // so 'zZ' and 'zz' are equivalent. If we increment 'Z' to '[', we get 'z['

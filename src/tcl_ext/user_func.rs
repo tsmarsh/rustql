@@ -32,13 +32,29 @@ pub fn call_tcl_user_function(func_name: &str, args: &[String]) -> Option<String
         return None;
     }
 
+    let argcount = args.len() as i32;
+
     // Find the function - check all connections for now
+    // First try exact argcount match, then try -1 (any args) match
     let proc_name = USER_FUNCTIONS.with(|funcs| {
         let funcs = funcs.borrow();
-        // Find any registered function with this name (ignoring db_name for simplicity)
-        for ((_, fname), proc) in funcs.iter() {
-            if fname.eq_ignore_ascii_case(func_name) {
+        // First: find exact argcount match
+        for ((_, fname, narg), proc) in funcs.iter() {
+            if fname.eq_ignore_ascii_case(func_name) && *narg == argcount {
                 return Some(proc.clone());
+            }
+        }
+        // Second: find any-args (-1) match (but NOT for built-in functions like LIKE)
+        // Built-in functions are NOT overridden by -1 registrations
+        let is_builtin = func_name.eq_ignore_ascii_case("like")
+            || func_name.eq_ignore_ascii_case("glob")
+            || func_name.eq_ignore_ascii_case("regexp")
+            || func_name.eq_ignore_ascii_case("match");
+        if !is_builtin {
+            for ((_, fname, narg), proc) in funcs.iter() {
+                if fname.eq_ignore_ascii_case(func_name) && *narg == -1 {
+                    return Some(proc.clone());
+                }
             }
         }
         None
@@ -74,12 +90,28 @@ pub fn call_tcl_user_function(func_name: &str, args: &[String]) -> Option<String
     None
 }
 
-/// Check if a user-defined TCL function exists
+/// Check if a user-defined TCL function exists (any argcount)
 pub fn has_tcl_user_function(func_name: &str) -> bool {
     USER_FUNCTIONS.with(|funcs| {
         let funcs = funcs.borrow();
-        for ((_, fname), _) in funcs.iter() {
+        for ((_, fname, _), _) in funcs.iter() {
             if fname.eq_ignore_ascii_case(func_name) {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// Check if a user-defined TCL function exists with specific argcount
+/// For built-in functions (LIKE, GLOB, etc.), only exact argcount matches count
+pub fn has_tcl_user_function_with_args(func_name: &str, argcount: i32) -> bool {
+    USER_FUNCTIONS.with(|funcs| {
+        let funcs = funcs.borrow();
+        // Check for exact argcount match only
+        // Built-in functions (LIKE, GLOB) are NOT overridden by -1 registrations
+        for ((_, fname, narg), _) in funcs.iter() {
+            if fname.eq_ignore_ascii_case(func_name) && *narg == argcount {
                 return true;
             }
         }

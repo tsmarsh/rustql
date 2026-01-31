@@ -524,6 +524,7 @@ impl<'a> Tokenizer<'a> {
     }
 
     /// Scan a variable (?NNN, :name, @name, $name)
+    /// For $ variables, also supports TCL namespace syntax like $::name or $ns::var
     fn scan_variable(&mut self) -> Result<TokenKind> {
         let c = self.current();
         self.advance();
@@ -537,11 +538,14 @@ impl<'a> Tokenizer<'a> {
         }
 
         // :name, @name, $name - named variable
-        // Must have at least one identifier character after the prefix
+        // For $ variables, also allow : for TCL namespace syntax ($::var, $ns::name)
+        let allow_colon = c == b'$';
+
+        // Must have at least one identifier character (or : for $ vars) after the prefix
         let mut count = 0;
         while !self.is_eof() {
             let ch = self.current();
-            if ch.is_ascii_alphanumeric() || ch == b'_' {
+            if ch.is_ascii_alphanumeric() || ch == b'_' || (allow_colon && ch == b':') {
                 self.advance();
                 count += 1;
             } else {

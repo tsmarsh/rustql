@@ -2464,19 +2464,28 @@ impl Vdbe {
                 if has_more {
                     // Only count real B-tree cursor movements for search_count
                     // (not ephemeral/virtual/schema tables)
-                    let is_btree_cursor = self
-                        .cursor(op.p1)
-                        .map(|c| {
-                            !c.is_ephemeral
-                                && !c.is_virtual
-                                && !c.is_sqlite_master
-                                && !c.is_sqlite_stat1
-                        })
-                        .unwrap_or(false);
-                    if is_btree_cursor {
-                        inc_search_count(); // Count real B-tree cursor movements only
+                    let cursor_info = self.cursor(op.p1).map(|c| {
+                        let is_btree = !c.is_ephemeral
+                            && !c.is_virtual
+                            && !c.is_sqlite_master
+                            && !c.is_sqlite_stat1;
+                        // Check if this is a table cursor (cur_int_key=true) vs index cursor
+                        let is_table = c
+                            .btree_cursor
+                            .as_ref()
+                            .map(|btc| btc.cur_int_key)
+                            .unwrap_or(false);
+                        (is_btree, is_table)
+                    });
+                    if let Some((is_btree, is_table)) = cursor_info {
+                        if is_btree {
+                            inc_search_count(); // Count real B-tree cursor movements only
+                        }
+                        // Only count fullscan steps for table cursors (not index cursors)
+                        if is_table {
+                            inc_step_count(); // Track fullscan step for "db status step"
+                        }
                     }
-                    inc_step_count(); // Track fullscan step for "db status step"
                     self.pc = op.p2;
                 }
                 if let Some((name, rowid)) = vtab_context {
@@ -3469,6 +3478,7 @@ impl Vdbe {
                         self.mem_mut(op.p3).set_int(total);
                     } else if name.eq_ignore_ascii_case("LIKE") {
                         // LIKE requires special handling for case_sensitive_like pragma
+                        // Also supports custom LIKE function override via TCL
                         inc_like_count();
                         let argc = op.p1.max(0) as usize;
                         let arg_base = op.p2;
@@ -3480,23 +3490,56 @@ impl Vdbe {
                             if matches!(pattern, Value::Null) || matches!(text, Value::Null) {
                                 self.mem_mut(op.p3).set_null();
                             } else {
-                                let case_sensitive = self
-                                    .conn_ptr
-                                    .map(|ptr| unsafe { &*ptr }.db_config.case_sensitive_like)
-                                    .unwrap_or(false);
-                                let mut args = vec![pattern, text];
-                                if argc >= 3 {
-                                    args.push(self.mem(arg_base + 2).to_value());
-                                }
-                                match crate::functions::scalar::func_like_case_sensitive(
-                                    &args,
-                                    case_sensitive,
-                                ) {
-                                    Ok(Value::Integer(result)) => {
-                                        self.mem_mut(op.p3).set_int(result);
+                                // Check for custom LIKE function with exact argcount
+                                #[cfg(feature = "tcl")]
+                                let custom_result = {
+                                    if crate::tcl_ext::has_tcl_user_function_with_args(
+                                        "like",
+                                        argc as i32,
+                                    ) {
+                                        let mut args_str = vec![pattern.to_text(), text.to_text()];
+                                        if argc >= 3 {
+                                            args_str
+                                                .push(self.mem(arg_base + 2).to_value().to_text());
+                                        }
+                                        crate::tcl_ext::call_tcl_user_function("like", &args_str)
+                                            .map(|r| {
+                                                // Custom function returns 0/1 or true/false
+                                                if r == "0" || r.is_empty() {
+                                                    0i64
+                                                } else {
+                                                    1i64
+                                                }
+                                            })
+                                    } else {
+                                        None
                                     }
-                                    _ => {
-                                        self.mem_mut(op.p3).set_int(0);
+                                };
+                                #[cfg(not(feature = "tcl"))]
+                                let custom_result: Option<i64> = None;
+
+                                if let Some(result) = custom_result {
+                                    self.mem_mut(op.p3).set_int(result);
+                                } else {
+                                    // Use built-in LIKE
+                                    let case_sensitive = self
+                                        .conn_ptr
+                                        .map(|ptr| unsafe { &*ptr }.db_config.case_sensitive_like)
+                                        .unwrap_or(false);
+                                    let mut args = vec![pattern, text];
+                                    if argc >= 3 {
+                                        args.push(self.mem(arg_base + 2).to_value());
+                                    }
+                                    match crate::functions::scalar::func_like_case_sensitive(
+                                        &args,
+                                        case_sensitive,
+                                    ) {
+                                        Ok(Value::Integer(result)) => {
+                                            self.mem_mut(op.p3).set_int(result);
+                                        }
+                                        _ => {
+                                            self.mem_mut(op.p3).set_int(0);
+                                        }
                                     }
                                 }
                             }

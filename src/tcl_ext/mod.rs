@@ -31,7 +31,9 @@ pub mod user_func;
 
 // Re-exports for public API
 pub use ffi::{Tcl_Interp, Tcl_Obj};
-pub use user_func::{call_tcl_user_function, has_tcl_user_function};
+pub use user_func::{
+    call_tcl_user_function, has_tcl_user_function, has_tcl_user_function_with_args,
+};
 
 use ffi::{Tcl_CreateObjCommand, TCL_ERROR, TCL_OK};
 
@@ -42,8 +44,9 @@ thread_local! {
     pub(crate) static NULL_VALUES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
     // Current TCL interpreter for user function callbacks
     pub(crate) static CURRENT_INTERP: RefCell<Option<*mut Tcl_Interp>> = const { RefCell::new(None) };
-    // User-defined TCL functions per connection: (db_name, func_name) -> tcl_proc_name
-    pub(crate) static USER_FUNCTIONS: RefCell<HashMap<(String, String), String>> = RefCell::new(HashMap::new());
+    // User-defined TCL functions per connection: (db_name, func_name, argcount) -> tcl_proc_name
+    // argcount of -1 means "any number of args"
+    pub(crate) static USER_FUNCTIONS: RefCell<HashMap<(String, String, i32), String>> = RefCell::new(HashMap::new());
 }
 
 // Force the linker to keep the init functions - they're called by TCL, not Rust code

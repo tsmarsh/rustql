@@ -10,7 +10,7 @@ use crate::error::Result;
 use crate::parser::ast::{
     ConflictAction, Expr, InsertSource, InsertStmt, ResultColumn, SelectBody, SelectStmt, TableRef,
 };
-use crate::schema::{Schema, Trigger, TriggerEvent, TriggerTiming};
+use crate::schema::{Affinity, Schema, Trigger, TriggerEvent, TriggerTiming};
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
 use super::column_mapping::{ColumnMapper, ColumnSource, RowidMapping};
@@ -102,6 +102,9 @@ pub struct InsertCompiler<'a> {
 
     /// Table name for trigger firing
     table_name: String,
+
+    /// Column affinity string (one char per column)
+    column_affinities: String,
 }
 
 impl<'a> InsertCompiler<'a> {
@@ -125,6 +128,7 @@ impl<'a> InsertCompiler<'a> {
             before_delete_triggers: Vec::new(),
             after_delete_triggers: Vec::new(),
             table_name: String::new(),
+            column_affinities: String::new(),
         }
     }
 
@@ -148,6 +152,7 @@ impl<'a> InsertCompiler<'a> {
             before_delete_triggers: Vec::new(),
             after_delete_triggers: Vec::new(),
             table_name: String::new(),
+            column_affinities: String::new(),
         }
     }
 
@@ -198,6 +203,7 @@ impl<'a> InsertCompiler<'a> {
         );
 
         self.num_columns = self.infer_num_columns(insert);
+        self.init_column_affinities(&insert.table.name);
 
         // Open indexes for writing
         self.open_indexes_for_write(&insert.table.name)?;
@@ -441,6 +447,9 @@ impl<'a> InsertCompiler<'a> {
             let table_name = insert.table.name.clone();
             self.emit_before_triggers(&table_name, data_base)?;
 
+            // Apply column affinities before making record
+            self.emit_affinity(data_base, self.num_columns as i32);
+
             // Make record
             let record_reg = self.alloc_reg();
             self.emit(
@@ -494,6 +503,42 @@ impl<'a> InsertCompiler<'a> {
             InsertSource::Values(rows) => rows.first().map(|row| row.len()).unwrap_or(0),
             InsertSource::Select(select) => self.count_select_columns(select),
             InsertSource::DefaultValues => 1,
+        }
+    }
+
+    /// Initialize column affinity string from schema
+    fn init_column_affinities(&mut self, table_name: &str) {
+        self.column_affinities.clear();
+        if let Some(schema) = self.schema {
+            let table_name_lower = table_name.to_lowercase();
+            if let Some(table) = schema.tables.get(&table_name_lower) {
+                for col in &table.columns {
+                    // Convert Affinity to SQLite's affinity character
+                    let ch = match col.affinity {
+                        Affinity::None => '@',
+                        Affinity::Blob => 'A',
+                        Affinity::Text => 'B',
+                        Affinity::Numeric => 'C',
+                        Affinity::Integer => 'D',
+                        Affinity::Real => 'E',
+                        Affinity::Flexnum => 'F',
+                    };
+                    self.column_affinities.push(ch);
+                }
+            }
+        }
+    }
+
+    /// Emit Affinity opcode to apply column affinities to registers
+    fn emit_affinity(&mut self, base_reg: i32, count: i32) {
+        if !self.column_affinities.is_empty() {
+            self.emit(
+                Opcode::Affinity,
+                base_reg,
+                count,
+                0,
+                P4::Text(self.column_affinities.clone()),
+            );
         }
     }
 
@@ -763,6 +808,9 @@ impl<'a> InsertCompiler<'a> {
         // Fire BEFORE INSERT triggers
         let table_name = insert.table.name.clone();
         self.emit_before_triggers(&table_name, data_base)?;
+
+        // Apply column affinities before making record
+        self.emit_affinity(data_base, self.num_columns as i32);
 
         // Make and insert record
         let record_reg = self.alloc_reg();
@@ -1035,6 +1083,9 @@ impl<'a> InsertCompiler<'a> {
         // Fire BEFORE INSERT triggers
         let table_name = insert.table.name.clone();
         self.emit_before_triggers(&table_name, data_base)?;
+
+        // Apply column affinities before making record
+        self.emit_affinity(data_base, self.num_columns as i32);
 
         // Make and insert record
         let record_reg = self.alloc_reg();
@@ -1552,6 +1603,9 @@ impl<'a> InsertCompiler<'a> {
         // Fire BEFORE INSERT triggers
         let table_name = insert.table.name.clone();
         self.emit_before_triggers(&table_name, data_base)?;
+
+        // Apply column affinities before making record
+        self.emit_affinity(data_base, self.num_columns as i32);
 
         // Make and insert record
         let record_reg = self.alloc_reg();

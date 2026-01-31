@@ -120,6 +120,8 @@ pub struct StatementCompiler<'s> {
     full_column_names: bool,
     /// LIKE case sensitivity (for LIKE index optimization)
     case_sensitive_like: bool,
+    /// Enable view access (from db config)
+    enable_view: bool,
 }
 
 impl<'s> StatementCompiler<'s> {
@@ -134,6 +136,7 @@ impl<'s> StatementCompiler<'s> {
             short_column_names: true,
             full_column_names: false,
             case_sensitive_like: false,
+            enable_view: true,
         }
     }
 
@@ -148,6 +151,7 @@ impl<'s> StatementCompiler<'s> {
             short_column_names: true,
             full_column_names: false,
             case_sensitive_like: false,
+            enable_view: true,
         }
     }
 
@@ -160,6 +164,11 @@ impl<'s> StatementCompiler<'s> {
     pub fn set_column_name_flags(&mut self, short_column_names: bool, full_column_names: bool) {
         self.short_column_names = short_column_names;
         self.full_column_names = full_column_names;
+    }
+
+    /// Set enable_view flag (from db config)
+    pub fn set_enable_view(&mut self, enable: bool) {
+        self.enable_view = enable;
     }
 
     /// Set LIKE case sensitivity for index optimization
@@ -220,6 +229,8 @@ impl<'s> StatementCompiler<'s> {
                 compiler.set_param_names(self.param_names.clone());
                 // Pass LIKE case sensitivity for index optimization
                 compiler.set_case_sensitive_like(self.case_sensitive_like);
+                // Pass enable_view flag from db config
+                compiler.set_enable_view(self.enable_view);
                 let ops = compiler.compile(select, &SelectDest::Output)?;
                 // Use column names from compiler (properly expanded for Star)
                 let names = if compiler.column_names().is_empty() {
@@ -1755,6 +1766,73 @@ impl<'s> StatementCompiler<'s> {
         ));
     }
 
+    /// Delete entries from sqlite_master where name matches
+    fn append_sqlite_master_delete(&self, ops: &mut Vec<VdbeOp>, cursor_id: i32, name: &str) {
+        // sqlite_master columns: type, name, tbl_name, rootpage, sql
+        // We need to scan and find rows where name (column 1) matches
+
+        // Use high register numbers to avoid conflicts
+        let reg_name_col = 30;
+        let reg_target = 31;
+
+        // Store the target name to match
+        ops.push(Self::make_op(
+            Opcode::String8,
+            0,
+            reg_target,
+            0,
+            P4::Text(name.to_string()),
+        ));
+
+        // Rewind to start of sqlite_master
+        let rewind_addr = ops.len();
+        let end_label = 0; // Will be fixed later
+        ops.push(Self::make_op(
+            Opcode::Rewind,
+            cursor_id,
+            end_label,
+            0,
+            P4::Unused,
+        ));
+
+        // Loop: read name column (column 1)
+        let loop_start = ops.len();
+        ops.push(Self::make_op(
+            Opcode::Column,
+            cursor_id,
+            1,
+            reg_name_col,
+            P4::Unused,
+        ));
+
+        // Compare with target name (case insensitive would be better, but for now exact match)
+        let skip_label = ops.len() + 2; // Jump over Delete if no match
+        ops.push(Self::make_op(
+            Opcode::Ne,
+            reg_name_col,
+            skip_label as i32,
+            reg_target,
+            P4::Unused,
+        ));
+
+        // Delete the current row
+        ops.push(Self::make_op(Opcode::Delete, cursor_id, 0, 0, P4::Unused));
+
+        // Next row
+        let _next_addr = ops.len();
+        ops.push(Self::make_op(
+            Opcode::Next,
+            cursor_id,
+            loop_start as i32,
+            0,
+            P4::Unused,
+        ));
+
+        // End of loop - fix the Rewind jump address
+        let end_addr = ops.len();
+        ops[rewind_addr].p2 = end_addr as i32;
+    }
+
     fn compile_create_index(&mut self, create: &CreateIndexStmt) -> Result<Vec<VdbeOp>> {
         use crate::storage::btree::BTREE_BLOBKEY;
 
@@ -3219,9 +3297,22 @@ impl<'s> StatementCompiler<'s> {
 
         // Generate bytecode to drop the object
         // P1 = db_idx (0=main, 1=temp)
+        // Control flow: Init -> main code -> Goto -> Halt
         let mut ops = Vec::new();
-        ops.push(Self::make_op(Opcode::Init, 0, 2, 0, P4::Unused));
-        ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
+        ops.push(Self::make_op(Opcode::Init, 0, 2, 0, P4::Unused)); // Jump to main code at 2
+        ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused)); // Error halt at 1
+
+        // Main code starts at index 2
+        // For non-temp objects, we need to delete from sqlite_master
+        // Temp objects are only in memory and don't persist to sqlite_master
+        if actual_db_idx != 1 {
+            // Delete from sqlite_master
+            let cursor_id = 0;
+            self.append_sqlite_master_open(&mut ops, cursor_id);
+            self.append_sqlite_master_delete(&mut ops, cursor_id, name);
+            self.append_sqlite_master_close(&mut ops, cursor_id);
+        }
+
         // Use appropriate Drop opcode based on type (SQLite: OP_DropTable/Index/Trigger)
         let drop_opcode = match kind {
             "table" | "view" => Opcode::DropTable, // SQLite uses DropTable for views too
@@ -3236,7 +3327,10 @@ impl<'s> StatementCompiler<'s> {
             0,
             P4::Text(name.clone()),
         ));
+
+        // End with Goto back to Halt
         ops.push(Self::make_op(Opcode::Goto, 0, 1, 0, P4::Unused));
+
         Ok(ops)
     }
 
@@ -4641,6 +4735,7 @@ pub fn compile_sql_with_full_config<'a>(
     short_column_names: bool,
     full_column_names: bool,
     case_sensitive_like: bool,
+    enable_view: bool,
 ) -> Result<(CompiledStmt, &'a str)> {
     let mut compiler = StatementCompiler::with_schema(schema);
     if let Some(ts) = temp_schema {
@@ -4648,6 +4743,7 @@ pub fn compile_sql_with_full_config<'a>(
     }
     compiler.set_column_name_flags(short_column_names, full_column_names);
     compiler.set_case_sensitive_like(case_sensitive_like);
+    compiler.set_enable_view(enable_view);
     compiler.compile(sql)
 }
 

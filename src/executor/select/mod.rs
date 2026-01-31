@@ -122,6 +122,8 @@ pub struct SelectCompiler<'s> {
     /// Depth of main database view expansions (when > 0, don't look in temp schema for views)
     /// This implements SQLite's behavior where views bind to their own database's objects
     main_view_depth: usize,
+    /// Enable view access (from db config enable_view)
+    enable_view: bool,
 }
 
 impl<'s> SelectCompiler<'s> {
@@ -170,7 +172,13 @@ impl<'s> SelectCompiler<'s> {
             order_by_index: None,
             expanding_views: HashSet::new(),
             main_view_depth: 0,
+            enable_view: true,
         }
+    }
+
+    /// Set enable_view flag (from db config)
+    pub fn set_enable_view(&mut self, enable: bool) {
+        self.enable_view = enable;
     }
 
     /// Set parameter names for Variable compilation
@@ -223,6 +231,7 @@ impl<'s> SelectCompiler<'s> {
             order_by_index: None,
             expanding_views: HashSet::new(),
             main_view_depth: 0,
+            enable_view: true,
         }
     }
 
@@ -543,6 +552,8 @@ impl<'s> SelectCompiler<'s> {
         subcompiler.expanding_views = self.expanding_views.clone();
         // Propagate main_view_depth for proper temp schema handling
         subcompiler.main_view_depth = self.main_view_depth;
+        // Propagate enable_view flag
+        subcompiler.enable_view = self.enable_view;
         if let Some(name) = exclude_cte {
             subcompiler.ctes.remove(name);
             subcompiler.recursive_ctes.remove(name);
@@ -2894,6 +2905,14 @@ impl<'s> SelectCompiler<'s> {
                 };
 
                 if let Some(view) = view_opt {
+                    // Check if view access is disabled (temp views are always allowed)
+                    if !self.enable_view && view.db_idx != 1 {
+                        return Err(Error::with_message(
+                            ErrorCode::Error,
+                            format!("access to view \"{}\" prohibited", view.name),
+                        ));
+                    }
+
                     // Check for circular view definition
                     if self.expanding_views.contains(&table_name_lower) {
                         return Err(Error::with_message(
@@ -2913,6 +2932,7 @@ impl<'s> SelectCompiler<'s> {
 
                     let view_select = (*view.select).clone();
                     let view_alias = item.alias.clone().unwrap_or_else(|| table_name.clone());
+                    let view_columns = view.columns.clone();
 
                     // Compile view's SELECT as a subquery into ephemeral table
                     let result = self.compile_subquery_to_ephemeral(&view_select, cursor, None);
@@ -2925,6 +2945,14 @@ impl<'s> SelectCompiler<'s> {
 
                     let subquery_col_names = result?;
 
+                    // Use view's explicit column names if defined, otherwise use subquery column names
+                    let final_col_names = if let Some(explicit_cols) = view_columns {
+                        // View has explicit column names like CREATE VIEW v(c1, c2) AS ...
+                        explicit_cols
+                    } else {
+                        subquery_col_names
+                    };
+
                     self.tables.push(TableInfo {
                         name: view_alias,
                         table_name: String::new(),
@@ -2932,13 +2960,33 @@ impl<'s> SelectCompiler<'s> {
                         schema_table: None,
                         is_subquery: true,
                         join_type: item.join_type,
-                        subquery_columns: Some(subquery_col_names),
+                        subquery_columns: Some(final_col_names),
                     });
                     return Ok(());
                 }
 
                 // Look up table in schema if available
                 let schema_table = self.lookup_table_schema(&table_name_lower);
+
+                // If we have a schema and the table doesn't exist, return error
+                // (Skip this check if no schema is set - for backwards compatibility with unit tests)
+                if self.schema.is_some() && schema_table.is_none() {
+                    // Use qualified name with database prefix for error message
+                    // Only add "main." prefix when inside a view expansion (for consistency with SQLite)
+                    let qualified_name = if let Some(ref schema) = name.schema {
+                        format!("{}.{}", schema, table_name)
+                    } else if self.main_view_depth > 0 {
+                        // Inside a view expansion - use qualified name
+                        format!("main.{}", table_name)
+                    } else {
+                        // Top-level query - use plain name
+                        table_name.clone()
+                    };
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        format!("no such table: {}", qualified_name),
+                    ));
+                }
 
                 // Emit OpenRead for the table
                 self.emit(Opcode::OpenRead, cursor, 0, 0, P4::Text(table_name.clone()));
@@ -4448,6 +4496,14 @@ impl<'s> SelectCompiler<'s> {
                     };
 
                     if let Some(view) = view_opt {
+                        // Check if view access is disabled (temp views are always allowed)
+                        if !self.enable_view && view.db_idx != 1 {
+                            return Err(Error::with_message(
+                                ErrorCode::Error,
+                                format!("access to view \"{}\" prohibited", view.name),
+                            ));
+                        }
+
                         // Check for circular view definition
                         if self.expanding_views.contains(&table_name_lower) {
                             return Err(Error::with_message(
@@ -4468,6 +4524,7 @@ impl<'s> SelectCompiler<'s> {
                         // Expand view as subquery
                         let view_select = (*view.select).clone();
                         let view_alias = alias.clone().unwrap_or_else(|| table_name.clone());
+                        let view_columns = view.columns.clone();
 
                         // Compile view's SELECT as a subquery
                         let cursor = self.alloc_cursor();
@@ -4488,6 +4545,8 @@ impl<'s> SelectCompiler<'s> {
                         subcompiler.expanding_views = self.expanding_views.clone();
                         // Propagate main_view_depth
                         subcompiler.main_view_depth = self.main_view_depth;
+                        // Propagate enable_view flag
+                        subcompiler.enable_view = self.enable_view;
                         subcompiler
                             .set_column_name_flags(self.short_column_names, self.full_column_names);
                         let result = subcompiler.compile(&view_select, &subquery_dest);
@@ -4517,6 +4576,14 @@ impl<'s> SelectCompiler<'s> {
                         self.next_reg = subcompiler.next_reg;
                         self.next_cursor = subcompiler.next_cursor;
 
+                        // Use view's explicit column names if defined, otherwise use subquery column names
+                        let final_col_names = if let Some(explicit_cols) = view_columns {
+                            // View has explicit column names like CREATE VIEW v(c1, c2) AS ...
+                            explicit_cols
+                        } else {
+                            subquery_col_names
+                        };
+
                         self.tables.push(TableInfo {
                             name: view_alias,
                             table_name: String::new(),
@@ -4524,7 +4591,7 @@ impl<'s> SelectCompiler<'s> {
                             schema_table: None,
                             is_subquery: true,
                             join_type,
-                            subquery_columns: Some(subquery_col_names),
+                            subquery_columns: Some(final_col_names),
                         });
                         return Ok(());
                     }

@@ -327,6 +327,7 @@ pub fn sqlite3_prepare_v2<'a>(
     let short_column_names = conn.db_config.short_column_names;
     let full_column_names = conn.db_config.full_column_names;
     let case_sensitive_like = conn.db_config.case_sensitive_like;
+    let enable_view = conn.db_config.enable_view;
 
     // Compile in a block so schema guards are dropped before we use conn mutably
     let compile_result = {
@@ -346,6 +347,7 @@ pub fn sqlite3_prepare_v2<'a>(
                     short_column_names,
                     full_column_names,
                     case_sensitive_like,
+                    enable_view,
                 )
             } else {
                 compile_sql(sql)

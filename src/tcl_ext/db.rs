@@ -570,13 +570,34 @@ pub unsafe extern "C" fn db_method_cmd(
         }
         "config" => {
             // Database configuration options
-            // Usage: db config ?option? ?value?
-            // Return empty for queries, accept values silently
-            if objc == 2 {
-                // No args - return empty list of options
+            // Usage: db config option ?value?
+            if objc < 3 {
+                // No args or just option name - return empty/current value
                 set_result_string(interp, "");
+                return TCL_OK;
             }
-            // With args - silently accept
+            let option = obj_to_string(*objv.offset(2));
+            match option.as_str() {
+                "enable_view" => {
+                    CONNECTIONS.with(|connections| {
+                        let mut conns = connections.borrow_mut();
+                        if let Some(conn) = conns.get_mut(db_name) {
+                            if objc >= 4 {
+                                // Setting enable_view
+                                let value_str = obj_to_string(*objv.offset(3));
+                                let value =
+                                    value_str == "on" || value_str == "1" || value_str == "true";
+                                conn.db_config.enable_view = value;
+                            }
+                            // Return current value
+                            set_result_int(interp, conn.db_config.enable_view as i32);
+                        }
+                    });
+                }
+                _ => {
+                    // Other config options - silently accept
+                }
+            }
             TCL_OK
         }
         "nullvalue" | "null" => {

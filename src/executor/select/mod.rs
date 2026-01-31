@@ -2302,8 +2302,19 @@ impl<'s> SelectCompiler<'s> {
     fn compile_grouped_aggregate(&mut self, core: &SelectCore, dest: &SelectDest) -> Result<()> {
         let group_by = core.group_by.as_ref().unwrap();
 
+        // Pre-scan result columns to extract alias expressions (for GROUP BY alias resolution)
+        // SQLite allows GROUP BY to reference result column aliases
+        self.prescan_result_aliases(&core.columns);
+
+        // Resolve aliases in GROUP BY expressions
+        // e.g., "SELECT x+1 AS y ... GROUP BY y" should resolve y to x+1
+        let resolved_group_by: Vec<Expr> = group_by
+            .iter()
+            .map(|expr| self.resolve_where_aliases(expr))
+            .collect();
+
         // Count total columns needed in sorter: group columns + aggregate arguments
-        let num_group_cols = group_by.len();
+        let num_group_cols = resolved_group_by.len();
         let num_agg_args = self.count_aggregate_args(&core.columns);
         let total_sorter_cols = num_group_cols + num_agg_args;
 
@@ -2341,8 +2352,8 @@ impl<'s> SelectCompiler<'s> {
             None
         };
 
-        // Evaluate GROUP BY expressions and store in sorter
-        let group_regs = self.compile_expressions(group_by)?;
+        // Evaluate GROUP BY expressions (with aliases resolved) and store in sorter
+        let group_regs = self.compile_expressions(&resolved_group_by)?;
 
         // Evaluate aggregate arguments
         let agg_arg_regs = self.compile_aggregate_args(&core.columns)?;
@@ -2461,7 +2472,7 @@ impl<'s> SelectCompiler<'s> {
         let result_regs = self.finalize_aggregates_with_group(
             &core.columns,
             &agg_regs,
-            Some(group_by),
+            Some(&resolved_group_by),
             prev_group_regs,
         )?;
         // Only keep names from first group output (truncate to saved length unless this is first)
@@ -2518,7 +2529,7 @@ impl<'s> SelectCompiler<'s> {
         let result_regs = self.finalize_aggregates_with_group(
             &core.columns,
             &agg_regs,
-            Some(group_by),
+            Some(&resolved_group_by),
             prev_group_regs,
         )?;
         // Restore column names (don't double-count for final group output)

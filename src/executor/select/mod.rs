@@ -3281,20 +3281,27 @@ impl<'s> SelectCompiler<'s> {
                             let index_cols: Vec<i32> =
                                 idx.columns.iter().map(|ic| ic.column_idx).collect();
                             // Get collations for each index column
-                            // Use index column's explicit collation, or fall back to table column collation
+                            // Use index column's explicit collation if set, otherwise fall back to table column collation
+                            // Empty collation means "no explicit COLLATE clause" - inherit from table
                             let collations: Vec<String> = idx
                                 .columns
                                 .iter()
                                 .map(|ic| {
-                                    if !ic.collation.is_empty()
-                                        && ic.collation.to_uppercase() != "BINARY"
-                                    {
+                                    if !ic.collation.is_empty() {
+                                        // Index has explicit collation (including BINARY)
                                         ic.collation.to_uppercase()
                                     } else if ic.column_idx >= 0 {
+                                        // No explicit collation, inherit from table column
                                         schema_table
                                             .columns
                                             .get(ic.column_idx as usize)
-                                            .map(|c| c.collation.to_uppercase())
+                                            .map(|c| {
+                                                if !c.collation.is_empty() {
+                                                    c.collation.to_uppercase()
+                                                } else {
+                                                    "BINARY".to_string()
+                                                }
+                                            })
                                             .unwrap_or_else(|| "BINARY".to_string())
                                     } else {
                                         "BINARY".to_string()
@@ -3342,17 +3349,26 @@ impl<'s> SelectCompiler<'s> {
                     }
 
                     // Get collations for each index column
+                    // Use index column's explicit collation if set, otherwise inherit from table
                     let collations: Vec<String> = index
                         .columns
                         .iter()
                         .map(|ic| {
-                            if !ic.collation.is_empty() && ic.collation.to_uppercase() != "BINARY" {
+                            if !ic.collation.is_empty() {
+                                // Index has explicit collation (including BINARY)
                                 ic.collation.to_uppercase()
                             } else if ic.column_idx >= 0 {
+                                // No explicit collation, inherit from table column
                                 schema_table
                                     .columns
                                     .get(ic.column_idx as usize)
-                                    .map(|c| c.collation.to_uppercase())
+                                    .map(|c| {
+                                        if !c.collation.is_empty() {
+                                            c.collation.to_uppercase()
+                                        } else {
+                                            "BINARY".to_string()
+                                        }
+                                    })
                                     .unwrap_or_else(|| "BINARY".to_string())
                             } else {
                                 "BINARY".to_string()

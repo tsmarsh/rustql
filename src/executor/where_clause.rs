@@ -830,7 +830,16 @@ impl QueryPlanner {
         table_usage_info: &[(String, Option<String>, u64, Vec<String>)],
     ) -> Result<()> {
         // Collect LIKE terms that can be optimized
-        let like_terms: Vec<(usize, Box<Expr>, Box<Expr>, LikeOp, Option<(i32, i32)>, u64)> = self
+        // Tuple: (idx, col_expr, pattern_expr, op, escape_char, left_col, mask)
+        let like_terms: Vec<(
+            usize,
+            Box<Expr>,
+            Box<Expr>,
+            LikeOp,
+            Option<char>,
+            Option<(i32, i32)>,
+            u64,
+        )> = self
             .where_clause
             .terms
             .iter()
@@ -844,16 +853,32 @@ impl QueryPlanner {
                     expr,
                     pattern,
                     op,
+                    escape,
                     negated: false,
-                    ..
                 } = term.expr.as_ref()
                 {
                     if matches!(op, LikeOp::Like | LikeOp::Glob) {
+                        // Extract escape character if it's a single-character literal
+                        let escape_char = escape.as_ref().and_then(|e| {
+                            if let Expr::Literal(Literal::String(s)) = e.as_ref() {
+                                let mut chars = s.chars();
+                                let first = chars.next();
+                                // Only valid if it's exactly one character
+                                if chars.next().is_none() {
+                                    first
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        });
                         return Some((
                             idx,
                             expr.clone(),
                             pattern.clone(),
                             *op,
+                            escape_char,
                             term.left_col,
                             term.mask,
                         ));
@@ -864,7 +889,7 @@ impl QueryPlanner {
             .collect();
 
         // Generate virtual range terms for each LIKE term
-        for (like_idx, col_expr, pattern_expr, op, left_col, mask) in like_terms {
+        for (like_idx, col_expr, pattern_expr, op, escape_char, left_col, mask) in like_terms {
             // SQLite disables LIKE optimization for non-TEXT columns because LIKE is a
             // string operation and comparing TEXT range bounds against INTEGER values
             // doesn't work correctly. Check the column affinity and skip if not TEXT.
@@ -885,7 +910,7 @@ impl QueryPlanner {
             let is_case_sensitive = matches!(op, LikeOp::Glob) || self.case_sensitive_like;
 
             if let Some((prefix, upper_bound)) =
-                Self::extract_like_bounds(&pattern_expr, op, is_case_sensitive)
+                Self::extract_like_bounds(&pattern_expr, op, is_case_sensitive, escape_char)
             {
                 // Determine required collation for the LIKE range terms:
                 // - case_sensitive_like=ON: requires BINARY collation index
@@ -1325,6 +1350,7 @@ impl QueryPlanner {
         pattern: &Expr,
         op: LikeOp,
         is_case_sensitive: bool,
+        escape_char: Option<char>,
     ) -> Option<(String, String)> {
         // Unwrap Collate wrapper if present: x LIKE 'abc%' COLLATE nocase
         let inner_pattern = match pattern {
@@ -1345,6 +1371,9 @@ impl QueryPlanner {
             _ => return None,
         };
 
+        // Determine escape character: explicit ESCAPE clause > default backslash for LIKE
+        let esc = escape_char.or_else(|| if op == LikeOp::Like { Some('\\') } else { None });
+
         // Extract prefix up to first wildcard
         let mut prefix = String::new();
         let mut chars = text.chars().peekable();
@@ -1357,11 +1386,12 @@ impl QueryPlanner {
                 continue;
             }
 
-            // For LIKE, backslash is escape (if no explicit escape char)
-            // For GLOB, we don't have escape handling in basic implementation
-            if ch == '\\' && op == LikeOp::Like {
-                escape_next = true;
-                continue;
+            // Check for escape character
+            if let Some(esc_ch) = esc {
+                if ch == esc_ch {
+                    escape_next = true;
+                    continue;
+                }
             }
 
             if ch == multi_wild || ch == single_wild {

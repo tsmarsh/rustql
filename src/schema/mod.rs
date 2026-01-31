@@ -1173,7 +1173,8 @@ pub fn parse_create_index_sql(sql: &str, _is_unique: bool) -> Option<Index> {
         let col_name = parts.first()?.to_string();
 
         // Look for COLLATE clause
-        let mut collation = DEFAULT_COLLATION.to_string();
+        // Use empty string to indicate "no explicit collation" - will be inherited from table column later
+        let mut collation = String::new();
         let mut sort_order = SortOrder::Asc;
 
         let mut i = 1;

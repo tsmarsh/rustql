@@ -6070,22 +6070,26 @@ impl Vdbe {
                                                         })
                                                     {
                                                         ic.column_idx = pos as i32;
-                                                        // Inherit collation from table column if not explicitly set
-                                                        if ic
-                                                            .collation
-                                                            .eq_ignore_ascii_case("BINARY")
-                                                        {
+                                                        // Inherit collation from table column only if not explicitly set.
+                                                        // Empty collation means "no COLLATE clause was specified".
+                                                        // Explicit COLLATE (including COLLATE BINARY) should be preserved.
+                                                        if ic.collation.is_empty() {
                                                             if let Some(table_col) =
                                                                 table.columns.get(pos)
                                                             {
-                                                                if !table_col
-                                                                    .collation
-                                                                    .eq_ignore_ascii_case("BINARY")
-                                                                {
+                                                                if !table_col.collation.is_empty() {
                                                                     ic.collation = table_col
                                                                         .collation
                                                                         .to_uppercase();
+                                                                } else {
+                                                                    ic.collation =
+                                                                        crate::schema::DEFAULT_COLLATION
+                                                                            .to_string();
                                                                 }
+                                                            } else {
+                                                                ic.collation =
+                                                                    crate::schema::DEFAULT_COLLATION
+                                                                        .to_string();
                                                             }
                                                         }
                                                     }

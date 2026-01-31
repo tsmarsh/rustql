@@ -3707,12 +3707,16 @@ impl<'s> StatementCompiler<'s> {
                     if let Some(idx) = col_idx {
                         columns.push(idx);
                         // Get collation from index column, or fall back to table column collation
-                        let collation = if !col.collation.is_empty()
-                            && col.collation.to_uppercase() != "BINARY"
-                        {
+                        // If the index has an explicit collation (non-empty), use it
+                        // Otherwise, inherit from the table column's collation
+                        let collation = if !col.collation.is_empty() {
                             col.collation.to_uppercase()
                         } else if let Some(table_col) = table.columns.get(idx as usize) {
-                            table_col.collation.to_uppercase()
+                            if !table_col.collation.is_empty() {
+                                table_col.collation.to_uppercase()
+                            } else {
+                                "BINARY".to_string()
+                            }
                         } else {
                             "BINARY".to_string()
                         };
@@ -3786,12 +3790,16 @@ impl<'s> StatementCompiler<'s> {
                     if let Some(cidx) = col_idx {
                         columns.push(cidx);
                         // Get collation from index column, or fall back to table column collation
-                        let collation = if !col.collation.is_empty()
-                            && col.collation.to_uppercase() != "BINARY"
-                        {
+                        // If the index has an explicit collation (non-empty), use it
+                        // Otherwise, inherit from the table column's collation
+                        let collation = if !col.collation.is_empty() {
                             col.collation.to_uppercase()
                         } else if let Some(table_col) = table.columns.get(cidx as usize) {
-                            table_col.collation.to_uppercase()
+                            if !table_col.collation.is_empty() {
+                                table_col.collation.to_uppercase()
+                            } else {
+                                "BINARY".to_string()
+                            }
                         } else {
                             "BINARY".to_string()
                         };

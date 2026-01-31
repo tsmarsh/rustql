@@ -3202,6 +3202,27 @@ impl<'s> SelectCompiler<'s> {
                         if idx.table.eq_ignore_ascii_case(&table_name_lower) {
                             let index_cols: Vec<i32> =
                                 idx.columns.iter().map(|ic| ic.column_idx).collect();
+                            // Get collations for each index column
+                            // Use index column's explicit collation, or fall back to table column collation
+                            let collations: Vec<String> = idx
+                                .columns
+                                .iter()
+                                .map(|ic| {
+                                    if !ic.collation.is_empty()
+                                        && ic.collation.to_uppercase() != "BINARY"
+                                    {
+                                        ic.collation.to_uppercase()
+                                    } else if ic.column_idx >= 0 {
+                                        schema_table
+                                            .columns
+                                            .get(ic.column_idx as usize)
+                                            .map(|c| c.collation.to_uppercase())
+                                            .unwrap_or_else(|| "BINARY".to_string())
+                                    } else {
+                                        "BINARY".to_string()
+                                    }
+                                })
+                                .collect();
 
                             // An index is covering if it contains all table columns
                             // This is a simple heuristic - full detection requires
@@ -3215,6 +3236,7 @@ impl<'s> SelectCompiler<'s> {
                                 IndexInfo {
                                     name: idx.name.clone(),
                                     columns: index_cols.clone(),
+                                    collations,
                                     is_primary: idx.is_primary_key,
                                     is_unique: idx.unique,
                                     is_covering,
@@ -3241,6 +3263,25 @@ impl<'s> SelectCompiler<'s> {
                         continue;
                     }
 
+                    // Get collations for each index column
+                    let collations: Vec<String> = index
+                        .columns
+                        .iter()
+                        .map(|ic| {
+                            if !ic.collation.is_empty() && ic.collation.to_uppercase() != "BINARY" {
+                                ic.collation.to_uppercase()
+                            } else if ic.column_idx >= 0 {
+                                schema_table
+                                    .columns
+                                    .get(ic.column_idx as usize)
+                                    .map(|c| c.collation.to_uppercase())
+                                    .unwrap_or_else(|| "BINARY".to_string())
+                            } else {
+                                "BINARY".to_string()
+                            }
+                        })
+                        .collect();
+
                     // Check if index covers all table columns
                     let num_table_cols = schema_table.columns.len();
                     let is_covering = index_cols.len() >= num_table_cols
@@ -3251,6 +3292,7 @@ impl<'s> SelectCompiler<'s> {
                         IndexInfo {
                             name: index.name.clone(),
                             columns: index_cols,
+                            collations,
                             is_primary: index.is_primary_key,
                             is_unique: index.unique,
                             is_covering,

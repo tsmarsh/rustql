@@ -708,6 +708,24 @@ fn extract_default_value(col_def_upper: &str, col_def: &str) -> Option<DefaultVa
     None
 }
 
+/// Extract the COLLATE value from a column definition.
+/// Returns the collation name in uppercase, or None if not specified.
+fn extract_collation(col_def_upper: &str) -> Option<String> {
+    // Find " COLLATE " in the column definition
+    if let Some(collate_pos) = col_def_upper.find(" COLLATE ") {
+        let after_collate = col_def_upper[collate_pos + 9..].trim();
+        // The collation name is the first word after COLLATE
+        let collation = after_collate
+            .split(|c: char| c.is_whitespace() || c == ',' || c == ')' || c == '(' || c == ';')
+            .next()
+            .unwrap_or("");
+        if !collation.is_empty() {
+            return Some(collation.to_uppercase());
+        }
+    }
+    None
+}
+
 /// Parse a CREATE TABLE/CREATE VIRTUAL TABLE SQL string into a Table struct.
 pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
     // Simple parser for CREATE TABLE name (col1 type, col2 type, ...)
@@ -986,6 +1004,10 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
             .map(|t| type_affinity(t))
             .unwrap_or(Affinity::Blob);
 
+        // Extract COLLATE constraint if present
+        let collation =
+            extract_collation(&col_def_upper).unwrap_or_else(|| DEFAULT_COLLATION.to_string());
+
         columns.push(Column {
             name,
             type_name,
@@ -993,7 +1015,7 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
             not_null: is_not_null,
             not_null_conflict: None,
             default_value,
-            collation: DEFAULT_COLLATION.to_string(),
+            collation,
             is_primary_key,
             is_unique,
             is_hidden: false,

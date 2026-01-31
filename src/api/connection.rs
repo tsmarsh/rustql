@@ -1466,14 +1466,29 @@ fn parse_create_index_sql(
             continue;
         }
 
-        // Parse "colname [ASC|DESC]"
+        // Parse "colname [COLLATE collation] [ASC|DESC]"
+        let col_str_upper = col_str.to_uppercase();
         let parts: Vec<&str> = col_str.split_whitespace().collect();
         let col_name = parts.first()?.to_lowercase();
-        let sort_order = if parts.len() > 1 && parts[1].eq_ignore_ascii_case("DESC") {
-            SortOrder::Desc
-        } else {
-            SortOrder::Asc
-        };
+
+        // Look for COLLATE keyword
+        let mut explicit_collation: Option<String> = None;
+        let mut sort_order = SortOrder::Asc;
+
+        let mut i = 1;
+        while i < parts.len() {
+            if parts[i].eq_ignore_ascii_case("COLLATE") && i + 1 < parts.len() {
+                explicit_collation = Some(parts[i + 1].to_uppercase());
+                i += 2;
+            } else if parts[i].eq_ignore_ascii_case("DESC") {
+                sort_order = SortOrder::Desc;
+                i += 1;
+            } else if parts[i].eq_ignore_ascii_case("ASC") {
+                i += 1;
+            } else {
+                i += 1;
+            }
+        }
 
         // Find column index in table
         let column_idx = table
@@ -1483,11 +1498,24 @@ fn parse_create_index_sql(
             .map(|i| i as i32)
             .unwrap_or(-1);
 
+        // Determine collation: explicit COLLATE > table column collation > BINARY
+        let collation = explicit_collation.unwrap_or_else(|| {
+            if column_idx >= 0 {
+                table
+                    .columns
+                    .get(column_idx as usize)
+                    .map(|c| c.collation.to_uppercase())
+                    .unwrap_or_else(|| DEFAULT_COLLATION.to_string())
+            } else {
+                DEFAULT_COLLATION.to_string()
+            }
+        });
+
         columns.push(IndexColumn {
             column_idx,
             expr: None,
             sort_order,
-            collation: DEFAULT_COLLATION.to_string(),
+            collation,
         });
     }
 

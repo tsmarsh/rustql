@@ -3520,6 +3520,7 @@ impl<'s> StatementCompiler<'s> {
                 }
 
                 let mut columns = Vec::new();
+                let mut collations = Vec::new();
                 for col in &index.columns {
                     let col_idx = if col.column_idx >= 0 {
                         Some(col.column_idx)
@@ -3535,6 +3536,17 @@ impl<'s> StatementCompiler<'s> {
                     };
                     if let Some(idx) = col_idx {
                         columns.push(idx);
+                        // Get collation from index column, or fall back to table column collation
+                        let collation = if !col.collation.is_empty()
+                            && col.collation.to_uppercase() != "BINARY"
+                        {
+                            col.collation.to_uppercase()
+                        } else if let Some(table_col) = table.columns.get(idx as usize) {
+                            table_col.collation.to_uppercase()
+                        } else {
+                            "BINARY".to_string()
+                        };
+                        collations.push(collation);
                     }
                 }
                 if columns.is_empty() {
@@ -3555,11 +3567,92 @@ impl<'s> StatementCompiler<'s> {
                 indexes.push(IndexInfo {
                     name: index.name.clone(),
                     columns,
+                    collations,
                     is_primary: index.is_primary_key,
                     is_unique: index.unique,
                     is_covering,
                     stats: index.stats.clone(),
                 });
+            }
+
+            // Also look at indexes from schema.indexes (separately created indexes)
+            let mut added_indexes: std::collections::HashSet<String> =
+                indexes.iter().map(|i| i.name.to_lowercase()).collect();
+
+            for (_name, index) in schema.indexes.iter() {
+                // Only consider indexes for this table
+                if !index.table.eq_ignore_ascii_case(&table_info.name) {
+                    continue;
+                }
+                // Skip if already added from table.indexes
+                if added_indexes.contains(&index.name.to_lowercase()) {
+                    continue;
+                }
+                // Apply index filter if specified
+                if let Some(IndexedBy::NotIndexed) = index_filter {
+                    break;
+                }
+                if let Some(IndexedBy::Index(forced)) = index_filter {
+                    if !index.name.eq_ignore_ascii_case(forced) {
+                        continue;
+                    }
+                }
+
+                let mut columns = Vec::new();
+                let mut collations = Vec::new();
+                for col in &index.columns {
+                    let col_idx = if col.column_idx >= 0 {
+                        Some(col.column_idx)
+                    } else {
+                        match col.expr.as_ref() {
+                            Some(crate::schema::Expr::Column { column, .. }) => table
+                                .columns
+                                .iter()
+                                .position(|c| c.name.eq_ignore_ascii_case(column))
+                                .map(|idx| idx as i32),
+                            _ => None,
+                        }
+                    };
+                    if let Some(cidx) = col_idx {
+                        columns.push(cidx);
+                        // Get collation from index column, or fall back to table column collation
+                        let collation = if !col.collation.is_empty()
+                            && col.collation.to_uppercase() != "BINARY"
+                        {
+                            col.collation.to_uppercase()
+                        } else if let Some(table_col) = table.columns.get(cidx as usize) {
+                            table_col.collation.to_uppercase()
+                        } else {
+                            "BINARY".to_string()
+                        };
+                        collations.push(collation);
+                    }
+                }
+                if columns.is_empty() {
+                    continue;
+                }
+
+                let is_covering = !requires_all_cols[idx]
+                    && required_columns[idx].iter().all(|col| {
+                        columns.iter().any(|cidx| {
+                            table
+                                .columns
+                                .get(*cidx as usize)
+                                .map(|c| c.name.eq_ignore_ascii_case(col))
+                                .unwrap_or(false)
+                        })
+                    });
+
+                indexes.push(IndexInfo {
+                    name: index.name.clone(),
+                    columns,
+                    collations,
+                    is_primary: index.is_primary_key,
+                    is_unique: index.unique,
+                    is_covering,
+                    stats: index.stats.clone(),
+                });
+                added_indexes.insert(index.name.to_lowercase());
             }
 
             table_info.indexes = indexes;

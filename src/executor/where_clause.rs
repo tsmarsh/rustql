@@ -195,6 +195,11 @@ pub struct WhereTerm {
     /// Estimated cost to evaluate this term (lower = cheaper)
     /// Used to order term evaluation for optimal short-circuit behavior
     pub eval_cost: i32,
+
+    /// Required collation for this term (for LIKE-generated range terms)
+    /// "BINARY" for case-sensitive LIKE, "NOCASE" for case-insensitive
+    /// None means any collation is acceptable
+    pub required_collation: Option<String>,
 }
 
 /// Operator type for a WHERE term
@@ -231,6 +236,7 @@ impl WhereTerm {
             op: None,
             or_terms: Vec::new(),
             eval_cost,
+            required_collation: None,
         }
     }
 
@@ -573,6 +579,10 @@ pub struct IndexInfo {
     /// Column indices in the index
     pub columns: Vec<i32>,
 
+    /// Collation sequences for each column (parallel to columns)
+    /// "BINARY" for case-sensitive, "NOCASE" for case-insensitive
+    pub collations: Vec<String>,
+
     /// Is this the primary key?
     pub is_primary: bool,
 
@@ -790,11 +800,11 @@ impl QueryPlanner {
             Self::analyze_term_expr_static(&table_info, term)?;
         }
 
-        // LIKE index optimization: when case_sensitive_like is enabled,
-        // generate virtual range terms for LIKE patterns with usable prefixes
-        if self.case_sensitive_like {
-            self.generate_like_range_terms(&table_info, &table_usage_info)?;
-        }
+        // LIKE index optimization: generate virtual range terms for LIKE patterns
+        // with usable prefixes. The required collation depends on case_sensitive_like:
+        // - case_sensitive_like=ON: requires BINARY collation index
+        // - case_sensitive_like=OFF: requires NOCASE collation index
+        self.generate_like_range_terms(&table_info, &table_usage_info)?;
 
         Ok(())
     }
@@ -854,6 +864,16 @@ impl QueryPlanner {
                     }
                 }
 
+                // Determine required collation for the LIKE range terms:
+                // - case_sensitive_like=ON: requires BINARY collation index
+                // - case_sensitive_like=OFF: requires NOCASE collation index
+                // GLOB always requires BINARY collation
+                let required_collation = if matches!(op, LikeOp::Glob) || self.case_sensitive_like {
+                    Some("BINARY".to_string())
+                } else {
+                    Some("NOCASE".to_string())
+                };
+
                 // Create lower bound term: col >= 'prefix'
                 let lower_idx = self.where_clause.terms.len() as i32;
                 let lower_expr = Expr::Binary {
@@ -868,6 +888,7 @@ impl QueryPlanner {
                 lower_term.mask = mask;
                 lower_term.prereq = mask;
                 lower_term.selectivity = 0.33;
+                lower_term.required_collation = required_collation.clone();
 
                 // Re-analyze the term to set proper table references
                 lower_term.mask =
@@ -891,6 +912,7 @@ impl QueryPlanner {
                 upper_term.mask = mask;
                 upper_term.prereq = mask;
                 upper_term.selectivity = 0.33;
+                upper_term.required_collation = required_collation;
 
                 // Re-analyze the term
                 upper_term.mask =
@@ -1828,9 +1850,30 @@ impl QueryPlanner {
             return false;
         }
         let col_idx = index.columns[next_idx];
+        // Get the collation for this index column
+        let index_collation = index
+            .collations
+            .get(next_idx)
+            .map(|s| s.as_str())
+            .unwrap_or("BINARY");
+
         range_terms.iter().any(|t| {
-            t.left_col
-                .is_some_and(|(ti, ci)| ti == table_idx as i32 && ci == col_idx)
+            // Check column match
+            let col_matches = t
+                .left_col
+                .is_some_and(|(ti, ci)| ti == table_idx as i32 && ci == col_idx);
+
+            if !col_matches {
+                return false;
+            }
+
+            // Check collation compatibility
+            // If term has no required collation, any index collation works
+            // Otherwise, the index collation must match the required collation
+            match &t.required_collation {
+                None => true,
+                Some(required) => required.eq_ignore_ascii_case(index_collation),
+            }
         })
     }
 }
@@ -1951,6 +1994,7 @@ mod tests {
             IndexInfo {
                 name: "idx_users_email".to_string(),
                 columns: vec![1],
+                collations: vec!["BINARY".to_string()],
                 is_primary: false,
                 is_unique: true,
                 is_covering: false,

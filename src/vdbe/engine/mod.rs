@@ -1605,6 +1605,7 @@ impl Vdbe {
                     let mut is_index = false;
                     let mut index_unique = false;
                     let mut index_table_name: Option<String> = None;
+                    let mut index_collations: Vec<String> = Vec::new();
                     // If root_page is 0 and we have a name in P4, look it up in schema
                     // (could be a table or an index)
                     if root_page == 0 {
@@ -1644,6 +1645,12 @@ impl Vdbe {
                                             is_index = true;
                                             index_unique = index.unique;
                                             index_table_name = Some(index.table.clone());
+                                            // Capture collations for KeyInfo
+                                            index_collations = index
+                                                .columns
+                                                .iter()
+                                                .map(|c| c.collation.clone())
+                                                .collect();
                                         }
                                     }
 
@@ -1656,6 +1663,12 @@ impl Vdbe {
                                                     is_index = true;
                                                     index_unique = idx.unique;
                                                     index_table_name = Some(idx.table.clone());
+                                                    // Capture collations for KeyInfo
+                                                    index_collations = idx
+                                                        .columns
+                                                        .iter()
+                                                        .map(|c| c.collation.clone())
+                                                        .collect();
                                                     break;
                                                 }
                                             }
@@ -1724,7 +1737,29 @@ impl Vdbe {
                                                           // Create a real BtCursor if we have a btree
                             if let Some(ref btree) = btree {
                                 let flags = BtreeCursorFlags::empty();
-                                match btree.cursor(root_page, flags, None) {
+                                // Create KeyInfo with collations for index cursors
+                                let key_info = if is_index && !index_collations.is_empty() {
+                                    use crate::storage::btree::{CollSeq, KeyInfo};
+                                    let collseqs: Vec<CollSeq> = index_collations
+                                        .iter()
+                                        .map(|s| {
+                                            if s.eq_ignore_ascii_case("NOCASE") {
+                                                CollSeq::NoCase
+                                            } else if s.eq_ignore_ascii_case("RTRIM") {
+                                                CollSeq::RTrim
+                                            } else {
+                                                CollSeq::Binary
+                                            }
+                                        })
+                                        .collect();
+                                    Some(std::sync::Arc::new(KeyInfo::with_collations(
+                                        collseqs.len() as u16,
+                                        collseqs,
+                                    )))
+                                } else {
+                                    None
+                                };
+                                match btree.cursor(root_page, flags, key_info) {
                                     Ok(mut bt_cursor) => {
                                         // Set cur_int_key based on cursor type:
                                         // Tables use intkey btrees, indexes use blobkey btrees
@@ -1756,6 +1791,7 @@ impl Vdbe {
                 let mut table_columns = None;
                 let mut table_found = false;
                 let mut is_temp_table = false;
+                let mut index_collations: Vec<String> = Vec::new();
                 if let P4::Text(name) = &op.p4 {
                     table_name = Some(name.clone());
                     if let Some(ref schema) = self.schema {
@@ -1779,6 +1815,9 @@ impl Vdbe {
                                     index_unique = index.unique;
                                     is_temp_table = index.db_idx == 1;
                                     root_page = index.root_page;
+                                    // Capture collations for KeyInfo
+                                    index_collations =
+                                        index.columns.iter().map(|c| c.collation.clone()).collect();
                                 }
                             }
 
@@ -1793,6 +1832,12 @@ impl Vdbe {
                                             index_unique = idx.unique;
                                             is_temp_table = tbl.db_idx == 1;
                                             root_page = idx.root_page;
+                                            // Capture collations for KeyInfo
+                                            index_collations = idx
+                                                .columns
+                                                .iter()
+                                                .map(|c| c.collation.clone())
+                                                .collect();
                                             break;
                                         }
                                     }
@@ -1856,7 +1901,29 @@ impl Vdbe {
                                                       // Create a writable BtCursor if we have a btree
                         if let Some(ref btree) = btree {
                             let flags = BtreeCursorFlags::WRCSR;
-                            match btree.cursor(root_page, flags, None) {
+                            // Create KeyInfo with collations for index cursors
+                            let key_info = if is_index && !index_collations.is_empty() {
+                                use crate::storage::btree::{CollSeq, KeyInfo};
+                                let collseqs: Vec<CollSeq> = index_collations
+                                    .iter()
+                                    .map(|s| {
+                                        if s.eq_ignore_ascii_case("NOCASE") {
+                                            CollSeq::NoCase
+                                        } else if s.eq_ignore_ascii_case("RTRIM") {
+                                            CollSeq::RTrim
+                                        } else {
+                                            CollSeq::Binary
+                                        }
+                                    })
+                                    .collect();
+                                Some(std::sync::Arc::new(KeyInfo::with_collations(
+                                    collseqs.len() as u16,
+                                    collseqs,
+                                )))
+                            } else {
+                                None
+                            };
+                            match btree.cursor(root_page, flags, key_info) {
                                 Ok(mut bt_cursor) => {
                                     // Set cur_int_key based on cursor type
                                     bt_cursor.cur_int_key = !is_index;

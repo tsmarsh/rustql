@@ -3408,6 +3408,30 @@ impl Vdbe {
                                 self.mem_mut(op.p3).set_int(if matched { 1 } else { 0 });
                             }
                         }
+                    } else if name.eq_ignore_ascii_case("GLOB") {
+                        // GLOB pattern matching (case-sensitive)
+                        // Also increments like_count since SQLite counts GLOB and LIKE together
+                        inc_like_count();
+                        let argc = op.p1.max(0) as usize;
+                        let arg_base = op.p2;
+                        if argc < 2 {
+                            self.mem_mut(op.p3).set_null();
+                        } else {
+                            let pattern = self.mem(arg_base).to_value();
+                            let text = self.mem(arg_base + 1).to_value();
+                            if matches!(pattern, Value::Null) || matches!(text, Value::Null) {
+                                self.mem_mut(op.p3).set_null();
+                            } else {
+                                match crate::functions::scalar::func_glob(&[pattern, text]) {
+                                    Ok(result) => {
+                                        self.mem_mut(op.p3).set_value(&result);
+                                    }
+                                    Err(_) => {
+                                        self.mem_mut(op.p3).set_null();
+                                    }
+                                }
+                            }
+                        }
                     } else if let Some(func) = crate::functions::get_scalar_function(name) {
                         let argc = op.p1.max(0) as usize;
                         let arg_base = op.p2;

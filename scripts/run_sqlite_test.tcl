@@ -163,7 +163,7 @@ array set sqlite_options {
     default_cache_size 1
     memorymanage 0
     like_match_blobs 0
-    vtab 0
+    vtab 1
     auth 0
     wsd 1
     worker_threads 0

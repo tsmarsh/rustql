@@ -155,13 +155,15 @@ update_delete_limit hidden_columns      crashtest          tclvar
 icu                 deprecated          direct_read        legacyformat
 configslower        rowid32             cursorhints        uri
 analyze             autoindex           cte                memorymanage
-like_match_blobs    vtab                auth               worker_threads
-load_ext            tempdb_in_memory    default_temp_store localtime
-malloc_usable_size  mmap_size           offset_sql_func    pagecache_overflow_stats
+like_match_blobs    auth                worker_threads     load_ext
+tempdb_in_memory    default_temp_store  localtime          malloc_usable_size
+mmap_size           offset_sql_func     pagecache_overflow_stats
 preupdate           session             snapshot           sorter_reference_size
 stat3               unlock_notify       userauth           win32heap
 yytrackmaxstackdepth
 ```
+
+**Note**: `vtab` should now be enabled (value = 1) as virtual table support is implemented.
 
 ### Key Missing Features
 
@@ -169,12 +171,20 @@ These disabled features affect many tests:
 
 | Feature | Impact | Notes |
 |---------|--------|-------|
-| `vtab` | High | Virtual tables not implemented |
 | `cte` | Medium | Common Table Expressions (WITH clause) |
 | `analyze` | Medium | ANALYZE statement |
 | `autoindex` | Low | Automatic index creation |
 | `tclvar` | Low | TCL variable binding ($var) |
 | `incrblob` | Low | Incremental blob I/O |
+
+### Recently Implemented Features
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `vtab` | **Working** | Virtual table core infrastructure complete |
+| `fts3` | **Working** | Full-text search: INSERT, SELECT, MATCH, COUNT |
+| `fts5` | **Working** | Full-text search: INSERT, SELECT, MATCH, COUNT |
+| `rtree` | **Partial** | R-tree module registered, basic support |
 
 ---
 
@@ -441,11 +451,18 @@ finish_test
 | `cast` | expr cast | Enabled |
 | `savepoint` | savepoint | Enabled |
 
+### Recently Enabled Features
+
+| Feature | Tests Affected | Notes |
+|---------|----------------|-------|
+| `vtab` | where, fts*, vtab* | **Now working** - Virtual tables implemented |
+| `fts3` | fts3*, insert2 | **Now working** - Full-text search |
+| `fts5` | fts5* | **Now working** - Full-text search v5 |
+
 ### Low-Priority Features (currently disabled)
 
 | Feature | Tests Affected | Notes |
 |---------|----------------|-------|
-| `vtab` | where (skipped sections) | Virtual tables |
 | `tclvar` | select2 where2 | $variable binding |
 | `cte` | (would affect WITH clause) | Not implemented |
 | `analyze` | (ANALYZE stmt) | Not implemented |
@@ -488,7 +505,7 @@ columncount=1 complete=1 hexlit=1 like=1 or_opt=1 reindex=1
 trace=1 pragma=1 floatingpoint=1 autoinc=1 maxexpr=1 cast=1
 altertable=1 schema_pragmas=1 like_opt=1 between_opt=1
 schema_version=1 default_cache_size=1 encoding=1 wsd=1
-oversize_cell_check=1 savepoint=1 system_malloc=1
+oversize_cell_check=1 savepoint=1 system_malloc=1 vtab=1
 
 # Disabled in RustQL
 incrblob=0 builtin_test=0 memdebug=0 lock_proxy_pragmas=0
@@ -496,10 +513,37 @@ long_double=0 mem5=0 casesensitivelike=0 debug=0
 update_delete_limit=0 hidden_columns=0 crashtest=0 tclvar=0
 icu=0 deprecated=0 direct_read=0 legacyformat=0 configslower=0
 rowid32=0 cursorhints=0 uri=0 analyze=0 autoindex=0 cte=0
-memorymanage=0 like_match_blobs=0 vtab=0 auth=0 worker_threads=0
+memorymanage=0 like_match_blobs=0 auth=0 worker_threads=0
 load_ext=0 tempdb_in_memory=0 default_temp_store=0 localtime=0
 malloc_usable_size=0 mmap_size=0 offset_sql_func=0
 pagecache_overflow_stats=0 preupdate=0 session=0 snapshot=0
 sorter_reference_size=0 stat3=0 unlock_notify=0 userauth=0
 win32heap=0 yytrackmaxstackdepth=0
 ```
+
+---
+
+## Virtual Table Implementation Status
+
+As of the latest updates, RustQL supports virtual tables with the following functionality:
+
+### FTS3/FTS5 Full-Text Search
+- ✅ `CREATE VIRTUAL TABLE ... USING fts3/fts5`
+- ✅ `INSERT INTO fts_table VALUES(...)`
+- ✅ `SELECT * FROM fts_table` (full table scan)
+- ✅ `SELECT * FROM fts_table WHERE table MATCH 'query'`
+- ✅ `SELECT COUNT(*) FROM fts_table`
+- ✅ Unique rowid generation across statements
+- ⚠️ DELETE/UPDATE support (partial)
+- ⚠️ Advanced FTS5 ranking functions (not implemented)
+
+### R-Tree Spatial Index
+- ✅ Module registered
+- ⚠️ Spatial queries (partial implementation)
+
+### Generic Virtual Table Support
+- ✅ VtabModule/VtabTable/VtabCursor traits
+- ✅ VtabRegistry for module registration
+- ✅ VFilter/VNext/VColumn/VRowid opcodes (legacy path)
+- ⚠️ VUpdate opcode (empty - uses legacy Insert path)
+- ⚠️ xBestIndex constraint passing (partial)

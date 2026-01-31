@@ -164,6 +164,30 @@ array set sqlite_options {
     like_match_blobs 0
     vtab 0
     auth 0
+    wsd 1
+    worker_threads 0
+    load_ext 0
+    tempdb_in_memory 0
+    default_temp_store 0
+    default_synchronous 2
+    default_wal_synchronous 2
+    localtime 0
+    malloc_usable_size 0
+    mmap_size 0
+    offset_sql_func 0
+    oversize_cell_check 1
+    pagecache_overflow_stats 0
+    preupdate 0
+    savepoint 1
+    session 0
+    snapshot 0
+    sorter_reference_size 0
+    stat3 0
+    system_malloc 1
+    unlock_notify 0
+    userauth 0
+    win32heap 0
+    yytrackmaxstackdepth 0
 }
 
 # SQLite compile-time limits
@@ -186,6 +210,8 @@ set ::nRepeat 0
 
 # Transaction verification variables
 set ::checksum ""
+set ::checksum2 ""
+set ::cksum ""
 
 # File I/O test variables
 set ::fd ""

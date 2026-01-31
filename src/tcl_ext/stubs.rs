@@ -233,6 +233,45 @@ pub unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         "sqlite3_vfs_find",
         "sqlite3_vfs_register",
         "sqlite3_vfs_unregister",
+        // Additional btree commands
+        "btree_ismemdb",
+        "btree_set_cache_size",
+        "btree_cursor_db",
+        "btree_tree_dump",
+        "btree_sanity_check",
+        // Malloc test commands
+        "sqlite3_memdebug_benign_failures",
+        "sqlite3_memdebug_pending",
+        "sqlite3_memory_alarm",
+        // Mutex test commands
+        "sqlite3_mutex_try",
+        "sqlite3_mutex_enter",
+        "sqlite3_mutex_leave",
+        "sqlite3_mutex_held",
+        "sqlite3_mutex_notheld",
+        // Thread test commands
+        "sqlthread",
+        "clock_seconds",
+        // More test stubs
+        "sqlite3_thread_cleanup",
+        "sqlite3_pager_refcounts",
+        "sqlite3_enable_load_extension",
+        "sqlite3_load_extension",
+        "sqlite3_auto_extension",
+        "sqlite3_cancel_auto_extension",
+        "sorter_test_fakeheap",
+        "sorter_test_sort4_helper",
+        "test_quota_initialize",
+        "test_quota_shutdown",
+        "test_quota_file",
+        "test_quota_dump",
+        "test_quota_fopen",
+        "test_quota_fread",
+        "test_quota_fwrite",
+        "test_quota_fclose",
+        "test_quota_fflush",
+        "test_quota_fseek",
+        "test_quota_remove",
     ];
 
     for cmd in stub_commands {
@@ -527,6 +566,31 @@ pub unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         ("authorization", "1"),
         ("default_autovacuum", "0"),
         ("autovacuum", "1"),
+        // Additional options for various tests
+        ("wsd", "1"),            // Without-static-data (thread safety)
+        ("worker_threads", "0"), // No worker threads
+        ("load_ext", "0"),       // Load extension not supported
+        ("tempdb_in_memory", "0"),
+        ("default_temp_store", "0"),
+        ("default_synchronous", "2"),
+        ("default_wal_synchronous", "2"),
+        ("localtime", "0"),
+        ("malloc_usable_size", "0"),
+        ("mmap_size", "0"),
+        ("offset_sql_func", "0"),
+        ("oversize_cell_check", "1"),
+        ("pagecache_overflow_stats", "0"),
+        ("preupdate", "0"),
+        ("savepoint", "1"),
+        ("session", "0"),
+        ("snapshot", "0"),
+        ("sorter_reference_size", "0"),
+        ("stat3", "0"),
+        ("system_malloc", "1"),
+        ("unlock_notify", "0"),
+        ("userauth", "0"),
+        ("win32heap", "0"),
+        ("yytrackmaxstackdepth", "0"),
     ];
 
     let arr_name = CString::new("::sqlite_options").unwrap();

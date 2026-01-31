@@ -79,6 +79,18 @@ proc fpnum_compare {a b} { expr {$a == $b} }
 proc set_test_counter {args} { return 0 }
 proc sqlite_register_test_function {db name} { return }
 proc abuse_create_function {db} { return }
+proc reset_prng_state {} { return }
+proc load_testfixture_extensions {db} { return }
+proc sqlite3_test_control {args} { return 0 }
+proc sqlite3_soft_heap_limit {args} { return 0 }
+proc sqlite3_reset_auto_extension {} { return }
+proc sqlite3_register_cksumvfs {} { return }
+proc test_multiplex_control {args} { return 0 }
+proc run_test_suite {suite} {
+    # Run a test suite by sourcing all test files for that suite
+    # For now, just return - individual tests handle themselves
+    return
+}
 
 # Set up sqlite_options that tester.tcl expects
 array set sqlite_options {

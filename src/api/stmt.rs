@@ -8,7 +8,8 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::executor::analyze::execute_analyze;
 use crate::executor::pragma::{execute_pragma, pragma_columns};
 use crate::executor::prepare::{
-    compile_sql, compile_sql_with_config, compile_sql_with_schema, CompiledStmt, StmtType,
+    compile_sql, compile_sql_with_config, compile_sql_with_full_config, compile_sql_with_schema,
+    CompiledStmt, StmtType,
 };
 use crate::parser::ast::{AttachStmt, Expr, Literal, QualifiedName, Variable};
 use crate::types::{ColumnType, StepResult, Value};
@@ -326,20 +327,32 @@ pub fn sqlite3_prepare_v2<'a>(
     let short_column_names = conn.db_config.short_column_names;
     let full_column_names = conn.db_config.full_column_names;
     let case_sensitive_like = conn.db_config.case_sensitive_like;
-    let compile_result = if let Some(ref schema_arc) = conn.main_db().schema {
-        if let Ok(schema) = schema_arc.read() {
-            compile_sql_with_config(
-                sql,
-                &schema,
-                short_column_names,
-                full_column_names,
-                case_sensitive_like,
-            )
+
+    // Compile in a block so schema guards are dropped before we use conn mutably
+    let compile_result = {
+        // Get temp schema if it exists
+        let temp_schema_guard = if conn.dbs.len() > 1 {
+            conn.dbs[1].schema.as_ref().and_then(|s| s.read().ok())
+        } else {
+            None
+        };
+
+        if let Some(ref schema_arc) = conn.main_db().schema {
+            if let Ok(schema) = schema_arc.read() {
+                compile_sql_with_full_config(
+                    sql,
+                    &schema,
+                    temp_schema_guard.as_deref(),
+                    short_column_names,
+                    full_column_names,
+                    case_sensitive_like,
+                )
+            } else {
+                compile_sql(sql)
+            }
         } else {
             compile_sql(sql)
         }
-    } else {
-        compile_sql(sql)
     };
 
     match compile_result {
@@ -509,7 +522,7 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
             if let Some(schema) = main_schema {
                 vdbe.set_schema(schema);
             }
-            // Also set temp btree if it exists (for TEMP tables)
+            // Also set temp btree and schema if they exist (for TEMP tables/views)
             if conn.dbs.len() > 1 {
                 if let Some(ref btree) = conn.dbs[1].btree {
                     vdbe.set_temp_btree(btree.clone());
@@ -518,6 +531,9 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
                         let _ = btree.begin_trans(true);
                         conn.transaction_state = crate::api::TransactionState::Write;
                     }
+                }
+                if let Some(ref temp_schema) = conn.dbs[1].schema {
+                    vdbe.set_temp_schema(temp_schema.clone());
                 }
             }
             vdbe.set_connection(conn_ptr);

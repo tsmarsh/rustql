@@ -421,6 +421,9 @@ pub struct Vdbe {
     /// Schema for main database (for DDL operations)
     schema: Option<Arc<RwLock<Schema>>>,
 
+    /// Schema for temp database (for TEMP tables/views)
+    temp_schema: Option<Arc<RwLock<Schema>>>,
+
     /// Connection pointer for transaction/autocommit state
     conn_ptr: Option<*mut SqliteConnection>,
 
@@ -506,6 +509,7 @@ impl Vdbe {
             btree: None,
             temp_btree: None,
             schema: None,
+            temp_schema: None,
             conn_ptr: None,
             deferred_fk_counter: 0,
             fk_enabled: true,
@@ -567,6 +571,11 @@ impl Vdbe {
     /// Set the schema for DDL operations
     pub fn set_schema(&mut self, schema: Arc<RwLock<Schema>>) {
         self.schema = Some(schema);
+    }
+
+    /// Set the temp schema for DDL operations on temp objects
+    pub fn set_temp_schema(&mut self, schema: Arc<RwLock<Schema>>) {
+        self.temp_schema = Some(schema);
     }
 
     /// Set the connection pointer for transaction/autocommit updates
@@ -5601,17 +5610,26 @@ impl Vdbe {
             Opcode::ParseSchema => {
                 // ParseSchema P1 P2 P3 P4
                 // Parse a CREATE TABLE/INDEX/TRIGGER statement and add to schema
+                // P1 = database index (0 for main, 1 for temp)
                 // P2 = register containing root page number (0 for triggers)
                 // P4 = SQL text of the CREATE statement
+                let db_idx = op.p1;
                 let root_page = self.mem(op.p2).to_int() as u32;
                 if let P4::Text(sql) = &op.p4 {
                     let sql_upper = sql.to_uppercase();
+
+                    // Select the correct schema based on db_idx
+                    let target_schema = if db_idx == 1 {
+                        self.temp_schema.clone()
+                    } else {
+                        self.schema.clone()
+                    };
 
                     // Handle CREATE TRIGGER
                     if sql_upper.contains("CREATE TRIGGER")
                         || sql_upper.contains("CREATE TEMPORARY TRIGGER")
                     {
-                        if let Some(ref schema) = self.schema {
+                        if let Some(ref schema) = target_schema {
                             if let Ok(mut schema_guard) = schema.write() {
                                 // Parse the trigger SQL
                                 if let Ok(stmt) = crate::parser::grammar::parse(sql) {
@@ -5752,7 +5770,7 @@ impl Vdbe {
                         || sql_upper.contains("CREATE TEMP VIEW")
                     {
                         // Handle CREATE VIEW
-                        if let Some(ref schema) = self.schema {
+                        if let Some(ref schema) = target_schema {
                             if let Ok(mut schema_guard) = schema.write() {
                                 if let Ok(stmt) = crate::parser::grammar::parse(sql) {
                                     if let crate::parser::ast::Stmt::CreateView(create) = stmt {
@@ -5793,7 +5811,7 @@ impl Vdbe {
                         || sql_upper.contains("CREATE UNIQUE INDEX")
                     {
                         // Handle CREATE INDEX (merged from ParseSchemaIndex)
-                        if let Some(ref schema) = self.schema {
+                        if let Some(ref schema) = target_schema {
                             if let Ok(mut schema_guard) = schema.write() {
                                 // Determine if UNIQUE index from SQL text
                                 let is_unique = sql_upper.contains("UNIQUE INDEX");
@@ -5855,7 +5873,7 @@ impl Vdbe {
                             }
                         }
                         // Continue to next opcode (index handled)
-                    } else if let Some(ref schema) = self.schema {
+                    } else if let Some(ref schema) = target_schema {
                         if let Ok(mut schema_guard) = schema.write() {
                             // Check if IF NOT EXISTS was specified
                             let if_not_exists = sql_upper.contains("IF NOT EXISTS");
@@ -5909,28 +5927,56 @@ impl Vdbe {
             }
 
             Opcode::DropTable => {
-                // DropTable P4
+                // DropTable P1 P4
                 // Remove table from schema (SQLite: OP_DropTable)
+                // P1 = database index (0=main, 1=temp)
                 // P4 = name of table to drop
                 // Also removes all indexes and triggers for this table
+                let db_idx = op.p1;
                 if let P4::Text(name) = &op.p4 {
-                    if let Some(ref schema) = self.schema {
-                        if let Ok(mut schema_guard) = schema.write() {
-                            let name_lower = name.to_lowercase();
-                            // Check if it's actually a view (DROP VIEW uses DropTable in SQLite)
-                            if schema_guard.views.contains_key(&name_lower) {
-                                schema_guard.views.remove(&name_lower);
-                            } else {
-                                // Drop table - also remove all indexes and triggers for this table
-                                schema_guard.tables.remove(&name_lower);
-                                // Remove indexes that reference this table from the global index map
-                                schema_guard
-                                    .indexes
-                                    .retain(|_, idx| idx.table.to_lowercase() != name_lower);
-                                // Remove triggers that reference this table
-                                schema_guard
-                                    .triggers
-                                    .retain(|_, trig| trig.table.to_lowercase() != name_lower);
+                    let name_lower = name.to_lowercase();
+
+                    // Helper to drop from a schema
+                    let drop_from_schema =
+                        |schema: &std::sync::Arc<std::sync::RwLock<crate::schema::Schema>>| {
+                            if let Ok(mut schema_guard) = schema.write() {
+                                // Check if it's actually a view (DROP VIEW uses DropTable in SQLite)
+                                if schema_guard.views.contains_key(&name_lower) {
+                                    schema_guard.views.remove(&name_lower);
+                                    return true;
+                                } else if schema_guard.tables.contains_key(&name_lower) {
+                                    // Drop table - also remove all indexes and triggers for this table
+                                    schema_guard.tables.remove(&name_lower);
+                                    // Remove indexes that reference this table from the global index map
+                                    schema_guard
+                                        .indexes
+                                        .retain(|_, idx| idx.table.to_lowercase() != name_lower);
+                                    // Remove triggers that reference this table
+                                    schema_guard
+                                        .triggers
+                                        .retain(|_, trig| trig.table.to_lowercase() != name_lower);
+                                    return true;
+                                }
+                            }
+                            false
+                        };
+
+                    // Drop from the specified schema based on db_idx
+                    if db_idx == 1 {
+                        // Temp database
+                        if let Some(ref temp_schema) = self.temp_schema {
+                            drop_from_schema(temp_schema);
+                        }
+                    } else {
+                        // Main database (or default: try main first, then temp)
+                        let mut dropped = false;
+                        if let Some(ref schema) = self.schema {
+                            dropped = drop_from_schema(schema);
+                        }
+                        // If not found in main schema, try temp schema
+                        if !dropped {
+                            if let Some(ref temp_schema) = self.temp_schema {
+                                drop_from_schema(temp_schema);
                             }
                         }
                     }

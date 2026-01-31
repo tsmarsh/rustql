@@ -112,6 +112,8 @@ pub struct StatementCompiler<'s> {
     named_params: HashSet<String>,
     /// Schema for name resolution (optional)
     schema: Option<&'s crate::schema::Schema>,
+    /// Temp schema for TEMP tables/views (optional)
+    temp_schema: Option<&'s crate::schema::Schema>,
     /// PRAGMA short_column_names (default ON)
     short_column_names: bool,
     /// PRAGMA full_column_names (default OFF)
@@ -128,6 +130,7 @@ impl<'s> StatementCompiler<'s> {
             param_names: Vec::new(),
             named_params: HashSet::new(),
             schema: None,
+            temp_schema: None,
             short_column_names: true,
             full_column_names: false,
             case_sensitive_like: false,
@@ -141,10 +144,16 @@ impl<'s> StatementCompiler<'s> {
             param_names: Vec::new(),
             named_params: HashSet::new(),
             schema: Some(schema),
+            temp_schema: None,
             short_column_names: true,
             full_column_names: false,
             case_sensitive_like: false,
         }
+    }
+
+    /// Set temp schema for TEMP tables/views
+    pub fn set_temp_schema(&mut self, temp_schema: &'s crate::schema::Schema) {
+        self.temp_schema = Some(temp_schema);
     }
 
     /// Set column naming flags from PRAGMA settings
@@ -201,6 +210,10 @@ impl<'s> StatementCompiler<'s> {
                 } else {
                     SelectCompiler::new()
                 };
+                // Pass temp schema for TEMP tables/views
+                if let Some(temp_schema) = self.temp_schema {
+                    compiler.set_temp_schema(temp_schema);
+                }
                 // Pass column naming flags from PRAGMA settings
                 compiler.set_column_name_flags(self.short_column_names, self.full_column_names);
                 // Pass parameter names for Variable compilation
@@ -1766,6 +1779,14 @@ impl<'s> StatementCompiler<'s> {
                 ));
             }
 
+            // Check if target is a view - cannot create index on views
+            if schema.views.contains_key(&table_name_lower) {
+                return Err(crate::error::Error::with_message(
+                    crate::error::ErrorCode::Error,
+                    "views may not be indexed".to_string(),
+                ));
+            }
+
             // Check if target table exists
             if !schema.tables.contains_key(&table_name_lower) {
                 return Err(crate::error::Error::with_message(
@@ -2072,24 +2093,39 @@ impl<'s> StatementCompiler<'s> {
     }
 
     fn compile_create_view(&mut self, create: &CreateViewStmt) -> Result<Vec<VdbeOp>> {
+        // Check for parameters in the view definition - not allowed
+        if Self::select_has_parameters(&create.query) {
+            return Err(crate::error::Error::with_message(
+                crate::error::ErrorCode::Error,
+                "parameters are not allowed in views".to_string(),
+            ));
+        }
+
         // Reconstruct the CREATE VIEW SQL for storage
+        // For non-temp views, this includes all keywords
+        // For temp views, we strip the TEMP keyword since it's stored in temp schema
         let sql = self.reconstruct_create_view_sql(create);
 
         let mut ops = Vec::new();
         ops.push(Self::make_op(Opcode::Init, 0, 2, 0, P4::Unused));
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
 
-        // Insert into sqlite_master
-        let cursor_id = 0;
-        self.append_sqlite_master_open(&mut ops, cursor_id);
-        self.append_sqlite_master_insert_view(&mut ops, cursor_id, &create.name.name, &sql);
-        self.append_sqlite_master_close(&mut ops, cursor_id);
+        // Only insert into sqlite_master for non-temp views
+        // Temp views are transient and only exist in the in-memory schema
+        if !create.temporary {
+            let cursor_id = 0;
+            self.append_sqlite_master_open(&mut ops, cursor_id);
+            self.append_sqlite_master_insert_view(&mut ops, cursor_id, &create.name.name, &sql);
+            self.append_sqlite_master_close(&mut ops, cursor_id);
+        }
 
         // Use ParseSchema to register the view in the schema at runtime
+        // P1=db_idx (0 for main, 1 for temp)
         // P2=0 (views don't need a root page), P4=SQL text
+        let db_idx = if create.temporary { 1 } else { 0 };
         ops.push(Self::make_op(
             Opcode::ParseSchema,
-            0,
+            db_idx,
             0,
             0,
             P4::Text(sql.clone()),
@@ -2281,6 +2317,276 @@ impl<'s> StatementCompiler<'s> {
         sql.push_str("END");
 
         sql
+    }
+
+    /// Check if a SELECT statement contains any parameters (? or :name)
+    fn select_has_parameters(select: &SelectStmt) -> bool {
+        // Check the select body
+        if Self::select_body_has_parameters(&select.body) {
+            return true;
+        }
+
+        // Check ORDER BY
+        if let Some(ref order_by) = select.order_by {
+            for ord in order_by {
+                if Self::expr_has_parameters(&ord.expr) {
+                    return true;
+                }
+            }
+        }
+
+        // Check LIMIT/OFFSET
+        if let Some(ref limit_clause) = select.limit {
+            if Self::expr_has_parameters(&limit_clause.limit) {
+                return true;
+            }
+            if let Some(ref offset) = limit_clause.offset {
+                if Self::expr_has_parameters(offset) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Check if a SelectBody contains parameters
+    fn select_body_has_parameters(body: &crate::parser::ast::SelectBody) -> bool {
+        match body {
+            crate::parser::ast::SelectBody::Select(core) => Self::select_core_has_parameters(core),
+            crate::parser::ast::SelectBody::Compound { left, right, .. } => {
+                Self::select_body_has_parameters(left) || Self::select_body_has_parameters(right)
+            }
+        }
+    }
+
+    /// Check if a SelectCore contains parameters
+    fn select_core_has_parameters(core: &crate::parser::ast::SelectCore) -> bool {
+        // Check result columns
+        for col in &core.columns {
+            match col {
+                crate::parser::ast::ResultColumn::Expr { expr, .. } => {
+                    if Self::expr_has_parameters(expr) {
+                        return true;
+                    }
+                }
+                crate::parser::ast::ResultColumn::Star
+                | crate::parser::ast::ResultColumn::TableStar(_) => {}
+            }
+        }
+
+        // Check FROM clause
+        if let Some(ref from) = core.from {
+            if Self::from_has_parameters(from) {
+                return true;
+            }
+        }
+
+        // Check WHERE clause
+        if let Some(ref where_expr) = core.where_clause {
+            if Self::expr_has_parameters(where_expr) {
+                return true;
+            }
+        }
+
+        // Check GROUP BY
+        if let Some(ref group_by) = core.group_by {
+            for expr in group_by {
+                if Self::expr_has_parameters(expr) {
+                    return true;
+                }
+            }
+        }
+
+        // Check HAVING
+        if let Some(ref having) = core.having {
+            if Self::expr_has_parameters(having) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Check if a FROM clause contains parameters (in subqueries)
+    fn from_has_parameters(from: &crate::parser::ast::FromClause) -> bool {
+        for table_ref in &from.tables {
+            if Self::table_ref_has_parameters(table_ref) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if a TableRef contains parameters
+    fn table_ref_has_parameters(table_ref: &crate::parser::ast::TableRef) -> bool {
+        match table_ref {
+            crate::parser::ast::TableRef::Table { .. } => false,
+            crate::parser::ast::TableRef::Subquery { query, .. } => {
+                Self::select_has_parameters(query)
+            }
+            crate::parser::ast::TableRef::Join {
+                left,
+                right,
+                constraint,
+                ..
+            } => {
+                Self::table_ref_has_parameters(left)
+                    || Self::table_ref_has_parameters(right)
+                    || constraint
+                        .as_ref()
+                        .map(|c| Self::join_constraint_has_parameters(c))
+                        .unwrap_or(false)
+            }
+            crate::parser::ast::TableRef::TableFunction { args, .. } => {
+                args.iter().any(|e| Self::expr_has_parameters(e))
+            }
+            crate::parser::ast::TableRef::Parens(inner) => Self::table_ref_has_parameters(inner),
+        }
+    }
+
+    /// Check if a JoinConstraint contains parameters
+    fn join_constraint_has_parameters(constraint: &crate::parser::ast::JoinConstraint) -> bool {
+        match constraint {
+            crate::parser::ast::JoinConstraint::On(expr) => Self::expr_has_parameters(expr),
+            crate::parser::ast::JoinConstraint::Using(_) => false,
+        }
+    }
+
+    /// Check if an expression contains any parameters
+    fn expr_has_parameters(expr: &Expr) -> bool {
+        match expr {
+            Expr::Variable(_) => true,
+            Expr::Literal(_) | Expr::Column(_) => false,
+            Expr::Binary { left, right, .. } => {
+                Self::expr_has_parameters(left) || Self::expr_has_parameters(right)
+            }
+            Expr::Unary { expr, .. } => Self::expr_has_parameters(expr),
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                Self::expr_has_parameters(expr)
+                    || Self::expr_has_parameters(low)
+                    || Self::expr_has_parameters(high)
+            }
+            Expr::In { expr, list, .. } => {
+                Self::expr_has_parameters(expr) || Self::in_list_has_parameters(list)
+            }
+            Expr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => {
+                Self::expr_has_parameters(expr)
+                    || Self::expr_has_parameters(pattern)
+                    || escape
+                        .as_ref()
+                        .map(|e| Self::expr_has_parameters(e))
+                        .unwrap_or(false)
+            }
+            Expr::IsNull { expr, .. } => Self::expr_has_parameters(expr),
+            Expr::IsDistinct { left, right, .. } => {
+                Self::expr_has_parameters(left) || Self::expr_has_parameters(right)
+            }
+            Expr::Function(func) => Self::function_call_has_parameters(func),
+            Expr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => {
+                operand
+                    .as_ref()
+                    .map(|e| Self::expr_has_parameters(e))
+                    .unwrap_or(false)
+                    || when_clauses.iter().any(|wc| {
+                        Self::expr_has_parameters(&wc.when) || Self::expr_has_parameters(&wc.then)
+                    })
+                    || else_clause
+                        .as_ref()
+                        .map(|e| Self::expr_has_parameters(e))
+                        .unwrap_or(false)
+            }
+            Expr::Cast { expr, .. } => Self::expr_has_parameters(expr),
+            Expr::Collate { expr, .. } => Self::expr_has_parameters(expr),
+            Expr::Subquery(q) => Self::select_has_parameters(q),
+            Expr::Exists { subquery, .. } => Self::select_has_parameters(subquery),
+            Expr::Parens(e) => Self::expr_has_parameters(e),
+            Expr::Raise { .. } => false,
+        }
+    }
+
+    /// Check if an InList contains parameters
+    fn in_list_has_parameters(list: &crate::parser::ast::InList) -> bool {
+        match list {
+            crate::parser::ast::InList::Values(exprs) => {
+                exprs.iter().any(|e| Self::expr_has_parameters(e))
+            }
+            crate::parser::ast::InList::Subquery(q) => Self::select_has_parameters(q),
+            crate::parser::ast::InList::Table(_) => false,
+        }
+    }
+
+    /// Check if a FunctionCall contains parameters
+    fn function_call_has_parameters(func: &crate::parser::ast::FunctionCall) -> bool {
+        // Check arguments
+        match &func.args {
+            crate::parser::ast::FunctionArgs::Star => {}
+            crate::parser::ast::FunctionArgs::Exprs(exprs) => {
+                for expr in exprs {
+                    if Self::expr_has_parameters(expr) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Check filter
+        if let Some(ref filter) = func.filter {
+            if Self::expr_has_parameters(filter) {
+                return true;
+            }
+        }
+
+        // Check over clause
+        if let Some(ref over) = func.over {
+            if Self::over_has_parameters(over) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Check if an Over clause contains parameters
+    fn over_has_parameters(over: &crate::parser::ast::Over) -> bool {
+        match over {
+            crate::parser::ast::Over::Window(_) => false, // Named window, check defined elsewhere
+            crate::parser::ast::Over::Spec(spec) => Self::window_spec_has_parameters(spec),
+        }
+    }
+
+    /// Check if a WindowSpec contains parameters
+    fn window_spec_has_parameters(spec: &crate::parser::ast::WindowSpec) -> bool {
+        // Check partition_by
+        if let Some(ref partition_by) = spec.partition_by {
+            for expr in partition_by {
+                if Self::expr_has_parameters(expr) {
+                    return true;
+                }
+            }
+        }
+
+        // Check order_by
+        if let Some(ref order_by) = spec.order_by {
+            for ord in order_by {
+                if Self::expr_has_parameters(&ord.expr) {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     /// Convert expression to SQL (for trigger reconstruction)
@@ -2640,6 +2946,14 @@ impl<'s> StatementCompiler<'s> {
     fn compile_drop(&mut self, drop: &DropStmt, kind: &str) -> Result<Vec<VdbeOp>> {
         let name = &drop.name.name;
         let name_lower = name.to_lowercase();
+        let db_idx = drop.name.database_idx();
+
+        // Build qualified name for error messages (include schema if specified)
+        let display_name = if let Some(ref schema) = drop.name.schema {
+            format!("{}.{}", schema, name)
+        } else {
+            name.clone()
+        };
 
         // Check for reserved names (sqlite_master, etc.) - cannot be dropped
         if name_lower.starts_with("sqlite_") {
@@ -2650,31 +2964,91 @@ impl<'s> StatementCompiler<'s> {
         }
 
         // Check if the object exists in schema based on kind
-        if let Some(schema) = self.schema {
-            let exists = match kind {
+        let check_exists = |schema: &crate::schema::Schema| -> bool {
+            match kind {
                 "table" => schema.tables.contains_key(&name_lower),
                 "index" => schema.indexes.contains_key(&name_lower),
                 "view" => schema.views.contains_key(&name_lower),
                 "trigger" => schema.triggers.contains_key(&name_lower),
                 _ => true, // Unknown kind - let it through
-            };
+            }
+        };
 
-            if !exists {
-                if !drop.if_exists {
+        // Check the appropriate schema based on database qualifier
+        // Returns (exists, actual_db_idx) - actual_db_idx is where the object was found
+        let (exists, actual_db_idx) = if db_idx == 1 {
+            // temp database specified - only check temp schema
+            let found = self.temp_schema.map(|s| check_exists(s)).unwrap_or(false);
+            (found, 1)
+        } else {
+            // main or no qualifier - check main schema first, then temp
+            // SQLite resolves unqualified names by checking temp first, then main
+            let in_temp = self.temp_schema.map(|s| check_exists(s)).unwrap_or(false);
+            let in_main = self.schema.map(|s| check_exists(s)).unwrap_or(false);
+            if in_temp {
+                (true, 1) // Found in temp - use temp db_idx
+            } else if in_main {
+                (true, 0) // Found in main - use main db_idx
+            } else {
+                (false, db_idx) // Not found - use original db_idx for error message
+            }
+        };
+
+        if !exists {
+            if !drop.if_exists {
+                // Check if the name exists as a different type and give helpful error
+                let check_wrong_type = |schema: &crate::schema::Schema| -> Option<&'static str> {
+                    match kind {
+                        "table" => {
+                            if schema.views.contains_key(&name_lower) {
+                                Some("view")
+                            } else {
+                                None
+                            }
+                        }
+                        "view" => {
+                            if schema.tables.contains_key(&name_lower) {
+                                Some("table")
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
+                };
+
+                // Check both schemas for wrong type
+                let wrong_type = self
+                    .temp_schema
+                    .and_then(check_wrong_type)
+                    .or_else(|| self.schema.and_then(check_wrong_type));
+
+                if let Some(actual_type) = wrong_type {
                     return Err(crate::error::Error::with_message(
                         crate::error::ErrorCode::Error,
-                        format!("no such {}: {}", kind, name),
+                        format!(
+                            "use DROP {} to delete {} {}",
+                            actual_type.to_uppercase(),
+                            actual_type,
+                            display_name
+                        ),
                     ));
                 }
-                // IF EXISTS specified and object doesn't exist - return no-op
-                let mut ops = Vec::new();
-                ops.push(Self::make_op(Opcode::Init, 0, 1, 0, P4::Unused));
-                ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
-                return Ok(ops);
+
+                return Err(crate::error::Error::with_message(
+                    crate::error::ErrorCode::Error,
+                    format!("no such {}: {}", kind, display_name),
+                ));
             }
+            // IF EXISTS specified and object doesn't exist - return no-op
+            let mut ops = Vec::new();
+            ops.push(Self::make_op(Opcode::Init, 0, 1, 0, P4::Unused));
+            ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
+            return Ok(ops);
         }
 
         // Generate bytecode to drop the object
+        // P1 = db_idx (0=main, 1=temp)
         let mut ops = Vec::new();
         ops.push(Self::make_op(Opcode::Init, 0, 2, 0, P4::Unused));
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
@@ -2685,7 +3059,13 @@ impl<'s> StatementCompiler<'s> {
             "trigger" => Opcode::DropTrigger,
             _ => Opcode::DropTable,
         };
-        ops.push(Self::make_op(drop_opcode, 0, 0, 0, P4::Text(name.clone())));
+        ops.push(Self::make_op(
+            drop_opcode,
+            actual_db_idx,
+            0,
+            0,
+            P4::Text(name.clone()),
+        ));
         ops.push(Self::make_op(Opcode::Goto, 0, 1, 0, P4::Unused));
         Ok(ops)
     }
@@ -3963,6 +4343,27 @@ pub fn compile_sql_with_config<'a>(
     case_sensitive_like: bool,
 ) -> Result<(CompiledStmt, &'a str)> {
     let mut compiler = StatementCompiler::with_schema(schema);
+    compiler.set_column_name_flags(short_column_names, full_column_names);
+    compiler.set_case_sensitive_like(case_sensitive_like);
+    compiler.compile(sql)
+}
+
+/// Compile SQL to VDBE bytecode with main and temp schema access
+///
+/// Returns the compiled statement and any remaining SQL (tail).
+/// Both main and temp schemas are used for name resolution.
+pub fn compile_sql_with_full_config<'a>(
+    sql: &'a str,
+    schema: &crate::schema::Schema,
+    temp_schema: Option<&crate::schema::Schema>,
+    short_column_names: bool,
+    full_column_names: bool,
+    case_sensitive_like: bool,
+) -> Result<(CompiledStmt, &'a str)> {
+    let mut compiler = StatementCompiler::with_schema(schema);
+    if let Some(ts) = temp_schema {
+        compiler.set_temp_schema(ts);
+    }
     compiler.set_column_name_flags(short_column_names, full_column_names);
     compiler.set_case_sensitive_like(case_sensitive_like);
     compiler.compile(sql)

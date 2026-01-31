@@ -171,6 +171,16 @@ impl<'a> InsertCompiler<'a> {
             ));
         }
 
+        // Check if target is a view - cannot modify views directly
+        if let Some(schema) = self.schema {
+            if schema.views.contains_key(&table_name_lower) {
+                return Err(crate::error::Error::with_message(
+                    crate::error::ErrorCode::Error,
+                    format!("cannot modify {} because it is a view", insert.table.name),
+                ));
+            }
+        }
+
         // Store table name for trigger firing
         self.table_name = insert.table.name.clone();
 

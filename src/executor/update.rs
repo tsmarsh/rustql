@@ -645,6 +645,13 @@ impl<'s> UpdateCompiler<'s> {
             if let Some(table) = schema.tables.get(&table_name_lower) {
                 return Ok((table.root_page, table.columns.len()));
             }
+            // Check if it's a view - cannot modify views
+            if schema.views.contains_key(&table_name_lower) {
+                return Err(crate::error::Error::with_message(
+                    crate::error::ErrorCode::Error,
+                    format!("cannot modify {} because it is a view", table_name),
+                ));
+            }
             // Table not found in schema - return error
             return Err(crate::error::Error::with_message(
                 crate::error::ErrorCode::Error,

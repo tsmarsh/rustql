@@ -1188,6 +1188,27 @@ pub fn parse_create_index_sql(sql: &str, _is_unique: bool) -> Option<Index> {
     })
 }
 
+/// Parse a CREATE VIEW SQL string into a View struct.
+///
+/// This function is used during schema loading to reconstruct View objects
+/// from their stored SQL in sqlite_master.
+pub fn parse_create_view_sql(sql: &str) -> Option<View> {
+    // Use the full parser to parse the CREATE VIEW statement
+    let stmt = crate::parser::grammar::parse(sql).ok()?;
+
+    if let crate::parser::ast::Stmt::CreateView(create) = stmt {
+        Some(View {
+            name: create.name.name.clone(),
+            db_idx: create.name.database_idx(),
+            sql: sql.to_string(),
+            columns: create.columns.clone(),
+            select: create.query,
+        })
+    } else {
+        None
+    }
+}
+
 /// Parse the WHERE clause of a partial index
 fn parse_partial_index_where(s: &str) -> Option<Expr> {
     let s_upper = s.trim().to_uppercase();

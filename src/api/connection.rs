@@ -9,7 +9,8 @@ use std::sync::{Arc, RwLock};
 use crate::error::{Error, ErrorCode, Result};
 use crate::functions::{get_aggregate_function, get_scalar_function, AggregateInfo, ScalarFunc};
 use crate::schema::{
-    parse_create_sql, Encoding, Index, IndexColumn, Schema, SortOrder, DEFAULT_COLLATION,
+    parse_create_sql, parse_create_view_sql, Encoding, Index, IndexColumn, Schema, SortOrder,
+    DEFAULT_COLLATION,
 };
 use crate::storage::btree::{Btree, BtreeCursorFlags, BtreeOpenFlags, CursorState, TransState};
 use crate::storage::pager::{JournalMode, LockingMode, DEFAULT_PAGE_SIZE};
@@ -927,15 +928,23 @@ impl SqliteConnection {
     /// This resets the in-memory schema cache by re-reading the sqlite_master
     /// table from the btree. Called after ROLLBACK to ensure schema cache
     /// reflects the actual on-disk state.
+    ///
+    /// Note: temp database (dbs[1]) is skipped because temp objects are purely
+    /// in-memory and not persisted to sqlite_master. Temp objects survive rollback.
     pub fn reload_schema(&mut self) -> Result<()> {
         let autocommit = self.get_autocommit();
-        for db in &mut self.dbs {
+        for (i, db) in self.dbs.iter_mut().enumerate() {
+            // Skip temp database - temp objects are in-memory only
+            if i == 1 {
+                continue;
+            }
             if let (Some(btree), Some(schema_arc)) = (&db.btree, &db.schema) {
                 if let Ok(mut schema) = schema_arc.write() {
                     // Clear existing schema cache
                     schema.tables.clear();
                     schema.indexes.clear();
                     schema.triggers.clear();
+                    schema.views.clear();
                     // Reload from sqlite_master
                     load_schema_from_btree(btree, &mut schema)?;
                 }
@@ -1384,7 +1393,13 @@ fn load_schema_from_btree(btree: &Arc<Btree>, schema: &mut Schema) -> Result<()>
                         .or_insert_with(|| Arc::new(index));
                 }
             }
-            // views and triggers not currently supported for schema reload
+            "view" => {
+                if let Some(view) = parse_create_view_sql(&sql) {
+                    let name = view.name.to_lowercase();
+                    schema.views.entry(name).or_insert_with(|| Arc::new(view));
+                }
+            }
+            // triggers not currently supported for schema reload
             _ => {}
         }
 

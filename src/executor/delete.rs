@@ -185,6 +185,16 @@ impl<'s> DeleteCompiler<'s> {
             ));
         }
 
+        // Check if target is a view - cannot modify views directly
+        if let Some(schema) = self.schema {
+            if schema.views.contains_key(&table_name_lower) {
+                return Err(crate::error::Error::with_message(
+                    crate::error::ErrorCode::Error,
+                    format!("cannot modify {} because it is a view", delete.table.name),
+                ));
+            }
+        }
+
         // Store target table name for subquery reference detection
         self.target_table = table_name_lower.clone();
 

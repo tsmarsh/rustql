@@ -68,6 +68,8 @@ pub struct SelectCompiler<'s> {
     alias_expressions: HashMap<String, Expr>,
     /// Schema for name resolution (optional)
     schema: Option<&'s crate::schema::Schema>,
+    /// Temp schema for name resolution (optional, for TEMP tables/views)
+    temp_schema: Option<&'s crate::schema::Schema>,
     /// Register holding the remaining LIMIT counter (None if no limit)
     limit_counter_reg: Option<i32>,
     /// Register holding the remaining OFFSET counter (None if no offset)
@@ -141,6 +143,7 @@ impl<'s> SelectCompiler<'s> {
             result_aliases: HashMap::new(),
             alias_expressions: HashMap::new(),
             schema: None,
+            temp_schema: None,
             limit_counter_reg: None,
             offset_counter_reg: None,
             limit_done_label: None,
@@ -192,6 +195,7 @@ impl<'s> SelectCompiler<'s> {
             result_aliases: HashMap::new(),
             alias_expressions: HashMap::new(),
             schema: Some(schema),
+            temp_schema: None,
             limit_counter_reg: None,
             offset_counter_reg: None,
             limit_done_label: None,
@@ -220,6 +224,11 @@ impl<'s> SelectCompiler<'s> {
     /// Set LIKE case sensitivity for index optimization
     pub fn set_case_sensitive_like(&mut self, value: bool) {
         self.case_sensitive_like = value;
+    }
+
+    /// Set the temp schema for TEMP tables/views lookup
+    pub fn set_temp_schema(&mut self, temp_schema: &'s crate::schema::Schema) {
+        self.temp_schema = Some(temp_schema);
     }
 
     /// Set column naming flags from PRAGMA settings
@@ -516,6 +525,10 @@ impl<'s> SelectCompiler<'s> {
         } else {
             SelectCompiler::new()
         };
+        // Propagate temp schema for TEMP tables/views
+        if let Some(temp_schema) = self.temp_schema {
+            subcompiler.set_temp_schema(temp_schema);
+        }
         subcompiler.next_reg = self.next_reg;
         subcompiler.next_cursor = self.next_cursor;
         subcompiler.ctes = self.ctes.clone();
@@ -2811,41 +2824,48 @@ impl<'s> SelectCompiler<'s> {
                 }
 
                 // Check if this is a view - expand views as subqueries
-                if let Some(schema) = self.schema {
-                    if let Some(view) = schema.views.get(&table_name_lower) {
-                        // Check for circular view definition
-                        if self.expanding_views.contains(&table_name_lower) {
-                            return Err(Error::with_message(
-                                ErrorCode::Error,
-                                format!("view {} is circularly defined", view.name),
-                            ));
-                        }
+                // Check both main schema and temp schema
+                let view_opt = self
+                    .schema
+                    .and_then(|s| s.views.get(&table_name_lower))
+                    .or_else(|| {
+                        self.temp_schema
+                            .and_then(|s| s.views.get(&table_name_lower))
+                    });
 
-                        // Mark this view as being expanded
-                        self.expanding_views.insert(table_name_lower.clone());
-
-                        let view_select = (*view.select).clone();
-                        let view_alias = item.alias.clone().unwrap_or_else(|| table_name.clone());
-
-                        // Compile view's SELECT as a subquery into ephemeral table
-                        let result = self.compile_subquery_to_ephemeral(&view_select, cursor, None);
-
-                        // Remove from expanding set (whether success or failure)
-                        self.expanding_views.remove(&table_name_lower);
-
-                        let subquery_col_names = result?;
-
-                        self.tables.push(TableInfo {
-                            name: view_alias,
-                            table_name: String::new(),
-                            cursor,
-                            schema_table: None,
-                            is_subquery: true,
-                            join_type: item.join_type,
-                            subquery_columns: Some(subquery_col_names),
-                        });
-                        return Ok(());
+                if let Some(view) = view_opt {
+                    // Check for circular view definition
+                    if self.expanding_views.contains(&table_name_lower) {
+                        return Err(Error::with_message(
+                            ErrorCode::Error,
+                            format!("view {} is circularly defined", view.name),
+                        ));
                     }
+
+                    // Mark this view as being expanded
+                    self.expanding_views.insert(table_name_lower.clone());
+
+                    let view_select = (*view.select).clone();
+                    let view_alias = item.alias.clone().unwrap_or_else(|| table_name.clone());
+
+                    // Compile view's SELECT as a subquery into ephemeral table
+                    let result = self.compile_subquery_to_ephemeral(&view_select, cursor, None);
+
+                    // Remove from expanding set (whether success or failure)
+                    self.expanding_views.remove(&table_name_lower);
+
+                    let subquery_col_names = result?;
+
+                    self.tables.push(TableInfo {
+                        name: view_alias,
+                        table_name: String::new(),
+                        cursor,
+                        schema_table: None,
+                        is_subquery: true,
+                        join_type: item.join_type,
+                        subquery_columns: Some(subquery_col_names),
+                    });
+                    return Ok(());
                 }
 
                 // Look up table in schema if available
@@ -4269,9 +4289,17 @@ impl<'s> SelectCompiler<'s> {
                         sql: None,
                         row_estimate: 0,
                     }))
-                } else if let Some(schema) = self.schema {
-                    // First check if this is a view
-                    if let Some(view) = schema.views.get(&table_name_lower) {
+                } else {
+                    // First check if this is a view in main or temp schema
+                    let view_opt = self
+                        .schema
+                        .and_then(|s| s.views.get(&table_name_lower))
+                        .or_else(|| {
+                            self.temp_schema
+                                .and_then(|s| s.views.get(&table_name_lower))
+                        });
+
+                    if let Some(view) = view_opt {
                         // Check for circular view definition
                         if self.expanding_views.contains(&table_name_lower) {
                             return Err(Error::with_message(
@@ -4292,7 +4320,14 @@ impl<'s> SelectCompiler<'s> {
                         self.emit(Opcode::OpenEphemeral, cursor, 0, 0, P4::Unused);
 
                         let subquery_dest = SelectDest::EphemTable { cursor };
-                        let mut subcompiler = SelectCompiler::with_schema(schema);
+                        let mut subcompiler = if let Some(schema) = self.schema {
+                            SelectCompiler::with_schema(schema)
+                        } else {
+                            SelectCompiler::new()
+                        };
+                        if let Some(temp_schema) = self.temp_schema {
+                            subcompiler.set_temp_schema(temp_schema);
+                        }
                         subcompiler.next_reg = self.next_reg;
                         subcompiler.next_cursor = self.next_cursor;
                         // Propagate expanding_views for circular view detection
@@ -4336,17 +4371,31 @@ impl<'s> SelectCompiler<'s> {
                     }
 
                     // Check if table exists (but not for sqlite_ internal tables)
-                    if !table_name_lower.starts_with("sqlite_")
-                        && !schema.tables.contains_key(&table_name_lower)
-                    {
-                        return Err(Error::with_message(
-                            ErrorCode::Error,
-                            format!("no such table: {}", qualified_name),
-                        ));
+                    if let Some(schema) = self.schema {
+                        if !table_name_lower.starts_with("sqlite_")
+                            && !schema.tables.contains_key(&table_name_lower)
+                        {
+                            // Also check temp schema for temp tables
+                            let in_temp = self
+                                .temp_schema
+                                .map(|s| s.tables.contains_key(&table_name_lower))
+                                .unwrap_or(false);
+                            if !in_temp {
+                                return Err(Error::with_message(
+                                    ErrorCode::Error,
+                                    format!("no such table: {}", qualified_name),
+                                ));
+                            }
+                        }
                     }
-                    schema.tables.get(&table_name_lower).cloned()
-                } else {
-                    None
+
+                    // Look up table schema from main or temp schema
+                    self.schema
+                        .and_then(|s| s.tables.get(&table_name_lower).cloned())
+                        .or_else(|| {
+                            self.temp_schema
+                                .and_then(|s| s.tables.get(&table_name_lower).cloned())
+                        })
                 };
 
                 // Open the table (read mode)

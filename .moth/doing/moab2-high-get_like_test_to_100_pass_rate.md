@@ -2,7 +2,7 @@
 
 ## Progress
 
-Started at 41% pass rate, now at **89%** (141/159 tests passing, 18 errors).
+Started at 41% pass rate, now at **89%** (142/159 tests passing, 17 errors).
 
 ### Session Progress (2026-01-31) - continued (session 4)
 
@@ -13,7 +13,12 @@ Started at 41% pass rate, now at **89%** (141/159 tests passing, 18 errors).
   - Fix: Added IPK handling in Column opcode - when reading NULL from an IPK column, return cursor's rowid
   - Result: like-10.10 through like-10.15 and like-11.6 now pass (7 tests fixed)
 
-- Combined result: LIKE test errors reduced from 25 to 18 (7 more tests passing)
+- **LIKE pattern with COLLATE wrapper** - Fixed index optimization for `x LIKE 'abc%' COLLATE nocase`
+  - Bug: Parser creates `Like { pattern: Collate { Literal('abc%') } }`, but pattern extraction only handled bare Literal
+  - Fix: Unwrap Collate wrapper in `like_prefix()`, `like_pattern_complete()`, and `extract_like_bounds()`
+  - Result: like-12.13 and like-12.15 now pass (2 tests fixed)
+
+- Combined result: LIKE test errors reduced from 25 to 17 (8 more tests passing)
 
 ### Session Progress (2026-01-31) - continued (session 3)
 

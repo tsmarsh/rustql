@@ -1090,6 +1090,31 @@ impl QueryPlanner {
                 term.selectivity = 1.0 - inner_selectivity;
             }
 
+            // Handle COLLATE wrapping a LIKE expression: (x LIKE 'abc%') COLLATE nocase
+            // Note: This is rare - usually COLLATE wraps the pattern, not the whole LIKE
+            Expr::Collate { expr: inner, .. } => {
+                if let Expr::Like {
+                    expr: like_inner,
+                    pattern,
+                    op,
+                    ..
+                } = inner.as_ref()
+                {
+                    term.op = Some(match op {
+                        LikeOp::Like | LikeOp::Regexp | LikeOp::Match => TermOp::Like,
+                        LikeOp::Glob => TermOp::Glob,
+                    });
+                    term.selectivity = 0.25;
+                    term.flags |= WhereTermFlags::LIKE;
+                    if Self::like_prefix(pattern, *op) {
+                        term.flags |= WhereTermFlags::LIKE_PREFIX;
+                    }
+                    Self::analyze_column_ref_static(table_info, term, like_inner)?;
+                } else {
+                    term.selectivity = 0.25;
+                }
+            }
+
             _ => {
                 // Default selectivity for unknown expressions
                 term.selectivity = 0.25;
@@ -1225,7 +1250,13 @@ impl QueryPlanner {
     }
 
     fn like_prefix(pattern: &Expr, op: LikeOp) -> bool {
-        let text = match pattern {
+        // Unwrap Collate wrapper if present: x LIKE 'abc%' COLLATE nocase
+        let inner_pattern = match pattern {
+            Expr::Collate { expr, .. } => expr.as_ref(),
+            other => other,
+        };
+
+        let text = match inner_pattern {
             Expr::Literal(Literal::String(text)) => text,
             _ => return false,
         };
@@ -1247,7 +1278,13 @@ impl QueryPlanner {
     /// in the prefix. In this case, the index range scan is sufficient and no runtime
     /// LIKE verification is needed.
     fn like_pattern_complete(pattern: &Expr, op: LikeOp) -> bool {
-        let text = match pattern {
+        // Unwrap Collate wrapper if present: x LIKE 'abc%' COLLATE nocase
+        let inner_pattern = match pattern {
+            Expr::Collate { expr, .. } => expr.as_ref(),
+            other => other,
+        };
+
+        let text = match inner_pattern {
             Expr::Literal(Literal::String(text)) => text,
             _ => return false,
         };
@@ -1289,7 +1326,13 @@ impl QueryPlanner {
         op: LikeOp,
         is_case_sensitive: bool,
     ) -> Option<(String, String)> {
-        let text = match pattern {
+        // Unwrap Collate wrapper if present: x LIKE 'abc%' COLLATE nocase
+        let inner_pattern = match pattern {
+            Expr::Collate { expr, .. } => expr.as_ref(),
+            other => other,
+        };
+
+        let text = match inner_pattern {
             Expr::Literal(Literal::String(text)) => text,
             _ => return None,
         };

@@ -387,6 +387,97 @@ impl<'a> Parser<'a> {
         Ok(exprs)
     }
 
+    /// Convert VALUES rows to a SelectBody (used for INSERT...VALUES...UNION...)
+    fn values_rows_to_select_body(&self, rows: Vec<Vec<Expr>>) -> SelectBody {
+        // Convert VALUES rows to UNION ALL chain
+        // VALUES(1),(2),(3) becomes SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3
+        let mut result: Option<SelectBody> = None;
+        for row in rows {
+            let core = SelectCore {
+                distinct: Distinct::All,
+                columns: row
+                    .into_iter()
+                    .map(|e| ResultColumn::Expr {
+                        expr: e,
+                        alias: None,
+                    })
+                    .collect(),
+                from: None,
+                where_clause: None,
+                group_by: None,
+                having: None,
+                window: None,
+            };
+            let body = SelectBody::Select(core);
+            result = Some(match result {
+                None => body,
+                Some(left) => SelectBody::Compound {
+                    op: CompoundOp::UnionAll,
+                    left: Box::new(left),
+                    right: Box::new(body),
+                },
+            });
+        }
+        result.unwrap()
+    }
+
+    /// Continue parsing compound operations (UNION, INTERSECT, EXCEPT) after an initial SelectBody
+    fn parse_compound_continuation(&mut self, mut left: SelectBody) -> Result<SelectBody> {
+        loop {
+            let op = if self.match_token(TokenKind::Union) {
+                if self.match_token(TokenKind::All) {
+                    CompoundOp::UnionAll
+                } else {
+                    CompoundOp::Union
+                }
+            } else if self.match_token(TokenKind::Intersect) {
+                CompoundOp::Intersect
+            } else if self.match_token(TokenKind::Except) {
+                CompoundOp::Except
+            } else {
+                break;
+            };
+
+            let right = if self.match_token(TokenKind::Values) {
+                self.parse_values_body()?
+            } else {
+                SelectBody::Select(self.parse_select_core()?)
+            };
+
+            left = SelectBody::Compound {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    /// Wrap a SelectBody in a SelectStmt with default ORDER BY and LIMIT
+    fn wrap_body_in_select_stmt(&mut self, body: SelectBody) -> SelectStmt {
+        // Check for ORDER BY
+        let order_by = if self.match_token(TokenKind::Order) {
+            self.expect(TokenKind::By).ok();
+            self.parse_ordering_terms().ok()
+        } else {
+            None
+        };
+
+        // Check for LIMIT
+        let limit = if self.match_token(TokenKind::Limit) {
+            self.parse_limit_clause().ok()
+        } else {
+            None
+        };
+
+        SelectStmt {
+            with: None,
+            body,
+            order_by,
+            limit,
+        }
+    }
+
     fn parse_result_columns(&mut self) -> Result<Vec<ResultColumn>> {
         let mut columns = vec![self.parse_result_column()?];
         while self.match_token(TokenKind::Comma) {
@@ -887,11 +978,26 @@ impl<'a> Parser<'a> {
             self.expect(TokenKind::Values)?;
             InsertSource::DefaultValues
         } else if self.match_token(TokenKind::Values) {
+            // Parse VALUES rows
             let mut rows = vec![self.parse_values_row()?];
             while self.match_token(TokenKind::Comma) {
                 rows.push(self.parse_values_row()?);
             }
-            InsertSource::Values(rows)
+
+            // Check if there's a compound operator (UNION, INTERSECT, EXCEPT)
+            // SQLite allows: INSERT INTO t VALUES(...) UNION SELECT...
+            if self.check(TokenKind::Union)
+                || self.check(TokenKind::Intersect)
+                || self.check(TokenKind::Except)
+            {
+                // Convert VALUES to SelectBody and continue with compound parsing
+                let values_body = self.values_rows_to_select_body(rows);
+                let compound_body = self.parse_compound_continuation(values_body)?;
+                let select_stmt = self.wrap_body_in_select_stmt(compound_body);
+                InsertSource::Select(Box::new(select_stmt))
+            } else {
+                InsertSource::Values(rows)
+            }
         } else {
             InsertSource::Select(Box::new(self.parse_select_stmt()?))
         };

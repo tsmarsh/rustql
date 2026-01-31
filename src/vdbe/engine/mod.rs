@@ -179,6 +179,12 @@ pub struct VdbeCursor {
     pub saved_key: Option<Vec<u8>>,
     /// Whether the cursor position has been saved
     pub position_saved: bool,
+
+    // --- Generic virtual table support ---
+    /// Virtual table instance from registry
+    pub vtab_table: Option<std::sync::Arc<dyn crate::vtab::VtabTable>>,
+    /// Virtual table cursor from VtabTable::open_cursor()
+    pub vtab_cursor: Option<Box<dyn crate::vtab::VtabCursor>>,
 }
 
 impl std::fmt::Debug for VdbeCursor {
@@ -244,6 +250,8 @@ impl VdbeCursor {
             saved_rowid: None,
             saved_key: None,
             position_saved: false,
+            vtab_table: None,
+            vtab_cursor: None,
         }
     }
 
@@ -1979,127 +1987,181 @@ impl Vdbe {
             }
 
             Opcode::VFilter => {
-                // Apply filter to virtual table cursor P1 (P4 = query string)
-                // Extract query from P4 or memory before getting mutable cursor
-                let mut query = match &op.p4 {
+                // Apply filter to virtual table cursor P1
+                // P2 = register containing query/constraint value
+                // P4 = query string or index info
+
+                // Extract query from P4 or memory
+                let query = match &op.p4 {
                     P4::Text(text) => text.clone(),
                     P4::Vtab(text) => text.clone(),
-                    _ => String::new(),
+                    _ => {
+                        if op.p2 > 0 {
+                            self.mem(op.p2).to_str()
+                        } else {
+                            String::new()
+                        }
+                    }
                 };
-                if query.is_empty() && op.p2 > 0 {
-                    query = self.mem(op.p2).to_str();
-                }
 
                 let vtab_name = self
                     .cursor(op.p1)
                     .and_then(|cursor| cursor.vtab_name.clone());
 
-                let btree = self.btree.clone();
-                let schema = self.schema.clone();
-                let vtab_module = vtab_name.as_ref().and_then(|name| {
-                    schema.as_ref().and_then(|schema| {
-                        schema
-                            .read()
-                            .ok()
-                            .and_then(|guard| guard.table(name))
-                            .and_then(|table| table.virtual_module.clone())
-                    })
-                });
-                let mut new_vtab_query: Option<String> = None;
-                if let Some(cursor) = self.cursor_mut(op.p1) {
-                    if cursor.is_virtual {
-                        #[allow(unused_variables)]
-                        if let Some(ref vtab_name) = vtab_name {
-                            #[cfg(feature = "fts3")]
-                            {
-                                if let Some(module) = vtab_module.as_ref() {
-                                    if module.eq_ignore_ascii_case("fts3tokenize") {
-                                        if let Some(table) =
-                                            crate::fts3::get_tokenize_table(vtab_name)
-                                        {
-                                            if let Ok(table) = table.lock() {
-                                                cursor.vtab_input = if query.is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(query.clone())
-                                                };
-                                                let tokens = table.tokenize(&query)?;
-                                                cursor.vtab_tokens = tokens;
-                                                cursor.vtab_rowids =
-                                                    (0..cursor.vtab_tokens.len() as i64).collect();
-                                                cursor.vtab_row_index = 0;
-                                                if cursor.vtab_rowids.is_empty() {
-                                                    cursor.state = CursorState::AtEnd;
-                                                    cursor.rowid = None;
-                                                } else {
-                                                    cursor.state = CursorState::Valid;
-                                                    cursor.rowid = Some(cursor.vtab_rowids[0]);
-                                                }
-                                            }
-                                        }
-                                    } else if module.eq_ignore_ascii_case("fts3") {
-                                        if let Some(table) = crate::fts3::get_table(vtab_name) {
-                                            if let Ok(mut table) = table.lock() {
-                                                if let (Some(ref btree), Some(ref schema)) =
-                                                    (btree.as_ref(), schema.as_ref())
-                                                {
-                                                    if let Ok(schema_guard) = schema.read() {
-                                                        table
-                                                            .ensure_loaded(btree, &schema_guard)?;
-                                                    }
-                                                }
-                                                if let Ok(rowids) = table.query_rowids(&query) {
-                                                    cursor.vtab_rowids = rowids;
-                                                    cursor.vtab_row_index = 0;
-                                                    if cursor.vtab_rowids.is_empty() {
-                                                        cursor.state = CursorState::AtEnd;
-                                                        cursor.rowid = None;
-                                                    } else {
-                                                        cursor.state = CursorState::Valid;
-                                                        cursor.rowid = Some(cursor.vtab_rowids[0]);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        new_vtab_query = if query.is_empty() {
-                                            None
-                                        } else {
-                                            Some(query.clone())
-                                        };
+                // Try to use the registry first (new generic path)
+                let mut handled_by_registry = false;
+                if let Some(ref registry) = self.vtab_registry {
+                    if let Some(ref name) = vtab_name {
+                        // Get the database name (default to "main")
+                        let db_name = "main";
+                        if let Ok(Some(vtab_instance)) = registry.get_instance(db_name, name) {
+                            // Open or reuse cursor
+                            if let Some(cursor) = self.cursor_mut(op.p1) {
+                                if cursor.vtab_cursor.is_none() {
+                                    // Create a new cursor
+                                    if let Ok(vtab_cursor) = vtab_instance.open_cursor() {
+                                        cursor.vtab_cursor = Some(vtab_cursor);
+                                        cursor.vtab_table = Some(vtab_instance.clone());
                                     }
                                 }
-                            }
-                            #[cfg(feature = "fts5")]
-                            {
-                                if let Some(module) = vtab_module.as_ref() {
-                                    if module.eq_ignore_ascii_case("fts5") {
-                                        if let Some(table) = crate::fts5::get_table(vtab_name) {
-                                            if let Ok(table) = table.lock() {
-                                                if let Ok(rowids) = table.query_rowids(&query) {
-                                                    cursor.vtab_rowids = rowids;
-                                                    cursor.vtab_row_index = 0;
-                                                    if cursor.vtab_rowids.is_empty() {
-                                                        cursor.state = CursorState::AtEnd;
-                                                        cursor.rowid = None;
-                                                    } else {
-                                                        cursor.state = CursorState::Valid;
-                                                        cursor.rowid = Some(cursor.vtab_rowids[0]);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        new_vtab_query = if query.is_empty() {
-                                            None
+
+                                // Apply filter using the VtabCursor trait
+                                if let Some(ref mut vtab_cursor) = cursor.vtab_cursor {
+                                    // Build constraint values from query
+                                    let constraints = if query.is_empty() {
+                                        vec![]
+                                    } else {
+                                        vec![crate::vtab::ConstraintValue::new(
+                                            Mem::from_str(&query),
+                                            crate::vtab::SQLITE_INDEX_CONSTRAINT_MATCH,
+                                            0,
+                                        )]
+                                    };
+
+                                    // Call filter - index_num=1 for MATCH queries, 0 for full scan
+                                    let index_num = if query.is_empty() { 0 } else { 1 };
+                                    if vtab_cursor.filter(index_num, None, &constraints).is_ok() {
+                                        if vtab_cursor.eof() {
+                                            cursor.state = CursorState::AtEnd;
+                                            cursor.rowid = None;
                                         } else {
-                                            Some(query.clone())
-                                        };
+                                            cursor.state = CursorState::Valid;
+                                            cursor.rowid = vtab_cursor.rowid().ok();
+                                        }
+                                        handled_by_registry = true;
                                     }
                                 }
                             }
                         }
                     }
                 }
-                self.vtab_query = new_vtab_query;
+
+                // Fall back to legacy hardcoded path if registry didn't handle it
+                if !handled_by_registry {
+                    let btree = self.btree.clone();
+                    let schema = self.schema.clone();
+                    let vtab_module = vtab_name.as_ref().and_then(|name| {
+                        schema.as_ref().and_then(|schema| {
+                            schema
+                                .read()
+                                .ok()
+                                .and_then(|guard| guard.table(name))
+                                .and_then(|table| table.virtual_module.clone())
+                        })
+                    });
+
+                    if let Some(cursor) = self.cursor_mut(op.p1) {
+                        if cursor.is_virtual {
+                            #[allow(unused_variables)]
+                            if let Some(ref vtab_name) = vtab_name {
+                                #[cfg(feature = "fts3")]
+                                {
+                                    if let Some(module) = vtab_module.as_ref() {
+                                        if module.eq_ignore_ascii_case("fts3tokenize") {
+                                            if let Some(table) =
+                                                crate::fts3::get_tokenize_table(vtab_name)
+                                            {
+                                                if let Ok(table) = table.lock() {
+                                                    cursor.vtab_input = if query.is_empty() {
+                                                        None
+                                                    } else {
+                                                        Some(query.clone())
+                                                    };
+                                                    let tokens = table.tokenize(&query)?;
+                                                    cursor.vtab_tokens = tokens;
+                                                    cursor.vtab_rowids =
+                                                        (0..cursor.vtab_tokens.len() as i64)
+                                                            .collect();
+                                                    cursor.vtab_row_index = 0;
+                                                    if cursor.vtab_rowids.is_empty() {
+                                                        cursor.state = CursorState::AtEnd;
+                                                        cursor.rowid = None;
+                                                    } else {
+                                                        cursor.state = CursorState::Valid;
+                                                        cursor.rowid = Some(cursor.vtab_rowids[0]);
+                                                    }
+                                                }
+                                            }
+                                        } else if module.eq_ignore_ascii_case("fts3") {
+                                            if let Some(table) = crate::fts3::get_table(vtab_name) {
+                                                if let Ok(mut table) = table.lock() {
+                                                    if let (Some(ref btree), Some(ref schema)) =
+                                                        (btree.as_ref(), schema.as_ref())
+                                                    {
+                                                        if let Ok(schema_guard) = schema.read() {
+                                                            table.ensure_loaded(
+                                                                btree,
+                                                                &schema_guard,
+                                                            )?;
+                                                        }
+                                                    }
+                                                    if let Ok(rowids) = table.query_rowids(&query) {
+                                                        cursor.vtab_rowids = rowids;
+                                                        cursor.vtab_row_index = 0;
+                                                        if cursor.vtab_rowids.is_empty() {
+                                                            cursor.state = CursorState::AtEnd;
+                                                            cursor.rowid = None;
+                                                        } else {
+                                                            cursor.state = CursorState::Valid;
+                                                            cursor.rowid =
+                                                                Some(cursor.vtab_rowids[0]);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                #[cfg(feature = "fts5")]
+                                {
+                                    if let Some(module) = vtab_module.as_ref() {
+                                        if module.eq_ignore_ascii_case("fts5") {
+                                            if let Some(table) = crate::fts5::get_table(vtab_name) {
+                                                if let Ok(table) = table.lock() {
+                                                    if let Ok(rowids) = table.query_rowids(&query) {
+                                                        cursor.vtab_rowids = rowids;
+                                                        cursor.vtab_row_index = 0;
+                                                        if cursor.vtab_rowids.is_empty() {
+                                                            cursor.state = CursorState::AtEnd;
+                                                            cursor.rowid = None;
+                                                        } else {
+                                                            cursor.state = CursorState::Valid;
+                                                            cursor.rowid =
+                                                                Some(cursor.vtab_rowids[0]);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Store query for FTS helper functions
+                self.vtab_query = if query.is_empty() { None } else { Some(query) };
             }
 
             Opcode::OpenEphemeral => {
@@ -7196,8 +7258,23 @@ impl Vdbe {
 
             Opcode::VColumn => {
                 // Read column from virtual table cursor
-                // P1 = cursor, P2 = column, P3 = dest register
-                // Handled by VFilter cursor
+                // P1 = cursor, P2 = column index, P3 = dest register
+                let col_idx = op.p2 as usize;
+                let dest_reg = op.p3;
+
+                let value = if let Some(cursor) = self.cursor(op.p1) {
+                    if let Some(ref vtab_cursor) = cursor.vtab_cursor {
+                        // Use registry cursor
+                        vtab_cursor.column(col_idx).unwrap_or_else(|_| Mem::new())
+                    } else {
+                        // Fall back to legacy path - no column data available
+                        Mem::new()
+                    }
+                } else {
+                    Mem::new()
+                };
+
+                self.set_mem(dest_reg, value);
             }
 
             Opcode::VCreate => {
@@ -7218,9 +7295,28 @@ impl Vdbe {
                 // Jump to P2 if no more rows
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if cursor.is_virtual {
-                        cursor.vtab_row_index += 1;
-                        if cursor.vtab_row_index >= cursor.vtab_rowids.len() {
-                            self.pc = op.p2;
+                        // Try registry cursor first
+                        if let Some(ref mut vtab_cursor) = cursor.vtab_cursor {
+                            let _ = vtab_cursor.next();
+                            if vtab_cursor.eof() {
+                                cursor.state = CursorState::AtEnd;
+                                cursor.rowid = None;
+                                self.pc = op.p2;
+                            } else {
+                                cursor.state = CursorState::Valid;
+                                cursor.rowid = vtab_cursor.rowid().ok();
+                            }
+                        } else {
+                            // Fall back to legacy vtab_rowids path
+                            cursor.vtab_row_index += 1;
+                            if cursor.vtab_row_index >= cursor.vtab_rowids.len() {
+                                cursor.state = CursorState::AtEnd;
+                                cursor.rowid = None;
+                                self.pc = op.p2;
+                            } else {
+                                cursor.state = CursorState::Valid;
+                                cursor.rowid = Some(cursor.vtab_rowids[cursor.vtab_row_index]);
+                            }
                         }
                     } else {
                         self.pc = op.p2;

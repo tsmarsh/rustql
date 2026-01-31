@@ -74,6 +74,35 @@ pub unsafe extern "C" fn sqlite3_txn_state_cmd(
     TCL_OK
 }
 
+/// sqlite3_get_autocommit - returns 1 if autocommit is on, else 0
+/// Usage: sqlite3_get_autocommit DB
+pub unsafe extern "C" fn sqlite3_get_autocommit_cmd(
+    _client_data: *mut std::ffi::c_void,
+    interp: *mut Tcl_Interp,
+    objc: c_int,
+    objv: *const *mut Tcl_Obj,
+) -> c_int {
+    if objc < 2 {
+        set_result_string(
+            interp,
+            "wrong # args: should be \"sqlite3_get_autocommit DB\"",
+        );
+        return TCL_ERROR;
+    }
+
+    let db_name = obj_to_string(*objv.offset(1));
+    let autocommit = CONNECTIONS.with(|connections| {
+        let conns = connections.borrow();
+        conns
+            .get(&db_name)
+            .map(|conn| conn.get_autocommit())
+            .unwrap_or(false)
+    });
+
+    set_result_int(interp, if autocommit { 1 } else { 0 });
+    TCL_OK
+}
+
 /// sqlite3_exec - execute SQL and return result code and results
 /// Usage: sqlite3_exec DB SQL
 /// Returns: {RESULT_CODE {results}}

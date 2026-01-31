@@ -136,6 +136,7 @@ pub fn execute_pragma(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Resul
         "freelist_count" => pragma_freelist_count(conn),
         "lock_status" => pragma_lock_status(conn),
         "incremental_vacuum" => pragma_incremental_vacuum(),
+        "incr_vacuum" => pragma_incremental_vacuum(),
         "cache_spill" => pragma_cache_spill(conn, pragma),
         "writable_schema" => pragma_writable_schema(conn, pragma),
         "automatic_index" => pragma_automatic_index(conn, pragma),
@@ -769,10 +770,22 @@ fn pragma_lock_status(conn: &SqliteConnection) -> Result<PragmaResult> {
     // Format: database, status (unlocked, shared, reserved, pending, exclusive)
     let mut rows = Vec::new();
     for db in &conn.dbs {
-        // Currently we don't track lock state, report as unlocked
+        let status = if let Some(btree) = &db.btree {
+            match btree.lock_level()? {
+                crate::types::LockLevel::None => "unlocked",
+                crate::types::LockLevel::Shared => "shared",
+                crate::types::LockLevel::Reserved => "reserved",
+                crate::types::LockLevel::Pending => "pending",
+                crate::types::LockLevel::Exclusive => "exclusive",
+            }
+        } else if db.name.eq_ignore_ascii_case("temp") {
+            "closed"
+        } else {
+            "unlocked"
+        };
         rows.push(vec![
             Value::Text(db.name.clone()),
-            Value::Text("unlocked".to_string()),
+            Value::Text(status.to_string()),
         ]);
     }
     Ok(PragmaResult {

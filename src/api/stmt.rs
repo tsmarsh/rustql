@@ -419,6 +419,17 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
         return Ok(StepResult::Done);
     }
 
+    let skip_auto_txn = matches!(
+        stmt.stmt_type,
+        Some(
+            StmtType::Begin
+                | StmtType::Commit
+                | StmtType::Rollback
+                | StmtType::Savepoint
+                | StmtType::Release
+        )
+    );
+
     // Check if statement is expired due to schema change
     if stmt.is_expired() {
         return Err(Error::with_message(
@@ -472,7 +483,7 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
         // Set up btree and schema from connection
         if let Some(conn_ptr) = stmt.conn_ptr {
             // SAFETY: conn_ptr is valid for the lifetime of the statement
-            let conn = unsafe { &*conn_ptr };
+            let conn = unsafe { &mut *conn_ptr };
 
             // Reset the changes counter only for write statements
             // (SELECT and other read-only statements should not reset it)
@@ -480,28 +491,32 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
                 conn.changes.store(0, Ordering::SeqCst);
             }
 
-            if let Some(main_db) = conn.find_db("main") {
-                if let Some(ref btree) = main_db.btree {
-                    vdbe.set_btree(btree.clone());
+            let (main_btree, main_schema) = conn
+                .find_db("main")
+                .map(|db| (db.btree.clone(), db.schema.clone()))
+                .unwrap_or((None, None));
+            if let Some(btree) = main_btree {
+                vdbe.set_btree(btree.clone());
 
-                    // In autocommit mode, start a write transaction for write statements
-                    // This is necessary because individual statements don't include
-                    // Transaction opcodes in their bytecode
-                    if !stmt.read_only && conn.get_autocommit() {
-                        let _ = btree.begin_trans(true);
-                    }
+                // In autocommit mode, start a write transaction for write statements
+                // This is necessary because individual statements don't include
+                // Transaction opcodes in their bytecode
+                if !stmt.read_only && conn.get_autocommit() && !skip_auto_txn {
+                    let _ = btree.begin_trans(true);
+                    conn.transaction_state = crate::api::TransactionState::Write;
                 }
-                if let Some(ref schema) = main_db.schema {
-                    vdbe.set_schema(schema.clone());
-                }
+            }
+            if let Some(schema) = main_schema {
+                vdbe.set_schema(schema);
             }
             // Also set temp btree if it exists (for TEMP tables)
             if conn.dbs.len() > 1 {
                 if let Some(ref btree) = conn.dbs[1].btree {
                     vdbe.set_temp_btree(btree.clone());
                     // Start transaction on temp btree for write statements
-                    if !stmt.read_only && conn.get_autocommit() {
+                    if !stmt.read_only && conn.get_autocommit() && !skip_auto_txn {
                         let _ = btree.begin_trans(true);
+                        conn.transaction_state = crate::api::TransactionState::Write;
                     }
                 }
             }
@@ -536,9 +551,9 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
         }
         Ok(ExecResult::Done) => {
             // In autocommit mode, commit the implicit write transaction
-            if !stmt.read_only {
+            if !stmt.read_only && !skip_auto_txn {
                 if let Some(conn_ptr) = stmt.conn_ptr {
-                    let conn = unsafe { &*conn_ptr };
+                    let conn = unsafe { &mut *conn_ptr };
                     if conn.get_autocommit() {
                         if let Some(main_db) = conn.find_db("main") {
                             if let Some(ref btree) = main_db.btree {
@@ -551,6 +566,7 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
                                 let _ = btree.commit();
                             }
                         }
+                        conn.transaction_state = crate::api::TransactionState::None;
                     }
                 }
             }

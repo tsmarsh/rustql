@@ -23,8 +23,8 @@ use super::md5::md5_cmd;
 
 // Database commands from db module
 use super::db::{
-    clang_sanitize_address_cmd, sqlite3_exec_cmd, sqlite3_exec_hex_cmd, sqlite3_txn_state_cmd,
-    tcl_variable_type_cmd, working_64bit_int_cmd,
+    clang_sanitize_address_cmd, sqlite3_exec_cmd, sqlite3_exec_hex_cmd, sqlite3_get_autocommit_cmd,
+    sqlite3_txn_state_cmd, tcl_variable_type_cmd, working_64bit_int_cmd,
 };
 
 // Printf formatting commands from printf module
@@ -149,7 +149,6 @@ pub unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         "sqlite3_changes",
         "sqlite3_total_changes",
         "sqlite3_last_insert_rowid",
-        "sqlite3_get_autocommit",
         "sqlite3_data_count",
         "sqlite3_column_count",
         "sqlite3_column_text",
@@ -284,6 +283,15 @@ pub unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
             None,
         );
     }
+
+    let cmd_name = CString::new("sqlite3_get_autocommit").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(sqlite3_get_autocommit_cmd),
+        std::ptr::null_mut(),
+        None,
+    );
 
     // Commands that return specific values
     let cmd_name = CString::new("sqlite3_memory_used").unwrap();

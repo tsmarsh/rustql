@@ -1672,6 +1672,17 @@ impl Vdbe {
                         } else {
                             self.btree.clone()
                         };
+                        if !is_temp {
+                            if let Some(conn_ptr) = self.conn_ptr {
+                                let conn = unsafe { &mut *conn_ptr };
+                                if conn.transaction_state == TransactionState::None {
+                                    if let Some(ref btree) = btree {
+                                        btree.begin_trans(false)?;
+                                        conn.transaction_state = TransactionState::Read;
+                                    }
+                                }
+                            }
+                        }
                         self.open_cursor(op.p1, root_page, false)?;
                         if let Some(cursor) = self.cursor_mut(op.p1) {
                             cursor.n_field = op.p3;
@@ -1791,6 +1802,17 @@ impl Vdbe {
                     } else {
                         self.btree.clone()
                     };
+                    if !is_temp_table {
+                        if let Some(conn_ptr) = self.conn_ptr {
+                            let conn = unsafe { &mut *conn_ptr };
+                            if conn.transaction_state != TransactionState::Write {
+                                if let Some(ref btree) = btree {
+                                    btree.begin_trans(true)?;
+                                    conn.transaction_state = TransactionState::Write;
+                                }
+                            }
+                        }
+                    }
                     if let Some(ref btree) = btree {
                         btree.lock_table(root_page as i32, true)?;
                     }
@@ -4713,10 +4735,6 @@ impl Vdbe {
                         if conn.autocommit.load(AtomicOrdering::SeqCst) {
                             conn.autocommit.store(false, AtomicOrdering::SeqCst);
                             conn.is_transaction_savepoint = true;
-                            if conn.transaction_state == TransactionState::None {
-                                btree.begin_trans(false)?;
-                                conn.transaction_state = TransactionState::Read;
-                            }
                         }
                         let idx = conn.savepoints.len() as i32;
                         btree.savepoint(SavepointOp::Begin, idx)?;

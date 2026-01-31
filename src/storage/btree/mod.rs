@@ -15,7 +15,7 @@ use crate::shared_cache;
 use crate::storage::pager::{
     JournalMode, Pager, PagerFlags, PagerGetFlags, PagerOpenFlags, SavepointOp,
 };
-use crate::types::{Connection, OpenFlags, Pgno, RowId, Value, Vfs};
+use crate::types::{Connection, LockLevel, OpenFlags, Pgno, RowId, Value, Vfs};
 use crate::util::bitvec::BitVec;
 
 // Re-export types from submodules
@@ -3674,6 +3674,15 @@ impl Btree {
     /// sqlite3BtreeBeginTrans with schema flag
     pub fn begin_trans_with_schema(&self, write: bool, _schema_modified: &mut i32) -> Result<()> {
         self.begin_trans(write)
+    }
+
+    /// Current pager lock level (for PRAGMA lock_status).
+    pub fn lock_level(&self) -> Result<LockLevel> {
+        let shared = self
+            .shared
+            .read()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
+        Ok(shared.pager.lock)
     }
 
     /// Check if btree is in a write transaction

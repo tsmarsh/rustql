@@ -170,6 +170,16 @@ impl PCache {
     }
 
     pub fn truncate(&mut self, pgno: Pgno) {
+        let mut current = self.dirty_head;
+        while let Some(page) = current {
+            unsafe {
+                current = page.as_ref().dirty_next;
+                if page.as_ref().pgno >= pgno {
+                    self.make_clean(page);
+                    self.cache.unpin(page, true);
+                }
+            }
+        }
         self.cache.truncate(pgno);
     }
 

@@ -5,6 +5,7 @@
 //! OS file system.
 
 use bitflags::bitflags;
+use std::collections::HashMap;
 use std::ptr::NonNull;
 
 use crate::error::{Error, ErrorCode, Result};
@@ -239,6 +240,21 @@ impl Drop for PgHdr {
     }
 }
 
+#[derive(Clone)]
+pub struct PageSnapshot {
+    pub data: Vec<u8>,
+    pub flags: PgFlags,
+}
+
+impl PageSnapshot {
+    fn from_data(data: &[u8], flags: PgFlags) -> Self {
+        Self {
+            data: data.to_vec(),
+            flags,
+        }
+    }
+}
+
 // ============================================================================
 // Savepoint
 // ============================================================================
@@ -255,6 +271,8 @@ pub struct Savepoint {
     pub n_orig: Pgno,
     /// Savepoint name hash
     pub name_hash: u32,
+    /// Page snapshots captured at savepoint creation
+    pub pages: HashMap<Pgno, PageSnapshot>,
 }
 
 impl Savepoint {
@@ -266,7 +284,17 @@ impl Savepoint {
             orig_db_size: db_size,
             n_orig: db_size,
             name_hash: 0,
+            pages: HashMap::new(),
         }
+    }
+
+    fn snapshot_page(&mut self, pgno: Pgno, data: &[u8], flags: PgFlags) {
+        if pgno > self.orig_db_size {
+            return;
+        }
+        self.pages
+            .entry(pgno)
+            .or_insert_with(|| PageSnapshot::from_data(data, flags));
     }
 }
 
@@ -870,6 +898,12 @@ impl Pager {
             self.begin(true)?;
         }
 
+        if !self.savepoints.is_empty() {
+            for savepoint in &mut self.savepoints {
+                savepoint.snapshot_page(page.pgno, &page.data, page.flags);
+            }
+        }
+
         // Journal the original page content before modification
         if !page.flags.contains(PgFlags::WRITEABLE) {
             self.journal_page(page)?;
@@ -1070,7 +1104,15 @@ impl Pager {
     /// Open a new savepoint (sqlite3PagerOpenSavepoint)
     pub fn open_savepoint(&mut self, n: i32) -> Result<()> {
         while self.savepoints.len() < n as usize {
-            let savepoint = Savepoint::new(self.journal_offset, self.db_size);
+            let mut savepoint = Savepoint::new(self.journal_offset, self.db_size);
+            let mut current = self.pcache.dirty_list();
+            while let Some(page) = current {
+                unsafe {
+                    let page_ref = page.as_ref();
+                    current = page_ref.dirty_next;
+                    savepoint.snapshot_page(page_ref.pgno, &page_ref.data, page_ref.flags);
+                }
+            }
             self.savepoints.push(savepoint);
         }
         Ok(())
@@ -1090,29 +1132,47 @@ impl Pager {
             SavepointOp::Rollback => {
                 // Rollback to savepoint
                 if idx < self.savepoints.len() {
-                    let savepoint = &self.savepoints[idx];
-                    self.db_size = savepoint.orig_db_size;
+                    let (orig_db_size, snapshots) = {
+                        let savepoint = &self.savepoints[idx];
+                        (savepoint.orig_db_size, savepoint.pages.clone())
+                    };
+                    self.db_size = orig_db_size;
+                    self.pcache.truncate(orig_db_size + 1);
 
-                    // Playback sub-journal to restore pages modified after savepoint
-                    // Pages recorded in sub_journal_pages after savepoint.sub_rec
-                    // need to be restored from the main journal
-                    let sub_rec_start = savepoint.sub_rec as usize;
-                    let pages_to_restore: Vec<Pgno> =
-                        self.sub_journal_pages[sub_rec_start..].to_vec();
+                    for (pgno, snapshot) in snapshots {
+                        if let Some(mut cache_page) = self.pcache.fetch(pgno, false) {
+                            unsafe {
+                                let page_ref = cache_page.as_mut();
+                                page_ref.data.copy_from_slice(&snapshot.data);
+                            }
 
-                    for pgno in pages_to_restore {
-                        // Invalidate cache entry - forces re-read from disk on next access
-                        if let Some(cache_page) = self.pcache.fetch(pgno, false) {
-                            self.pcache.make_clean(cache_page);
+                            if snapshot.flags.contains(PgFlags::DIRTY) {
+                                self.pcache.make_dirty(cache_page);
+                            } else {
+                                self.pcache.make_clean(cache_page);
+                            }
+
+                            unsafe {
+                                let page_ref = cache_page.as_mut();
+                                page_ref.flags.remove(PgFlags::WRITEABLE);
+                                page_ref.flags.remove(PgFlags::DONT_WRITE);
+                                page_ref.flags.remove(PgFlags::NEED_SYNC);
+                                if snapshot.flags.contains(PgFlags::WRITEABLE) {
+                                    page_ref.flags.insert(PgFlags::WRITEABLE);
+                                }
+                                if snapshot.flags.contains(PgFlags::DONT_WRITE) {
+                                    page_ref.flags.insert(PgFlags::DONT_WRITE);
+                                }
+                                if snapshot.flags.contains(PgFlags::NEED_SYNC) {
+                                    page_ref.flags.insert(PgFlags::NEED_SYNC);
+                                }
+                            }
+                            self.pcache.release(cache_page);
                         }
                     }
 
-                    // Truncate sub-journal tracking
-                    let sub_rec = savepoint.sub_rec as usize;
-                    self.sub_journal_pages.truncate(sub_rec);
-
-                    // Truncate savepoints to the rolled-back level
-                    self.savepoints.truncate(idx);
+                    // Truncate savepoints to the rolled-back level (keep target)
+                    self.savepoints.truncate(idx + 1);
                 }
             }
             SavepointOp::Begin => {

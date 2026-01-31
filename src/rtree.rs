@@ -211,6 +211,21 @@ impl RtreeTable {
         results
     }
 
+    /// Get an entry by rowid (O(1) lookup via rowid_map)
+    pub fn get(&self, rowid: i64) -> Option<RtreeResult> {
+        let leaf_id = self.rowid_map.get(&rowid)?;
+        let node = self.nodes.get(leaf_id)?;
+        for entry in &node.entries {
+            if entry.id == rowid {
+                return Some(RtreeResult {
+                    rowid: entry.id,
+                    bbox: entry.bbox.clone(),
+                });
+            }
+        }
+        None
+    }
+
     fn test_constraint(&self, constraint: &RtreeConstraint, bbox: &RtreeBbox) -> bool {
         match constraint {
             RtreeConstraint::Overlap(query) => bbox.overlaps(query),

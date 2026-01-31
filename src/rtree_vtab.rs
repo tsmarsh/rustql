@@ -307,36 +307,83 @@ impl VtabCursor for RtreeVtabCursorAdapter {
         let idx_type = index_num & 0xFF;
 
         if idx_type == 1 && !constraints.is_empty() {
-            // ID lookup
+            // ID lookup - use O(1) rowid_map lookup
             let id = constraints[0].as_int();
-            // Do a full scan and filter by ID
-            let all_results = table.query(RtreeConstraint::Overlap(RtreeBbox::new(self.n_dim)?));
-            self.results = all_results.into_iter().filter(|r| r.rowid == id).collect();
+            if let Some(result) = table.get(id) {
+                self.results = vec![result];
+            } else {
+                self.results = Vec::new();
+            }
         } else if idx_type == 2 {
             // Spatial query - build bounding box from constraints
-            let mut min_coords = vec![f64::NEG_INFINITY; self.n_dim];
-            let mut max_coords = vec![f64::INFINITY; self.n_dim];
+            // R-tree columns: 0=id, 1=minX, 2=maxX, 3=minY, 4=maxY, ...
+            // For n_dim dimensions, we have 2*n_dim coordinate columns
+            let mut query_min = vec![f64::NEG_INFINITY; self.n_dim];
+            let mut query_max = vec![f64::INFINITY; self.n_dim];
 
-            // Parse constraints to build query box
-            // This is a simplified implementation
-            for (i, cv) in constraints.iter().enumerate() {
-                let dim = i / 2;
-                let is_max = i % 2 == 1;
-                if dim < self.n_dim {
-                    let val = cv.as_float();
-                    if is_max {
-                        max_coords[dim] = max_coords[dim].min(val);
-                    } else {
-                        min_coords[dim] = min_coords[dim].max(val);
+            // Process each constraint based on its column and operator
+            for cv in constraints {
+                let col = cv.col_idx as usize;
+                if col == 0 {
+                    continue; // Skip id column in spatial query
+                }
+                if col > self.n_dim * 2 {
+                    continue; // Invalid column
+                }
+
+                // Column layout: 1=minX, 2=maxX, 3=minY, 4=maxY, ...
+                // So: dim = (col-1) / 2, is_max_col = (col-1) % 2 == 1
+                let coord_idx = col - 1;
+                let dim = coord_idx / 2;
+                let is_max_col = coord_idx % 2 == 1;
+                let val = cv.as_float();
+
+                // Build query bounds based on operator and whether it's a min or max column
+                // For overlap queries:
+                // - minX >= value means we want entries that could overlap with x >= value
+                //   So query_min[dim] = max(query_min[dim], value)
+                // - maxX <= value means we want entries that could overlap with x <= value
+                //   So query_max[dim] = min(query_max[dim], value)
+                match cv.op {
+                    crate::vtab::SQLITE_INDEX_CONSTRAINT_EQ => {
+                        // Equality on min or max column
+                        if is_max_col {
+                            query_max[dim] = query_max[dim].min(val);
+                        } else {
+                            query_min[dim] = query_min[dim].max(val);
+                        }
                     }
+                    crate::vtab::SQLITE_INDEX_CONSTRAINT_GT
+                    | crate::vtab::SQLITE_INDEX_CONSTRAINT_GE => {
+                        // Lower bound constraint
+                        if is_max_col {
+                            // maxX >= value: query needs max >= value
+                            query_min[dim] = query_min[dim].max(val);
+                        } else {
+                            // minX >= value: tighten lower bound
+                            query_min[dim] = query_min[dim].max(val);
+                        }
+                    }
+                    crate::vtab::SQLITE_INDEX_CONSTRAINT_LT
+                    | crate::vtab::SQLITE_INDEX_CONSTRAINT_LE => {
+                        // Upper bound constraint
+                        if is_max_col {
+                            // maxX <= value: tighten upper bound
+                            query_max[dim] = query_max[dim].min(val);
+                        } else {
+                            // minX <= value: query needs min <= value
+                            query_max[dim] = query_max[dim].min(val);
+                        }
+                    }
+                    _ => {}
                 }
             }
 
-            // Build query bbox
+            // Build query bbox from computed bounds
             let mut coords = Vec::with_capacity(self.n_dim * 2);
             for i in 0..self.n_dim {
-                coords.push(min_coords[i]);
-                coords.push(max_coords[i]);
+                coords.push(query_min[i]);
+                coords.push(query_max[i]);
             }
 
             if let Ok(bbox) = RtreeBbox::from_coords(&coords) {

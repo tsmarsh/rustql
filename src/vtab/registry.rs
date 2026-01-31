@@ -242,6 +242,113 @@ impl VtabRegistry {
 
         Ok(())
     }
+
+    // ========================================================================
+    // Transaction callbacks
+    // ========================================================================
+
+    /// Begin a transaction on all virtual tables
+    ///
+    /// This should be called when a write transaction starts on the database.
+    /// Each virtual table's `begin()` method is called.
+    pub fn begin_all(&self) -> Result<()> {
+        let instances = self.instances.read().map_err(|_| {
+            Error::with_message(ErrorCode::Internal, "failed to acquire registry lock")
+        })?;
+
+        for table in instances.values() {
+            table.begin()?;
+        }
+
+        Ok(())
+    }
+
+    /// Sync all virtual tables before commit
+    ///
+    /// This should be called before committing a transaction. Each virtual
+    /// table's `sync()` method is called to ensure data is flushed.
+    pub fn sync_all(&self) -> Result<()> {
+        let instances = self.instances.read().map_err(|_| {
+            Error::with_message(ErrorCode::Internal, "failed to acquire registry lock")
+        })?;
+
+        for table in instances.values() {
+            table.sync()?;
+        }
+
+        Ok(())
+    }
+
+    /// Commit a transaction on all virtual tables
+    ///
+    /// This should be called when a transaction is committed. Each virtual
+    /// table's `commit()` method is called.
+    pub fn commit_all(&self) -> Result<()> {
+        let instances = self.instances.read().map_err(|_| {
+            Error::with_message(ErrorCode::Internal, "failed to acquire registry lock")
+        })?;
+
+        for table in instances.values() {
+            table.commit()?;
+        }
+
+        Ok(())
+    }
+
+    /// Rollback a transaction on all virtual tables
+    ///
+    /// This should be called when a transaction is rolled back. Each virtual
+    /// table's `rollback()` method is called.
+    pub fn rollback_all(&self) -> Result<()> {
+        let instances = self.instances.read().map_err(|_| {
+            Error::with_message(ErrorCode::Internal, "failed to acquire registry lock")
+        })?;
+
+        for table in instances.values() {
+            table.rollback()?;
+        }
+
+        Ok(())
+    }
+
+    /// Create a savepoint on all virtual tables
+    pub fn savepoint_all(&self, point: i32) -> Result<()> {
+        let instances = self.instances.read().map_err(|_| {
+            Error::with_message(ErrorCode::Internal, "failed to acquire registry lock")
+        })?;
+
+        for table in instances.values() {
+            table.savepoint(point)?;
+        }
+
+        Ok(())
+    }
+
+    /// Release a savepoint on all virtual tables
+    pub fn release_all(&self, point: i32) -> Result<()> {
+        let instances = self.instances.read().map_err(|_| {
+            Error::with_message(ErrorCode::Internal, "failed to acquire registry lock")
+        })?;
+
+        for table in instances.values() {
+            table.release(point)?;
+        }
+
+        Ok(())
+    }
+
+    /// Rollback to a savepoint on all virtual tables
+    pub fn rollback_to_all(&self, point: i32) -> Result<()> {
+        let instances = self.instances.read().map_err(|_| {
+            Error::with_message(ErrorCode::Internal, "failed to acquire registry lock")
+        })?;
+
+        for table in instances.values() {
+            table.rollback_to(point)?;
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for VtabRegistry {

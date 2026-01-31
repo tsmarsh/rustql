@@ -3219,6 +3219,10 @@ impl Vdbe {
                     if current != TransactionState::Write {
                         btree.begin_trans(true)?;
                         conn.transaction_state = TransactionState::Write;
+                        // Call begin() on all virtual tables
+                        if let Some(ref registry) = self.vtab_registry {
+                            let _ = registry.begin_all();
+                        }
                     }
                 } else if current == TransactionState::None {
                     btree.begin_trans(false)?;
@@ -3287,6 +3291,10 @@ impl Vdbe {
                 }
 
                 if rollback {
+                    // Call rollback on all virtual tables first
+                    if let Some(ref registry) = self.vtab_registry {
+                        let _ = registry.rollback_all();
+                    }
                     if let Some(ref btree) = self.btree {
                         let _ = btree.rollback(0, false);
                     }
@@ -3330,15 +3338,28 @@ impl Vdbe {
                             ));
                         }
                     }
+                    // Sync and commit all virtual tables before btree commit
+                    if let Some(ref registry) = self.vtab_registry {
+                        registry.sync_all()?;
+                    }
                     if let Some(ref btree) = self.btree {
                         btree.commit()?;
+                    }
+                    // Commit virtual tables after btree commit succeeds
+                    if let Some(ref registry) = self.vtab_registry {
+                        let _ = registry.commit_all();
                     }
                     conn.transaction_state = TransactionState::None;
                     conn.autocommit.store(true, AtomicOrdering::SeqCst);
                     conn.savepoints.clear();
                     conn.is_transaction_savepoint = false;
                 } else {
+                    // Starting a new transaction (autocommit=0)
                     conn.autocommit.store(false, AtomicOrdering::SeqCst);
+                    // Call begin on all virtual tables
+                    if let Some(ref registry) = self.vtab_registry {
+                        let _ = registry.begin_all();
+                    }
                 }
             }
 
@@ -5009,6 +5030,7 @@ impl Vdbe {
 
                 match op.p1 {
                     0 => {
+                        // Begin savepoint
                         if conn.autocommit.load(AtomicOrdering::SeqCst) {
                             conn.autocommit.store(false, AtomicOrdering::SeqCst);
                             conn.is_transaction_savepoint = true;
@@ -5016,6 +5038,10 @@ impl Vdbe {
                         let idx = conn.savepoints.len() as i32;
                         btree.savepoint(SavepointOp::Begin, idx)?;
                         conn.savepoints.push(name.to_string());
+                        // Notify virtual tables about savepoint
+                        if let Some(ref registry) = self.vtab_registry {
+                            let _ = registry.savepoint_all(idx);
+                        }
                     }
                     1 | 2 => {
                         let pos = conn
@@ -5030,7 +5056,12 @@ impl Vdbe {
                         };
                         let idx = pos as i32;
                         if op.p1 == 1 {
+                            // Release savepoint
                             btree.savepoint(SavepointOp::Release, idx)?;
+                            // Notify virtual tables about release
+                            if let Some(ref registry) = self.vtab_registry {
+                                let _ = registry.release_all(idx);
+                            }
                             conn.savepoints.truncate(pos);
                             if conn.savepoints.is_empty() && conn.is_transaction_savepoint {
                                 if self.deferred_fk_counter > 0 {
@@ -5041,6 +5072,10 @@ impl Vdbe {
                                 }
                                 if let Some(hook) = conn.commit_hook.as_ref() {
                                     if hook() {
+                                        // Rollback vtabs before btree
+                                        if let Some(ref registry) = self.vtab_registry {
+                                            let _ = registry.rollback_all();
+                                        }
                                         let _ = btree.rollback(0, false);
                                         if let Some(hook) = conn.rollback_hook.as_ref() {
                                             hook();
@@ -5055,12 +5090,25 @@ impl Vdbe {
                                         ));
                                     }
                                 }
+                                // Sync virtual tables before commit
+                                if let Some(ref registry) = self.vtab_registry {
+                                    registry.sync_all()?;
+                                }
                                 btree.commit()?;
+                                // Commit virtual tables after btree commit
+                                if let Some(ref registry) = self.vtab_registry {
+                                    let _ = registry.commit_all();
+                                }
                                 conn.transaction_state = TransactionState::None;
                                 conn.autocommit.store(true, AtomicOrdering::SeqCst);
                                 conn.is_transaction_savepoint = false;
                             }
                         } else {
+                            // Rollback to savepoint
+                            // Notify virtual tables about rollback first
+                            if let Some(ref registry) = self.vtab_registry {
+                                let _ = registry.rollback_to_all(idx);
+                            }
                             btree.savepoint(SavepointOp::Rollback, idx)?;
                             conn.reload_schema()?;
                             conn.savepoints.truncate(pos + 1);

@@ -29,11 +29,13 @@
 //! ```
 
 mod cursor;
+mod declare_vtab;
 mod index_info;
 mod module;
 mod registry;
 
 pub use cursor::VtabCursor;
+pub use declare_vtab::{declare_vtab, DeclaredColumn, DeclaredSchema};
 pub use index_info::{
     ConstraintUsage, ConstraintValue, IndexConstraint, IndexInfo, OrderBy,
     SQLITE_INDEX_CONSTRAINT_EQ, SQLITE_INDEX_CONSTRAINT_GE, SQLITE_INDEX_CONSTRAINT_GLOB,

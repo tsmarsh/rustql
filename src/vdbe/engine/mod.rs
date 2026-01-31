@@ -1600,15 +1600,15 @@ impl Vdbe {
                         if let Some(ref tname) = table_name {
                             if let Some(ref schema) = self.schema {
                                 if let Ok(schema_guard) = schema.read() {
-                                    // First try as a table
-                                    if let Some(table) = schema_guard.tables.get(tname) {
+                                    // First try as a table (case-insensitive lookup)
+                                    let tname_lower = tname.to_lowercase();
+                                    if let Some(table) = schema_guard.tables.get(&tname_lower) {
                                         root_page = table.root_page;
                                         table_meta = Some(std::sync::Arc::clone(table));
                                     }
                                     // If not found as table, try as index
                                     if root_page == 0 {
-                                        if let Some(index) =
-                                            schema_guard.indexes.get(&tname.to_lowercase())
+                                        if let Some(index) = schema_guard.indexes.get(&tname_lower)
                                         {
                                             root_page = index.root_page;
                                             is_index = true;
@@ -1619,7 +1619,6 @@ impl Vdbe {
 
                                     // Also search for auto-indexes in table.indexes
                                     if root_page == 0 && !is_index {
-                                        let tname_lower = tname.to_lowercase();
                                         for (_table_name, tbl) in schema_guard.tables.iter() {
                                             for idx in &tbl.indexes {
                                                 if idx.name.to_lowercase() == tname_lower {
@@ -2378,7 +2377,9 @@ impl Vdbe {
                         } else if let Some(ref table_name) = cursor.table_name {
                             if let Some(ref schema) = self.schema {
                                 if let Ok(schema_guard) = schema.read() {
-                                    if let Some(table) = schema_guard.tables.get(table_name) {
+                                    if let Some(table) =
+                                        schema_guard.tables.get(&table_name.to_lowercase())
+                                    {
                                         for (i, col) in table.columns.iter().enumerate() {
                                             if col.name.eq_ignore_ascii_case(col_name) {
                                                 col_idx = i;
@@ -2578,7 +2579,9 @@ impl Vdbe {
                         if let Some(ref table_name) = cursor.table_name {
                             if let Some(ref schema) = self.schema {
                                 if let Ok(schema_guard) = schema.read() {
-                                    if let Some(table) = schema_guard.tables.get(table_name) {
+                                    if let Some(table) =
+                                        schema_guard.tables.get(&table_name.to_lowercase())
+                                    {
                                         affinity = table.columns.get(col_idx).map(|c| c.affinity);
                                     }
                                 }

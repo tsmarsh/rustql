@@ -1130,10 +1130,10 @@ impl SqliteConnection {
     /// Attach a database file under a schema name
     pub fn attach_database(&mut self, filename: &str, schema_name: &str) -> Result<()> {
         let schema_lower = schema_name.to_lowercase();
-        if schema_lower.is_empty() || schema_lower == "main" || schema_lower == "temp" {
+        if schema_lower.is_empty() {
             return Err(Error::with_message(
                 ErrorCode::Error,
-                format!("cannot attach database {}", schema_name),
+                "cannot attach database",
             ));
         }
         if schema_lower.starts_with("sqlite_") {
@@ -1142,10 +1142,14 @@ impl SqliteConnection {
                 format!("cannot attach database {}", schema_name),
             ));
         }
-        if self
-            .dbs
-            .iter()
-            .any(|db| db.name.eq_ignore_ascii_case(schema_name))
+        // Check if the name is already in use (including main and temp)
+        // SQLite uses "database X is already in use" for all existing names
+        if schema_lower == "main"
+            || schema_lower == "temp"
+            || self
+                .dbs
+                .iter()
+                .any(|db| db.name.eq_ignore_ascii_case(schema_name))
         {
             return Err(Error::with_message(
                 ErrorCode::Error,
@@ -1163,12 +1167,8 @@ impl SqliteConnection {
             ));
         }
 
-        if self.transaction_state != TransactionState::None {
-            return Err(Error::with_message(
-                ErrorCode::Error,
-                "cannot ATTACH database within transaction",
-            ));
-        }
+        // Note: SQLite allows ATTACH within transactions, so we don't check transaction_state here
+        // DETACH has stricter requirements (no references to the database)
 
         let auth = self.authorize(
             AuthAction::Attach,
@@ -1209,7 +1209,9 @@ impl SqliteConnection {
                 )
             })?;
 
-        if self.dbs[idx].busy || self.transaction_state != TransactionState::None {
+        // Only check if the database is actively busy, not just in a transaction
+        // SQLite allows DETACH within transactions if the db isn't currently in use
+        if self.dbs[idx].busy {
             return Err(Error::with_message(
                 ErrorCode::Busy,
                 format!("database {} is locked", schema_name),

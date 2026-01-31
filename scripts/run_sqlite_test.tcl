@@ -104,6 +104,7 @@ array set sqlite_options {
     tcl 1
     windowfunc 1
     json 1
+    json1 1
     fts3 1
     fts5 1
     rtree 1

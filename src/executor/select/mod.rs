@@ -23,6 +23,9 @@ use crate::parser::ast::{
 use crate::schema::{Affinity, Table};
 use crate::vdbe::ops::{affinity as vdbe_affinity, Opcode, VdbeOp, P4};
 
+/// Maximum number of tables allowed in a single join (matches SQLite BMS)
+const MAX_TABLES_IN_JOIN: usize = 64;
+
 // ============================================================================
 // Select Compiler State
 // ============================================================================
@@ -2721,6 +2724,16 @@ impl<'s> SelectCompiler<'s> {
         // Open cursors for each source item
         for (i, item) in src_list.items.iter().enumerate() {
             self.compile_src_item(item, i)?;
+        }
+
+        // Check table count limit (matches SQLite's BMS check in where.c)
+        // Only count tables added by this FROM clause (not outer query tables)
+        let local_tables = self.tables.len() - self.outer_tables_boundary;
+        if local_tables > MAX_TABLES_IN_JOIN {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                format!("at most {} tables in a join", MAX_TABLES_IN_JOIN),
+            ));
         }
 
         // Process join constraints (NATURAL, USING, ON) and add to join_conditions

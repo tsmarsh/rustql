@@ -1168,18 +1168,31 @@ pub fn parse_create_index_sql(sql: &str, _is_unique: bool) -> Option<Index> {
         if col.is_empty() {
             continue;
         }
-        // Handle "colname ASC" or "colname DESC"
+        // Handle "colname [COLLATE name] [ASC|DESC]"
         let parts: Vec<&str> = col.split_whitespace().collect();
         let col_name = parts.first()?.to_string();
-        let sort_order = if parts
-            .get(1)
-            .map(|s| s.to_uppercase() == "DESC")
-            .unwrap_or(false)
-        {
-            SortOrder::Desc
-        } else {
-            SortOrder::Asc
-        };
+
+        // Look for COLLATE clause
+        let mut collation = DEFAULT_COLLATION.to_string();
+        let mut sort_order = SortOrder::Asc;
+
+        let mut i = 1;
+        while i < parts.len() {
+            let part_upper = parts[i].to_uppercase();
+            if part_upper == "COLLATE" && i + 1 < parts.len() {
+                collation = parts[i + 1].to_uppercase();
+                i += 2;
+            } else if part_upper == "ASC" {
+                sort_order = SortOrder::Asc;
+                i += 1;
+            } else if part_upper == "DESC" {
+                sort_order = SortOrder::Desc;
+                i += 1;
+            } else {
+                i += 1;
+            }
+        }
+
         columns.push(IndexColumn {
             column_idx: -1, // Will be resolved later when we have table schema
             expr: Some(Expr::Column {
@@ -1187,7 +1200,7 @@ pub fn parse_create_index_sql(sql: &str, _is_unique: bool) -> Option<Index> {
                 column: col_name,
             }),
             sort_order,
-            collation: DEFAULT_COLLATION.to_string(),
+            collation,
         });
     }
 

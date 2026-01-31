@@ -1807,14 +1807,41 @@ impl<'s> StatementCompiler<'s> {
             .columns
             .iter()
             .map(|c| {
-                let name = match &c.column {
-                    crate::parser::ast::IndexedColumnKind::Name(n) => n.clone(),
-                    crate::parser::ast::IndexedColumnKind::Expr(e) => self.expr_to_sql(e),
+                // Extract column name and collation, handling both Name and Expr cases
+                // When the parser sees "x COLLATE NOCASE", it may parse it as
+                // Expr::Collate { expr: Column("x"), collation: "NOCASE" }
+                let (name, collation) = match &c.column {
+                    crate::parser::ast::IndexedColumnKind::Name(n) => {
+                        (n.clone(), c.collation.clone())
+                    }
+                    crate::parser::ast::IndexedColumnKind::Expr(e) => {
+                        // Check if it's a Collate expression wrapping a column
+                        if let Expr::Collate { expr, collation } = e.as_ref() {
+                            if let Expr::Column(col) = expr.as_ref() {
+                                // Column with collation parsed as expression
+                                (col.column.clone(), Some(collation.clone()))
+                            } else {
+                                // Complex expression with collation
+                                (
+                                    format!("{} COLLATE {}", self.expr_to_sql(expr), collation),
+                                    None,
+                                )
+                            }
+                        } else {
+                            (self.expr_to_sql(e), c.collation.clone())
+                        }
+                    }
+                };
+                // Build column spec with optional COLLATE and ORDER
+                let with_collate = if let Some(ref coll) = collation {
+                    format!("{} COLLATE {}", name, coll)
+                } else {
+                    name
                 };
                 match c.order {
-                    Some(crate::parser::ast::SortOrder::Asc) => format!("{} ASC", name),
-                    Some(crate::parser::ast::SortOrder::Desc) => format!("{} DESC", name),
-                    None => name,
+                    Some(crate::parser::ast::SortOrder::Asc) => format!("{} ASC", with_collate),
+                    Some(crate::parser::ast::SortOrder::Desc) => format!("{} DESC", with_collate),
+                    None => with_collate,
                 }
             })
             .collect();
@@ -1861,29 +1888,55 @@ impl<'s> StatementCompiler<'s> {
         ));
 
         // Populate the index with existing table data
-        // Get column indices for the indexed columns
-        let indexed_col_indices: Vec<usize> = if let Some(schema) = self.schema {
-            if let Some(table) = schema.tables.get(&table_name_lower) {
-                create
-                    .columns
-                    .iter()
-                    .filter_map(|c| {
-                        let col_name = match &c.column {
-                            crate::parser::ast::IndexedColumnKind::Name(n) => n.clone(),
-                            crate::parser::ast::IndexedColumnKind::Expr(_) => return None,
-                        };
-                        table
-                            .columns
-                            .iter()
-                            .position(|tc| tc.name.eq_ignore_ascii_case(&col_name))
-                    })
-                    .collect()
+        // Get column indices and collations for the indexed columns
+        let (indexed_col_indices, index_collations): (Vec<usize>, Vec<String>) =
+            if let Some(schema) = self.schema {
+                if let Some(table) = schema.tables.get(&table_name_lower) {
+                    create
+                        .columns
+                        .iter()
+                        .filter_map(|c| {
+                            // Extract column name and explicit collation, handling both Name and Expr cases
+                            let (col_name, explicit_collation) = match &c.column {
+                                crate::parser::ast::IndexedColumnKind::Name(n) => {
+                                    (n.clone(), c.collation.clone())
+                                }
+                                crate::parser::ast::IndexedColumnKind::Expr(e) => {
+                                    // Handle Collate expression wrapping a column
+                                    if let Expr::Collate { expr, collation } = e.as_ref() {
+                                        if let Expr::Column(col) = expr.as_ref() {
+                                            (col.column.clone(), Some(collation.clone()))
+                                        } else {
+                                            return None;
+                                        }
+                                    } else if let Expr::Column(col) = e.as_ref() {
+                                        (col.column.clone(), c.collation.clone())
+                                    } else {
+                                        return None;
+                                    }
+                                }
+                            };
+                            let col_idx = table
+                                .columns
+                                .iter()
+                                .position(|tc| tc.name.eq_ignore_ascii_case(&col_name))?;
+                            // Determine collation: explicit COLLATE > table column > BINARY
+                            let collation = explicit_collation.unwrap_or_else(|| {
+                                table
+                                    .columns
+                                    .get(col_idx)
+                                    .map(|c| c.collation.to_uppercase())
+                                    .unwrap_or_else(|| "BINARY".to_string())
+                            });
+                            Some((col_idx, collation))
+                        })
+                        .unzip()
+                } else {
+                    (Vec::new(), Vec::new())
+                }
             } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
+                (Vec::new(), Vec::new())
+            };
 
         if !indexed_col_indices.is_empty() {
             let table_cursor = 1;
@@ -1909,13 +1962,21 @@ impl<'s> StatementCompiler<'s> {
                 P4::Text(table_name.to_string()),
             ));
 
+            // Build KeyInfo with collations for the index
+            use crate::vdbe::ops::KeyInfo;
+            let key_info = KeyInfo {
+                collations: index_collations.clone(),
+                sort_orders: vec![false; index_collations.len()],
+                n_key_field: index_collations.len() as u16,
+            };
+
             // OpenWrite index cursor using root page from register
             ops.push(Self::make_op_with_p5(
                 Opcode::OpenWrite,
                 index_cursor,
                 reg_root_page,
                 (num_key_cols + 1) as i32, // +1 for rowid
-                P4::Unused,
+                P4::KeyInfo(std::sync::Arc::new(key_info)),
                 0x02, // P2 is register
             ));
 

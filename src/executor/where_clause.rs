@@ -853,17 +853,6 @@ impl QueryPlanner {
         // Generate virtual range terms for each LIKE term
         for (like_idx, col_expr, pattern_expr, op, left_col, mask) in like_terms {
             if let Some((prefix, upper_bound)) = Self::extract_like_bounds(&pattern_expr, op) {
-                // Check if the LIKE pattern is fully satisfied by the range bounds
-                // This is true when the pattern is "prefix%" with no other wildcards
-                let is_complete = Self::like_pattern_complete(&pattern_expr, op);
-
-                // Mark the original LIKE term as fully optimized if complete
-                if is_complete {
-                    if let Some(term) = self.where_clause.terms.get_mut(like_idx) {
-                        term.flags |= WhereTermFlags::LIKE_OPT_COMPLETE;
-                    }
-                }
-
                 // Determine required collation for the LIKE range terms:
                 // - case_sensitive_like=ON: requires BINARY collation index
                 // - case_sensitive_like=OFF: requires NOCASE collation index
@@ -873,6 +862,25 @@ impl QueryPlanner {
                 } else {
                     Some("NOCASE".to_string())
                 };
+
+                // Check if the LIKE pattern is fully satisfied by the range bounds
+                // This is true when:
+                // 1. The pattern is "prefix%" with no other wildcards
+                // 2. We're using BINARY collation (case-sensitive)
+                //
+                // For NOCASE collation, the range scan can include false positives
+                // (e.g., 'ABxy' falls between 'abc' and 'abd' but doesn't start with 'abc')
+                // so we must still verify with the LIKE function.
+                let is_case_sensitive = matches!(op, LikeOp::Glob) || self.case_sensitive_like;
+                let is_complete =
+                    is_case_sensitive && Self::like_pattern_complete(&pattern_expr, op);
+
+                // Mark the original LIKE term as fully optimized if complete
+                if is_complete {
+                    if let Some(term) = self.where_clause.terms.get_mut(like_idx) {
+                        term.flags |= WhereTermFlags::LIKE_OPT_COMPLETE;
+                    }
+                }
 
                 // Create lower bound term: col >= 'prefix'
                 let lower_idx = self.where_clause.terms.len() as i32;

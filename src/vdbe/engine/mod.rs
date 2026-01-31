@@ -1792,7 +1792,32 @@ impl Vdbe {
                 let mut table_found = false;
                 let mut is_temp_table = false;
                 let mut index_collations: Vec<String> = Vec::new();
-                if let P4::Text(name) = &op.p4 {
+                let mut provided_key_info: Option<std::sync::Arc<crate::storage::btree::KeyInfo>> =
+                    None;
+
+                // Check for directly provided KeyInfo (e.g., during CREATE INDEX)
+                if let P4::KeyInfo(ki) = &op.p4 {
+                    // Convert vdbe::ops::KeyInfo to storage::btree::KeyInfo
+                    use crate::storage::btree::{CollSeq, KeyInfo as BtreeKeyInfo};
+                    let collseqs: Vec<CollSeq> = ki
+                        .collations
+                        .iter()
+                        .map(|s| {
+                            if s.eq_ignore_ascii_case("NOCASE") {
+                                CollSeq::NoCase
+                            } else if s.eq_ignore_ascii_case("RTRIM") {
+                                CollSeq::RTrim
+                            } else {
+                                CollSeq::Binary
+                            }
+                        })
+                        .collect();
+                    provided_key_info = Some(std::sync::Arc::new(BtreeKeyInfo::with_collations(
+                        collseqs.len() as u16,
+                        collseqs,
+                    )));
+                    is_index = true; // KeyInfo implies index
+                } else if let P4::Text(name) = &op.p4 {
                     table_name = Some(name.clone());
                     if let Some(ref schema) = self.schema {
                         if let Ok(schema_guard) = schema.read() {
@@ -1902,7 +1927,10 @@ impl Vdbe {
                         if let Some(ref btree) = btree {
                             let flags = BtreeCursorFlags::WRCSR;
                             // Create KeyInfo with collations for index cursors
-                            let key_info = if is_index && !index_collations.is_empty() {
+                            // Prefer directly provided KeyInfo (from CREATE INDEX), otherwise build from schema
+                            let key_info = if let Some(ki) = provided_key_info.clone() {
+                                Some(ki)
+                            } else if is_index && !index_collations.is_empty() {
                                 use crate::storage::btree::{CollSeq, KeyInfo};
                                 let collseqs: Vec<CollSeq> = index_collations
                                     .iter()
@@ -5892,7 +5920,7 @@ impl Vdbe {
                                     let index_name_lower = index.name.to_lowercase();
                                     let table_name_lower = index.table.to_lowercase();
 
-                                    // Resolve column indices from table schema
+                                    // Resolve column indices and inherit collations from table schema
                                     if let Some(table) = schema_guard.tables.get(&table_name_lower)
                                     {
                                         for ic in &mut index.columns {
@@ -5908,6 +5936,24 @@ impl Vdbe {
                                                         })
                                                     {
                                                         ic.column_idx = pos as i32;
+                                                        // Inherit collation from table column if not explicitly set
+                                                        if ic
+                                                            .collation
+                                                            .eq_ignore_ascii_case("BINARY")
+                                                        {
+                                                            if let Some(table_col) =
+                                                                table.columns.get(pos)
+                                                            {
+                                                                if !table_col
+                                                                    .collation
+                                                                    .eq_ignore_ascii_case("BINARY")
+                                                                {
+                                                                    ic.collation = table_col
+                                                                        .collation
+                                                                        .to_uppercase();
+                                                                }
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }

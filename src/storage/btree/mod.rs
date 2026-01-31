@@ -5614,11 +5614,6 @@ impl BtCursor {
     /// Moves cursor to the entry matching the unpacked record key.
     /// Uses KeyInfo collations if available for proper comparison.
     pub fn index_moveto(&mut self, search_key: &UnpackedRecord) -> Result<i32> {
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "DEBUG index_moveto: cursor_has_key_info={}",
-            self.key_info.is_some()
-        );
         let shared = self
             .bt_shared
             .upgrade()

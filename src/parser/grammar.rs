@@ -210,6 +210,13 @@ impl<'a> Parser<'a> {
     // ========================================================================
 
     fn parse_select_stmt(&mut self) -> Result<SelectStmt> {
+        // Check for optional WITH clause (CTEs can precede SELECT in various contexts)
+        let with = if self.check(TokenKind::With) {
+            Some(self.parse_with_clause()?)
+        } else {
+            None
+        };
+
         let body = self.parse_select_body()?;
 
         let order_by = if self.match_token(TokenKind::Order) {
@@ -226,7 +233,7 @@ impl<'a> Parser<'a> {
         };
 
         Ok(SelectStmt {
-            with: None,
+            with,
             body,
             order_by,
             limit,

@@ -6132,19 +6132,43 @@ impl<'s> SelectCompiler<'s> {
                 escape,
             } => {
                 // Compile LIKE/GLOB expression using Function opcode (SQLite style)
-                // Args stored in consecutive registers: [pattern, text, optional_escape]
-                let args_base = self.alloc_reg();
-                self.compile_expr(pattern, args_base)?;
-                let text_reg = self.alloc_reg();
-                self.compile_expr(text_expr, text_reg)?;
+                // Args must be in consecutive registers: [pattern, text, optional_escape]
+                //
+                // IMPORTANT: We must compile all expressions first, THEN allocate
+                // consecutive registers for the function call. This is because
+                // compile_expr for complex expressions (like Concat) uses intermediate
+                // registers, which would break the consecutive layout.
 
-                let argc = if let Some(esc_expr) = escape {
-                    let esc_reg = self.alloc_reg();
-                    self.compile_expr(esc_expr, esc_reg)?;
-                    3
+                // 1. Compile pattern to a temporary register
+                let temp_pattern = self.alloc_reg();
+                self.compile_expr(pattern, temp_pattern)?;
+
+                // 2. Compile text expression to a temporary register
+                let temp_text = self.alloc_reg();
+                self.compile_expr(text_expr, temp_text)?;
+
+                // 3. Compile escape expression if present
+                let temp_escape = if escape.is_some() {
+                    let temp = self.alloc_reg();
+                    self.compile_expr(escape.as_ref().unwrap(), temp)?;
+                    Some(temp)
                 } else {
-                    2
+                    None
                 };
+
+                // 4. Now allocate consecutive registers for the function call
+                let argc = if temp_escape.is_some() { 3 } else { 2 };
+                let args_base = self.alloc_reg();
+                for _ in 1..argc {
+                    self.alloc_reg();
+                }
+
+                // 5. Copy values to consecutive registers
+                self.emit(Opcode::Copy, temp_pattern, args_base, 0, P4::Unused);
+                self.emit(Opcode::Copy, temp_text, args_base + 1, 0, P4::Unused);
+                if let Some(te) = temp_escape {
+                    self.emit(Opcode::Copy, te, args_base + 2, 0, P4::Unused);
+                }
 
                 let func_name = match op {
                     crate::parser::ast::LikeOp::Like => "like",

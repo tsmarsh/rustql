@@ -4086,8 +4086,11 @@ impl<'s> SelectCompiler<'s> {
         match table_ref {
             TableRef::Table { name, alias, .. } => {
                 let cursor = self.alloc_cursor();
+                // Use just the table name for internal lookups
                 let table_name = &name.name;
                 let table_name_lower = table_name.to_lowercase();
+                // Use full qualified name (schema.table) for VDBE if schema is specified
+                let qualified_name = name.to_string();
 
                 // Look up table in schema if available
                 let schema_table = if table_name_lower == "sqlite_master"
@@ -4324,7 +4327,14 @@ impl<'s> SelectCompiler<'s> {
                 };
 
                 // Open the table (read mode)
-                self.emit(Opcode::OpenRead, cursor, 0, 0, P4::Text(table_name.clone()));
+                // Use qualified_name to support attached database references like "db.table"
+                self.emit(
+                    Opcode::OpenRead,
+                    cursor,
+                    0,
+                    0,
+                    P4::Text(qualified_name.clone()),
+                );
 
                 self.tables.push(TableInfo {
                     name: alias.clone().unwrap_or_else(|| table_name.clone()),

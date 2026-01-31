@@ -459,11 +459,7 @@ fn pragma_page_count(conn: &SqliteConnection) -> Result<PragmaResult> {
                 .shared
                 .read()
                 .map_err(|_| Error::new(ErrorCode::Internal))?;
-            let count = if shared.n_page > 0 {
-                shared.n_page
-            } else {
-                shared.pager.file_page_count().unwrap_or(0)
-            };
+            let count = shared.pager.page_count();
             return Ok(single_int_result(count as i64));
         }
     }

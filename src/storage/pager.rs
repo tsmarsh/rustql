@@ -1539,11 +1539,7 @@ impl Pager {
 
     /// Get page count (sqlite3PagerPagecount)
     pub fn page_count(&self) -> Pgno {
-        if self.db_file_size > 0 {
-            self.db_file_size
-        } else {
-            self.db_size
-        }
+        self.db_size.max(self.db_file_size)
     }
 
     /// Get page count from file size.

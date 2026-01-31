@@ -3414,6 +3414,16 @@ impl<'s> SelectCompiler<'s> {
             }
         }
 
+        // Check if ORDER BY is on the INTEGER PRIMARY KEY (rowid)
+        // Table scans are naturally in rowid order, so no sorting needed
+        if let Some(ipk_idx) = schema_table.rowid_alias_column() {
+            let ipk_col_name = &schema_table.columns[ipk_idx].name;
+            if ipk_col_name.eq_ignore_ascii_case(order_col) {
+                // ORDER BY is on the rowid column - natural table scan order works
+                return true;
+            }
+        }
+
         // If no WHERE clause or WHERE doesn't use a suitable index,
         // search ALL indexes on the table for one that matches ORDER BY
         // This allows index scan to be used purely for ordering

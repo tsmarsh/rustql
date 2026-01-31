@@ -5966,9 +5966,11 @@ impl Vdbe {
                                             // IF NOT EXISTS was specified, silently succeed
                                         } else {
                                             // Create view definition
+                                            // Use db_idx from ParseSchema P1, not from parsed name
+                                            // (CREATE TEMP VIEW t1... has no schema prefix on name)
                                             let view = crate::schema::View {
                                                 name: create.name.name.clone(),
-                                                db_idx: create.name.database_idx(),
+                                                db_idx,
                                                 sql: sql.clone(),
                                                 columns: create.columns.clone(),
                                                 select: create.query,

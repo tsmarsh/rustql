@@ -2162,6 +2162,20 @@ impl<'s> StatementCompiler<'s> {
             ));
         }
 
+        // Check for references to objects in other databases (not allowed for non-temp views)
+        // Views in main cannot reference tables in attached databases
+        if !create.temporary {
+            if let Some(db_name) = Self::select_references_other_database(&create.query) {
+                return Err(crate::error::Error::with_message(
+                    crate::error::ErrorCode::Error,
+                    format!(
+                        "view {} cannot reference objects in database {}",
+                        create.name.name, db_name
+                    ),
+                ));
+            }
+        }
+
         // Reconstruct the CREATE VIEW SQL for storage
         // For non-temp views, this includes all keywords
         // For temp views, we strip the TEMP keyword since it's stored in temp schema
@@ -2648,6 +2662,101 @@ impl<'s> StatementCompiler<'s> {
         }
 
         false
+    }
+
+    /// Check if a SELECT references tables in databases other than main/temp
+    /// Returns the database name if found, None otherwise
+    fn select_references_other_database(select: &SelectStmt) -> Option<String> {
+        Self::select_body_references_other_database(&select.body)
+    }
+
+    fn select_body_references_other_database(
+        body: &crate::parser::ast::SelectBody,
+    ) -> Option<String> {
+        match body {
+            crate::parser::ast::SelectBody::Select(core) => {
+                Self::select_core_references_other_database(core)
+            }
+            crate::parser::ast::SelectBody::Compound { left, right, .. } => {
+                Self::select_body_references_other_database(left)
+                    .or_else(|| Self::select_body_references_other_database(right))
+            }
+        }
+    }
+
+    fn select_core_references_other_database(
+        core: &crate::parser::ast::SelectCore,
+    ) -> Option<String> {
+        if let Some(ref from) = core.from {
+            if let Some(db) = Self::from_references_other_database(from) {
+                return Some(db);
+            }
+        }
+        None
+    }
+
+    fn from_references_other_database(from: &crate::parser::ast::FromClause) -> Option<String> {
+        for table_ref in &from.tables {
+            if let Some(db) = Self::table_ref_references_other_database(table_ref) {
+                return Some(db);
+            }
+        }
+        None
+    }
+
+    fn table_ref_references_other_database(
+        table_ref: &crate::parser::ast::TableRef,
+    ) -> Option<String> {
+        match table_ref {
+            crate::parser::ast::TableRef::Table { name, .. } => {
+                if let Some(ref schema) = name.schema {
+                    let schema_lower = schema.to_lowercase();
+                    // main and temp are allowed
+                    if schema_lower != "main" && schema_lower != "temp" {
+                        return Some(schema.clone());
+                    }
+                }
+                None
+            }
+            crate::parser::ast::TableRef::Subquery { query, .. } => {
+                Self::select_references_other_database(query)
+            }
+            crate::parser::ast::TableRef::Join {
+                left,
+                right,
+                constraint,
+                ..
+            } => Self::table_ref_references_other_database(left)
+                .or_else(|| Self::table_ref_references_other_database(right))
+                .or_else(|| {
+                    // Also check subqueries in ON clause
+                    if let Some(crate::parser::ast::JoinConstraint::On(expr)) = constraint {
+                        Self::expr_references_other_database(expr)
+                    } else {
+                        None
+                    }
+                }),
+            crate::parser::ast::TableRef::TableFunction { .. } => None,
+            crate::parser::ast::TableRef::Parens(inner) => {
+                Self::table_ref_references_other_database(inner)
+            }
+        }
+    }
+
+    fn expr_references_other_database(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Subquery(q) => Self::select_references_other_database(q),
+            Expr::Exists { subquery, .. } => Self::select_references_other_database(subquery),
+            Expr::In { list, .. } => {
+                if let crate::parser::ast::InList::Subquery(q) = list {
+                    Self::select_references_other_database(q)
+                } else {
+                    None
+                }
+            }
+            // Other expressions don't contain table references directly
+            _ => None,
+        }
     }
 
     /// Convert expression to SQL (for trigger reconstruction)

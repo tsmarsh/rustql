@@ -119,6 +119,9 @@ pub struct SelectCompiler<'s> {
     order_by_index: Option<(String, String)>,
     /// Views currently being expanded (to detect circular view definitions)
     expanding_views: HashSet<String>,
+    /// Depth of main database view expansions (when > 0, don't look in temp schema for views)
+    /// This implements SQLite's behavior where views bind to their own database's objects
+    main_view_depth: usize,
 }
 
 impl<'s> SelectCompiler<'s> {
@@ -166,6 +169,7 @@ impl<'s> SelectCompiler<'s> {
             resolving_aliases: HashSet::new(),
             order_by_index: None,
             expanding_views: HashSet::new(),
+            main_view_depth: 0,
         }
     }
 
@@ -218,6 +222,7 @@ impl<'s> SelectCompiler<'s> {
             resolving_aliases: HashSet::new(),
             order_by_index: None,
             expanding_views: HashSet::new(),
+            main_view_depth: 0,
         }
     }
 
@@ -536,6 +541,8 @@ impl<'s> SelectCompiler<'s> {
         subcompiler.cte_cursors = self.cte_cursors.clone();
         // Propagate expanding_views for circular view detection
         subcompiler.expanding_views = self.expanding_views.clone();
+        // Propagate main_view_depth for proper temp schema handling
+        subcompiler.main_view_depth = self.main_view_depth;
         if let Some(name) = exclude_cte {
             subcompiler.ctes.remove(name);
             subcompiler.recursive_ctes.remove(name);
@@ -553,32 +560,71 @@ impl<'s> SelectCompiler<'s> {
         // Mark inlined jump ops so resolve_labels doesn't reprocess them
         let offset = self.ops.len() as i32;
 
-        // Count how many leading instructions we skip (typically just Init at addr 0)
-        // This is needed because jump targets in the subcompiler are absolute addresses
-        // that include Init, but we're not inlining Init.
-        let skipped_prefix = subquery_ops
-            .iter()
-            .take_while(|op| {
-                op.opcode == Opcode::Init
-                    || op.opcode == Opcode::Transaction
-                    || op.opcode == Opcode::Goto
-                    || op.opcode == Opcode::Halt
-            })
-            .count() as i32;
+        // Identify which instructions to skip:
+        // - Init (always at address 0)
+        // - Halt (usually right before Transaction/Goto footer)
+        // - Transaction (part of footer)
+        // - The final Goto that jumps back to start (wrapper, not control-flow Goto)
+        // Control-flow Gotos within the query should be kept.
+        let len = subquery_ops.len();
+        let mut skip_indices = std::collections::HashSet::new();
 
-        for mut op in subquery_ops {
-            // Skip the Init/Halt/Transaction/Goto control flow wrapper
-            // These are added by compile() but shouldn't be inlined
-            if op.opcode != Opcode::Halt
-                && op.opcode != Opcode::Init
-                && op.opcode != Opcode::Transaction
-                && op.opcode != Opcode::Goto
+        // Skip Init at 0
+        if !subquery_ops.is_empty() && subquery_ops[0].opcode == Opcode::Init {
+            skip_indices.insert(0);
+        }
+
+        // Skip footer: typically Halt, Transaction, Goto at the end
+        // Work backwards from the end to find these
+        for i in (0..len).rev() {
+            let op = &subquery_ops[i];
+            if op.opcode == Opcode::Halt
+                || op.opcode == Opcode::Transaction
+                || (op.opcode == Opcode::Goto && i >= len.saturating_sub(3))
             {
-                // Adjust P2 for jump instructions
-                // The subcompiler already resolved labels, so P2 contains actual addresses
-                // We need to adjust by offset and subtract skipped prefix count
+                skip_indices.insert(i);
+            } else {
+                // Stop when we hit a non-wrapper instruction
+                break;
+            }
+        }
+
+        // Build address mapping: old_addr -> new_addr
+        // Skipped instructions get mapped to the end of the inlined section
+        let mut addr_map: Vec<i32> = Vec::with_capacity(len);
+        let mut new_addr = offset;
+        for i in 0..len {
+            if skip_indices.contains(&i) {
+                // Skipped instruction - will map to end later
+                addr_map.push(-1);
+            } else {
+                addr_map.push(new_addr);
+                new_addr += 1;
+            }
+        }
+
+        // Calculate end address for the inlined section
+        let inlined_end = new_addr;
+
+        // Fix up -1 entries (skipped instructions) to point to end
+        for addr in &mut addr_map {
+            if *addr == -1 {
+                *addr = inlined_end;
+            }
+        }
+
+        for (old_addr, mut op) in subquery_ops.into_iter().enumerate() {
+            // Skip wrapper instructions only
+            if !skip_indices.contains(&old_addr) {
+                // Adjust P2 for jump instructions using the address map
                 if op.opcode.is_jump() {
-                    op.p2 = op.p2 - skipped_prefix + offset;
+                    let target = op.p2 as usize;
+                    if target < addr_map.len() {
+                        op.p2 = addr_map[target];
+                    } else {
+                        // Jump beyond subquery - point to end
+                        op.p2 = inlined_end;
+                    }
                     // Use P5 = 0xFFFF to mark as already resolved so resolve_labels skips it
                     op.p5 = 0xFFFF;
                 }
@@ -2824,14 +2870,28 @@ impl<'s> SelectCompiler<'s> {
                 }
 
                 // Check if this is a view - expand views as subqueries
-                // Check both main schema and temp schema
-                let view_opt = self
-                    .schema
-                    .and_then(|s| s.views.get(&table_name_lower))
-                    .or_else(|| {
+                // When inside a main view expansion, only check main schema for unqualified names
+                // (SQLite: views bind to objects in their own database)
+                // If there's an explicit database qualifier, respect it
+                let view_opt = if let Some(ref schema_name) = name.schema {
+                    // Explicit database qualifier
+                    let schema_lower = schema_name.to_lowercase();
+                    if schema_lower == "temp" {
                         self.temp_schema
                             .and_then(|s| s.views.get(&table_name_lower))
-                    });
+                    } else {
+                        // main or other database - use main schema
+                        self.schema.and_then(|s| s.views.get(&table_name_lower))
+                    }
+                } else if self.main_view_depth > 0 {
+                    // Unqualified name inside main view: only look in main schema
+                    self.schema.and_then(|s| s.views.get(&table_name_lower))
+                } else {
+                    // Unqualified name at top-level or in temp view: check temp first, then main
+                    self.temp_schema
+                        .and_then(|s| s.views.get(&table_name_lower))
+                        .or_else(|| self.schema.and_then(|s| s.views.get(&table_name_lower)))
+                };
 
                 if let Some(view) = view_opt {
                     // Check for circular view definition
@@ -2845,14 +2905,23 @@ impl<'s> SelectCompiler<'s> {
                     // Mark this view as being expanded
                     self.expanding_views.insert(table_name_lower.clone());
 
+                    // Track if we're entering a main database view
+                    let is_main_view = view.db_idx == 0;
+                    if is_main_view {
+                        self.main_view_depth += 1;
+                    }
+
                     let view_select = (*view.select).clone();
                     let view_alias = item.alias.clone().unwrap_or_else(|| table_name.clone());
 
                     // Compile view's SELECT as a subquery into ephemeral table
                     let result = self.compile_subquery_to_ephemeral(&view_select, cursor, None);
 
-                    // Remove from expanding set (whether success or failure)
+                    // Remove from expanding set and restore depth (whether success or failure)
                     self.expanding_views.remove(&table_name_lower);
+                    if is_main_view {
+                        self.main_view_depth -= 1;
+                    }
 
                     let subquery_col_names = result?;
 
@@ -4333,13 +4402,25 @@ impl<'s> SelectCompiler<'s> {
                     }))
                 } else {
                     // First check if this is a view in main or temp schema
-                    let view_opt = self
-                        .schema
-                        .and_then(|s| s.views.get(&table_name_lower))
-                        .or_else(|| {
+                    // Handle explicit database qualifiers and main_view_depth
+                    let view_opt = if let Some(ref schema_name) = name.schema {
+                        // Explicit database qualifier - respect it
+                        let schema_lower = schema_name.to_lowercase();
+                        if schema_lower == "temp" {
                             self.temp_schema
                                 .and_then(|s| s.views.get(&table_name_lower))
-                        });
+                        } else {
+                            self.schema.and_then(|s| s.views.get(&table_name_lower))
+                        }
+                    } else if self.main_view_depth > 0 {
+                        // Unqualified name inside main view: only look in main schema
+                        self.schema.and_then(|s| s.views.get(&table_name_lower))
+                    } else {
+                        // Unqualified name at top-level: check temp first, then main
+                        self.temp_schema
+                            .and_then(|s| s.views.get(&table_name_lower))
+                            .or_else(|| self.schema.and_then(|s| s.views.get(&table_name_lower)))
+                    };
 
                     if let Some(view) = view_opt {
                         // Check for circular view definition
@@ -4352,6 +4433,12 @@ impl<'s> SelectCompiler<'s> {
 
                         // Mark this view as being expanded
                         self.expanding_views.insert(table_name_lower.clone());
+
+                        // Track if we're entering a main database view
+                        let is_main_view = view.db_idx == 0;
+                        if is_main_view {
+                            self.main_view_depth += 1;
+                        }
 
                         // Expand view as subquery
                         let view_select = (*view.select).clone();
@@ -4374,12 +4461,17 @@ impl<'s> SelectCompiler<'s> {
                         subcompiler.next_cursor = self.next_cursor;
                         // Propagate expanding_views for circular view detection
                         subcompiler.expanding_views = self.expanding_views.clone();
+                        // Propagate main_view_depth
+                        subcompiler.main_view_depth = self.main_view_depth;
                         subcompiler
                             .set_column_name_flags(self.short_column_names, self.full_column_names);
                         let result = subcompiler.compile(&view_select, &subquery_dest);
 
-                        // Remove from expanding set (whether success or failure)
+                        // Remove from expanding set and restore depth (whether success or failure)
                         self.expanding_views.remove(&table_name_lower);
+                        if is_main_view {
+                            self.main_view_depth -= 1;
+                        }
 
                         let subquery_ops = result?;
 

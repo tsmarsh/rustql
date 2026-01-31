@@ -21,7 +21,15 @@ use crate::parser::ast::{
     SelectStmt, SortOrder, TableRef, WithClause,
 };
 use crate::schema::{Affinity, Table};
-use crate::vdbe::ops::{affinity as vdbe_affinity, Opcode, VdbeOp, P4};
+use crate::vdbe::ops::{
+    affinity as vdbe_affinity, Opcode, VFilterConstraint, VFilterPlan, VdbeOp, P4,
+};
+use crate::vtab::{
+    IndexConstraint as VtabIndexConstraint, IndexInfo as VtabIndexInfo, VtabRegistry,
+    SQLITE_INDEX_CONSTRAINT_EQ, SQLITE_INDEX_CONSTRAINT_GE, SQLITE_INDEX_CONSTRAINT_GT,
+    SQLITE_INDEX_CONSTRAINT_LE, SQLITE_INDEX_CONSTRAINT_LIKE, SQLITE_INDEX_CONSTRAINT_LT,
+    SQLITE_INDEX_CONSTRAINT_MATCH,
+};
 
 /// Maximum number of tables allowed in a single join (matches SQLite BMS)
 const MAX_TABLES_IN_JOIN: usize = 64;
@@ -124,6 +132,8 @@ pub struct SelectCompiler<'s> {
     main_view_depth: usize,
     /// Enable view access (from db config enable_view)
     enable_view: bool,
+    /// Virtual table registry for xBestIndex calls
+    vtab_registry: Option<std::sync::Arc<VtabRegistry>>,
 }
 
 impl<'s> SelectCompiler<'s> {
@@ -173,6 +183,7 @@ impl<'s> SelectCompiler<'s> {
             expanding_views: HashSet::new(),
             main_view_depth: 0,
             enable_view: true,
+            vtab_registry: None,
         }
     }
 
@@ -232,6 +243,7 @@ impl<'s> SelectCompiler<'s> {
             expanding_views: HashSet::new(),
             main_view_depth: 0,
             enable_view: true,
+            vtab_registry: None,
         }
     }
 
@@ -243,6 +255,11 @@ impl<'s> SelectCompiler<'s> {
     /// Set the temp schema for TEMP tables/views lookup
     pub fn set_temp_schema(&mut self, temp_schema: &'s crate::schema::Schema) {
         self.temp_schema = Some(temp_schema);
+    }
+
+    /// Set the virtual table registry for xBestIndex calls
+    pub fn set_vtab_registry(&mut self, registry: std::sync::Arc<VtabRegistry>) {
+        self.vtab_registry = Some(registry);
     }
 
     /// Set column naming flags from PRAGMA settings
@@ -1095,13 +1112,36 @@ impl<'s> SelectCompiler<'s> {
         let mut range_end_keys: Vec<Option<(i32, i32, TermOp)>> =
             Vec::with_capacity(table_cursors.len());
 
+        // Plan virtual table access using xBestIndex
+        // This needs to happen before the loop since plan_virtual_table_access may allocate registers
+        // Track both planned access AND which cursors are virtual tables (for full scans)
+        let mut vtab_plans: std::collections::HashMap<i32, VFilterPlan> =
+            std::collections::HashMap::new();
+        let mut vtab_cursors: std::collections::HashSet<i32> = std::collections::HashSet::new();
+        for i in self.outer_tables_boundary..self.tables.len() {
+            let table = self.tables[i].clone();
+            if table.schema_table.as_ref().is_some_and(|t| t.is_virtual) {
+                vtab_cursors.insert(table.cursor);
+                if let Ok(Some(plan)) =
+                    self.plan_virtual_table_access(&table, remaining_where.as_ref())
+                {
+                    vtab_plans.insert(table.cursor, plan);
+                }
+            }
+        }
+
         // Now emit the Rewind/loop structure (or index seek structure based on plan)
         // Iterate in optimizer order: iteration_order[loop_pos] gives the FROM clause index
         for (loop_pos, &from_idx) in iteration_order.iter().enumerate() {
             let cursor = table_cursors[from_idx];
 
-            // Handle FTS3 filter if applicable
-            if let Some(filter) = &fts3_filter {
+            // Handle virtual table filter
+            // Virtual tables ALWAYS need VFilter emitted (even for full table scans)
+            if let Some(plan) = vtab_plans.remove(&cursor) {
+                // Use xBestIndex-planned VFilter with VFilterPlan
+                self.emit(Opcode::VFilter, cursor, 0, 0, P4::VFilterPlan(plan));
+            } else if let Some(filter) = &fts3_filter {
+                // FTS3-specific filter handling (legacy path)
                 if filter.cursor == cursor {
                     match &filter.pattern {
                         Expr::Literal(Literal::String(text)) => {
@@ -1114,6 +1154,20 @@ impl<'s> SelectCompiler<'s> {
                         }
                     }
                 }
+            } else if vtab_cursors.contains(&cursor) {
+                // Virtual table full scan (no constraints) - emit VFilter with idx_num=0
+                let full_scan_plan = VFilterPlan {
+                    idx_num: 0,
+                    idx_str: None,
+                    constraints: vec![],
+                };
+                self.emit(
+                    Opcode::VFilter,
+                    cursor,
+                    0,
+                    0,
+                    P4::VFilterPlan(full_scan_plan),
+                );
             }
 
             // For the outermost table, jump to done_all on empty
@@ -5682,6 +5736,229 @@ impl<'s> SelectCompiler<'s> {
 
     fn is_fts3_match(&self, expr: &Expr) -> bool {
         self.extract_fts3_match_filter(expr).is_some()
+    }
+
+    /// Plan access to a virtual table using xBestIndex
+    ///
+    /// This extracts constraints from the WHERE clause that apply to the virtual table,
+    /// calls best_index on the vtab instance, and returns a VFilterPlan.
+    fn plan_virtual_table_access(
+        &mut self,
+        table: &TableInfo,
+        where_clause: Option<&Expr>,
+    ) -> Result<Option<VFilterPlan>> {
+        // Need vtab_registry and schema_table
+        let registry = match &self.vtab_registry {
+            Some(r) => r.clone(),
+            None => return Ok(None),
+        };
+        let schema_table = match &table.schema_table {
+            Some(t) => t.clone(),
+            None => return Ok(None),
+        };
+        if !schema_table.is_virtual {
+            return Ok(None);
+        }
+
+        // Get the vtab instance
+        let vtab = match registry.get_instance("main", &table.table_name) {
+            Ok(Some(v)) => v,
+            _ => return Ok(None),
+        };
+
+        // Extract constraints from WHERE clause
+        let mut constraints = Vec::new();
+        let mut constraint_exprs = Vec::new(); // Track exprs for each constraint
+
+        if let Some(where_expr) = where_clause {
+            self.extract_vtab_constraints(
+                where_expr,
+                table,
+                &schema_table,
+                &mut constraints,
+                &mut constraint_exprs,
+            );
+        }
+
+        // Build IndexInfo for best_index
+        let mut index_info = VtabIndexInfo::new(constraints, vec![]);
+
+        // Call best_index
+        vtab.best_index(&mut index_info)?;
+
+        // Build VFilterPlan from the result
+        let mut plan_constraints = Vec::new();
+        for (i, usage) in index_info.constraint_usage.iter().enumerate() {
+            if usage.arg_index > 0 {
+                // This constraint is used - allocate register for the value
+                let value_reg = self.alloc_reg();
+
+                // Compile the constraint expression into the register
+                if i < constraint_exprs.len() {
+                    self.compile_expr(&constraint_exprs[i], value_reg)?;
+                }
+
+                plan_constraints.push(VFilterConstraint {
+                    col_idx: index_info.constraints[i].col_idx,
+                    op: index_info.constraints[i].op,
+                    value_reg,
+                    omit: usage.omit,
+                });
+            }
+        }
+
+        // Only return a plan if best_index chose a non-trivial index
+        // (idx_num != 0 or we have constraints)
+        if index_info.idx_num != 0 || !plan_constraints.is_empty() {
+            Ok(Some(VFilterPlan {
+                idx_num: index_info.idx_num,
+                idx_str: index_info.idx_str,
+                constraints: plan_constraints,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Extract constraints from WHERE clause applicable to a virtual table
+    fn extract_vtab_constraints(
+        &self,
+        expr: &Expr,
+        table: &TableInfo,
+        schema_table: &crate::schema::Table,
+        constraints: &mut Vec<VtabIndexConstraint>,
+        exprs: &mut Vec<Expr>,
+    ) {
+        match expr {
+            Expr::Binary { op, left, right } => {
+                // Check for AND - recurse into both sides
+                if *op == BinaryOp::And {
+                    self.extract_vtab_constraints(left, table, schema_table, constraints, exprs);
+                    self.extract_vtab_constraints(right, table, schema_table, constraints, exprs);
+                    return;
+                }
+
+                // Check if this is a comparison involving a column from this table
+                let (col_idx, value_expr, constraint_op) = if let Some((col, idx)) =
+                    self.get_vtab_column(left, table, schema_table)
+                {
+                    let op = self.binary_op_to_constraint_op(op);
+                    if let Some(op) = op {
+                        (idx, right.as_ref(), op)
+                    } else {
+                        return;
+                    }
+                } else if let Some((col, idx)) = self.get_vtab_column(right, table, schema_table) {
+                    // Reverse the operator for col on right side
+                    let op = self.binary_op_to_constraint_op_reversed(op);
+                    if let Some(op) = op {
+                        (idx, left.as_ref(), op)
+                    } else {
+                        return;
+                    }
+                } else {
+                    return;
+                };
+
+                constraints.push(VtabIndexConstraint::new(col_idx, constraint_op, true));
+                exprs.push(value_expr.clone());
+            }
+            Expr::Like {
+                expr: left,
+                pattern,
+                op: LikeOp::Match,
+                ..
+            } => {
+                // MATCH constraint - used by FTS
+                if let Some((_, col_idx)) = self.get_vtab_column(left, table, schema_table) {
+                    constraints.push(VtabIndexConstraint::new(
+                        col_idx,
+                        SQLITE_INDEX_CONSTRAINT_MATCH,
+                        true,
+                    ));
+                    exprs.push(*pattern.clone());
+                }
+            }
+            Expr::Like {
+                expr: left,
+                pattern,
+                op: LikeOp::Like,
+                ..
+            } => {
+                // LIKE constraint
+                if let Some((_, col_idx)) = self.get_vtab_column(left, table, schema_table) {
+                    constraints.push(VtabIndexConstraint::new(
+                        col_idx,
+                        SQLITE_INDEX_CONSTRAINT_LIKE,
+                        true,
+                    ));
+                    exprs.push(*pattern.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Get column index if expr references a column from the given virtual table
+    fn get_vtab_column(
+        &self,
+        expr: &Expr,
+        table: &TableInfo,
+        schema_table: &crate::schema::Table,
+    ) -> Option<(String, i32)> {
+        let Expr::Column(col) = expr else {
+            return None;
+        };
+
+        // Check table qualifier if present
+        if let Some(ref tbl) = col.table {
+            if !tbl.eq_ignore_ascii_case(&table.name)
+                && !tbl.eq_ignore_ascii_case(&table.table_name)
+            {
+                return None;
+            }
+        }
+
+        // Find column index
+        let col_lower = col.column.to_lowercase();
+
+        // Check for rowid/id aliases
+        if col_lower == "rowid" || col_lower == "_rowid_" || col_lower == "oid" {
+            return Some((col.column.clone(), -1)); // -1 is rowid
+        }
+
+        // Look up in schema table columns
+        for (i, schema_col) in schema_table.columns.iter().enumerate() {
+            if schema_col.name.eq_ignore_ascii_case(&col.column) {
+                return Some((col.column.clone(), i as i32));
+            }
+        }
+
+        None
+    }
+
+    /// Convert BinaryOp to vtab constraint operator
+    fn binary_op_to_constraint_op(&self, op: &BinaryOp) -> Option<u8> {
+        match op {
+            BinaryOp::Eq => Some(SQLITE_INDEX_CONSTRAINT_EQ),
+            BinaryOp::Gt => Some(SQLITE_INDEX_CONSTRAINT_GT),
+            BinaryOp::Ge => Some(SQLITE_INDEX_CONSTRAINT_GE),
+            BinaryOp::Lt => Some(SQLITE_INDEX_CONSTRAINT_LT),
+            BinaryOp::Le => Some(SQLITE_INDEX_CONSTRAINT_LE),
+            _ => None,
+        }
+    }
+
+    /// Convert BinaryOp to vtab constraint operator (reversed for column on right)
+    fn binary_op_to_constraint_op_reversed(&self, op: &BinaryOp) -> Option<u8> {
+        match op {
+            BinaryOp::Eq => Some(SQLITE_INDEX_CONSTRAINT_EQ),
+            BinaryOp::Gt => Some(SQLITE_INDEX_CONSTRAINT_LT), // a > col means col < a
+            BinaryOp::Ge => Some(SQLITE_INDEX_CONSTRAINT_LE),
+            BinaryOp::Lt => Some(SQLITE_INDEX_CONSTRAINT_GT),
+            BinaryOp::Le => Some(SQLITE_INDEX_CONSTRAINT_GE),
+            _ => None,
+        }
     }
 
     /// Compile an expression into a register

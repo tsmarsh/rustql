@@ -1035,6 +1035,33 @@ pub enum P4 {
     Table(String),
     /// Integer array (for IN lists)
     IntArray(Vec<i64>),
+    /// Virtual table filter plan (from xBestIndex)
+    VFilterPlan(VFilterPlan),
+}
+
+/// Virtual table filter plan from xBestIndex
+#[derive(Debug, Clone, PartialEq)]
+pub struct VFilterPlan {
+    /// Index number returned by xBestIndex
+    pub idx_num: i32,
+    /// Index string returned by xBestIndex (optional)
+    pub idx_str: Option<String>,
+    /// Constraint info: (column_idx, operator, value_register, omit)
+    /// value_register is the register holding the constraint value at runtime
+    pub constraints: Vec<VFilterConstraint>,
+}
+
+/// A single constraint for VFilter
+#[derive(Debug, Clone, PartialEq)]
+pub struct VFilterConstraint {
+    /// Column index in the virtual table (-1 for rowid)
+    pub col_idx: i32,
+    /// Operator (SQLITE_INDEX_CONSTRAINT_* constant)
+    pub op: u8,
+    /// Register containing the constraint value
+    pub value_reg: i32,
+    /// If true, the virtual table handles this constraint (omit from WHERE)
+    pub omit: bool,
 }
 
 impl P4 {
@@ -1174,6 +1201,7 @@ impl fmt::Display for VdbeOp {
             P4::Subprogram(s) => write!(f, "  program({} ops)", s.ops.len())?,
             P4::Table(t) => write!(f, "  table({})", t)?,
             P4::IntArray(a) => write!(f, "  [{} ints]", a.len())?,
+            P4::VFilterPlan(p) => write!(f, "  vfplan(idx={})", p.idx_num)?,
         }
 
         if let Some(ref comment) = self.comment {

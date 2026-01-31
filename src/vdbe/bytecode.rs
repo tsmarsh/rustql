@@ -73,6 +73,7 @@ fn format_p4(p4: &P4) -> String {
             let vals: Vec<String> = arr.iter().map(|i| i.to_string()).collect();
             format!("[{}]", vals.join(","))
         }
+        P4::VFilterPlan(p) => format!("vfplan(idx={})", p.idx_num),
     }
 }
 

@@ -122,6 +122,8 @@ pub struct StatementCompiler<'s> {
     case_sensitive_like: bool,
     /// Enable view access (from db config)
     enable_view: bool,
+    /// Virtual table registry for xBestIndex calls
+    vtab_registry: Option<std::sync::Arc<crate::vtab::VtabRegistry>>,
 }
 
 impl<'s> StatementCompiler<'s> {
@@ -137,6 +139,7 @@ impl<'s> StatementCompiler<'s> {
             full_column_names: false,
             case_sensitive_like: false,
             enable_view: true,
+            vtab_registry: None,
         }
     }
 
@@ -152,6 +155,7 @@ impl<'s> StatementCompiler<'s> {
             full_column_names: false,
             case_sensitive_like: false,
             enable_view: true,
+            vtab_registry: None,
         }
     }
 
@@ -174,6 +178,11 @@ impl<'s> StatementCompiler<'s> {
     /// Set LIKE case sensitivity for index optimization
     pub fn set_case_sensitive_like(&mut self, value: bool) {
         self.case_sensitive_like = value;
+    }
+
+    /// Set virtual table registry for xBestIndex calls
+    pub fn set_vtab_registry(&mut self, registry: std::sync::Arc<crate::vtab::VtabRegistry>) {
+        self.vtab_registry = Some(registry);
     }
 
     /// Compile a SQL string to VDBE bytecode
@@ -231,6 +240,10 @@ impl<'s> StatementCompiler<'s> {
                 compiler.set_case_sensitive_like(self.case_sensitive_like);
                 // Pass enable_view flag from db config
                 compiler.set_enable_view(self.enable_view);
+                // Pass vtab_registry for xBestIndex calls
+                if let Some(ref registry) = self.vtab_registry {
+                    compiler.set_vtab_registry(registry.clone());
+                }
                 let ops = compiler.compile(select, &SelectDest::Output)?;
                 // Use column names from compiler (properly expanded for Star)
                 let names = if compiler.column_names().is_empty() {
@@ -4802,6 +4815,7 @@ pub fn compile_sql_with_full_config<'a>(
     full_column_names: bool,
     case_sensitive_like: bool,
     enable_view: bool,
+    vtab_registry: Option<std::sync::Arc<crate::vtab::VtabRegistry>>,
 ) -> Result<(CompiledStmt, &'a str)> {
     let mut compiler = StatementCompiler::with_schema(schema);
     if let Some(ts) = temp_schema {
@@ -4810,6 +4824,9 @@ pub fn compile_sql_with_full_config<'a>(
     compiler.set_column_name_flags(short_column_names, full_column_names);
     compiler.set_case_sensitive_like(case_sensitive_like);
     compiler.set_enable_view(enable_view);
+    if let Some(registry) = vtab_registry {
+        compiler.set_vtab_registry(registry);
+    }
     compiler.compile(sql)
 }
 

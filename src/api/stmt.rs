@@ -348,6 +348,7 @@ pub fn sqlite3_prepare_v2<'a>(
                     full_column_names,
                     case_sensitive_like,
                     enable_view,
+                    Some(conn.vtab_registry.clone()),
                 )
             } else {
                 compile_sql(sql)

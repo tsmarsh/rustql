@@ -1988,13 +1988,20 @@ impl Vdbe {
 
             Opcode::VFilter => {
                 // Apply filter to virtual table cursor P1
-                // P2 = register containing query/constraint value
-                // P4 = query string or index info
+                // P2 = register containing query/constraint value (legacy) or base register for constraints
+                // P4 = query string, VFilterPlan, or index info
 
-                // Extract query from P4 or memory
+                // Check for VFilterPlan first (new xBestIndex path)
+                let vfilter_plan = match &op.p4 {
+                    P4::VFilterPlan(plan) => Some(plan.clone()),
+                    _ => None,
+                };
+
+                // Extract query from P4 or memory (legacy path)
                 let query = match &op.p4 {
                     P4::Text(text) => text.clone(),
                     P4::Vtab(text) => text.clone(),
+                    P4::VFilterPlan(_) => String::new(), // Plan doesn't use query string
                     _ => {
                         if op.p2 > 0 {
                             self.mem(op.p2).to_str()
@@ -2007,6 +2014,25 @@ impl Vdbe {
                 let vtab_name = self
                     .cursor(op.p1)
                     .and_then(|cursor| cursor.vtab_name.clone());
+
+                // Build constraint values BEFORE getting mutable cursor reference
+                // (to satisfy borrow checker)
+                let (plan_idx_num, plan_idx_str, plan_constraints) =
+                    if let Some(ref plan) = vfilter_plan {
+                        let mut constraint_values = Vec::new();
+                        for c in &plan.constraints {
+                            let value = self.mem(c.value_reg).clone();
+                            constraint_values
+                                .push(crate::vtab::ConstraintValue::new(value, c.op, c.col_idx));
+                        }
+                        (
+                            Some(plan.idx_num),
+                            plan.idx_str.clone(),
+                            Some(constraint_values),
+                        )
+                    } else {
+                        (None, None, None)
+                    };
 
                 // Try to use the registry first (new generic path)
                 let mut handled_by_registry = false;
@@ -2027,20 +2053,34 @@ impl Vdbe {
 
                                 // Apply filter using the VtabCursor trait
                                 if let Some(ref mut vtab_cursor) = cursor.vtab_cursor {
-                                    // Build constraint values from query
-                                    let constraints = if query.is_empty() {
-                                        vec![]
-                                    } else {
-                                        vec![crate::vtab::ConstraintValue::new(
-                                            Mem::from_str(&query),
-                                            crate::vtab::SQLITE_INDEX_CONSTRAINT_MATCH,
-                                            0,
-                                        )]
-                                    };
+                                    // Use plan constraints or build legacy MATCH constraint
+                                    let (index_num, index_str, constraints) =
+                                        if let Some(constraints) = plan_constraints.clone() {
+                                            (
+                                                plan_idx_num.unwrap_or(0),
+                                                plan_idx_str.as_deref(),
+                                                constraints,
+                                            )
+                                        } else {
+                                            // Legacy path: build single MATCH constraint from query
+                                            let constraints = if query.is_empty() {
+                                                vec![]
+                                            } else {
+                                                vec![crate::vtab::ConstraintValue::new(
+                                                    Mem::from_str(&query),
+                                                    crate::vtab::SQLITE_INDEX_CONSTRAINT_MATCH,
+                                                    0,
+                                                )]
+                                            };
+                                            let index_num = if query.is_empty() { 0 } else { 1 };
+                                            (index_num, None, constraints)
+                                        };
 
-                                    // Call filter - index_num=1 for MATCH queries, 0 for full scan
-                                    let index_num = if query.is_empty() { 0 } else { 1 };
-                                    if vtab_cursor.filter(index_num, None, &constraints).is_ok() {
+                                    // Call filter with the determined index and constraints
+                                    if vtab_cursor
+                                        .filter(index_num, index_str, &constraints)
+                                        .is_ok()
+                                    {
                                         if vtab_cursor.eof() {
                                             cursor.state = CursorState::AtEnd;
                                             cursor.rowid = None;

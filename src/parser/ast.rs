@@ -755,6 +755,8 @@ pub enum ColumnConstraintKind {
     NotNull {
         conflict: Option<ConflictAction>,
     },
+    /// Explicit NULL constraint (allows NULL values - this is the default)
+    Null,
     Unique {
         conflict: Option<ConflictAction>,
     },
@@ -1243,6 +1245,10 @@ pub enum BinaryOp {
 
     // String
     Concat,
+
+    // JSON operators
+    JsonExtract,     // ->
+    JsonExtractText, // ->>
 }
 
 impl BinaryOp {
@@ -1265,6 +1271,7 @@ impl BinaryOp {
             BinaryOp::Add | BinaryOp::Sub => 7,
             BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => 8,
             BinaryOp::Concat => 9,
+            BinaryOp::JsonExtract | BinaryOp::JsonExtractText => 10,
         }
     }
 }

@@ -1358,6 +1358,9 @@ impl<'s> StatementCompiler<'s> {
                                     col_sql.push_str(" COLLATE ");
                                     col_sql.push_str(name);
                                 }
+                                ColumnConstraintKind::Null => {
+                                    col_sql.push_str(" NULL");
+                                }
                                 _ => {}
                             }
                         }
@@ -1785,7 +1788,7 @@ impl<'s> StatementCompiler<'s> {
             .map(|c| {
                 let name = match &c.column {
                     crate::parser::ast::IndexedColumnKind::Name(n) => n.clone(),
-                    crate::parser::ast::IndexedColumnKind::Expr(_) => "expr".to_string(),
+                    crate::parser::ast::IndexedColumnKind::Expr(e) => self.expr_to_sql(e),
                 };
                 match c.order {
                     Some(crate::parser::ast::SortOrder::Asc) => format!("{} ASC", name),
@@ -2323,6 +2326,8 @@ impl<'s> StatementCompiler<'s> {
                     BinaryOp::ShiftRight => ">>",
                     BinaryOp::Is => "IS",
                     BinaryOp::IsNot => "IS NOT",
+                    BinaryOp::JsonExtract => "->",
+                    BinaryOp::JsonExtractText => "->>",
                 };
                 format!(
                     "({} {} {})",

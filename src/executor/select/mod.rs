@@ -4819,6 +4819,8 @@ impl<'s> SelectCompiler<'s> {
                     BinaryOp::ShiftRight => ">>",
                     BinaryOp::Is => " IS ",
                     BinaryOp::IsNot => " IS NOT ",
+                    BinaryOp::JsonExtract => "->",
+                    BinaryOp::JsonExtractText => "->>",
                 };
                 format!(
                     "{}{}{}",
@@ -5681,6 +5683,28 @@ impl<'s> SelectCompiler<'s> {
 
                         // End label
                         self.resolve_label(end_label, self.current_addr());
+                    }
+                } else if matches!(op, BinaryOp::JsonExtract | BinaryOp::JsonExtractText) {
+                    // JSON extraction operators -> and ->>
+                    // These are converted to json_extract function calls
+                    // -> returns JSON, ->> returns text
+                    let func_name = if *op == BinaryOp::JsonExtract {
+                        "json_extract"
+                    } else {
+                        "json_extract" // ->> is json_extract with implicit text conversion
+                    };
+                    self.emit(
+                        Opcode::Function,
+                        2,
+                        left_reg,
+                        dest_reg,
+                        P4::Text(func_name.to_string()),
+                    );
+                    // For ->>, we need to convert to text (SQLite does this implicitly)
+                    if *op == BinaryOp::JsonExtractText {
+                        // The result is already text from json_extract in most cases
+                        // but we add explicit cast for safety
+                        self.emit(Opcode::Cast, dest_reg, Affinity::Text as i32, 0, P4::Unused);
                     }
                 } else {
                     // Arithmetic and other value-producing operations

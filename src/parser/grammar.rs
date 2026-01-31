@@ -1327,6 +1327,7 @@ impl<'a> Parser<'a> {
             TokenKind::Constraint
                 | TokenKind::Primary
                 | TokenKind::Not
+                | TokenKind::Null
                 | TokenKind::Unique
                 | TokenKind::Check
                 | TokenKind::Default
@@ -1392,6 +1393,10 @@ impl<'a> Parser<'a> {
                 self.expect(TokenKind::Null)?;
                 let conflict = self.parse_conflict_clause()?;
                 ColumnConstraintKind::NotNull { conflict }
+            } else if self.match_token(TokenKind::Null) {
+                // Explicit NULL constraint (allows NULL values - this is the default)
+                // SQLite allows this for compatibility, it's a no-op
+                ColumnConstraintKind::Null
             } else if self.match_token(TokenKind::Unique) {
                 let conflict = self.parse_conflict_clause()?;
                 ColumnConstraintKind::Unique { conflict }
@@ -1644,48 +1649,22 @@ impl<'a> Parser<'a> {
             let expr = self.parse_expr()?;
             self.expect(TokenKind::RParen)?;
             IndexedColumnKind::Expr(Box::new(expr))
-        } else if self.check(TokenKind::Minus)
-            || self.check(TokenKind::Plus)
-            || self.check(TokenKind::Tilde)
-            || self.check(TokenKind::Not)
-        {
-            // Unary operator expression (e.g., -b=b)
-            let expr = self.parse_expr()?;
-            IndexedColumnKind::Expr(Box::new(expr))
-        } else if self.check(TokenKind::Identifier) || self.check(TokenKind::String) {
-            // Could be a simple column name or a function call expression
-            // Peek ahead to see if it's followed by '(' indicating a function call
-            let name = self.expect_identifier_or_string()?;
-            if self.check(TokenKind::LParen) {
-                // It's a function call - parse the full expression
-                // We need to re-parse as an expression since we already consumed the name
-                // Create an Expr::Column for the name and then parse the function call
-                self.expect(TokenKind::LParen)?;
-                let args = if self.check(TokenKind::RParen) {
-                    crate::parser::ast::FunctionArgs::Exprs(vec![])
-                } else if self.match_token(TokenKind::Star) {
-                    crate::parser::ast::FunctionArgs::Star
-                } else {
-                    let mut exprs = vec![self.parse_expr()?];
-                    while self.match_token(TokenKind::Comma) {
-                        exprs.push(self.parse_expr()?);
-                    }
-                    crate::parser::ast::FunctionArgs::Exprs(exprs)
-                };
-                self.expect(TokenKind::RParen)?;
-                let func_expr = Expr::Function(crate::parser::ast::FunctionCall {
-                    name,
-                    args,
-                    distinct: false,
-                    filter: None,
-                    over: None,
-                });
-                IndexedColumnKind::Expr(Box::new(func_expr))
-            } else {
-                IndexedColumnKind::Name(name)
-            }
         } else {
-            return Err(self.error("expected column name or expression"));
+            // Parse as expression - handles both simple column names and complex expressions
+            // like `b==0`, `a+b`, `func(x)`, `-col`, etc.
+            let expr = self.parse_expr()?;
+
+            // If it's a simple unqualified column reference, use Name variant
+            // Otherwise, use Expr variant for any complex expression
+            match expr {
+                Expr::Column(crate::parser::ast::ColumnRef {
+                    database: None,
+                    table: None,
+                    column,
+                    column_index: None,
+                }) => IndexedColumnKind::Name(column),
+                _ => IndexedColumnKind::Expr(Box::new(expr)),
+            }
         };
 
         let collation = if self.match_token(TokenKind::Collate) {
@@ -2515,14 +2494,35 @@ impl<'a> Parser<'a> {
     fn parse_collate_expr(&mut self) -> Result<Expr> {
         let mut expr = self.parse_primary_expr()?;
 
-        // Handle multiple chained COLLATE clauses (e.g., ORDER BY 1 COLLATE nocase COLLATE binary)
-        // The last COLLATE takes precedence
-        while self.match_token(TokenKind::Collate) {
-            let collation = self.expect_identifier()?;
-            expr = Expr::Collate {
-                expr: Box::new(expr),
-                collation,
-            };
+        // Handle JSON operators and COLLATE (similar high precedence)
+        loop {
+            if self.match_token(TokenKind::Ptr) {
+                // -> JSON extraction operator
+                let right = self.parse_primary_expr()?;
+                expr = Expr::Binary {
+                    op: BinaryOp::JsonExtract,
+                    left: Box::new(expr),
+                    right: Box::new(right),
+                };
+            } else if self.match_token(TokenKind::PtrPtr) {
+                // ->> JSON extraction as text operator
+                let right = self.parse_primary_expr()?;
+                expr = Expr::Binary {
+                    op: BinaryOp::JsonExtractText,
+                    left: Box::new(expr),
+                    right: Box::new(right),
+                };
+            } else if self.match_token(TokenKind::Collate) {
+                // Handle multiple chained COLLATE clauses (e.g., ORDER BY 1 COLLATE nocase COLLATE binary)
+                // The last COLLATE takes precedence
+                let collation = self.expect_identifier()?;
+                expr = Expr::Collate {
+                    expr: Box::new(expr),
+                    collation,
+                };
+            } else {
+                break;
+            }
         }
 
         Ok(expr)

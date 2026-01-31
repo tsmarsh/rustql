@@ -900,8 +900,9 @@ impl SqliteConnection {
         // FTS5 module (if feature enabled)
         #[cfg(feature = "fts5")]
         {
-            // TODO: Wire FTS5 module into registry when Fts5VtabModule is implemented
-            // self.vtab_registry.register_module(Arc::new(crate::fts5::Fts5VtabModule)).ok();
+            let _ = self
+                .vtab_registry
+                .register_module(Arc::new(crate::fts5::Fts5VtabModule));
         }
 
         // R-tree module

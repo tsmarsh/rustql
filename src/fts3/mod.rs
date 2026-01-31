@@ -5,6 +5,7 @@ pub mod registry;
 pub mod tokenize;
 pub mod tokenizer;
 pub mod unicode;
+pub mod vtab_adapter;
 
 pub use fts3::{
     fts3_dequote, fts3_get_varint_u64, fts3_put_varint_u64, fts3_varint_len, DoclistIter,
@@ -17,3 +18,4 @@ pub use tokenize::Fts3TokenizeTable;
 pub use tokenizer::{
     create_tokenizer, parse_tokenize_arg, register_tokenizer, PorterTokenizer, Unicode61Tokenizer,
 };
+pub use vtab_adapter::Fts3VtabModule;

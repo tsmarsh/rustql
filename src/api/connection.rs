@@ -892,8 +892,9 @@ impl SqliteConnection {
         // FTS3 module (if feature enabled)
         #[cfg(feature = "fts3")]
         {
-            // TODO: Wire FTS3 module into registry when Fts3VtabModule is implemented
-            // self.vtab_registry.register_module(Arc::new(crate::fts3::Fts3VtabModule)).ok();
+            let _ = self
+                .vtab_registry
+                .register_module(Arc::new(crate::fts3::Fts3VtabModule));
         }
 
         // FTS5 module (if feature enabled)

@@ -2,9 +2,29 @@
 
 ## Progress
 
-Started at 41% pass rate, now at **71%** (113/159 tests passing, 46 errors).
+Started at 41% pass rate, now at **75%** (119/159 tests passing, 40 errors).
 
-### Session Progress (2026-01-31) - continued
+### Session Progress (2026-01-31) - continued (session 2)
+
+- **INSERT...SELECT...ORDER BY fix** - Fixed cursor offset for OpenPseudo opcode
+  - Bug: `compile_select_with_subqueries()` was adjusting cursor offsets for most opcodes but missed `OpenPseudo`
+  - This caused pseudo cursor to have wrong number, leading to Column reads from non-existent cursor
+  - Result: INSERT...SELECT...ORDER BY now works correctly
+
+- **IdxGE/GT/LE/LT collation fix** - Fixed index range comparisons to use cursor's collation
+  - Bug: Idx* opcodes were using P4::KeyInfo for collation, but bytecode often passes P4::Int64
+  - When P4 doesn't have KeyInfo, it fell back to BINARY collation instead of cursor's key_info
+  - Fix: Extract collation names from cursor's btree_cursor.key_info before mutable borrow, use as fallback
+  - Result: NOCASE index scans now correctly filter using NOCASE collation
+
+- **LIKE_OPT_COMPLETE for all prefix patterns** - Updated to set flag for NOCASE too
+  - The flag is now set for all prefix% patterns regardless of case sensitivity
+  - The actual skip decision happens in compile_runtime_filter_terms which checks using_index_range
+  - If collation-matching index is used, range scan is sufficient (no LIKE function needed)
+
+- Combined result: LIKE test errors reduced from 46 to 40 (6 more tests passing)
+
+### Previous Session Progress (2026-01-31)
 
 - **NOCASE collation handling for CREATE INDEX and LIKE optimization** - Major fix for case-insensitive LIKE with indexes
   - Fixed CREATE INDEX SQL storage to include COLLATE clause
@@ -13,8 +33,6 @@ Started at 41% pass rate, now at **71%** (113/159 tests passing, 46 errors).
   - Fixed index population during CREATE INDEX to use proper KeyInfo with collations
   - Fixed LIKE optimization to not skip LIKE function for NOCASE (range scan captures false positives)
   - Result: LIKE test errors reduced from 53 to 46 (7 more tests passing)
-
-### Earlier Session Progress (2026-01-31)
 
 - **ORDER BY on INTEGER PRIMARY KEY optimization** - Added check to skip sorter when ORDER BY is on rowid column
   - Fixed like-11.1 and like-11.2 tests
@@ -41,11 +59,11 @@ Started at 41% pass rate, now at **71%** (113/159 tests passing, 46 errors).
 
 4. **sqlite_like_count tracking** (previous work) - Global counter for LIKE function calls exposed via TCL
 
-### Remaining Failures (~46 tests)
+### Remaining Failures (~40 tests)
 
-1. **INSERT...SELECT...ORDER BY issue** (~15 tests)
-   - Tests like-5.x use `INSERT INTO t2 SELECT * FROM t1 ORDER BY rowid` which fails silently
-   - This is a pre-existing issue separate from LIKE optimization
+1. **INSERT...SELECT result ordering** (~6 tests, like-5.x)
+   - like-5.3, like-5.8, like-5.13, like-5.18, like-5.22, like-5.24
+   - Results appear but ordering or sqlite_like_count is wrong
 
 2. **Custom LIKE functions** (like-8.3, like-8.4)
    - Tests use `db function like -argcount 2 newlike` to override built-in LIKE
@@ -55,25 +73,35 @@ Started at 41% pass rate, now at **71%** (113/159 tests passing, 46 errors).
    - Tests use `db status step` and `db status sort` for instrumentation
    - We don't fully support this API yet
 
-4. **QPSG feature** (like-3.3.104, like-3.3.105)
+4. **QPSG feature** (like-3.3.102, like-3.3.104, like-3.3.105)
    - Query Planner Stability Guarantee not implemented
 
-5. **Unicode LIKE matching** (like-13.4)
+5. **like-3.18, like-3.24, like-4.5**
+   - Expression index or other LIKE optimization edge cases
+
+6. **Unicode LIKE matching** (like-13.4)
    - Character comparison for non-ASCII characters
 
-6. **Missing sqlite_options** (like-14.x)
+7. **Missing sqlite_options** (like-14.1, like-14.2)
    - Tests require `::sqlite_options(configslower)` variable
 
-7. **EQP output differences** (like-15.x, like-12.x)
+8. **EQP output differences** (like-12.13, like-12.15, like-15.101, like-15.112, like-15.121)
    - SEARCH vs SCAN expected in EXPLAIN QUERY PLAN output
 
+9. **like-11.6, like-11.7, like-11.8** - Sorting or index usage issues
+
+10. **like-16.1** - Result ordering issue
+
 ### Files Modified
+
+- src/executor/insert.rs
+  - Added `OpenPseudo` to list of opcodes that get cursor offset adjustment in `compile_select_with_subqueries()`
 
 - src/executor/where_clause.rs
   - Added `LIKE_OPT_COMPLETE` flag
   - Added `like_pattern_complete()` helper
   - Modified `generate_like_range_terms()` to mark complete patterns
-  - Fixed NOCASE collation: only skip LIKE function for BINARY collation (not NOCASE)
+  - Updated is_complete logic to set flag for all prefix patterns (collation check happens at runtime)
 
 - src/executor/select/mod.rs
   - Modified `compile_runtime_filter_terms()` to skip LIKE_OPT_COMPLETE terms
@@ -94,6 +122,7 @@ Started at 41% pass rate, now at **71%** (113/159 tests passing, 46 errors).
   - OpenRead: fixed collation capture from schema indexes
   - OpenWrite: handle P4::KeyInfo for directly provided collations
   - ParseSchema: inherit collation from table columns when creating index
+  - IdxGE/GT/LE/LT: added fallback to cursor's key_info for collation comparison
 
 - src/api/connection.rs
   - Fixed parse_create_index_sql to inherit collation from table columns

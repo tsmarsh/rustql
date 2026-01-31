@@ -914,6 +914,7 @@ impl<'a> InsertCompiler<'a> {
                     | Opcode::SorterData
                     | Opcode::OpenEphemeral
                     | Opcode::OpenAutoindex
+                    | Opcode::OpenPseudo
             ) {
                 // Don't adjust if it's our ephemeral cursor
                 if op.p1 != eph_cursor {

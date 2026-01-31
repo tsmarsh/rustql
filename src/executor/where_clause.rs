@@ -864,16 +864,14 @@ impl QueryPlanner {
                 };
 
                 // Check if the LIKE pattern is fully satisfied by the range bounds
-                // This is true when:
-                // 1. The pattern is "prefix%" with no other wildcards
-                // 2. We're using BINARY collation (case-sensitive)
+                // This is true when the pattern is "prefix%" with no other wildcards.
                 //
-                // For NOCASE collation, the range scan can include false positives
-                // (e.g., 'ABxy' falls between 'abc' and 'abd' but doesn't start with 'abc')
-                // so we must still verify with the LIKE function.
-                let is_case_sensitive = matches!(op, LikeOp::Glob) || self.case_sensitive_like;
-                let is_complete =
-                    is_case_sensitive && Self::like_pattern_complete(&pattern_expr, op);
+                // The LIKE_OPT_COMPLETE flag is set here, but the actual skip decision
+                // happens in compile_runtime_filter_terms which checks using_index_range.
+                // If an index with matching collation is used (NOCASE index for NOCASE LIKE,
+                // BINARY index for BINARY LIKE/GLOB), the range scan fully captures all
+                // matches and no LIKE verification is needed.
+                let is_complete = Self::like_pattern_complete(&pattern_expr, op);
 
                 // Mark the original LIKE term as fully optimized if complete
                 if is_complete {

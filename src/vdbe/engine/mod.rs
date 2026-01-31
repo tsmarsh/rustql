@@ -5094,7 +5094,7 @@ impl Vdbe {
                 // Pre-read the record for ephemeral check (before mutable cursor borrow)
                 let record = self.mem(op.p3).to_blob();
 
-                let key_info = match &op.p4 {
+                let p4_key_info = match &op.p4 {
                     P4::KeyInfo(info) => Some(info),
                     _ => None,
                 };
@@ -5105,6 +5105,19 @@ impl Vdbe {
                 };
 
                 let mut should_jump = false;
+
+                // Extract cursor's key_info collation names before mutable borrow
+                let cursor_collations: Vec<String> = self
+                    .cursor(op.p1)
+                    .and_then(|c| c.btree_cursor.as_ref())
+                    .and_then(|bt| bt.key_info.as_ref())
+                    .map(|ki| {
+                        ki.collations
+                            .iter()
+                            .map(|cs| cs.name().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
 
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if cursor.is_ephemeral {
@@ -5125,15 +5138,16 @@ impl Vdbe {
                                 let idx_mem = index_mems.get(i).unwrap_or(&null_mem);
                                 let key_mem = self.mem(op.p3 + i as i32);
 
-                                // Get collation for this column
-                                let collation = key_info
+                                // Get collation for this column - prefer P4 KeyInfo, fall back to cursor's key_info
+                                let collation = p4_key_info
                                     .and_then(|ki| ki.collations.get(i))
                                     .map(|s| s.as_str())
+                                    .or_else(|| cursor_collations.get(i).map(|s| s.as_str()))
                                     .unwrap_or("BINARY");
                                 let col_cmp = idx_mem.compare_with_collation(key_mem, collation);
 
                                 // Apply DESC sort order
-                                let desc = key_info
+                                let desc = p4_key_info
                                     .and_then(|ki| ki.sort_orders.get(i).copied())
                                     .unwrap_or(false);
                                 let col_cmp = if desc { col_cmp.reverse() } else { col_cmp };
@@ -5157,7 +5171,7 @@ impl Vdbe {
 
             Opcode::IdxGT => {
                 // IdxGT P1 P2 P3 P4: jump if index entry > key
-                let key_info = match &op.p4 {
+                let p4_key_info = match &op.p4 {
                     P4::KeyInfo(info) => Some(info),
                     _ => None,
                 };
@@ -5169,6 +5183,19 @@ impl Vdbe {
 
                 if key_cols != 0 {
                     let mut should_jump = false;
+
+                    // Extract cursor's key_info collation names before mutable borrow
+                    let cursor_collations: Vec<String> = self
+                        .cursor(op.p1)
+                        .and_then(|c| c.btree_cursor.as_ref())
+                        .and_then(|bt| bt.key_info.as_ref())
+                        .map(|ki| {
+                            ki.collations
+                                .iter()
+                                .map(|cs| cs.name().to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default();
 
                     if let Some(cursor) = self.cursor_mut(op.p1) {
                         if !cursor.is_ephemeral {
@@ -5185,16 +5212,17 @@ impl Vdbe {
                                     let idx_mem = index_mems.get(i).unwrap_or(&null_mem);
                                     let key_mem = self.mem(op.p3 + i as i32);
 
-                                    // Get collation for this column
-                                    let collation = key_info
+                                    // Get collation for this column - prefer P4 KeyInfo, fall back to cursor's key_info
+                                    let collation = p4_key_info
                                         .and_then(|ki| ki.collations.get(i))
                                         .map(|s| s.as_str())
+                                        .or_else(|| cursor_collations.get(i).map(|s| s.as_str()))
                                         .unwrap_or("BINARY");
                                     let col_cmp =
                                         idx_mem.compare_with_collation(key_mem, collation);
 
                                     // Apply DESC sort order
-                                    let desc = key_info
+                                    let desc = p4_key_info
                                         .and_then(|ki| ki.sort_orders.get(i).copied())
                                         .unwrap_or(false);
                                     let col_cmp = if desc { col_cmp.reverse() } else { col_cmp };
@@ -5217,7 +5245,7 @@ impl Vdbe {
 
             Opcode::IdxLE => {
                 // IdxLE P1 P2 P3 P4: jump if index entry <= key
-                let key_info = match &op.p4 {
+                let p4_key_info = match &op.p4 {
                     P4::KeyInfo(info) => Some(info),
                     _ => None,
                 };
@@ -5229,6 +5257,19 @@ impl Vdbe {
 
                 if key_cols != 0 {
                     let mut should_jump = false;
+
+                    // Extract cursor's key_info collation names before mutable borrow
+                    let cursor_collations: Vec<String> = self
+                        .cursor(op.p1)
+                        .and_then(|c| c.btree_cursor.as_ref())
+                        .and_then(|bt| bt.key_info.as_ref())
+                        .map(|ki| {
+                            ki.collations
+                                .iter()
+                                .map(|cs| cs.name().to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default();
 
                     if let Some(cursor) = self.cursor_mut(op.p1) {
                         if !cursor.is_ephemeral {
@@ -5245,16 +5286,17 @@ impl Vdbe {
                                     let idx_mem = index_mems.get(i).unwrap_or(&null_mem);
                                     let key_mem = self.mem(op.p3 + i as i32);
 
-                                    // Get collation for this column
-                                    let collation = key_info
+                                    // Get collation for this column - prefer P4 KeyInfo, fall back to cursor's key_info
+                                    let collation = p4_key_info
                                         .and_then(|ki| ki.collations.get(i))
                                         .map(|s| s.as_str())
+                                        .or_else(|| cursor_collations.get(i).map(|s| s.as_str()))
                                         .unwrap_or("BINARY");
                                     let col_cmp =
                                         idx_mem.compare_with_collation(key_mem, collation);
 
                                     // Apply DESC sort order
-                                    let desc = key_info
+                                    let desc = p4_key_info
                                         .and_then(|ki| ki.sort_orders.get(i).copied())
                                         .unwrap_or(false);
                                     let col_cmp = if desc { col_cmp.reverse() } else { col_cmp };
@@ -5280,7 +5322,7 @@ impl Vdbe {
 
             Opcode::IdxLT => {
                 // IdxLT P1 P2 P3 P4: jump if index entry < key
-                let key_info = match &op.p4 {
+                let p4_key_info = match &op.p4 {
                     P4::KeyInfo(info) => Some(info),
                     _ => None,
                 };
@@ -5292,6 +5334,19 @@ impl Vdbe {
 
                 if key_cols != 0 {
                     let mut should_jump = false;
+
+                    // Extract cursor's key_info collation names before mutable borrow
+                    let cursor_collations: Vec<String> = self
+                        .cursor(op.p1)
+                        .and_then(|c| c.btree_cursor.as_ref())
+                        .and_then(|bt| bt.key_info.as_ref())
+                        .map(|ki| {
+                            ki.collations
+                                .iter()
+                                .map(|cs| cs.name().to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default();
 
                     if let Some(cursor) = self.cursor_mut(op.p1) {
                         if !cursor.is_ephemeral {
@@ -5308,16 +5363,17 @@ impl Vdbe {
                                     let idx_mem = index_mems.get(i).unwrap_or(&null_mem);
                                     let key_mem = self.mem(op.p3 + i as i32);
 
-                                    // Get collation for this column
-                                    let collation = key_info
+                                    // Get collation for this column - prefer P4 KeyInfo, fall back to cursor's key_info
+                                    let collation = p4_key_info
                                         .and_then(|ki| ki.collations.get(i))
                                         .map(|s| s.as_str())
+                                        .or_else(|| cursor_collations.get(i).map(|s| s.as_str()))
                                         .unwrap_or("BINARY");
                                     let col_cmp =
                                         idx_mem.compare_with_collation(key_mem, collation);
 
                                     // Apply DESC sort order
-                                    let desc = key_info
+                                    let desc = p4_key_info
                                         .and_then(|ki| ki.sort_orders.get(i).copied())
                                         .unwrap_or(false);
                                     let col_cmp = if desc { col_cmp.reverse() } else { col_cmp };

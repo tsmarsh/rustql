@@ -3350,6 +3350,27 @@ impl Vdbe {
                             }
                             Err(e) => return Err(e),
                         }
+                    } else if crate::functions::is_aggregate_function(name) {
+                        // Handle aggregate function called as scalar (e.g., SELECT md5sum('hello'))
+                        // Create state, step once with args, finalize
+                        let argc = op.p1.max(0) as usize;
+                        let arg_base = op.p2;
+                        let mut args = Vec::with_capacity(argc);
+                        for i in 0..argc {
+                            let mem = self.mem(arg_base + i as i32);
+                            args.push(mem.to_value());
+                        }
+                        if let Some(mut state) = crate::functions::AggregateState::new(name) {
+                            let _ = state.step(&args);
+                            match state.finalize() {
+                                Ok(value) => {
+                                    *self.mem_mut(op.p3) = Mem::from_value(&value);
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        } else {
+                            self.mem_mut(op.p3).set_null();
+                        }
                     } else {
                         // Check for user-defined TCL function
                         #[cfg(feature = "tcl")]

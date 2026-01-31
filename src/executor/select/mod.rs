@@ -5760,31 +5760,22 @@ impl<'s> SelectCompiler<'s> {
                 let is_multi_arg_min_max =
                     matches!(name_upper.as_str(), "MIN" | "MAX") && arg_count > 1;
                 let is_aggregate = !is_multi_arg_min_max
-                    && matches!(
-                        name_upper.as_str(),
-                        "COUNT"
-                            | "SUM"
-                            | "AVG"
-                            | "MIN"
-                            | "MAX"
-                            | "GROUP_CONCAT"
-                            | "STRING_AGG"
-                            | "TOTAL"
-                    );
+                    && crate::functions::is_aggregate_function(&func_call.name);
 
                 // Validate aggregate function argument counts
                 if is_aggregate {
-                    let (min_args, max_args) = match name_upper.as_str() {
-                        "COUNT" => (0, 1),
-                        "SUM" | "AVG" | "TOTAL" | "MIN" | "MAX" => (1, 1),
-                        "GROUP_CONCAT" => (1, 2),
-                        _ => (0, 255),
-                    };
-                    if arg_count < min_args || arg_count > max_args {
-                        return Err(Error::with_message(
-                            ErrorCode::Error,
-                            format!("wrong number of arguments to function {}()", func_call.name),
-                        ));
+                    if let Some(agg_info) =
+                        crate::functions::get_aggregate_function(&func_call.name)
+                    {
+                        if arg_count < agg_info.min_args || arg_count > agg_info.max_args {
+                            return Err(Error::with_message(
+                                ErrorCode::Error,
+                                format!(
+                                    "wrong number of arguments to function {}()",
+                                    func_call.name
+                                ),
+                            ));
+                        }
                     }
                 }
 
@@ -6869,17 +6860,7 @@ impl<'s> SelectCompiler<'s> {
                 {
                     false
                 } else {
-                    matches!(
-                        name_upper.as_str(),
-                        "COUNT"
-                            | "SUM"
-                            | "AVG"
-                            | "MIN"
-                            | "MAX"
-                            | "GROUP_CONCAT"
-                            | "STRING_AGG"
-                            | "TOTAL"
-                    )
+                    crate::functions::is_aggregate_function(&func_call.name)
                 };
 
                 if is_aggregate {
@@ -6923,17 +6904,7 @@ impl<'s> SelectCompiler<'s> {
                 {
                     false
                 } else {
-                    matches!(
-                        name_upper.as_str(),
-                        "COUNT"
-                            | "SUM"
-                            | "AVG"
-                            | "MIN"
-                            | "MAX"
-                            | "GROUP_CONCAT"
-                            | "STRING_AGG"
-                            | "TOTAL"
-                    )
+                    crate::functions::is_aggregate_function(&func_call.name)
                 };
                 if is_aggregate {
                     return Some(func_call.name.clone());

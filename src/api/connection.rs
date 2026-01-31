@@ -591,6 +591,10 @@ pub struct DbInfo {
     pub locking_mode: LockingMode,
     /// B-tree storage
     pub btree: Option<Arc<Btree>>,
+    /// User version (PRAGMA user_version) - application-defined integer
+    pub user_version: i32,
+    /// Schema version (PRAGMA schema_version) - incremented on schema changes
+    pub schema_version: i32,
 }
 
 /// Default cache size in KiB (SQLite default is -2000 meaning 2000 KiB)
@@ -611,6 +615,8 @@ impl DbInfo {
             journal_mode: JournalMode::Delete,
             locking_mode: LockingMode::Normal,
             btree: None,
+            user_version: 0,
+            schema_version: 0,
         }
     }
 }
@@ -764,6 +770,18 @@ pub struct DbConfigFlags {
     pub automatic_index: bool,
     /// Cache spill - when true, allow cache to spill to disk under memory pressure (default ON)
     pub cache_spill: bool,
+    /// Temp store: 0=default, 1=file, 2=memory
+    pub temp_store: i32,
+    /// Temp store directory (deprecated)
+    pub temp_store_directory: Option<String>,
+    /// Full fsync on commit
+    pub fullfsync: bool,
+    /// Full fsync on checkpoint
+    pub checkpoint_fullfsync: bool,
+    /// Read uncommitted isolation level
+    pub read_uncommitted: bool,
+    /// Reverse unordered selects (for testing)
+    pub reverse_unordered_selects: bool,
 }
 
 impl Default for SqliteConnection {
@@ -818,13 +836,19 @@ impl SqliteConnection {
                 legacy_file_format: false,
                 no_ckpt_on_close: false,
                 count_changes: false,
-                short_column_names: true,      // Default ON
-                full_column_names: false,      // Default OFF
-                vdbe_listing: false,           // Default OFF
-                empty_result_callbacks: false, // Default OFF
-                case_sensitive_like: false,    // Default OFF
-                automatic_index: true,         // Default ON
-                cache_spill: true,             // Default ON
+                short_column_names: true,         // Default ON
+                full_column_names: false,         // Default OFF
+                vdbe_listing: false,              // Default OFF
+                empty_result_callbacks: false,    // Default OFF
+                case_sensitive_like: false,       // Default OFF
+                automatic_index: true,            // Default ON
+                cache_spill: true,                // Default ON
+                temp_store: 0,                    // Default (use compile-time default)
+                temp_store_directory: None,       // Default (deprecated, empty)
+                fullfsync: false,                 // Default OFF
+                checkpoint_fullfsync: false,      // Default OFF
+                read_uncommitted: false,          // Default OFF
+                reverse_unordered_selects: false, // Default OFF
             },
             schema_generation: AtomicU64::new(0),
             memory_used: AtomicI64::new(0),

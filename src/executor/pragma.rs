@@ -140,6 +140,14 @@ pub fn execute_pragma(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Resul
         "writable_schema" => pragma_writable_schema(conn, pragma),
         "automatic_index" => pragma_automatic_index(conn, pragma),
         "trusted_schema" => pragma_trusted_schema(conn, pragma),
+        "user_version" => pragma_user_version(conn, schema_name, pragma),
+        "schema_version" => pragma_schema_version(conn, schema_name, pragma),
+        "temp_store" => pragma_temp_store(conn, pragma),
+        "temp_store_directory" => pragma_temp_store_directory(conn, pragma),
+        "fullfsync" => pragma_fullfsync(conn, pragma),
+        "checkpoint_fullfsync" => pragma_checkpoint_fullfsync(conn, pragma),
+        "read_uncommitted" => pragma_read_uncommitted(conn, pragma),
+        "reverse_unordered_selects" => pragma_reverse_unordered_selects(conn, pragma),
         _ => Err(Error::with_message(
             ErrorCode::Error,
             format!("unknown pragma: {}", pragma.name),
@@ -829,6 +837,136 @@ fn pragma_trusted_schema(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Re
     }
     if pragma.value.is_none() {
         return Ok(single_int_result(i64::from(conn.db_config.trusted_schema)));
+    }
+    Ok(empty_result())
+}
+
+fn pragma_user_version(
+    conn: &mut SqliteConnection,
+    schema_name: &str,
+    pragma: &PragmaStmt,
+) -> Result<PragmaResult> {
+    let db = lookup_db_mut(conn, schema_name)?;
+    if let Some(value) = pragma_value_i64(pragma) {
+        db.user_version = value as i32;
+    }
+    if pragma.value.is_none() {
+        return Ok(single_int_result(db.user_version as i64));
+    }
+    Ok(empty_result())
+}
+
+fn pragma_schema_version(
+    conn: &mut SqliteConnection,
+    schema_name: &str,
+    pragma: &PragmaStmt,
+) -> Result<PragmaResult> {
+    let db = lookup_db_mut(conn, schema_name)?;
+    if let Some(value) = pragma_value_i64(pragma) {
+        db.schema_version = value as i32;
+    }
+    if pragma.value.is_none() {
+        return Ok(single_int_result(db.schema_version as i64));
+    }
+    Ok(empty_result())
+}
+
+fn pragma_temp_store(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Result<PragmaResult> {
+    // temp_store: 0=default, 1=file, 2=memory
+    if let Some(value) = pragma_value_i64(pragma) {
+        conn.db_config.temp_store = value.clamp(0, 2) as i32;
+    } else if let Some(s) = pragma_value_string(pragma) {
+        conn.db_config.temp_store = match s.to_lowercase().as_str() {
+            "default" => 0,
+            "file" => 1,
+            "memory" => 2,
+            _ => conn.db_config.temp_store,
+        };
+    }
+    if pragma.value.is_none() {
+        return Ok(single_int_result(conn.db_config.temp_store as i64));
+    }
+    Ok(empty_result())
+}
+
+fn pragma_temp_store_directory(
+    conn: &mut SqliteConnection,
+    pragma: &PragmaStmt,
+) -> Result<PragmaResult> {
+    // temp_store_directory is deprecated but still needs to be recognized
+    if let Some(dir) = pragma_value_string(pragma) {
+        conn.db_config.temp_store_directory = if dir.is_empty() { None } else { Some(dir) };
+    }
+    if pragma.value.is_none() {
+        let dir = conn
+            .db_config
+            .temp_store_directory
+            .clone()
+            .unwrap_or_default();
+        return Ok(single_text_result(dir));
+    }
+    Ok(empty_result())
+}
+
+fn pragma_fullfsync(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Result<PragmaResult> {
+    if let Some(value) = pragma_value_i64(pragma) {
+        conn.db_config.fullfsync = value != 0;
+    } else if let Some(value) = pragma_value_string(pragma) {
+        conn.db_config.fullfsync = parse_bool_value(&value);
+    }
+    if pragma.value.is_none() {
+        return Ok(single_int_result(i64::from(conn.db_config.fullfsync)));
+    }
+    Ok(empty_result())
+}
+
+fn pragma_checkpoint_fullfsync(
+    conn: &mut SqliteConnection,
+    pragma: &PragmaStmt,
+) -> Result<PragmaResult> {
+    if let Some(value) = pragma_value_i64(pragma) {
+        conn.db_config.checkpoint_fullfsync = value != 0;
+    } else if let Some(value) = pragma_value_string(pragma) {
+        conn.db_config.checkpoint_fullfsync = parse_bool_value(&value);
+    }
+    if pragma.value.is_none() {
+        return Ok(single_int_result(i64::from(
+            conn.db_config.checkpoint_fullfsync,
+        )));
+    }
+    Ok(empty_result())
+}
+
+fn pragma_read_uncommitted(
+    conn: &mut SqliteConnection,
+    pragma: &PragmaStmt,
+) -> Result<PragmaResult> {
+    if let Some(value) = pragma_value_i64(pragma) {
+        conn.db_config.read_uncommitted = value != 0;
+    } else if let Some(value) = pragma_value_string(pragma) {
+        conn.db_config.read_uncommitted = parse_bool_value(&value);
+    }
+    if pragma.value.is_none() {
+        return Ok(single_int_result(i64::from(
+            conn.db_config.read_uncommitted,
+        )));
+    }
+    Ok(empty_result())
+}
+
+fn pragma_reverse_unordered_selects(
+    conn: &mut SqliteConnection,
+    pragma: &PragmaStmt,
+) -> Result<PragmaResult> {
+    if let Some(value) = pragma_value_i64(pragma) {
+        conn.db_config.reverse_unordered_selects = value != 0;
+    } else if let Some(value) = pragma_value_string(pragma) {
+        conn.db_config.reverse_unordered_selects = parse_bool_value(&value);
+    }
+    if pragma.value.is_none() {
+        return Ok(single_int_result(i64::from(
+            conn.db_config.reverse_unordered_selects,
+        )));
     }
     Ok(empty_result())
 }

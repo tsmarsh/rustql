@@ -1,0 +1,1 @@
+Fix savepoint test failures: transaction/savepoint state handling, locking semantics, incrblob/incr_vacuum support (or appropriate gating), and Tcl channel integration regressions. Use sqlite3/test/savepoint.test as the source of truth. Update tests and engine to match SQLite behavior; no shortcut normalization.

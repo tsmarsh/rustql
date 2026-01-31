@@ -440,6 +440,9 @@ pub struct Vdbe {
     /// Active virtual table rowid for FTS helpers
     vtab_context_rowid: Option<i64>,
 
+    /// Virtual table module registry
+    vtab_registry: Option<Arc<crate::vtab::VtabRegistry>>,
+
     // ========================================================================
     // Trigger Context
     // ========================================================================
@@ -516,6 +519,7 @@ impl Vdbe {
             vtab_query: None,
             vtab_context_name: None,
             vtab_context_rowid: None,
+            vtab_registry: None,
             trigger_param_base: None,
             trigger_num_columns: 0,
             trigger_depth: 0,
@@ -581,6 +585,16 @@ impl Vdbe {
     /// Set the connection pointer for transaction/autocommit updates
     pub fn set_connection(&mut self, conn_ptr: *mut SqliteConnection) {
         self.conn_ptr = Some(conn_ptr);
+    }
+
+    /// Set the virtual table registry
+    pub fn set_vtab_registry(&mut self, registry: Arc<crate::vtab::VtabRegistry>) {
+        self.vtab_registry = Some(registry);
+    }
+
+    /// Get the virtual table registry
+    pub fn vtab_registry(&self) -> Option<&Arc<crate::vtab::VtabRegistry>> {
+        self.vtab_registry.as_ref()
     }
 
     /// Create from a list of operations

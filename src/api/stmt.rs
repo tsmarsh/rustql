@@ -539,6 +539,9 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
                 }
             }
             vdbe.set_connection(conn_ptr);
+
+            // Set up virtual table registry
+            vdbe.set_vtab_registry(conn.vtab_registry.clone());
         }
 
         // Set up parameters

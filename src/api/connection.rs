@@ -20,6 +20,7 @@ use crate::types::{
 };
 use crate::vdbe::auxdata::{decode_record_header, deserialize_value, SerialType};
 use crate::vdbe::mem::Mem;
+use crate::vtab::VtabRegistry;
 
 use super::config::{sqlite3_initialize, DbConfigOption};
 
@@ -726,6 +727,8 @@ pub struct SqliteConnection {
     pub memory_used: AtomicI64,
     /// Peak memory usage (highwater mark) for this connection
     pub memory_highwater: AtomicI64,
+    /// Virtual table module registry
+    pub vtab_registry: Arc<VtabRegistry>,
 }
 
 /// Per-connection configuration flags
@@ -854,6 +857,7 @@ impl SqliteConnection {
             schema_generation: AtomicU64::new(0),
             memory_used: AtomicI64::new(0),
             memory_highwater: AtomicI64::new(0),
+            vtab_registry: Arc::new(VtabRegistry::new()),
         };
 
         // Add main and temp databases
@@ -862,6 +866,9 @@ impl SqliteConnection {
 
         // Register built-in collations
         conn.register_builtin_collations();
+
+        // Register built-in virtual table modules
+        conn.register_builtin_vtab_modules();
 
         conn
     }
@@ -878,6 +885,27 @@ impl SqliteConnection {
 
         // RTRIM - ignore trailing spaces
         self.create_collation("RTRIM", |a, b| a.trim_end().cmp(b.trim_end()));
+    }
+
+    /// Register built-in virtual table modules
+    fn register_builtin_vtab_modules(&self) {
+        // FTS3 module (if feature enabled)
+        #[cfg(feature = "fts3")]
+        {
+            // TODO: Wire FTS3 module into registry when Fts3VtabModule is implemented
+            // self.vtab_registry.register_module(Arc::new(crate::fts3::Fts3VtabModule)).ok();
+        }
+
+        // FTS5 module (if feature enabled)
+        #[cfg(feature = "fts5")]
+        {
+            // TODO: Wire FTS5 module into registry when Fts5VtabModule is implemented
+            // self.vtab_registry.register_module(Arc::new(crate::fts5::Fts5VtabModule)).ok();
+        }
+
+        // R-tree module
+        // TODO: Wire R-tree module into registry when RtreeVtabModule is implemented
+        // self.vtab_registry.register_module(Arc::new(crate::rtree::RtreeVtabModule)).ok();
     }
 
     /// Register a collation sequence

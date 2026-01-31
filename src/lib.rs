@@ -26,6 +26,7 @@ pub mod types;
 pub mod utf;
 pub mod util;
 pub mod vdbe;
+pub mod vtab;
 
 #[cfg(feature = "tcl")]
 pub mod tcl_ext;

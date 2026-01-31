@@ -4318,7 +4318,7 @@ impl<'s> SelectCompiler<'s> {
                     {
                         return Err(Error::with_message(
                             ErrorCode::Error,
-                            format!("no such table: {}", table_name),
+                            format!("no such table: {}", qualified_name),
                         ));
                     }
                     schema.tables.get(&table_name_lower).cloned()

@@ -1598,10 +1598,29 @@ impl Vdbe {
                     // (could be a table or an index)
                     if root_page == 0 {
                         if let Some(ref tname) = table_name {
+                            // Parse qualified name (db.table or just table)
+                            let (db_name, simple_name) = if let Some(dot_pos) = tname.find('.') {
+                                (Some(&tname[..dot_pos]), &tname[dot_pos + 1..])
+                            } else {
+                                (None, tname.as_str())
+                            };
+
+                            // For attached databases, we need their schemas loaded
+                            // Currently only "main" schema is available; error if different db requested
+                            if let Some(db) = db_name {
+                                if !db.eq_ignore_ascii_case("main") {
+                                    // TODO: Support attached database schema lookup
+                                    return Err(Error::with_message(
+                                        ErrorCode::Error,
+                                        format!("no such table: {}", tname),
+                                    ));
+                                }
+                            }
+
                             if let Some(ref schema) = self.schema {
                                 if let Ok(schema_guard) = schema.read() {
                                     // First try as a table (case-insensitive lookup)
-                                    let tname_lower = tname.to_lowercase();
+                                    let tname_lower = simple_name.to_lowercase();
                                     if let Some(table) = schema_guard.tables.get(&tname_lower) {
                                         root_page = table.root_page;
                                         table_meta = Some(std::sync::Arc::clone(table));

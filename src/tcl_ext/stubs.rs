@@ -176,6 +176,63 @@ pub unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         // Printf test commands (stubs)
         "sqlite3_mprintf_z_test",
         "vfs_unlink_test",
+        // Btree test commands (stubs)
+        "btree_open",
+        "btree_close",
+        "btree_cursor",
+        "btree_first",
+        "btree_next",
+        "btree_key",
+        "btree_data",
+        "btree_cursor_info",
+        "btree_insert",
+        "btree_delete",
+        "btree_clear_table",
+        "btree_drop_table",
+        "btree_get_page_size",
+        "btree_set_page_size",
+        "btree_integrity_check",
+        "btree_pager_stats",
+        "btree_cursor_list",
+        "btree_move_to",
+        "btree_eof",
+        "btree_keysize",
+        "btree_payload_size",
+        "btree_varint_test",
+        "btree_from_db",
+        "btree_shared_cache_report",
+        "pager_open",
+        "pager_close",
+        "pager_commit",
+        "pager_rollback",
+        "pager_stmt_begin",
+        "pager_stmt_commit",
+        "pager_stmt_rollback",
+        "pager_stats",
+        "pager_pagecount",
+        "pager_truncate",
+        "page_get",
+        "page_lookup",
+        "page_unref",
+        "page_read",
+        "page_write",
+        "page_number",
+        "fake_big_file",
+        // Misc test commands
+        "sqlite3_blob_open",
+        "sqlite3_blob_close",
+        "sqlite3_blob_read",
+        "sqlite3_blob_write",
+        "sqlite3_blob_reopen",
+        "sqlite3_blob_bytes",
+        "sqlite_delete_function",
+        "sqlite_delete_collation",
+        "sqlite3_table_column_metadata",
+        "sqlite3_file_control",
+        "sqlite3_vfs_list",
+        "sqlite3_vfs_find",
+        "sqlite3_vfs_register",
+        "sqlite3_vfs_unregister",
     ];
 
     for cmd in stub_commands {
@@ -437,6 +494,39 @@ pub unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         ("threadsafe1", "0"),
         ("threadsafe2", "0"),
         ("like_match_blobs", "0"), // LIKE does not match blobs
+        // Additional options required by various tests
+        ("legacyformat", "0"),
+        ("autoinc", "1"),
+        ("configslower", "0"),
+        ("rowid32", "0"),
+        ("maxexpr", "1"),
+        ("hexlit", "1"),
+        ("floatingpoint", "1"),
+        ("check", "1"),
+        ("complete", "1"),
+        ("reindex", "1"),
+        ("diskio", "1"),
+        ("trace", "1"),
+        ("secure_delete", "1"),
+        ("fts3", "1"),
+        ("fts5", "1"),
+        ("rtree", "1"),
+        ("json", "1"),
+        ("memdebug", "0"),
+        ("crashtest", "0"),
+        ("debug", "0"),
+        ("hidden_columns", "0"),
+        ("deprecated", "0"),
+        ("direct_read", "0"),
+        ("lock_proxy_pragmas", "0"),
+        ("mem5", "0"),
+        ("icu", "0"),
+        ("tclvar", "0"),
+        ("builtin_test", "0"),
+        ("columncount", "1"),
+        ("authorization", "1"),
+        ("default_autovacuum", "0"),
+        ("autovacuum", "1"),
     ];
 
     let arr_name = CString::new("::sqlite_options").unwrap();
@@ -510,6 +600,117 @@ pub unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         Some(md5_cmd),
         std::ptr::null_mut(),
         None,
+    );
+
+    // Register sqlite3_db_config_lookaside - configures per-connection lookaside memory
+    // Used by printf.test, altermalloc.test, analyze9.test, dbstatus.test, and others
+    let cmd_name = CString::new("sqlite3_db_config_lookaside").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(test_stub_return_zero),
+        std::ptr::null_mut(),
+        None,
+    );
+
+    // Register sqlite3_rekey - encrypt/decrypt database with new key
+    // Used by types.test and encryption tests
+    // Returns error since encryption is not supported
+    let cmd_name = CString::new("sqlite3_rekey").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(test_stub_return_zero),
+        std::ptr::null_mut(),
+        None,
+    );
+
+    // Register sqlite3_key - set database encryption key
+    // Used by encryption tests
+    let cmd_name = CString::new("sqlite3_key").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(test_stub_return_zero),
+        std::ptr::null_mut(),
+        None,
+    );
+
+    // Register sqlite_set_magic - test utility to corrupt database magic number
+    let cmd_name = CString::new("sqlite_set_magic").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(test_stub_return_zero),
+        std::ptr::null_mut(),
+        None,
+    );
+
+    // Register btree_begin_transaction - test utility for btree transactions
+    let cmd_name = CString::new("btree_begin_transaction").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(test_stub_return_zero),
+        std::ptr::null_mut(),
+        None,
+    );
+
+    // Register btree_commit - test utility for btree commits
+    let cmd_name = CString::new("btree_commit").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(test_stub_return_zero),
+        std::ptr::null_mut(),
+        None,
+    );
+
+    // Register btree_rollback - test utility for btree rollbacks
+    let cmd_name = CString::new("btree_rollback").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(test_stub_return_zero),
+        std::ptr::null_mut(),
+        None,
+    );
+
+    // Set additional SQLite compile-time limits
+    let max_attached_name = CString::new("SQLITE_MAX_ATTACHED").unwrap();
+    let max_attached_val = CString::new("10").unwrap();
+    Tcl_SetVar(
+        interp,
+        max_attached_name.as_ptr(),
+        max_attached_val.as_ptr(),
+        TCL_GLOBAL_ONLY,
+    );
+
+    let max_compound_name = CString::new("SQLITE_MAX_COMPOUND_SELECT").unwrap();
+    let max_compound_val = CString::new("500").unwrap();
+    Tcl_SetVar(
+        interp,
+        max_compound_name.as_ptr(),
+        max_compound_val.as_ptr(),
+        TCL_GLOBAL_ONLY,
+    );
+
+    let temp_store_name = CString::new("TEMP_STORE").unwrap();
+    let temp_store_val = CString::new("0").unwrap();
+    Tcl_SetVar(
+        interp,
+        temp_store_name.as_ptr(),
+        temp_store_val.as_ptr(),
+        TCL_GLOBAL_ONLY,
+    );
+
+    let max_variable_name = CString::new("SQLITE_MAX_VARIABLE_NUMBER").unwrap();
+    let max_variable_val = CString::new("999").unwrap();
+    Tcl_SetVar(
+        interp,
+        max_variable_name.as_ptr(),
+        max_variable_val.as_ptr(),
+        TCL_GLOBAL_ONLY,
     );
 }
 

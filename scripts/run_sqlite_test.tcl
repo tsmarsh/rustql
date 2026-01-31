@@ -142,10 +142,53 @@ array set sqlite_options {
     icu 0
     deprecated 0
     direct_read 0
+    legacyformat 0
+    autoinc 1
+    configslower 0
+    rowid32 0
+    maxexpr 1
+    cast 1
+    altertable 1
+    schema_pragmas 1
+    like_opt 1
+    cursorhints 0
+    uri 0
+    analyze 0
+    autoindex 0
+    encoding 1
+    cte 0
+    between_opt 1
+    schema_version 1
+    default_cache_size 1
+    memorymanage 0
+    like_match_blobs 0
+    vtab 0
+    auth 0
 }
 
 # SQLite compile-time limits
 set ::SQLITE_MAX_FUNCTION_ARG 127
+set ::SQLITE_MAX_ATTACHED 10
+set ::SQLITE_MAX_COMPOUND_SELECT 500
+set ::SQLITE_MAX_VARIABLE_NUMBER 999
+set ::SQLITE_MAX_EXPR_DEPTH 1000
+set ::SQLITE_MAX_COLUMN 2000
+set ::SQLITE_MAX_SQL_LENGTH 1000000000
+set ::SQLITE_MAX_TRIGGER_DEPTH 1000
+
+# Temp storage mode (0=file default, 1=file always, 2=memory, 3=memory always)
+set ::TEMP_STORE 0
+
+# Memory allocation test variables
+set ::nBenign 0
+set ::nFail 0
+set ::nRepeat 0
+
+# Transaction verification variables
+set ::checksum ""
+
+# File I/O test variables
+set ::fd ""
 
 # Source the test infrastructure
 # Set guard flag to prevent double reset_db when test file re-sources tester.tcl

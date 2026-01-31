@@ -19,6 +19,7 @@ pub mod os;
 pub mod parser;
 pub mod random;
 pub mod rtree;
+pub mod rtree_vtab;
 pub mod schema;
 pub mod shared_cache;
 pub mod storage;

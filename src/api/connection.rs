@@ -906,8 +906,9 @@ impl SqliteConnection {
         }
 
         // R-tree module
-        // TODO: Wire R-tree module into registry when RtreeVtabModule is implemented
-        // self.vtab_registry.register_module(Arc::new(crate::rtree::RtreeVtabModule)).ok();
+        let _ = self
+            .vtab_registry
+            .register_module(Arc::new(crate::rtree_vtab::RtreeVtabModule));
     }
 
     /// Register a collation sequence

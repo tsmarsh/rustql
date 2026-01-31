@@ -564,6 +564,10 @@ pub struct TableInfo {
     /// Table column names (for column index resolution)
     pub columns: Vec<String>,
 
+    /// Column affinities (TEXT, INTEGER, REAL, BLOB, NUMERIC)
+    /// Used to disable LIKE optimization for non-TEXT columns
+    pub column_affinities: Vec<String>,
+
     /// Column index that is INTEGER PRIMARY KEY (rowid alias), if any
     /// This is set when a column is declared as `INTEGER PRIMARY KEY` and
     /// acts as an alias for the rowid. Value is -1 if no IPK column.
@@ -663,6 +667,7 @@ impl QueryPlanner {
             indexes: Vec::new(),
             has_rowid: true,
             columns: Vec::new(),
+            column_affinities: Vec::new(),
             ipk_column: -1, // No INTEGER PRIMARY KEY column by default
         });
     }
@@ -670,6 +675,13 @@ impl QueryPlanner {
     pub fn set_table_columns(&mut self, table_idx: usize, columns: Vec<String>) {
         if let Some(table) = self.tables.get_mut(table_idx) {
             table.columns = columns;
+        }
+    }
+
+    /// Set column affinities for a table (TEXT, INTEGER, REAL, BLOB, NUMERIC)
+    pub fn set_table_column_affinities(&mut self, table_idx: usize, affinities: Vec<String>) {
+        if let Some(table) = self.tables.get_mut(table_idx) {
+            table.column_affinities = affinities;
         }
     }
 
@@ -778,7 +790,7 @@ impl QueryPlanner {
             .iter()
             .map(|t| (t.name.clone(), t.alias.clone(), t.mask, t.columns.clone()))
             .collect();
-        // Include ipk_column in the tuple for recognizing INTEGER PRIMARY KEY columns
+        // Include ipk_column and column_affinities for analysis
         let table_info: Vec<_> = self
             .tables
             .iter()
@@ -789,6 +801,7 @@ impl QueryPlanner {
                     t.mask,
                     t.columns.clone(),
                     t.ipk_column,
+                    t.column_affinities.clone(),
                 )
             })
             .collect();
@@ -813,7 +826,7 @@ impl QueryPlanner {
     /// This allows the query planner to use an index for `x LIKE 'abc%'` queries
     fn generate_like_range_terms(
         &mut self,
-        table_info: &[(String, Option<String>, u64, Vec<String>, i32)],
+        table_info: &[(String, Option<String>, u64, Vec<String>, i32, Vec<String>)],
         table_usage_info: &[(String, Option<String>, u64, Vec<String>)],
     ) -> Result<()> {
         // Collect LIKE terms that can be optimized
@@ -852,6 +865,22 @@ impl QueryPlanner {
 
         // Generate virtual range terms for each LIKE term
         for (like_idx, col_expr, pattern_expr, op, left_col, mask) in like_terms {
+            // SQLite disables LIKE optimization for non-TEXT columns because LIKE is a
+            // string operation and comparing TEXT range bounds against INTEGER values
+            // doesn't work correctly. Check the column affinity and skip if not TEXT.
+            if let Some((table_idx, col_idx)) = left_col {
+                if table_idx >= 0 && col_idx >= 0 {
+                    if let Some((_, _, _, _, _, affinities)) = table_info.get(table_idx as usize) {
+                        if let Some(affinity) = affinities.get(col_idx as usize) {
+                            // Only optimize for TEXT affinity columns
+                            if !affinity.eq_ignore_ascii_case("TEXT") {
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+
             // Determine if this is case-sensitive (BINARY) or case-insensitive (NOCASE)
             let is_case_sensitive = matches!(op, LikeOp::Glob) || self.case_sensitive_like;
 
@@ -940,7 +969,7 @@ impl QueryPlanner {
 
     /// Analyze a single term's expression (static version for borrow checker)
     fn analyze_term_expr_static(
-        table_info: &[(String, Option<String>, u64, Vec<String>, i32)],
+        table_info: &[(String, Option<String>, u64, Vec<String>, i32, Vec<String>)],
         term: &mut WhereTerm,
     ) -> Result<()> {
         let needs_commute = match term.expr.as_ref() {
@@ -1072,14 +1101,16 @@ impl QueryPlanner {
     /// Analyze a potential column reference in an expression (static version)
     /// This handles expressions wrapped in parentheses like (w) or ((w))
     fn analyze_column_ref_static(
-        table_info: &[(String, Option<String>, u64, Vec<String>, i32)],
+        table_info: &[(String, Option<String>, u64, Vec<String>, i32, Vec<String>)],
         term: &mut WhereTerm,
         expr: &Expr,
     ) -> Result<()> {
         // Unwrap parentheses to get the actual column reference
         if let Some(col_ref) = Self::get_column_ref(expr) {
             // Try to find which table this column belongs to
-            for (i, (name, alias, mask, columns, ipk_column)) in table_info.iter().enumerate() {
+            for (i, (name, alias, mask, columns, ipk_column, _affinities)) in
+                table_info.iter().enumerate()
+            {
                 let table_matches = match (&col_ref.table, alias) {
                     (Some(t), Some(a)) => t == a || t == name,
                     (Some(t), None) => t == name,
@@ -1141,12 +1172,14 @@ impl QueryPlanner {
     /// Analyze the right side of an equality expression for join conditions
     /// This populates right_col for terms like col1 = col2
     fn analyze_right_column_ref(
-        table_info: &[(String, Option<String>, u64, Vec<String>, i32)],
+        table_info: &[(String, Option<String>, u64, Vec<String>, i32, Vec<String>)],
         term: &mut WhereTerm,
         expr: &Expr,
     ) -> Result<()> {
         if let Some(col_ref) = Self::get_column_ref(expr) {
-            for (i, (name, alias, _mask, columns, ipk_column)) in table_info.iter().enumerate() {
+            for (i, (name, alias, _mask, columns, ipk_column, affinities)) in
+                table_info.iter().enumerate()
+            {
                 let table_matches = match (&col_ref.table, alias) {
                     (Some(t), Some(a)) => t == a || t == name,
                     (Some(t), None) => t == name,

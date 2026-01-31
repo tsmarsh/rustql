@@ -3241,6 +3241,15 @@ impl<'s> SelectCompiler<'s> {
                 planner.set_table_columns(table_idx, columns);
                 planner.set_table_rowid(table_idx, !schema_table.without_rowid);
 
+                // Set column affinities for LIKE optimization check
+                // LIKE index optimization is only valid for TEXT columns
+                let affinities: Vec<String> = schema_table
+                    .columns
+                    .iter()
+                    .map(|c| format!("{:?}", c.affinity))
+                    .collect();
+                planner.set_table_column_affinities(table_idx, affinities);
+
                 // Check for INTEGER PRIMARY KEY column (rowid alias)
                 // This is a single-column INTEGER PRIMARY KEY
                 if !schema_table.without_rowid {

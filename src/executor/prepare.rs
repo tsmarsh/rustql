@@ -3841,6 +3841,17 @@ impl<'s> StatementCompiler<'s> {
             planner.set_table_columns(idx, table.columns.clone());
             planner.set_table_rowid(idx, table.has_rowid);
 
+            // Set column affinities for LIKE optimization check
+            // LIKE index optimization is only valid for TEXT columns
+            if let Some(schema_table) = schema.table(&table.name) {
+                let affinities: Vec<String> = schema_table
+                    .columns
+                    .iter()
+                    .map(|c| format!("{:?}", c.affinity))
+                    .collect();
+                planner.set_table_column_affinities(idx, affinities);
+            }
+
             // Set INTEGER PRIMARY KEY column (rowid alias) if present
             if table.has_rowid {
                 if let Some(schema_table) = schema.table(&table.name) {

@@ -1275,7 +1275,7 @@ impl<'s> StatementCompiler<'s> {
             sql.push_str("IF NOT EXISTS ");
         }
         sql.push_str(&create.name.name);
-        sql.push_str(" (");
+        sql.push('(');
 
         match &create.definition {
             TableDefinition::Columns {

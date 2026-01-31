@@ -1561,6 +1561,8 @@ impl Vdbe {
                             }
                         }
                     }
+                    // Stabilize sqlite_master row order by root page.
+                    entries.sort_by_key(|entry| entry.3);
 
                     // Create virtual cursor for sqlite_master
                     self.open_cursor(op.p1, 0, false)?;
@@ -4804,6 +4806,7 @@ impl Vdbe {
                             }
                         } else {
                             btree.savepoint(SavepointOp::Rollback, idx)?;
+                            conn.reload_schema()?;
                             conn.savepoints.truncate(pos + 1);
                             self.deferred_fk_counter = 0;
                         }

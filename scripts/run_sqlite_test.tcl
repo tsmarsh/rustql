@@ -97,7 +97,7 @@ array set sqlite_options {
     conflict 1
     schema 1
     foreignkey 1
-    incrblob 1
+    incrblob 0
     datetime 1
     pager_pragmas 1
     utf16 1

@@ -928,6 +928,7 @@ impl SqliteConnection {
     /// table from the btree. Called after ROLLBACK to ensure schema cache
     /// reflects the actual on-disk state.
     pub fn reload_schema(&mut self) -> Result<()> {
+        let autocommit = self.get_autocommit();
         for db in &mut self.dbs {
             if let (Some(btree), Some(schema_arc)) = (&db.btree, &db.schema) {
                 if let Ok(mut schema) = schema_arc.write() {
@@ -937,6 +938,16 @@ impl SqliteConnection {
                     schema.triggers.clear();
                     // Reload from sqlite_master
                     load_schema_from_btree(btree, &mut schema)?;
+                }
+                if autocommit {
+                    if let Ok(mut shared) = btree.shared.write() {
+                        shared.pager.unlock_read()?;
+                        shared.in_transaction = crate::storage::btree::TransState::None;
+                        btree.in_trans.store(
+                            crate::storage::btree::TransState::None as u8,
+                            Ordering::SeqCst,
+                        );
+                    }
                 }
             }
         }

@@ -452,7 +452,21 @@ fn pragma_page_size(
     Ok(empty_result())
 }
 
-fn pragma_page_count(_conn: &SqliteConnection) -> Result<PragmaResult> {
+fn pragma_page_count(conn: &SqliteConnection) -> Result<PragmaResult> {
+    if let Some(db) = conn.find_db("main") {
+        if let Some(ref btree) = db.btree {
+            let shared = btree
+                .shared
+                .read()
+                .map_err(|_| Error::new(ErrorCode::Internal))?;
+            let count = if shared.n_page > 0 {
+                shared.n_page
+            } else {
+                shared.pager.file_page_count().unwrap_or(0)
+            };
+            return Ok(single_int_result(count as i64));
+        }
+    }
     Ok(single_int_result(0))
 }
 

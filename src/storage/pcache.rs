@@ -48,6 +48,7 @@ pub trait PcacheImpl {
     fn truncate(&mut self, pgno: Pgno);
     fn destroy(&mut self);
     fn shrink(&mut self);
+    fn for_each_page(&self, f: &mut dyn FnMut(&PgHdr));
     /// Check if cache is at or near capacity (may need spilling)
     fn needs_spill(&self) -> bool {
         false
@@ -185,6 +186,10 @@ impl PCache {
 
     pub fn shrink(&mut self) {
         self.cache.shrink();
+    }
+
+    pub fn for_each_page(&self, f: &mut dyn FnMut(&PgHdr)) {
+        self.cache.for_each_page(f);
     }
 
     /// Get the total reference count sum across all pages
@@ -425,6 +430,12 @@ impl PcacheImpl for PCache1 {
             if self.evict_lru().is_none() {
                 break;
             }
+        }
+    }
+
+    fn for_each_page(&self, f: &mut dyn FnMut(&PgHdr)) {
+        for page in self.pages.iter().flatten() {
+            f(page);
         }
     }
 

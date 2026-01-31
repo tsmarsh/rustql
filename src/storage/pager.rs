@@ -854,8 +854,12 @@ impl Pager {
 
     /// Write page data back to cache (call after modifying a page)
     pub fn write_page_to_cache(&mut self, page: &PgHdr) {
-        if let Some(cache_page) = self.pcache.fetch(page.pgno, false) {
+        if let Some(mut cache_page) = self.pcache.fetch(page.pgno, false) {
             self.update_cache_page(cache_page, &page.data);
+            self.pcache.make_dirty(cache_page);
+            unsafe {
+                cache_page.as_mut().flags.insert(PgFlags::WRITEABLE);
+            }
         }
     }
 
@@ -1033,6 +1037,11 @@ impl Pager {
 
         // End journal (delete/truncate/zero based on mode)
         self.end_journal()?;
+        self.savepoints.clear();
+
+        if self.db_size > self.db_file_size {
+            self.db_file_size = self.db_size;
+        }
 
         // Truncate database file if needed (in case of vacuum shrinking)
         if self.db_size < self.db_file_size {
@@ -1045,8 +1054,8 @@ impl Pager {
 
         // Release locks (unless in exclusive mode)
         if self.locking_mode == LockingMode::Normal {
-            self.unlock(LockLevel::Shared)?;
-            self.state = PagerState::Reader;
+            self.unlock(LockLevel::None)?;
+            self.state = PagerState::Open;
         } else {
             self.state = PagerState::WriterFinished;
         }
@@ -1077,11 +1086,12 @@ impl Pager {
 
         // End journal
         self.end_journal()?;
+        self.savepoints.clear();
 
         // Release locks
         if self.locking_mode == LockingMode::Normal {
-            self.unlock(LockLevel::Shared)?;
-            self.state = PagerState::Reader;
+            self.unlock(LockLevel::None)?;
+            self.state = PagerState::Open;
         } else {
             self.state = PagerState::WriterFinished;
         }
@@ -1104,15 +1114,14 @@ impl Pager {
     /// Open a new savepoint (sqlite3PagerOpenSavepoint)
     pub fn open_savepoint(&mut self, n: i32) -> Result<()> {
         while self.savepoints.len() < n as usize {
-            let mut savepoint = Savepoint::new(self.journal_offset, self.db_size);
-            let mut current = self.pcache.dirty_list();
-            while let Some(page) = current {
-                unsafe {
-                    let page_ref = page.as_ref();
-                    current = page_ref.dirty_next;
-                    savepoint.snapshot_page(page_ref.pgno, &page_ref.data, page_ref.flags);
-                }
+            let orig_db_size = self.db_size.max(self.pcache.page_count() as Pgno);
+            if orig_db_size != self.db_size {
+                self.db_size = orig_db_size;
             }
+            let mut savepoint = Savepoint::new(self.journal_offset, orig_db_size);
+            self.pcache.for_each_page(&mut |page| {
+                savepoint.snapshot_page(page.pgno, &page.data, page.flags);
+            });
             self.savepoints.push(savepoint);
         }
         Ok(())
@@ -1140,35 +1149,36 @@ impl Pager {
                     self.pcache.truncate(orig_db_size + 1);
 
                     for (pgno, snapshot) in snapshots {
-                        if let Some(mut cache_page) = self.pcache.fetch(pgno, false) {
-                            unsafe {
-                                let page_ref = cache_page.as_mut();
-                                page_ref.data.copy_from_slice(&snapshot.data);
-                            }
-
-                            if snapshot.flags.contains(PgFlags::DIRTY) {
-                                self.pcache.make_dirty(cache_page);
-                            } else {
-                                self.pcache.make_clean(cache_page);
-                            }
-
-                            unsafe {
-                                let page_ref = cache_page.as_mut();
-                                page_ref.flags.remove(PgFlags::WRITEABLE);
-                                page_ref.flags.remove(PgFlags::DONT_WRITE);
-                                page_ref.flags.remove(PgFlags::NEED_SYNC);
-                                if snapshot.flags.contains(PgFlags::WRITEABLE) {
-                                    page_ref.flags.insert(PgFlags::WRITEABLE);
-                                }
-                                if snapshot.flags.contains(PgFlags::DONT_WRITE) {
-                                    page_ref.flags.insert(PgFlags::DONT_WRITE);
-                                }
-                                if snapshot.flags.contains(PgFlags::NEED_SYNC) {
-                                    page_ref.flags.insert(PgFlags::NEED_SYNC);
-                                }
-                            }
-                            self.pcache.release(cache_page);
+                        let Some(mut cache_page) = self.pcache.fetch(pgno, true) else {
+                            return Err(Error::new(ErrorCode::NoMem));
+                        };
+                        unsafe {
+                            let page_ref = cache_page.as_mut();
+                            page_ref.data.copy_from_slice(&snapshot.data);
                         }
+
+                        if snapshot.flags.contains(PgFlags::DIRTY) {
+                            self.pcache.make_dirty(cache_page);
+                        } else {
+                            self.pcache.make_clean(cache_page);
+                        }
+
+                        unsafe {
+                            let page_ref = cache_page.as_mut();
+                            page_ref.flags.remove(PgFlags::WRITEABLE);
+                            page_ref.flags.remove(PgFlags::DONT_WRITE);
+                            page_ref.flags.remove(PgFlags::NEED_SYNC);
+                            if snapshot.flags.contains(PgFlags::WRITEABLE) {
+                                page_ref.flags.insert(PgFlags::WRITEABLE);
+                            }
+                            if snapshot.flags.contains(PgFlags::DONT_WRITE) {
+                                page_ref.flags.insert(PgFlags::DONT_WRITE);
+                            }
+                            if snapshot.flags.contains(PgFlags::NEED_SYNC) {
+                                page_ref.flags.insert(PgFlags::NEED_SYNC);
+                            }
+                        }
+                        self.pcache.release(cache_page);
                     }
 
                     // Truncate savepoints to the rolled-back level (keep target)
@@ -1216,6 +1226,15 @@ impl Pager {
     /// Acquire exclusive lock (sqlite3PagerExclusiveLock)
     pub fn exclusive_lock(&mut self) -> Result<()> {
         self.lock(LockLevel::Exclusive)
+    }
+
+    /// Release shared read lock and return to open state.
+    pub fn unlock_read(&mut self) -> Result<()> {
+        if self.state == PagerState::Reader {
+            self.unlock(LockLevel::None)?;
+            self.state = PagerState::Open;
+        }
+        Ok(())
     }
 
     // ========================================================================
@@ -1520,7 +1539,21 @@ impl Pager {
 
     /// Get page count (sqlite3PagerPagecount)
     pub fn page_count(&self) -> Pgno {
-        self.db_size
+        if self.db_file_size > 0 {
+            self.db_file_size
+        } else {
+            self.db_size
+        }
+    }
+
+    /// Get page count from file size.
+    pub fn file_page_count(&self) -> Result<Pgno> {
+        if let Some(ref fd) = self.fd {
+            let size = fd.file_size()?;
+            Ok((size / self.page_size as i64) as Pgno)
+        } else {
+            Ok(0)
+        }
     }
 
     /// Get temporary space buffer (sqlite3PagerTempSpace)

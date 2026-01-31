@@ -570,6 +570,38 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
                     }
                 }
             }
+            // Release read locks after read-only statements in autocommit mode.
+            if stmt.read_only {
+                if let Some(conn_ptr) = stmt.conn_ptr {
+                    let conn = unsafe { &mut *conn_ptr };
+                    if conn.get_autocommit() {
+                        if let Some(main_db) = conn.find_db("main") {
+                            if let Some(ref btree) = main_db.btree {
+                                if let Ok(mut shared) = btree.shared.write() {
+                                    let _ = shared.pager.unlock_read();
+                                    shared.in_transaction = crate::storage::btree::TransState::None;
+                                    btree.in_trans.store(
+                                        crate::storage::btree::TransState::None as u8,
+                                        Ordering::SeqCst,
+                                    );
+                                }
+                            }
+                        }
+                        if conn.dbs.len() > 1 {
+                            if let Some(ref btree) = conn.dbs[1].btree {
+                                if let Ok(mut shared) = btree.shared.write() {
+                                    let _ = shared.pager.unlock_read();
+                                    shared.in_transaction = crate::storage::btree::TransState::None;
+                                    btree.in_trans.store(
+                                        crate::storage::btree::TransState::None as u8,
+                                        Ordering::SeqCst,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             stmt.set_done();
             Ok(StepResult::Done)
         }

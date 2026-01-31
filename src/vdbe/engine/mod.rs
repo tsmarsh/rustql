@@ -2948,6 +2948,58 @@ impl Vdbe {
                         self.mem_mut(op.p3).set_null();
                     }
                 }
+
+                // Handle INTEGER PRIMARY KEY implicit rowid substitution:
+                // When reading a NULL from an IPK column, return the rowid instead
+                if self.mem(op.p3).is_null() {
+                    // Get cursor info for IPK check
+                    if let Some(cursor) = self.cursor(op.p1) {
+                        // Don't do this for ephemeral, index, virtual tables, etc.
+                        if !cursor.is_ephemeral
+                            && !cursor.is_index
+                            && !cursor.is_sqlite_master
+                            && !cursor.is_sqlite_stat1
+                            && !cursor.is_virtual
+                        {
+                            if let Some(ref table_name) = cursor.table_name {
+                                // Check schema to see if this column is INTEGER PRIMARY KEY
+                                let is_ipk = if let Some(ref schema) = self.schema {
+                                    if let Ok(schema_guard) = schema.read() {
+                                        if let Some(table) =
+                                            schema_guard.tables.get(&table_name.to_lowercase())
+                                        {
+                                            if let Some(col) = table.columns.get(col_idx) {
+                                                col.is_primary_key
+                                                    && col.type_name.as_ref().map_or(false, |t| {
+                                                        t.eq_ignore_ascii_case("INTEGER")
+                                                    })
+                                            } else {
+                                                false
+                                            }
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
+
+                                if is_ipk {
+                                    // Get the rowid from the cursor
+                                    let rowid = cursor.rowid.or_else(|| {
+                                        cursor.btree_cursor.as_ref().map(|bt| bt.integer_key())
+                                    });
+                                    if let Some(rid) = rowid {
+                                        self.mem_mut(op.p3).set_int(rid);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // DEBUG: show what Column returned
                 if std::env::var("VDBE_TRACE").is_ok() {
                     eprintln!("  -> reg[{}] = {:?}", op.p3, self.mem(op.p3));

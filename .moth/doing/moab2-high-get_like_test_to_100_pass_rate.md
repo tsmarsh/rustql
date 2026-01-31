@@ -2,7 +2,18 @@
 
 ## Progress
 
-Started at 41% pass rate, now at **84%** (134/159 tests passing, 25 errors).
+Started at 41% pass rate, now at **89%** (141/159 tests passing, 18 errors).
+
+### Session Progress (2026-01-31) - continued (session 4)
+
+- **INTEGER PRIMARY KEY implicit rowid substitution in Column opcode** - Fixed INSERT...SELECT not preserving IPK values
+  - Bug: `INSERT INTO t10b SELECT * FROM t10` would auto-generate rowids (1,2,3...) instead of using values from column 0
+  - Root cause: Column opcode returned NULL for IPK columns in records, but should return rowid instead
+  - In SQLite, INTEGER PRIMARY KEY columns store NULL in the record but Column opcode returns rowid
+  - Fix: Added IPK handling in Column opcode - when reading NULL from an IPK column, return cursor's rowid
+  - Result: like-10.10 through like-10.15 and like-11.6 now pass (7 tests fixed)
+
+- Combined result: LIKE test errors reduced from 25 to 18 (7 more tests passing)
 
 ### Session Progress (2026-01-31) - continued (session 3)
 
@@ -89,28 +100,28 @@ Started at 41% pass rate, now at **84%** (134/159 tests passing, 25 errors).
 
 4. **sqlite_like_count tracking** (previous work) - Global counter for LIKE function calls exposed via TCL
 
-### Remaining Failures (~25 tests)
+### Remaining Failures (18 tests)
 
-1. **Scan/step count instrumentation** (like-9.1, like-9.4.3, like-9.5.2, like-10.5b, like-10.10-15, ~11 tests)
+1. **Scan/step count instrumentation** (like-9.1, like-9.4.3, like-9.5.2, like-10.5b - 4 tests)
    - `db status step` and `db status sort` instrumentation issues
-   - Some tests missing data, wrong scan counts
-   - File database handling in TCL harness may need work
+   - Some tests wrong scan counts
 
-2. **Custom LIKE functions** (like-8.3, like-8.4)
+2. **Custom LIKE functions** (like-8.3, like-8.4 - 2 tests)
    - Tests use `db function like -argcount 2 newlike` to override built-in LIKE
    - Requires user-defined function support for LIKE
 
-3. **QPSG feature** (like-3.3.102, like-3.3.104, like-3.3.105)
+3. **QPSG feature** (like-3.3.102, like-3.3.104, like-3.3.105 - 3 tests)
    - Query Planner Stability Guarantee not implemented
 
-4. **Missing sqlite_options** (like-14.1, like-14.2)
+4. **Missing sqlite_options** (like-14.1, like-14.2 - 2 tests)
    - Tests require `::sqlite_options(configslower)` variable
 
-5. **EQP output differences** (like-12.13, like-12.15, like-15.101, like-15.112, like-15.121)
+5. **EQP output differences** (like-12.13, like-12.15, like-15.101, like-15.112, like-15.121 - 5 tests)
    - SEARCH vs SCAN expected in EXPLAIN QUERY PLAN output
 
-6. **Index selection for case_sensitive_like** (like-11.6, like-11.7, like-11.8)
-   - TCL test harness issue - works correctly when tested locally
+6. **Index selection for case_sensitive_like** (like-11.7, like-11.8 - 2 tests)
+   - SQLite prefers explicit COLLATE BINARY index over inherited BINARY
+   - Results are correct, just index selection differs
 
 ### Files Modified
 
@@ -143,6 +154,7 @@ Started at 41% pass rate, now at **84%** (134/159 tests passing, 25 errors).
   - OpenWrite: handle P4::KeyInfo for directly provided collations
   - ParseSchema: inherit collation from table columns when creating index
   - IdxGE/GT/LE/LT: added fallback to cursor's key_info for collation comparison
+  - Column: added IPK implicit rowid substitution (read NULL from IPK column → return rowid)
 
 - src/api/connection.rs
   - Fixed parse_create_index_sql to inherit collation from table columns

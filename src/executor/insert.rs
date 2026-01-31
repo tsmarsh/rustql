@@ -534,6 +534,27 @@ impl<'a> InsertCompiler<'a> {
         let select_exprs = self.get_select_expressions(select);
         let select_col_count = select_exprs.len();
 
+        // Validate column count: SELECT must provide exactly the right number of values
+        let expected_cols = col_targets.len();
+        if select_col_count != expected_cols {
+            if insert.columns.is_some() {
+                // Column list specified: "N values for M columns"
+                return Err(crate::error::Error::with_message(
+                    crate::error::ErrorCode::Error,
+                    format!("{} values for {} columns", select_col_count, expected_cols),
+                ));
+            } else {
+                // No column list: "table X has N columns but M values were supplied"
+                return Err(crate::error::Error::with_message(
+                    crate::error::ErrorCode::Error,
+                    format!(
+                        "table {} has {} columns but {} values were supplied",
+                        insert.table.name, self.num_columns, select_col_count
+                    ),
+                ));
+            }
+        }
+
         // Check if SELECT is complex and needs the full SelectCompiler
         // Complex cases include: UNION, ORDER BY, GROUP BY, multiple tables, WITH clause, etc.
         if insert.with.is_some()
@@ -781,6 +802,27 @@ impl<'a> InsertCompiler<'a> {
     ) -> Result<()> {
         // Get the number of columns in the SELECT result
         let select_col_count = self.get_select_column_count(select);
+
+        // Validate column count: SELECT must provide exactly the right number of values
+        let expected_cols = col_targets.len();
+        if select_col_count != expected_cols {
+            if insert.columns.is_some() {
+                // Column list specified: "N values for M columns"
+                return Err(crate::error::Error::with_message(
+                    crate::error::ErrorCode::Error,
+                    format!("{} values for {} columns", select_col_count, expected_cols),
+                ));
+            } else {
+                // No column list: "table X has N columns but M values were supplied"
+                return Err(crate::error::Error::with_message(
+                    crate::error::ErrorCode::Error,
+                    format!(
+                        "table {} has {} columns but {} values were supplied",
+                        insert.table.name, self.num_columns, select_col_count
+                    ),
+                ));
+            }
+        }
 
         // Use SelectCompiler to compile the SELECT first
         // We'll use a high cursor number for the ephemeral table to avoid conflicts
@@ -1053,21 +1095,31 @@ impl<'a> InsertCompiler<'a> {
 
     /// Get number of columns in SELECT result
     fn get_select_column_count(&self, select: &SelectStmt) -> usize {
-        if let SelectBody::Select(core) = &select.body {
-            // For SELECT *, return all columns from SOURCE table
-            // For explicit columns, count them
-            let mut count = 0;
-            for col in &core.columns {
-                match col {
-                    ResultColumn::Star | ResultColumn::TableStar(_) => {
-                        return self.get_source_table_column_count(select);
+        self.count_body_columns(&select.body, select)
+    }
+
+    /// Count columns in a SelectBody (handles compound queries)
+    fn count_body_columns(&self, body: &SelectBody, select: &SelectStmt) -> usize {
+        match body {
+            SelectBody::Select(core) => {
+                // For SELECT *, return all columns from SOURCE table
+                // For explicit columns, count them
+                let mut count = 0;
+                for col in &core.columns {
+                    match col {
+                        ResultColumn::Star | ResultColumn::TableStar(_) => {
+                            return self.get_source_table_column_count(select);
+                        }
+                        ResultColumn::Expr { .. } => count += 1,
                     }
-                    ResultColumn::Expr { .. } => count += 1,
                 }
+                count.max(1)
             }
-            return count.max(1);
+            SelectBody::Compound { left, .. } => {
+                // For UNION/UNION ALL/etc, column count comes from the left side
+                self.count_body_columns(left, select)
+            }
         }
-        self.num_columns
     }
 
     /// Extract expressions from SELECT clause

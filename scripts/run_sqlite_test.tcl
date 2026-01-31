@@ -216,6 +216,9 @@ set ::cksum ""
 # File I/O test variables
 set ::fd ""
 
+# Open file tracking (used by finalize_testing)
+set ::sqlite_open_file_count 0
+
 # Source the test infrastructure
 # Set guard flag to prevent double reset_db when test file re-sources tester.tcl
 set ::TESTER_SOURCED 1
@@ -237,6 +240,9 @@ set start_time [clock seconds]
 set argv0 $test_file
 puts "DEBUG: argv0=$argv0, test_file=$test_file"
 puts "DEBUG: testdir=$testdir"
+
+# Clear argv to prevent finish_test from trying to source extra test files
+set argv {}
 
 if {[catch {source $test_file} err]} {
     puts stderr ""

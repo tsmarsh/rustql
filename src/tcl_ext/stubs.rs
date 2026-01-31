@@ -532,6 +532,9 @@ pub unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         ("threadsafe", "0"),
         ("threadsafe1", "0"),
         ("threadsafe2", "0"),
+        ("mutex", "0"),            // Mutex operations not available (single-threaded)
+        ("mutex_noop", "1"),       // Using noop mutex (single-threaded)
+        ("mutex_nref", "0"),       // No nested mutex support
         ("like_match_blobs", "0"), // LIKE does not match blobs
         // Additional options required by various tests
         ("legacyformat", "0"),

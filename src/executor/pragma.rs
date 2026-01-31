@@ -9,6 +9,7 @@ use crate::api::{AutoVacuum, DbInfo, SafetyLevel, SqliteConnection};
 use crate::error::{Error, ErrorCode, Result};
 use crate::parser::ast::{Expr, Literal, PragmaStmt, PragmaValue};
 use crate::schema::{DefaultValue, Schema};
+use crate::storage::btree::{BTREE_SCHEMA_VERSION, BTREE_USER_VERSION};
 use crate::storage::pager::JournalMode;
 use crate::types::{ColumnType, Value};
 
@@ -144,6 +145,7 @@ pub fn execute_pragma(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Resul
         "schema_version" => pragma_schema_version(conn, schema_name, pragma),
         "temp_store" => pragma_temp_store(conn, pragma),
         "temp_store_directory" => pragma_temp_store_directory(conn, pragma),
+        "application_id" => pragma_application_id(conn, schema_name, pragma),
         "fullfsync" => pragma_fullfsync(conn, pragma),
         "checkpoint_fullfsync" => pragma_checkpoint_fullfsync(conn, pragma),
         "read_uncommitted" => pragma_read_uncommitted(conn, pragma),
@@ -1154,6 +1156,104 @@ fn journal_mode_name(mode: JournalMode) -> &'static str {
         JournalMode::Memory => "memory",
         JournalMode::Wal => "wal",
     }
+}
+
+fn pragma_user_version(
+    conn: &mut SqliteConnection,
+    schema_name: &str,
+    pragma: &PragmaStmt,
+) -> Result<PragmaResult> {
+    let db = lookup_db_mut(conn, schema_name)?;
+    if let Some(btree) = &db.btree {
+        if let Some(value) = pragma_value_i64(pragma) {
+            // Set user version
+            btree.update_meta(BTREE_USER_VERSION, value as u32)?;
+        }
+        if pragma.value.is_none() {
+            let version = btree.get_meta(BTREE_USER_VERSION)? as i64;
+            return Ok(single_int_result(version));
+        }
+    } else if pragma.value.is_none() {
+        // In-memory database without btree - return 0
+        return Ok(single_int_result(0));
+    }
+    Ok(empty_result())
+}
+
+fn pragma_schema_version(
+    conn: &mut SqliteConnection,
+    schema_name: &str,
+    pragma: &PragmaStmt,
+) -> Result<PragmaResult> {
+    let db = lookup_db_mut(conn, schema_name)?;
+    if let Some(btree) = &db.btree {
+        if let Some(value) = pragma_value_i64(pragma) {
+            // Set schema version
+            btree.update_meta(BTREE_SCHEMA_VERSION, value as u32)?;
+        }
+        if pragma.value.is_none() {
+            let version = btree.get_meta(BTREE_SCHEMA_VERSION)? as i64;
+            return Ok(single_int_result(version));
+        }
+    } else if pragma.value.is_none() {
+        // In-memory database without btree - return 0
+        return Ok(single_int_result(0));
+    }
+    Ok(empty_result())
+}
+
+fn pragma_temp_store(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Result<PragmaResult> {
+    // SQLite temp_store values: 0=DEFAULT, 1=FILE, 2=MEMORY
+    // For now we use memory-based temp storage
+    if let Some(value) = pragma_value_i64(pragma) {
+        // Silently accept but don't actually change behavior
+        let _ = value;
+    }
+    if pragma.value.is_none() {
+        // Return 2 (MEMORY)
+        return Ok(single_int_result(2));
+    }
+    Ok(empty_result())
+}
+
+fn pragma_temp_store_directory(
+    conn: &mut SqliteConnection,
+    pragma: &PragmaStmt,
+) -> Result<PragmaResult> {
+    // Deprecated pragma, but tests may use it
+    if let Some(_value) = pragma_value_string(pragma) {
+        // Silently accept but don't actually change behavior
+    }
+    if pragma.value.is_none() {
+        // Return empty string (use system default)
+        return Ok(PragmaResult {
+            columns: vec!["temp_store_directory".into()],
+            types: vec![ColumnType::Text],
+            rows: vec![vec![Value::Text(String::new())]],
+        });
+    }
+    Ok(empty_result())
+}
+
+fn pragma_application_id(
+    conn: &mut SqliteConnection,
+    schema_name: &str,
+    pragma: &PragmaStmt,
+) -> Result<PragmaResult> {
+    let db = lookup_db_mut(conn, schema_name)?;
+    const BTREE_APPLICATION_ID: usize = 8;
+    if let Some(btree) = &db.btree {
+        if let Some(value) = pragma_value_i64(pragma) {
+            btree.update_meta(BTREE_APPLICATION_ID, value as u32)?;
+        }
+        if pragma.value.is_none() {
+            let id = btree.get_meta(BTREE_APPLICATION_ID)? as i64;
+            return Ok(single_int_result(id));
+        }
+    } else if pragma.value.is_none() {
+        return Ok(single_int_result(0));
+    }
+    Ok(empty_result())
 }
 
 #[cfg(test)]

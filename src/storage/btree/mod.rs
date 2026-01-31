@@ -4627,6 +4627,18 @@ impl Btree {
         }
 
         shared.auto_vacuum = mode;
+        shared.incr_vacuum = if mode == BTREE_AUTOVACUUM_INCR { 1 } else { 0 };
+
+        let auto_vacuum_value = if mode == BTREE_AUTOVACUUM_NONE { 0 } else { 1 };
+        let incr_vacuum_value = if mode == BTREE_AUTOVACUUM_INCR { 1 } else { 0 };
+        let mut page = shared.pager.get(1, PagerGetFlags::empty())?;
+        shared.pager.write(&mut page)?;
+        write_u32(&mut page.data, 52, auto_vacuum_value)?;
+        write_u32(&mut page.data, 64, incr_vacuum_value)?;
+        if let Some(ref mut page1) = shared.page1 {
+            let _ = write_u32(&mut page1.data, 52, auto_vacuum_value);
+            let _ = write_u32(&mut page1.data, 64, incr_vacuum_value);
+        }
         Ok(())
     }
 
@@ -4662,10 +4674,11 @@ impl Btree {
 
     /// Get the total number of pages in the database
     pub fn page_count(&self) -> Result<u32> {
-        let shared = self
+        let mut shared = self
             .shared
-            .read()
+            .write()
             .map_err(|_| Error::new(ErrorCode::Internal))?;
+        shared.pager.shared_lock()?;
         Ok(shared.pager.page_count())
     }
 

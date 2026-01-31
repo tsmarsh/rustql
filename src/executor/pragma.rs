@@ -9,6 +9,7 @@ use crate::api::{AutoVacuum, DbInfo, SafetyLevel, SqliteConnection};
 use crate::error::{Error, ErrorCode, Result};
 use crate::parser::ast::{Expr, Literal, PragmaStmt, PragmaValue};
 use crate::schema::{DefaultValue, Schema};
+use crate::storage::btree::{BTREE_AUTOVACUUM_FULL, BTREE_AUTOVACUUM_INCR, BTREE_AUTOVACUUM_NONE};
 use crate::storage::pager::JournalMode;
 use crate::types::{ColumnType, Value};
 
@@ -135,8 +136,8 @@ pub fn execute_pragma(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Resul
         "case_sensitive_like" => pragma_case_sensitive_like(conn, pragma),
         "freelist_count" => pragma_freelist_count(conn),
         "lock_status" => pragma_lock_status(conn),
-        "incremental_vacuum" => pragma_incremental_vacuum(),
-        "incr_vacuum" => pragma_incremental_vacuum(),
+        "incremental_vacuum" => pragma_incremental_vacuum(conn, pragma),
+        "incr_vacuum" => pragma_incremental_vacuum(conn, pragma),
         "cache_spill" => pragma_cache_spill(conn, pragma),
         "writable_schema" => pragma_writable_schema(conn, pragma),
         "automatic_index" => pragma_automatic_index(conn, pragma),
@@ -455,11 +456,7 @@ fn pragma_page_size(
 fn pragma_page_count(conn: &SqliteConnection) -> Result<PragmaResult> {
     if let Some(db) = conn.find_db("main") {
         if let Some(ref btree) = db.btree {
-            let shared = btree
-                .shared
-                .read()
-                .map_err(|_| Error::new(ErrorCode::Internal))?;
-            let count = shared.pager.page_count();
+            let count = btree.page_count()?;
             return Ok(single_int_result(count as i64));
         }
     }
@@ -722,14 +719,45 @@ fn pragma_wal_checkpoint() -> Result<PragmaResult> {
 }
 
 fn pragma_auto_vacuum(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Result<PragmaResult> {
+    let mut requested = None;
     if let Some(value) = pragma_value_i64(pragma) {
-        conn.auto_vacuum = match value {
+        requested = Some(match value {
             1 => AutoVacuum::Full,
             2 => AutoVacuum::Incremental,
             _ => AutoVacuum::None,
+        });
+    } else if let Some(value) = pragma_value_string(pragma) {
+        let mode = match value.to_lowercase().as_str() {
+            "full" => AutoVacuum::Full,
+            "incremental" => AutoVacuum::Incremental,
+            "none" => AutoVacuum::None,
+            _ => AutoVacuum::None,
         };
+        requested = Some(mode);
     }
+
+    if let Some(mode) = requested {
+        conn.auto_vacuum = mode;
+        if let Some(db) = conn.find_db_mut("main") {
+            if let Some(ref btree) = db.btree {
+                let btree_mode = match mode {
+                    AutoVacuum::None => BTREE_AUTOVACUUM_NONE,
+                    AutoVacuum::Full => BTREE_AUTOVACUUM_FULL,
+                    AutoVacuum::Incremental => BTREE_AUTOVACUUM_INCR,
+                };
+                btree.set_auto_vacuum(btree_mode)?;
+            }
+        }
+        return Ok(empty_result());
+    }
+
     if pragma.value.is_none() {
+        if let Some(db) = conn.find_db("main") {
+            if let Some(ref btree) = db.btree {
+                let mode = btree.get_auto_vacuum()? as i64;
+                return Ok(single_int_result(mode));
+            }
+        }
         return Ok(single_int_result(conn.auto_vacuum as i64));
     }
     Ok(empty_result())
@@ -805,9 +833,24 @@ fn pragma_lock_status(conn: &SqliteConnection) -> Result<PragmaResult> {
     })
 }
 
-fn pragma_incremental_vacuum() -> Result<PragmaResult> {
-    // No-op - incremental vacuum not implemented
-    // Just return success with empty result
+fn pragma_incremental_vacuum(
+    conn: &mut SqliteConnection,
+    pragma: &PragmaStmt,
+) -> Result<PragmaResult> {
+    if let Some(db) = conn.find_db("main") {
+        if let Some(ref btree) = db.btree {
+            let steps = pragma_value_i64(pragma).unwrap_or(0);
+            if steps > 0 {
+                for _ in 0..steps {
+                    if !btree.incr_vacuum()? {
+                        break;
+                    }
+                }
+            } else {
+                while btree.incr_vacuum()? {}
+            }
+        }
+    }
     Ok(empty_result())
 }
 

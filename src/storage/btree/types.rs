@@ -357,16 +357,18 @@ impl DbHeader {
         // Offset 36-39: Total number of freelist pages
         let free_page_count = read_u32(data, 36).unwrap_or(0);
         let schema_cookie = read_u32(data, 40).ok_or(Error::new(ErrorCode::Corrupt))?;
-        let auto_vacuum = if read_u32(data, 52).unwrap_or(0) != 0 {
-            1
+        let auto_vacuum_raw = read_u32(data, 52).unwrap_or(0);
+        let incr_vacuum_raw = read_u32(data, 64).unwrap_or(0);
+        let auto_vacuum = if auto_vacuum_raw != 0 {
+            if incr_vacuum_raw != 0 {
+                BTREE_AUTOVACUUM_INCR
+            } else {
+                BTREE_AUTOVACUUM_FULL
+            }
         } else {
-            0
+            BTREE_AUTOVACUUM_NONE
         };
-        let incr_vacuum = if read_u32(data, 64).unwrap_or(0) != 0 {
-            1
-        } else {
-            0
-        };
+        let incr_vacuum = if incr_vacuum_raw != 0 { 1 } else { 0 };
         Ok(Self {
             page_size,
             reserve,

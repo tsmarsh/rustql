@@ -2,9 +2,19 @@
 
 ## Progress
 
-Started at 41% pass rate, now at **66%** (104/158 tests passing).
+Started at 41% pass rate, now at **69%** (109/159 tests passing, 50 errors).
 
-### Completed
+### Session Progress (2026-01-31)
+
+- **ORDER BY on INTEGER PRIMARY KEY optimization** - Added check to skip sorter when ORDER BY is on rowid column
+  - Fixed like-11.1 and like-11.2 tests
+  - Result: LIKE test errors reduced from 52 to 50
+
+- **Also fixed (as bonus):**
+  - **join3 test**: 100% pass rate (130/130) - enforced 64-table join limit with SQLite-compatible error
+  - **func2 test**: 100% pass rate (132/132) - fixed SUBSTR function name case in error message
+
+### Previously Completed
 
 1. **LIKE function call elimination for prefix patterns** - When LIKE uses index range scan for patterns like `'abc%'`, skip the LIKE function verification entirely
    - Added `LIKE_OPT_COMPLETE` flag in WhereTermFlags to track when index bounds fully satisfy the LIKE
@@ -21,7 +31,7 @@ Started at 41% pass rate, now at **66%** (104/158 tests passing).
 
 4. **sqlite_like_count tracking** (previous work) - Global counter for LIKE function calls exposed via TCL
 
-### Remaining Failures (~54 tests)
+### Remaining Failures (~50 tests)
 
 1. **NOCASE collation LIKE optimization** (~20 tests)
    - Tests like-5.x expect LIKE to use NOCASE collation index
@@ -59,7 +69,12 @@ Started at 41% pass rate, now at **66%** (104/158 tests passing).
 
 - src/executor/select/mod.rs
   - Modified `compile_runtime_filter_terms()` to skip LIKE_OPT_COMPLETE terms
+  - Added MAX_TABLES_IN_JOIN constant and check (for join3 fix)
+  - Added ORDER BY on INTEGER PRIMARY KEY optimization
 
 - src/executor/prepare.rs
   - Added `detect_order_by_index()` for ORDER BY index detection
   - Added `format_plan_detail_with_order()` for EQP output with ORDER BY index
+
+- src/functions/scalar.rs
+  - Fixed SUBSTR function name case in error message (for func2 fix)

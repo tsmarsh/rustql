@@ -2115,17 +2115,23 @@ impl Vdbe {
                                                             )?;
                                                         }
                                                     }
-                                                    if let Ok(rowids) = table.query_rowids(&query) {
-                                                        cursor.vtab_rowids = rowids;
-                                                        cursor.vtab_row_index = 0;
-                                                        if cursor.vtab_rowids.is_empty() {
-                                                            cursor.state = CursorState::AtEnd;
-                                                            cursor.rowid = None;
-                                                        } else {
-                                                            cursor.state = CursorState::Valid;
-                                                            cursor.rowid =
-                                                                Some(cursor.vtab_rowids[0]);
-                                                        }
+                                                    // For full table scan (empty query), use all_rowids()
+                                                    // For MATCH queries, use query_rowids()
+                                                    let rowids = if query.is_empty() {
+                                                        table.all_rowids()
+                                                    } else {
+                                                        table
+                                                            .query_rowids(&query)
+                                                            .unwrap_or_default()
+                                                    };
+                                                    cursor.vtab_rowids = rowids;
+                                                    cursor.vtab_row_index = 0;
+                                                    if cursor.vtab_rowids.is_empty() {
+                                                        cursor.state = CursorState::AtEnd;
+                                                        cursor.rowid = None;
+                                                    } else {
+                                                        cursor.state = CursorState::Valid;
+                                                        cursor.rowid = Some(cursor.vtab_rowids[0]);
                                                     }
                                                 }
                                             }
@@ -2138,17 +2144,23 @@ impl Vdbe {
                                         if module.eq_ignore_ascii_case("fts5") {
                                             if let Some(table) = crate::fts5::get_table(vtab_name) {
                                                 if let Ok(table) = table.lock() {
-                                                    if let Ok(rowids) = table.query_rowids(&query) {
-                                                        cursor.vtab_rowids = rowids;
-                                                        cursor.vtab_row_index = 0;
-                                                        if cursor.vtab_rowids.is_empty() {
-                                                            cursor.state = CursorState::AtEnd;
-                                                            cursor.rowid = None;
-                                                        } else {
-                                                            cursor.state = CursorState::Valid;
-                                                            cursor.rowid =
-                                                                Some(cursor.vtab_rowids[0]);
-                                                        }
+                                                    // For full table scan (empty query), use all_rowids()
+                                                    // For MATCH queries, use query_rowids()
+                                                    let rowids = if query.is_empty() {
+                                                        table.all_rowids()
+                                                    } else {
+                                                        table
+                                                            .query_rowids(&query)
+                                                            .unwrap_or_default()
+                                                    };
+                                                    cursor.vtab_rowids = rowids;
+                                                    cursor.vtab_row_index = 0;
+                                                    if cursor.vtab_rowids.is_empty() {
+                                                        cursor.state = CursorState::AtEnd;
+                                                        cursor.rowid = None;
+                                                    } else {
+                                                        cursor.state = CursorState::Valid;
+                                                        cursor.rowid = Some(cursor.vtab_rowids[0]);
                                                     }
                                                 }
                                             }
@@ -2201,6 +2213,34 @@ impl Vdbe {
                             .as_ref()
                             .map(|e| e.len() as i64)
                             .unwrap_or(0)
+                    } else if cursor.is_virtual {
+                        // For virtual tables, query the table directly
+                        let vtab_name = cursor.vtab_name.clone();
+                        let mut vtab_count: i64 = 0;
+
+                        if let Some(ref name) = vtab_name {
+                            #[cfg(feature = "fts3")]
+                            {
+                                if let Some(table) = crate::fts3::get_table(name) {
+                                    if let Ok(table) = table.lock() {
+                                        vtab_count = table.all_rowids().len() as i64;
+                                    }
+                                }
+                            }
+
+                            #[cfg(feature = "fts5")]
+                            {
+                                if vtab_count == 0 {
+                                    if let Some(table) = crate::fts5::get_table(name) {
+                                        if let Ok(table) = table.lock() {
+                                            vtab_count = table.all_rowids().len() as i64;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        vtab_count
                     } else if let Some(ref mut btree_cursor) = cursor.btree_cursor {
                         btree_cursor.count()?
                     } else {
@@ -3861,6 +3901,40 @@ impl Vdbe {
                                 ));
                             }
                         }
+                    } else if cursor.is_virtual {
+                        // For virtual tables, query the table for max rowid
+                        let vtab_name = cursor.vtab_name.clone();
+                        let mut max_rowid: i64 = 0;
+
+                        if let Some(ref name) = vtab_name {
+                            #[cfg(feature = "fts3")]
+                            {
+                                if let Some(table) = crate::fts3::get_table(name) {
+                                    if let Ok(table) = table.lock() {
+                                        let rowids = table.all_rowids();
+                                        if let Some(&last) = rowids.last() {
+                                            max_rowid = last;
+                                        }
+                                    }
+                                }
+                            }
+
+                            #[cfg(feature = "fts5")]
+                            {
+                                if max_rowid == 0 {
+                                    if let Some(table) = crate::fts5::get_table(name) {
+                                        if let Ok(table) = table.lock() {
+                                            let rowids = table.all_rowids();
+                                            if let Some(&last) = rowids.last() {
+                                                max_rowid = last;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        new_rowid = max_rowid.saturating_add(1);
                     } else {
                         // No btree cursor (ephemeral table, etc), use cursor's last known rowid
                         new_rowid = cursor.rowid.map_or(1, |r| r.saturating_add(1));
@@ -7357,8 +7431,47 @@ impl Vdbe {
                     if let Some(ref vtab_cursor) = cursor.vtab_cursor {
                         // Use registry cursor
                         vtab_cursor.column(col_idx).unwrap_or_else(|_| Mem::new())
+                    } else if cursor.is_virtual {
+                        // Fall back to legacy path for FTS3/FTS5
+                        let vtab_name = cursor.vtab_name.clone();
+                        let rowid = cursor.rowid;
+
+                        if let (Some(ref name), Some(rid)) = (vtab_name, rowid) {
+                            let mut found_value = Mem::new();
+
+                            #[cfg(feature = "fts3")]
+                            {
+                                if let Some(table) = crate::fts3::get_table(name) {
+                                    if let Ok(table) = table.lock() {
+                                        if let Some(values) = table.row_values(rid) {
+                                            if let Some(val) = values.get(col_idx) {
+                                                found_value = Mem::from_str(val);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            #[cfg(feature = "fts5")]
+                            {
+                                if found_value.is_null() {
+                                    if let Some(table) = crate::fts5::get_table(name) {
+                                        if let Ok(table) = table.lock() {
+                                            if let Some(values) = table.row_values(rid) {
+                                                if let Some(val) = values.get(col_idx) {
+                                                    found_value = Mem::from_str(val);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            found_value
+                        } else {
+                            Mem::new()
+                        }
                     } else {
-                        // Fall back to legacy path - no column data available
                         Mem::new()
                     }
                 } else {

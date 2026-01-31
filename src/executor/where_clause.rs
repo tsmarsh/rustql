@@ -852,12 +852,17 @@ impl QueryPlanner {
 
         // Generate virtual range terms for each LIKE term
         for (like_idx, col_expr, pattern_expr, op, left_col, mask) in like_terms {
-            if let Some((prefix, upper_bound)) = Self::extract_like_bounds(&pattern_expr, op) {
+            // Determine if this is case-sensitive (BINARY) or case-insensitive (NOCASE)
+            let is_case_sensitive = matches!(op, LikeOp::Glob) || self.case_sensitive_like;
+
+            if let Some((prefix, upper_bound)) =
+                Self::extract_like_bounds(&pattern_expr, op, is_case_sensitive)
+            {
                 // Determine required collation for the LIKE range terms:
                 // - case_sensitive_like=ON: requires BINARY collation index
                 // - case_sensitive_like=OFF: requires NOCASE collation index
                 // GLOB always requires BINARY collation
-                let required_collation = if matches!(op, LikeOp::Glob) || self.case_sensitive_like {
+                let required_collation = if is_case_sensitive {
                     Some("BINARY".to_string())
                 } else {
                     Some("NOCASE".to_string())
@@ -1245,7 +1250,12 @@ impl QueryPlanner {
     /// Extract the literal prefix from a LIKE/GLOB pattern for index optimization
     /// Returns (prefix, upper_bound) where upper_bound is prefix with last char incremented
     /// Returns None if the pattern cannot be optimized
-    fn extract_like_bounds(pattern: &Expr, op: LikeOp) -> Option<(String, String)> {
+    /// For NOCASE comparisons, normalizes to lowercase to ensure proper range bounds
+    fn extract_like_bounds(
+        pattern: &Expr,
+        op: LikeOp,
+        is_case_sensitive: bool,
+    ) -> Option<(String, String)> {
         let text = match pattern {
             Expr::Literal(Literal::String(text)) => text,
             _ => return None,
@@ -1295,11 +1305,25 @@ impl QueryPlanner {
             return None;
         }
 
+        // For NOCASE comparisons, normalize to lowercase for proper range bounds.
+        // This is necessary because NOCASE collation folds uppercase to lowercase,
+        // so 'zZ' and 'zz' are equivalent. If we increment 'Z' to '[', we get 'z['
+        // which is LESS than 'zZ' under NOCASE (since 'Z' folds to 'z' > '[').
+        // By normalizing to lowercase first, 'zZ' becomes 'zz', and incrementing
+        // gives 'z{' which is correctly greater than all 'zz...' variants.
+        let prefix_for_bounds = if is_case_sensitive {
+            prefix.clone()
+        } else {
+            prefix.to_ascii_lowercase()
+        };
+
         // Compute upper bound by incrementing the last character
         // This handles the range: prefix <= x < upper_bound
-        let upper_bound = Self::increment_string(&prefix)?;
+        let upper_bound = Self::increment_string(&prefix_for_bounds)?;
 
-        Some((prefix, upper_bound))
+        // Return the original prefix for the lower bound (NOCASE comparison will handle it)
+        // and the normalized upper bound
+        Some((prefix_for_bounds, upper_bound))
     }
 
     /// Increment a string to create an upper bound for range queries

@@ -330,8 +330,22 @@ impl KeyInfo {
             }
         }
 
-        // If all compared fields are equal, treat as equal (search key match)
-        std::cmp::Ordering::Equal
+        // If all key fields are equal but there are additional fields (like rowid in indexes),
+        // compare them using BINARY collation to maintain stable ordering.
+        // This ensures that when index key values are equal (e.g., 'abc' vs 'ABC' under NOCASE),
+        // the rowid is used as a tiebreaker for consistent ordering.
+        let n_key = self.n_key_field as usize;
+        let n_extra = fields_a.len().min(fields_b.len()).saturating_sub(n_key);
+        for i in 0..n_extra {
+            let cmp =
+                compare_record_fields(&fields_a[n_key + i], &fields_b[n_key + i], &CollSeq::Binary);
+            if cmp != std::cmp::Ordering::Equal {
+                return cmp;
+            }
+        }
+
+        // If one record has more fields than the other, longer record comes after
+        fields_a.len().cmp(&fields_b.len())
     }
 }
 

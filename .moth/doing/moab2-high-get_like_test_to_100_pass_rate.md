@@ -2,7 +2,21 @@
 
 ## Progress
 
-Started at 41% pass rate, now at **75%** (119/159 tests passing, 40 errors).
+Started at 41% pass rate, now at **78%** (124/159 tests passing, 35 errors).
+
+### Session Progress (2026-01-31) - continued (session 3)
+
+- **LIKE upper bound fix for NOCASE collation** - Fixed range bounds for mixed-case patterns
+  - Bug: Pattern 'zZ%' computed upper bound 'z[' (incrementing 'Z' to '['), but under NOCASE 'z[' < 'zZ'
+  - Fix: Normalize prefix to lowercase before computing upper bound for NOCASE patterns
+  - Result: like-5.22 and like-5.24 now pass
+
+- **Index entry ordering for NOCASE-equal values** - Added rowid as tiebreaker
+  - Bug: Index entries 'abc' and 'ABC' (equal under NOCASE) were stored in binary order not rowid order
+  - Fix: Modified `compare_records()` in btree to compare additional fields (rowid) after key fields are equal
+  - Result: like-5.3, like-5.13, like-11.6 now pass
+
+- Combined result: LIKE test errors reduced from 40 to 35 (5 more tests passing)
 
 ### Session Progress (2026-01-31) - continued (session 2)
 
@@ -59,25 +73,24 @@ Started at 41% pass rate, now at **75%** (119/159 tests passing, 40 errors).
 
 4. **sqlite_like_count tracking** (previous work) - Global counter for LIKE function calls exposed via TCL
 
-### Remaining Failures (~40 tests)
+### Remaining Failures (~35 tests)
 
-1. **INSERT...SELECT result ordering** (~6 tests, like-5.x)
-   - like-5.3, like-5.8, like-5.13, like-5.18, like-5.22, like-5.24
-   - Results appear but ordering or sqlite_like_count is wrong
+1. **sqlite_like_count differences** (like-5.8, like-5.18)
+   - Expected count 12, got 0 (optimization skipping LIKE function calls)
 
 2. **Custom LIKE functions** (like-8.3, like-8.4)
    - Tests use `db function like -argcount 2 newlike` to override built-in LIKE
    - Requires user-defined function support for LIKE
 
-3. **Scan/step count instrumentation** (like-9.x, like-10.x)
+3. **Scan/step count instrumentation** (like-9.x, like-10.x, ~11 tests)
    - Tests use `db status step` and `db status sort` for instrumentation
    - We don't fully support this API yet
 
 4. **QPSG feature** (like-3.3.102, like-3.3.104, like-3.3.105)
    - Query Planner Stability Guarantee not implemented
 
-5. **like-3.18, like-3.24, like-4.5**
-   - Expression index or other LIKE optimization edge cases
+5. **Expression index / LIKE optimization edge cases** (like-3.18, like-3.24, like-4.5)
+   - sqlite_like_count expected to be non-zero
 
 6. **Unicode LIKE matching** (like-13.4)
    - Character comparison for non-ASCII characters
@@ -88,9 +101,11 @@ Started at 41% pass rate, now at **75%** (119/159 tests passing, 40 errors).
 8. **EQP output differences** (like-12.13, like-12.15, like-15.101, like-15.112, like-15.121)
    - SEARCH vs SCAN expected in EXPLAIN QUERY PLAN output
 
-9. **like-11.6, like-11.7, like-11.8** - Sorting or index usage issues
+9. **Index selection for case_sensitive_like** (like-11.7, like-11.8)
+   - Should use BINARY-collated index when case_sensitive_like=ON
 
-10. **like-16.1** - Result ordering issue
+10. **Query plan affecting result order** (like-16.1)
+    - Using index scan instead of table scan changes result order for LIKE on INTEGER column
 
 ### Files Modified
 

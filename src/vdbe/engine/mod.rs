@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use crate::api::{SqliteConnection, StubVfs, TransactionState};
 use crate::error::{Error, ErrorCode, Result};
-use crate::executor::trigger::{find_matching_triggers, TriggerMask};
+use crate::executor::trigger::find_matching_triggers;
 use crate::functions::aggregate::AggregateState;
 use crate::schema::{Schema, TriggerEvent, TriggerTiming};
 use crate::storage::btree::{
@@ -37,8 +37,7 @@ pub use state::{
 use state::{
     inc_like_count, inc_search_count, inc_sort_count, inc_step_count, DEFAULT_CURSOR_SLOTS,
     DEFAULT_MEM_SIZE, OE_ABORT, OE_FAIL, OE_IGNORE, OE_MASK, OE_NONE, OE_REPLACE, OE_ROLLBACK,
-    OE_SHIFT, OPFLAG_APPEND, OPFLAG_ISUPDATE, OPFLAG_LASTROWID, OPFLAG_NCHANGE, VDBE_MAGIC_DEAD,
-    VDBE_MAGIC_HALT, VDBE_MAGIC_INIT, VDBE_MAGIC_RUN,
+    OE_SHIFT, OPFLAG_LASTROWID, OPFLAG_NCHANGE, VDBE_MAGIC_HALT, VDBE_MAGIC_INIT, VDBE_MAGIC_RUN,
 };
 
 // ============================================================================

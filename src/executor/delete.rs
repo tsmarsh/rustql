@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::error::Result;
 use crate::parser::ast::{DeleteStmt, Expr, ResultColumn};
-use crate::schema::{Schema, Trigger, TriggerEvent, TriggerTiming};
+use crate::schema::{Trigger, TriggerEvent, TriggerTiming};
 use crate::vdbe::ops::{Opcode, VdbeOp, P4};
 
 use super::column_mapping::ColumnMapper;

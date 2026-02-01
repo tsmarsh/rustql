@@ -4,9 +4,16 @@
 //! the official SQLite CLI tool. This is a non-negotiable requirement per CLAUDE.md.
 //!
 //! Every test creates a database with RustQL, then verifies it with sqlite3.
+//!
+//! Note: These tests are skipped on Windows as sqlite3 CLI is not available in CI.
 
 use std::process::Command;
 use std::sync::Once;
+
+/// Returns true if sqlite3 CLI is available
+fn sqlite3_available() -> bool {
+    Command::new("sqlite3").arg("--version").output().is_ok()
+}
 
 use rustql::types::StepResult;
 use rustql::{sqlite3_close, sqlite3_initialize, sqlite3_open, sqlite3_prepare_v2, sqlite3_step};
@@ -96,6 +103,10 @@ fn query_rustql(db_path: &str, sql: &str) -> Vec<Vec<String>> {
 #[test]
 fn test_empty_database_readable_by_sqlite() {
     init();
+    if !sqlite3_available() {
+        eprintln!("Skipping: sqlite3 CLI not available");
+        return;
+    }
     let db_path = "/tmp/rustql_compat_empty.db";
     let _ = std::fs::remove_file(db_path);
 
@@ -113,6 +124,10 @@ fn test_empty_database_readable_by_sqlite() {
 #[test]
 fn test_single_table_readable_by_sqlite() {
     init();
+    if !sqlite3_available() {
+        eprintln!("Skipping: sqlite3 CLI not available");
+        return;
+    }
     let db_path = "/tmp/rustql_compat_single.db";
     let _ = std::fs::remove_file(db_path);
 
@@ -136,6 +151,10 @@ fn test_single_table_readable_by_sqlite() {
 #[test]
 fn test_data_round_trip_rustql_to_sqlite() {
     init();
+    if !sqlite3_available() {
+        eprintln!("Skipping: sqlite3 CLI not available");
+        return;
+    }
     let db_path = "/tmp/rustql_compat_roundtrip.db";
     let _ = std::fs::remove_file(db_path);
 
@@ -166,6 +185,10 @@ fn test_data_round_trip_rustql_to_sqlite() {
 #[test]
 fn test_data_round_trip_sqlite_to_rustql() {
     init();
+    if !sqlite3_available() {
+        eprintln!("Skipping: sqlite3 CLI not available");
+        return;
+    }
     let db_path = "/tmp/rustql_compat_roundtrip2.db";
     let _ = std::fs::remove_file(db_path);
 
@@ -191,6 +214,10 @@ fn test_data_round_trip_sqlite_to_rustql() {
 #[test]
 fn test_index_readable_by_sqlite() {
     init();
+    if !sqlite3_available() {
+        eprintln!("Skipping: sqlite3 CLI not available");
+        return;
+    }
     let db_path = "/tmp/rustql_compat_index.db";
     let _ = std::fs::remove_file(db_path);
 
@@ -219,6 +246,10 @@ fn test_index_readable_by_sqlite() {
 #[test]
 fn test_multi_column_index_compatible() {
     init();
+    if !sqlite3_available() {
+        eprintln!("Skipping: sqlite3 CLI not available");
+        return;
+    }
     let db_path = "/tmp/rustql_compat_multi_idx.db";
     let _ = std::fs::remove_file(db_path);
 
@@ -247,6 +278,10 @@ fn test_multi_column_index_compatible() {
 #[test]
 fn test_many_rows_compatible() {
     init();
+    if !sqlite3_available() {
+        eprintln!("Skipping: sqlite3 CLI not available");
+        return;
+    }
     let db_path = "/tmp/rustql_compat_large.db";
     let _ = std::fs::remove_file(db_path);
 
@@ -283,6 +318,10 @@ fn test_many_rows_compatible() {
 #[test]
 fn test_large_text_compatible() {
     init();
+    if !sqlite3_available() {
+        eprintln!("Skipping: sqlite3 CLI not available");
+        return;
+    }
     let db_path = "/tmp/rustql_compat_largetext.db";
     let _ = std::fs::remove_file(db_path);
 
@@ -315,6 +354,10 @@ fn test_large_text_compatible() {
 #[ignore = "Known issue: UPDATE with INT PRIMARY KEY not persisting correctly - see moth eigtx"]
 fn test_update_compatible() {
     init();
+    if !sqlite3_available() {
+        eprintln!("Skipping: sqlite3 CLI not available");
+        return;
+    }
     let db_path = "/tmp/rustql_compat_update.db";
     let _ = std::fs::remove_file(db_path);
 
@@ -336,6 +379,10 @@ fn test_update_compatible() {
 #[test]
 fn test_delete_compatible() {
     init();
+    if !sqlite3_available() {
+        eprintln!("Skipping: sqlite3 CLI not available");
+        return;
+    }
     let db_path = "/tmp/rustql_compat_delete.db";
     let _ = std::fs::remove_file(db_path);
 
@@ -365,6 +412,10 @@ fn test_delete_compatible() {
 #[ignore = "Known issue: Multiple table INSERT with INT PRIMARY KEY - see moth eigtx"]
 fn test_multiple_tables_compatible() {
     init();
+    if !sqlite3_available() {
+        eprintln!("Skipping: sqlite3 CLI not available");
+        return;
+    }
     let db_path = "/tmp/rustql_compat_multi.db";
     let _ = std::fs::remove_file(db_path);
 
@@ -393,6 +444,10 @@ fn test_multiple_tables_compatible() {
 #[ignore = "Known issue: UNIQUE constraint false positive with INT PRIMARY KEY - see moth zenc6"]
 fn test_unique_constraint_compatible() {
     init();
+    if !sqlite3_available() {
+        eprintln!("Skipping: sqlite3 CLI not available");
+        return;
+    }
     let db_path = "/tmp/rustql_compat_unique.db";
     let _ = std::fs::remove_file(db_path);
 

@@ -1055,7 +1055,7 @@ impl<'s> TriggerBodyCompiler<'s> {
 
     /// Compile an expression, handling OLD/NEW references
     fn compile_expr(&mut self, expr: &crate::parser::ast::Expr, dest_reg: i32) -> Result<()> {
-        use crate::parser::ast::{ColumnRef, Expr, Literal};
+        use crate::parser::ast::{Expr, Literal};
 
         match expr {
             Expr::Literal(lit) => {

@@ -1,6 +1,6 @@
 //! Global state and constants for the VDBE engine
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 // ============================================================================
 // Magic numbers for VDBE state validation

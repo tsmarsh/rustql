@@ -2,20 +2,15 @@
 //!
 //! This module implements sqlite3_stmt (prepared statement) and related functions.
 
-use std::sync::atomic::Ordering;
-
 use crate::error::{Error, ErrorCode, Result};
 use crate::executor::analyze::execute_analyze;
 use crate::executor::pragma::{execute_pragma, pragma_columns};
-use crate::executor::prepare::{
-    compile_sql, compile_sql_with_config, compile_sql_with_full_config, compile_sql_with_schema,
-    CompiledStmt, StmtType,
-};
+use crate::executor::prepare::{compile_sql, compile_sql_with_full_config, CompiledStmt, StmtType};
 use crate::parser::ast::{AttachStmt, Expr, Literal, QualifiedName, Variable};
 use crate::types::{ColumnType, StepResult, Value};
 use crate::vdbe::engine::Vdbe;
 use crate::vdbe::ops::VdbeOp;
-use crate::vdbe::{reset_like_count, reset_sort_count, reset_step_count};
+use crate::vdbe::{reset_like_count, reset_sort_count};
 
 use super::connection::SqliteConnection;
 

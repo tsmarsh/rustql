@@ -21,6 +21,8 @@
 - [x] rtreenode() function - parse node blob into TCL list
 - [x] rtreecheck() function - validate R-tree integrity
 - [x] ON CONFLICT support (INSERT OR IGNORE, INSERT OR REPLACE)
+- [x] xBestIndex constraint passing (spatial queries use idx_num=2)
+- [x] xBestIndex ID lookup optimization (id = N uses idx_num=1)
 
 ### Test Results (Manual)
 - CREATE VIRTUAL TABLE: PASS
@@ -39,6 +41,8 @@
 - rtreecheck(): PASS (matches SQLite output)
 - INSERT OR IGNORE: PASS (ignores duplicate rowid)
 - INSERT OR REPLACE: PASS (replaces existing entry)
+- xBestIndex spatial query: PASS (idx_num=770 for 2 constraints)
+- xBestIndex ID lookup: PASS (idx_num=1, estimated_cost=1)
 
 ### Remaining Work
 1. **pragma table_list shadow support**: Show shadow tables in pragma

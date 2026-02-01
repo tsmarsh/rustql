@@ -6728,16 +6728,49 @@ impl Vdbe {
                                 }
 
                                 // Check if table already exists
+                                let table_name = table.name.clone();
+                                let is_virtual = table.is_virtual;
+                                let virtual_module = table.virtual_module.clone();
+                                let virtual_args = table.virtual_args.clone();
                                 if let std::collections::hash_map::Entry::Vacant(e) =
                                     schema_guard.tables.entry(table_name_lower)
                                 {
                                     e.insert(std::sync::Arc::new(table));
+
+                                    // For R-tree virtual tables, register adapter in vtab_registry
+                                    // This enables xBestIndex/best_index() to be called during query planning
+                                    // Note: FTS3/FTS5 have their own registration mechanism
+                                    if is_virtual {
+                                        if let (Some(ref registry), Some(ref module_name)) =
+                                            (&self.vtab_registry, &virtual_module)
+                                        {
+                                            // Only register R-tree for now (FTS3/FTS5 have separate registration)
+                                            if module_name.eq_ignore_ascii_case("rtree") {
+                                                let db_name =
+                                                    if db_idx == 1 { "temp" } else { "main" };
+                                                // Only register if instance doesn't exist yet
+                                                let already_exists = registry
+                                                    .get_instance(db_name, &table_name)
+                                                    .map(|opt| opt.is_some())
+                                                    .unwrap_or(false);
+                                                if !already_exists {
+                                                    let args: Vec<String> = virtual_args.clone();
+                                                    let _ = registry.connect_virtual_table(
+                                                        module_name,
+                                                        db_name,
+                                                        &table_name,
+                                                        &args,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
                                 } else {
                                     if !if_not_exists {
                                         // Return error: table already exists
                                         return Err(crate::error::Error::with_message(
                                             crate::error::ErrorCode::Error,
-                                            format!("table \"{}\" already exists", table.name),
+                                            format!("table \"{}\" already exists", table_name),
                                         ));
                                     }
                                     // IF NOT EXISTS was specified, silently succeed

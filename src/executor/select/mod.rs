@@ -784,6 +784,22 @@ impl<'s> SelectCompiler<'s> {
         subcompiler.main_view_depth = self.main_view_depth;
         // Propagate enable_view flag
         subcompiler.enable_view = self.enable_view;
+
+        // Pass outer tables for correlated subquery support
+        // FROM subqueries inside scalar subquery contexts (IN, EXISTS, scalar subqueries)
+        // may need to reference columns from the outer query's tables
+        // This enables patterns like: SELECT x FROM t1 WHERE x IN (SELECT * FROM (SELECT x+1))
+        // IMPORTANT: Only pass tables up to outer_tables_boundary (the actual outer tables)
+        // Do not pass local tables, as those would cause ambiguity with the subquery's own tables
+        for table in self.tables.iter().take(self.outer_tables_boundary) {
+            subcompiler.add_outer_table(
+                table.name.clone(),
+                table.table_name.clone(),
+                table.cursor,
+                table.schema_table.clone(),
+            );
+        }
+
         if let Some(name) = exclude_cte {
             subcompiler.ctes.remove(name);
             subcompiler.recursive_ctes.remove(name);
@@ -5569,8 +5585,11 @@ impl<'s> SelectCompiler<'s> {
     }
 
     /// Convert an expression to a column name, respecting PRAGMA settings
-    fn expr_to_name(&self, expr: &Expr, _index: usize) -> String {
+    fn expr_to_name(&self, expr: &Expr, index: usize) -> String {
         match expr {
+            // COLLATE expressions inherit the name of their underlying expression
+            // e.g., "x COLLATE rtrim" should be named "x" for column matching
+            Expr::Collate { expr: inner, .. } => self.expr_to_name(inner, index),
             Expr::Column(col) => {
                 // Handle column naming based on PRAGMA settings
                 // full_column_names=ON: use "realTable.column"
@@ -5743,6 +5762,9 @@ impl<'s> SelectCompiler<'s> {
             }
             Expr::Cast { expr, type_name } => {
                 format!("CAST({} AS {})", self.expr_to_string(expr), type_name.name)
+            }
+            Expr::Collate { expr, collation } => {
+                format!("{} COLLATE {}", self.expr_to_string(expr), collation)
             }
             _ => "?".to_string(),
         }
@@ -6708,26 +6730,20 @@ impl<'s> SelectCompiler<'s> {
                     }
 
                     if matches.is_empty() {
-                        for (table_idx, tinfo) in self
-                            .tables
-                            .iter()
-                            .enumerate()
-                            .take(self.outer_tables_boundary)
-                        {
+                        // Search outer tables in REVERSE order (closest scope first)
+                        // to match SQLite's behavior of preferring the nearest enclosing scope
+                        for table_idx in (0..self.outer_tables_boundary).rev() {
+                            let tinfo = &self.tables[table_idx];
                             if self.is_column_coalesced(table_idx, &col_lower) {
                                 continue;
                             }
                             if let Some(idx) = self.column_index_in_table(tinfo, &col_ref.column) {
                                 matches.push((tinfo.cursor, idx));
+                                // Stop at first match - prefer closest scope
+                                break;
                             }
                         }
-
-                        if matches.len() > 1 {
-                            return Err(Error::with_message(
-                                ErrorCode::Error,
-                                format!("ambiguous column name: {}", col_ref.column),
-                            ));
-                        }
+                        // No ambiguity check needed since we stop at first match
                     }
 
                     if let Some((cursor, idx)) = matches.pop() {
@@ -7480,6 +7496,13 @@ impl<'s> SelectCompiler<'s> {
                 negated,
             } => {
                 // Compile BETWEEN: val >= low AND val <= high
+                // NULL semantics: if any operand is NULL during comparison, result is NULL
+                // Specifically: (val >= low) AND (val <= high)
+                // - If val < low, result is 0 (false)
+                // - If val > high, result is 0 (false)
+                // - If val is NULL, low is NULL, or high is NULL and we reach that
+                //   comparison, result is NULL
+                // - Otherwise result is 1 (true)
                 let val_reg = self.alloc_reg();
                 let low_reg = self.alloc_reg();
                 let high_reg = self.alloc_reg();
@@ -7488,36 +7511,45 @@ impl<'s> SelectCompiler<'s> {
                 self.compile_expr(low, low_reg)?;
                 self.compile_expr(high, high_reg)?;
 
-                let fail_label = self.alloc_label();
+                let false_label = self.alloc_label();
+                let null_label = self.alloc_label();
                 let end_label = self.alloc_label();
 
                 // Determine affinity for comparisons
-                // Use the combined affinity from val_expr, low, and high
                 let low_affinity = self.get_comparison_affinity(val_expr, low);
                 let high_affinity = self.get_comparison_affinity(val_expr, high);
 
-                // Check val >= low (fail if val < low)
-                // Lt P1 P2 P3 jumps if r[P3] < r[P1], so P1=low, P3=val
+                // Check val >= low
+                // If val < low (definitely false), jump to false_label
+                // If either is NULL, jump to null_label (comparison is unknown)
+                // Use JUMPIFNULL flag to detect NULL operands
+                self.emit_with_p5(Opcode::IsNull, val_reg, null_label, 0, P4::Unused, 0);
+                self.emit_with_p5(Opcode::IsNull, low_reg, null_label, 0, P4::Unused, 0);
+                // Lt P1 P2 P3: jumps if r[P3] < r[P1], so P1=low, P3=val
                 self.emit_with_p5(
                     Opcode::Lt,
                     low_reg,
-                    fail_label,
+                    false_label,
                     val_reg,
                     P4::Unused,
                     low_affinity,
                 );
-                // Check val <= high (fail if val > high)
-                // Gt P1 P2 P3 jumps if r[P3] > r[P1], so P1=high, P3=val
+
+                // Check val <= high
+                // If val > high (definitely false), jump to false_label
+                // If high is NULL, jump to null_label (comparison is unknown)
+                self.emit_with_p5(Opcode::IsNull, high_reg, null_label, 0, P4::Unused, 0);
+                // Gt P1 P2 P3: jumps if r[P3] > r[P1], so P1=high, P3=val
                 self.emit_with_p5(
                     Opcode::Gt,
                     high_reg,
-                    fail_label,
+                    false_label,
                     val_reg,
                     P4::Unused,
                     high_affinity,
                 );
 
-                // Success - in range
+                // Success - in range (result is TRUE)
                 self.emit(
                     Opcode::Integer,
                     if *negated { 0 } else { 1 },
@@ -7527,8 +7559,13 @@ impl<'s> SelectCompiler<'s> {
                 );
                 self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
 
-                // Fail - not in range
-                self.resolve_label(fail_label, self.current_addr());
+                // NULL result - comparison involved NULL
+                self.resolve_label(null_label, self.current_addr());
+                self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+
+                // FALSE result - definitely not in range
+                self.resolve_label(false_label, self.current_addr());
                 self.emit(
                     Opcode::Integer,
                     if *negated { 1 } else { 0 },

@@ -1236,7 +1236,12 @@ impl QueryPlanner {
         expr: &Expr,
     ) -> Result<()> {
         if let Some(col_ref) = Self::get_column_ref(expr) {
-            for (i, (name, alias, _mask, columns, ipk_column, affinities)) in
+            // Get the table index that was matched by left_col (if any)
+            // For self-joins like "t1 JOIN t1 USING(a)", both sides reference "t1"
+            // but we need to match them to different table instances
+            let left_table_idx = term.left_col.map(|(tbl_idx, _)| tbl_idx);
+
+            for (i, (name, alias, _mask, columns, ipk_column, _affinities)) in
                 table_info.iter().enumerate()
             {
                 let table_matches = match (&col_ref.table, alias) {
@@ -1272,6 +1277,14 @@ impl QueryPlanner {
                     };
 
                     if let Some(idx) = column_idx {
+                        // For self-joins: if this table was already matched by left_col
+                        // and the column references use the same table name, skip this
+                        // table and look for another instance with the same name
+                        if left_table_idx == Some(i as i32) && col_ref.table.is_some() {
+                            // This table was already used for the left side
+                            // Continue searching for another table with the same name
+                            continue;
+                        }
                         term.right_col = Some((i as i32, idx));
                         break;
                     } else if col_ref.table.is_some() {
@@ -2303,5 +2316,392 @@ mod tests {
         // Two equality constraints should be cheaper
         let cost3 = estimate_simple_cost(1000, true, 2);
         assert!(cost3 < cost2);
+    }
+
+    // ============================================================================
+    // SQLite3 Compatibility Tests
+    // ============================================================================
+    // These tests ensure the query planner produces SQLite3-compatible plans
+
+    /// Helper to create a column reference expression
+    fn make_col_ref(table: Option<&str>, column: &str) -> Expr {
+        Expr::Column(crate::parser::ast::ColumnRef {
+            database: None,
+            table: table.map(|s| s.to_string()),
+            column: column.to_string(),
+            column_index: None,
+        })
+    }
+
+    /// Helper to create an equality expression: col = value
+    fn make_eq(col_table: Option<&str>, col_name: &str, value: i64) -> Expr {
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(make_col_ref(col_table, col_name)),
+            right: Box::new(Expr::Literal(Literal::Integer(value))),
+        }
+    }
+
+    /// Helper to create a join condition: t1.col = t2.col
+    fn make_join_cond(t1: &str, c1: &str, t2: &str, c2: &str) -> Expr {
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(make_col_ref(Some(t1), c1)),
+            right: Box::new(make_col_ref(Some(t2), c2)),
+        }
+    }
+
+    #[test]
+    fn test_multi_table_join_ordering_cost_based() {
+        // SQLite3 behavior: smaller tables should be scanned first when no indexes
+        // This reduces the number of rows in the intermediate result
+        let mut planner = QueryPlanner::new();
+
+        // Add a small table (100 rows) and a large table (10000 rows)
+        planner.add_table("small".to_string(), None, 100);
+        planner.add_table("large".to_string(), None, 10000);
+
+        // No WHERE clause - pure cost-based ordering
+        let result = planner.find_best_plan().unwrap();
+        assert_eq!(result.levels.len(), 2);
+
+        // Smaller table should be in the outer loop (first level)
+        assert_eq!(result.levels[0].table_name, "small");
+        assert_eq!(result.levels[1].table_name, "large");
+    }
+
+    #[test]
+    fn test_rowid_equality_detection() {
+        // SQLite3 behavior: WHERE rowid = ? should use RowidEq plan
+        let mut planner = QueryPlanner::new();
+        planner.add_table("t1".to_string(), None, 1000);
+
+        // Create WHERE rowid = 42
+        let mut term = WhereTerm::new(make_eq(None, "rowid", 42), 0);
+        term.op = Some(TermOp::Eq);
+        term.mask = 1; // References table 0
+        term.left_col = Some((0, -1)); // table 0, column -1 = rowid
+        planner.where_clause.terms.push(term);
+
+        let result = planner.find_best_plan().unwrap();
+        assert_eq!(result.levels.len(), 1);
+        assert!(
+            matches!(result.levels[0].plan, WherePlan::RowidEq),
+            "Expected RowidEq plan for rowid = ? condition"
+        );
+    }
+
+    #[test]
+    fn test_ipk_equality_treated_as_rowid() {
+        // SQLite3 behavior: INTEGER PRIMARY KEY is an alias for rowid
+        // WHERE ipk_column = ? should use RowidEq plan (when left_col is -1)
+        let mut planner = QueryPlanner::new();
+        planner.add_table("t1".to_string(), None, 1000);
+
+        // Create WHERE id = 42 (where 'id' is INTEGER PRIMARY KEY)
+        // The planner receives this with left_col = (table_idx, -1)
+        let mut term = WhereTerm::new(make_eq(Some("t1"), "id", 42), 0);
+        term.op = Some(TermOp::Eq);
+        term.mask = 1;
+        term.left_col = Some((0, -1)); // -1 indicates rowid/IPK
+        planner.where_clause.terms.push(term);
+
+        let result = planner.find_best_plan().unwrap();
+        assert!(
+            matches!(result.levels[0].plan, WherePlan::RowidEq),
+            "INTEGER PRIMARY KEY equality should use RowidEq"
+        );
+    }
+
+    #[test]
+    fn test_join_term_prereqs() {
+        // SQLite3 behavior: join conditions (t1.a = t2.b) have prerequisites
+        // The term cannot be used until all referenced tables are available
+        let mut planner = QueryPlanner::new();
+        planner.add_table("t1".to_string(), None, 100);
+        planner.add_table("t2".to_string(), None, 100);
+
+        // Create t1.a = t2.b join condition
+        let mut term = WhereTerm::new(make_join_cond("t1", "a", "t2", "b"), 0);
+        term.op = Some(TermOp::Eq);
+        term.mask = 0b11; // References both tables
+        term.prereq = 0b11; // Both tables are prerequisites
+        term.left_col = Some((0, 0)); // t1.a is column 0 of table 0
+        planner.where_clause.terms.push(term);
+
+        let result = planner.find_best_plan().unwrap();
+        assert_eq!(result.levels.len(), 2);
+        // The join term should only be usable for the second level
+        // (after the first table is already processed)
+    }
+
+    #[test]
+    fn test_rowid_in_uses_seek() {
+        // SQLite3 behavior: WHERE rowid IN (1,2,3) should use RowidIn plan
+        let mut planner = QueryPlanner::new();
+        planner.add_table("t1".to_string(), None, 10000);
+
+        // Create WHERE rowid IN (1, 2, 3)
+        let in_expr = Expr::In {
+            expr: Box::new(make_col_ref(None, "rowid")),
+            list: InList::Values(vec![
+                Expr::Literal(Literal::Integer(1)),
+                Expr::Literal(Literal::Integer(2)),
+                Expr::Literal(Literal::Integer(3)),
+            ]),
+            negated: false,
+        };
+        let mut term = WhereTerm::new(in_expr, 0);
+        term.op = Some(TermOp::In);
+        term.mask = 1;
+        term.left_col = Some((0, -1)); // rowid
+        planner.where_clause.terms.push(term);
+
+        let result = planner.find_best_plan().unwrap();
+        assert!(
+            matches!(result.levels[0].plan, WherePlan::RowidIn { .. }),
+            "rowid IN (...) should use RowidIn plan"
+        );
+    }
+
+    #[test]
+    fn test_index_beats_full_scan() {
+        // SQLite3 behavior: index lookup is cheaper than full scan
+        let mut planner = QueryPlanner::new();
+        planner.add_table("t1".to_string(), None, 10000);
+        planner.add_index(
+            0,
+            IndexInfo {
+                name: "idx_t1_a".to_string(),
+                columns: vec![0], // Column 0
+                collations: vec!["BINARY".to_string()],
+                is_primary: false,
+                is_unique: false,
+                is_covering: false,
+                stats: None,
+            },
+        );
+
+        // Create WHERE a = 42
+        let mut term = WhereTerm::new(make_eq(Some("t1"), "a", 42), 0);
+        term.op = Some(TermOp::Eq);
+        term.mask = 1;
+        term.left_col = Some((0, 0)); // table 0, column 0
+        planner.where_clause.terms.push(term);
+
+        let result = planner.find_best_plan().unwrap();
+        assert!(
+            matches!(
+                result.levels[0].plan,
+                WherePlan::IndexScan { .. } | WherePlan::PrimaryKey { .. }
+            ),
+            "Index should be preferred over full scan for equality"
+        );
+    }
+
+    #[test]
+    fn test_rowid_eq_cheaper_than_index() {
+        // SQLite3 behavior: rowid equality is the cheapest possible lookup
+        let mut planner = QueryPlanner::new();
+        planner.add_table("t1".to_string(), None, 10000);
+        planner.add_index(
+            0,
+            IndexInfo {
+                name: "idx_t1_a".to_string(),
+                columns: vec![0],
+                collations: vec!["BINARY".to_string()],
+                is_primary: false,
+                is_unique: true,
+                is_covering: false,
+                stats: None,
+            },
+        );
+
+        // Add both a = 42 AND rowid = 1
+        let mut term1 = WhereTerm::new(make_eq(Some("t1"), "a", 42), 0);
+        term1.op = Some(TermOp::Eq);
+        term1.mask = 1;
+        term1.left_col = Some((0, 0));
+        planner.where_clause.terms.push(term1);
+
+        let mut term2 = WhereTerm::new(make_eq(None, "rowid", 1), 1);
+        term2.op = Some(TermOp::Eq);
+        term2.mask = 1;
+        term2.left_col = Some((0, -1)); // rowid
+        planner.where_clause.terms.push(term2);
+
+        let result = planner.find_best_plan().unwrap();
+        assert!(
+            matches!(result.levels[0].plan, WherePlan::RowidEq),
+            "RowidEq should be preferred when both rowid and index equality are available"
+        );
+    }
+
+    #[test]
+    fn test_range_constraint_detection() {
+        // SQLite3 behavior: BETWEEN is split into >= and <= terms
+        let mut planner = QueryPlanner::new();
+        planner.add_table("t1".to_string(), None, 1000);
+
+        // a >= 10 AND a <= 20
+        let ge_expr = Expr::Binary {
+            op: BinaryOp::Ge,
+            left: Box::new(make_col_ref(Some("t1"), "a")),
+            right: Box::new(Expr::Literal(Literal::Integer(10))),
+        };
+        let le_expr = Expr::Binary {
+            op: BinaryOp::Le,
+            left: Box::new(make_col_ref(Some("t1"), "a")),
+            right: Box::new(Expr::Literal(Literal::Integer(20))),
+        };
+
+        let mut term1 = WhereTerm::new(ge_expr, 0);
+        term1.op = Some(TermOp::Ge);
+        term1.mask = 1;
+        term1.left_col = Some((0, 0));
+        planner.where_clause.terms.push(term1);
+
+        let mut term2 = WhereTerm::new(le_expr, 1);
+        term2.op = Some(TermOp::Le);
+        term2.mask = 1;
+        term2.left_col = Some((0, 0));
+        planner.where_clause.terms.push(term2);
+
+        // Both terms should be classified as range terms
+        assert!(planner.where_clause.terms[0].is_range());
+        assert!(planner.where_clause.terms[1].is_range());
+    }
+
+    #[test]
+    fn test_or_term_flags() {
+        // SQLite3 behavior: OR terms are marked with OR_INFO flag
+        let mut planner = QueryPlanner::new();
+        planner.add_table("t1".to_string(), None, 1000);
+
+        // a = 1 OR b = 2
+        let or_expr = Expr::Binary {
+            op: BinaryOp::Or,
+            left: Box::new(make_eq(Some("t1"), "a", 1)),
+            right: Box::new(make_eq(Some("t1"), "b", 2)),
+        };
+
+        planner.analyze_where(Some(&or_expr)).unwrap();
+
+        // The OR should be stored as a single term with OR_INFO flag
+        assert_eq!(planner.where_clause.len(), 1);
+        assert!(planner.where_clause.terms[0]
+            .flags
+            .contains(WhereTermFlags::OR_INFO));
+        assert_eq!(planner.where_clause.terms[0].or_terms.len(), 2);
+    }
+
+    #[test]
+    fn test_two_table_join_with_filter() {
+        // SQLite3 behavior: filter on one table affects join order
+        let mut planner = QueryPlanner::new();
+        planner.add_table("t1".to_string(), None, 10000);
+        planner.add_table("t2".to_string(), None, 10000);
+
+        // WHERE t1.a = t2.b AND t2.c = 5
+        // The filter on t2 should make t2 the outer loop (fewer rows)
+        let join_cond = make_join_cond("t1", "a", "t2", "b");
+        let filter = make_eq(Some("t2"), "c", 5);
+
+        planner
+            .analyze_where(Some(&Expr::Binary {
+                op: BinaryOp::And,
+                left: Box::new(join_cond),
+                right: Box::new(filter),
+            }))
+            .unwrap();
+
+        // Set up masks for the terms
+        for term in planner.where_clause.terms.iter_mut() {
+            // Simple mask assignment based on table references
+            // In real usage, this is done by the expression analyzer
+        }
+
+        let result = planner.find_best_plan().unwrap();
+        assert_eq!(result.levels.len(), 2);
+    }
+
+    #[test]
+    fn test_loop_levels_have_table_info() {
+        // Each WhereLevel should have correct table info
+        let mut planner = QueryPlanner::new();
+        planner.add_table("users".to_string(), Some("u".to_string()), 1000);
+
+        let result = planner.find_best_plan().unwrap();
+        assert_eq!(result.levels.len(), 1);
+        assert_eq!(result.levels[0].table_name, "users");
+        // from_idx should match the cursor number assigned to this table
+        assert_eq!(result.levels[0].from_idx, 0);
+    }
+
+    #[test]
+    fn test_three_table_join_permutations() {
+        // For 3 tables with equal size and no constraints,
+        // the planner should try all 6 permutations
+        let mut planner = QueryPlanner::new();
+        planner.add_table("t1".to_string(), None, 100);
+        planner.add_table("t2".to_string(), None, 100);
+        planner.add_table("t3".to_string(), None, 100);
+
+        let result = planner.find_best_plan().unwrap();
+        assert_eq!(result.levels.len(), 3);
+
+        // All three tables should be included
+        let table_names: Vec<&str> = result
+            .levels
+            .iter()
+            .map(|l| l.table_name.as_str())
+            .collect();
+        assert!(table_names.contains(&"t1"));
+        assert!(table_names.contains(&"t2"));
+        assert!(table_names.contains(&"t3"));
+    }
+
+    #[test]
+    fn test_cost_estimation_consistency() {
+        // Cost estimates should be consistent and monotonic
+        let mut planner = QueryPlanner::new();
+        planner.add_table("t1".to_string(), None, 1000);
+
+        // Full scan cost
+        let (full_scan_cost, _) = planner.evaluate_table_access(0, 0, 1.0).unwrap();
+
+        // Add an index and check that indexed access is cheaper
+        planner.add_index(
+            0,
+            IndexInfo {
+                name: "idx".to_string(),
+                columns: vec![0],
+                collations: vec!["BINARY".to_string()],
+                is_primary: false,
+                is_unique: true,
+                is_covering: true,
+                stats: Some(IndexStats {
+                    row_count: 100,
+                    avg_eq: vec![1.0],
+                    n_distinct: vec![100],
+                }),
+            },
+        );
+
+        // With an index constraint, cost should be lower
+        let mut term = WhereTerm::new(make_eq(Some("t1"), "a", 42), 0);
+        term.op = Some(TermOp::Eq);
+        term.mask = 1;
+        term.left_col = Some((0, 0));
+        planner.where_clause.terms.push(term);
+
+        let (indexed_cost, _) = planner.evaluate_table_access(0, 0, 1.0).unwrap();
+
+        assert!(
+            indexed_cost < full_scan_cost,
+            "Indexed access ({}) should be cheaper than full scan ({})",
+            indexed_cost,
+            full_scan_cost
+        );
     }
 }

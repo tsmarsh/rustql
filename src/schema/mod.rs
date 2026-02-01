@@ -726,6 +726,60 @@ fn extract_collation(col_def_upper: &str) -> Option<String> {
     None
 }
 
+/// Extract generated column expression from column definition (AS(expr))
+fn extract_generated_column(col_def: &str, col_def_upper: &str) -> Option<GeneratedColumn> {
+    // Look for " AS(" pattern
+    if let Some(as_pos) = col_def_upper.find(" AS(") {
+        let after_as = &col_def[as_pos + 4..]; // Skip " AS("
+                                               // Find the matching closing paren
+        let mut depth = 1;
+        let mut expr_end = 0;
+        for (i, ch) in after_as.chars().enumerate() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        expr_end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if depth == 0 && expr_end > 0 {
+            let expr_str = &after_as[..expr_end];
+            // Determine storage type (STORED or VIRTUAL, default is VIRTUAL)
+            let after_expr = &col_def_upper[as_pos + 4 + expr_end + 1..];
+            let storage = if after_expr.contains("STORED") {
+                GeneratedStorage::Stored
+            } else {
+                GeneratedStorage::Virtual
+            };
+            // Parse the expression string into a schema Expr
+            // For simple literals like 'Y', we can handle them directly
+            let expr_str = expr_str.trim();
+            let expr = if expr_str.starts_with('\'') && expr_str.ends_with('\'') {
+                // String literal
+                let s = &expr_str[1..expr_str.len() - 1];
+                Expr::String(s.replace("''", "'"))
+            } else if let Ok(n) = expr_str.parse::<i64>() {
+                Expr::Integer(n)
+            } else if let Ok(f) = expr_str.parse::<f64>() {
+                Expr::Real(f)
+            } else if expr_str.eq_ignore_ascii_case("NULL") {
+                Expr::Null
+            } else {
+                // For complex expressions, we would need to parse them properly
+                // For now, store as a simple column reference or string
+                Expr::String(expr_str.to_string())
+            };
+            return Some(GeneratedColumn { expr, storage });
+        }
+    }
+    None
+}
+
 /// Parse a CREATE TABLE/CREATE VIRTUAL TABLE SQL string into a Table struct.
 pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
     // Simple parser for CREATE TABLE name (col1 type, col2 type, ...)
@@ -1027,6 +1081,9 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
         let collation =
             extract_collation(&col_def_upper).unwrap_or_else(|| DEFAULT_COLLATION.to_string());
 
+        // Extract generated column expression if present (AS(expr))
+        let generated = extract_generated_column(&col_def, &col_def_upper);
+
         columns.push(Column {
             name,
             type_name,
@@ -1037,8 +1094,11 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
             collation,
             is_primary_key,
             is_unique,
-            is_hidden: false,
-            generated: None,
+            is_hidden: generated
+                .as_ref()
+                .map(|g| g.storage == GeneratedStorage::Virtual)
+                .unwrap_or(false),
+            generated,
         });
     }
 

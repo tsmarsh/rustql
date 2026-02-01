@@ -20,7 +20,7 @@ use crate::parser::ast::{
     JoinType, LikeOp, LimitClause, Literal, OrderingTerm, ResultColumn, SelectBody, SelectCore,
     SelectStmt, SortOrder, TableRef, WithClause,
 };
-use crate::schema::{Affinity, Table};
+use crate::schema::{Affinity, GeneratedStorage, Table};
 use crate::vdbe::ops::{
     affinity as vdbe_affinity, Opcode, VFilterConstraint, VFilterPlan, VdbeOp, P4,
 };
@@ -314,6 +314,202 @@ impl<'s> SelectCompiler<'s> {
     /// Get the expanded column names after compilation
     pub fn column_names(&self) -> &[String] {
         &self.result_column_names
+    }
+
+    /// Convert a schema expression to a parser AST expression
+    /// This is used for evaluating generated column expressions at compile time
+    fn convert_schema_expr_to_ast(schema_expr: &crate::schema::Expr) -> Expr {
+        use crate::schema::Expr as SchemaExpr;
+        match schema_expr {
+            SchemaExpr::Null => Expr::Literal(Literal::Null),
+            SchemaExpr::Integer(i) => Expr::Literal(Literal::Integer(*i)),
+            SchemaExpr::Real(f) => Expr::Literal(Literal::Float(*f)),
+            SchemaExpr::String(s) => Expr::Literal(Literal::String(s.clone())),
+            SchemaExpr::Blob(b) => Expr::Literal(Literal::Blob(b.clone())),
+            SchemaExpr::Column { table, column } => Expr::Column(ColumnRef {
+                database: None,
+                table: table.clone(),
+                column: column.clone(),
+                column_index: None,
+            }),
+            SchemaExpr::BinaryOp { left, op, right } => {
+                // Handle GLOB/MATCH/REGEXP as Like expressions, not binary ops
+                match op {
+                    crate::schema::BinaryOp::Glob => {
+                        return Expr::Like {
+                            expr: Box::new(Self::convert_schema_expr_to_ast(left)),
+                            pattern: Box::new(Self::convert_schema_expr_to_ast(right)),
+                            escape: None,
+                            op: LikeOp::Glob,
+                            negated: false,
+                        };
+                    }
+                    crate::schema::BinaryOp::Match => {
+                        return Expr::Like {
+                            expr: Box::new(Self::convert_schema_expr_to_ast(left)),
+                            pattern: Box::new(Self::convert_schema_expr_to_ast(right)),
+                            escape: None,
+                            op: LikeOp::Match,
+                            negated: false,
+                        };
+                    }
+                    crate::schema::BinaryOp::Regexp => {
+                        return Expr::Like {
+                            expr: Box::new(Self::convert_schema_expr_to_ast(left)),
+                            pattern: Box::new(Self::convert_schema_expr_to_ast(right)),
+                            escape: None,
+                            op: LikeOp::Regexp,
+                            negated: false,
+                        };
+                    }
+                    _ => {}
+                }
+                let ast_op = match op {
+                    crate::schema::BinaryOp::Add => BinaryOp::Add,
+                    crate::schema::BinaryOp::Sub => BinaryOp::Sub,
+                    crate::schema::BinaryOp::Mul => BinaryOp::Mul,
+                    crate::schema::BinaryOp::Div => BinaryOp::Div,
+                    crate::schema::BinaryOp::Mod => BinaryOp::Mod,
+                    crate::schema::BinaryOp::Concat => BinaryOp::Concat,
+                    crate::schema::BinaryOp::Eq => BinaryOp::Eq,
+                    crate::schema::BinaryOp::Ne => BinaryOp::Ne,
+                    crate::schema::BinaryOp::Lt => BinaryOp::Lt,
+                    crate::schema::BinaryOp::Le => BinaryOp::Le,
+                    crate::schema::BinaryOp::Gt => BinaryOp::Gt,
+                    crate::schema::BinaryOp::Ge => BinaryOp::Ge,
+                    crate::schema::BinaryOp::And => BinaryOp::And,
+                    crate::schema::BinaryOp::Or => BinaryOp::Or,
+                    crate::schema::BinaryOp::BitAnd => BinaryOp::BitAnd,
+                    crate::schema::BinaryOp::BitOr => BinaryOp::BitOr,
+                    crate::schema::BinaryOp::LeftShift => BinaryOp::ShiftLeft,
+                    crate::schema::BinaryOp::RightShift => BinaryOp::ShiftRight,
+                    crate::schema::BinaryOp::Is => BinaryOp::Is,
+                    crate::schema::BinaryOp::IsNot => BinaryOp::IsNot,
+                    // These were handled above
+                    crate::schema::BinaryOp::Glob
+                    | crate::schema::BinaryOp::Match
+                    | crate::schema::BinaryOp::Regexp => unreachable!(),
+                };
+                Expr::Binary {
+                    op: ast_op,
+                    left: Box::new(Self::convert_schema_expr_to_ast(left)),
+                    right: Box::new(Self::convert_schema_expr_to_ast(right)),
+                }
+            }
+            SchemaExpr::UnaryOp { op, operand } => {
+                let ast_op = match op {
+                    crate::schema::UnaryOp::Neg => crate::parser::ast::UnaryOp::Neg,
+                    crate::schema::UnaryOp::Not => crate::parser::ast::UnaryOp::Not,
+                    crate::schema::UnaryOp::BitNot => crate::parser::ast::UnaryOp::BitNot,
+                    crate::schema::UnaryOp::Plus => crate::parser::ast::UnaryOp::Pos,
+                };
+                Expr::Unary {
+                    op: ast_op,
+                    expr: Box::new(Self::convert_schema_expr_to_ast(operand)),
+                }
+            }
+            SchemaExpr::Function {
+                name,
+                args,
+                distinct,
+            } => Expr::Function(crate::parser::ast::FunctionCall {
+                name: name.clone(),
+                args: crate::parser::ast::FunctionArgs::Exprs(
+                    args.iter().map(Self::convert_schema_expr_to_ast).collect(),
+                ),
+                distinct: *distinct,
+                filter: None,
+                over: None,
+            }),
+            SchemaExpr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => Expr::Case {
+                operand: operand
+                    .as_ref()
+                    .map(|e| Box::new(Self::convert_schema_expr_to_ast(e))),
+                when_clauses: when_clauses
+                    .iter()
+                    .map(|(w, t)| crate::parser::ast::WhenClause {
+                        when: Box::new(Self::convert_schema_expr_to_ast(w)),
+                        then: Box::new(Self::convert_schema_expr_to_ast(t)),
+                    })
+                    .collect(),
+                else_clause: else_clause
+                    .as_ref()
+                    .map(|e| Box::new(Self::convert_schema_expr_to_ast(e))),
+            },
+            SchemaExpr::Cast { expr, type_name } => Expr::Cast {
+                expr: Box::new(Self::convert_schema_expr_to_ast(expr)),
+                type_name: crate::parser::ast::TypeName {
+                    name: type_name.clone(),
+                    args: Vec::new(),
+                },
+            },
+            SchemaExpr::In {
+                expr,
+                list,
+                negated,
+            } => Expr::In {
+                expr: Box::new(Self::convert_schema_expr_to_ast(expr)),
+                list: crate::parser::ast::InList::Values(
+                    list.iter().map(Self::convert_schema_expr_to_ast).collect(),
+                ),
+                negated: *negated,
+            },
+            SchemaExpr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => Expr::Between {
+                expr: Box::new(Self::convert_schema_expr_to_ast(expr)),
+                low: Box::new(Self::convert_schema_expr_to_ast(low)),
+                high: Box::new(Self::convert_schema_expr_to_ast(high)),
+                negated: *negated,
+            },
+            SchemaExpr::Like {
+                expr,
+                pattern,
+                escape,
+                op,
+                negated,
+            } => Expr::Like {
+                expr: Box::new(Self::convert_schema_expr_to_ast(expr)),
+                pattern: Box::new(Self::convert_schema_expr_to_ast(pattern)),
+                escape: escape
+                    .as_ref()
+                    .map(|e| Box::new(Self::convert_schema_expr_to_ast(e))),
+                op: *op,
+                negated: *negated,
+            },
+            SchemaExpr::IsNull { expr, negated } => Expr::IsNull {
+                expr: Box::new(Self::convert_schema_expr_to_ast(expr)),
+                negated: *negated,
+            },
+            SchemaExpr::Collate { expr, collation } => Expr::Collate {
+                expr: Box::new(Self::convert_schema_expr_to_ast(expr)),
+                collation: collation.clone(),
+            },
+            SchemaExpr::Parameter { index, name } => {
+                if let Some(n) = name {
+                    // Named parameter - use ':' as default prefix
+                    Expr::Variable(crate::parser::ast::Variable::Named {
+                        prefix: ':',
+                        name: n.clone(),
+                    })
+                } else {
+                    // Numbered parameter
+                    Expr::Variable(crate::parser::ast::Variable::Numbered(*index))
+                }
+            }
+            SchemaExpr::CurrentTime => Expr::Literal(Literal::CurrentTime),
+            SchemaExpr::CurrentDate => Expr::Literal(Literal::CurrentDate),
+            SchemaExpr::CurrentTimestamp => Expr::Literal(Literal::CurrentTimestamp),
+            // Subquery and Exists not typically used in generated columns
+            SchemaExpr::Subquery(_) | SchemaExpr::Exists { .. } => Expr::Literal(Literal::Null),
+        }
     }
 
     /// Compile a SELECT statement
@@ -2224,13 +2420,32 @@ impl<'s> SelectCompiler<'s> {
                                 }
 
                                 let reg = self.alloc_reg();
-                                self.emit(
-                                    Opcode::Column,
-                                    table.cursor,
-                                    col_idx as i32,
-                                    reg,
-                                    P4::Unused,
-                                );
+
+                                // Check if this is a VIRTUAL generated column
+                                if let Some(ref gen) = col_def.generated {
+                                    if gen.storage == GeneratedStorage::Virtual {
+                                        // Compile the generated expression
+                                        let gen_expr = Self::convert_schema_expr_to_ast(&gen.expr);
+                                        self.compile_expr(&gen_expr, reg)?;
+                                    } else {
+                                        // STORED generated columns are read normally
+                                        self.emit(
+                                            Opcode::Column,
+                                            table.cursor,
+                                            col_idx as i32,
+                                            reg,
+                                            P4::Unused,
+                                        );
+                                    }
+                                } else {
+                                    self.emit(
+                                        Opcode::Column,
+                                        table.cursor,
+                                        col_idx as i32,
+                                        reg,
+                                        P4::Unused,
+                                    );
+                                }
                                 count += 1;
                             }
                         }
@@ -2246,15 +2461,35 @@ impl<'s> SelectCompiler<'s> {
                         if table.name.eq_ignore_ascii_case(table_name) {
                             found = true;
                             if let Some(schema_table) = &table.schema_table {
-                                for (col_idx, _) in schema_table.columns.iter().enumerate() {
+                                for (col_idx, col_def) in schema_table.columns.iter().enumerate() {
                                     let reg = self.alloc_reg();
-                                    self.emit(
-                                        Opcode::Column,
-                                        table.cursor,
-                                        col_idx as i32,
-                                        reg,
-                                        P4::Unused,
-                                    );
+
+                                    // Check if this is a VIRTUAL generated column
+                                    if let Some(ref gen) = col_def.generated {
+                                        if gen.storage == GeneratedStorage::Virtual {
+                                            // Compile the generated expression
+                                            let gen_expr =
+                                                Self::convert_schema_expr_to_ast(&gen.expr);
+                                            self.compile_expr(&gen_expr, reg)?;
+                                        } else {
+                                            // STORED generated columns are read normally
+                                            self.emit(
+                                                Opcode::Column,
+                                                table.cursor,
+                                                col_idx as i32,
+                                                reg,
+                                                P4::Unused,
+                                            );
+                                        }
+                                    } else {
+                                        self.emit(
+                                            Opcode::Column,
+                                            table.cursor,
+                                            col_idx as i32,
+                                            reg,
+                                            P4::Unused,
+                                        );
+                                    }
                                     count += 1;
                                 }
                             }
@@ -4335,17 +4570,33 @@ impl<'s> SelectCompiler<'s> {
                     self.coalesced_columns.insert(i, excluded);
                 }
 
+                // For self-joins (same table name without distinct aliases),
+                // use synthetic table identifiers that encode the table index
+                // Format: __tbl_idx_N__ where N is the index in self.tables
+                let prev_table = &self.tables[i - 1];
+                let left_table_id = if prev_table.name == current_table.name {
+                    // Self-join: use synthetic identifier to disambiguate
+                    format!("__tbl_idx_{}__", i - 1)
+                } else {
+                    prev_table.name.clone()
+                };
+                let right_table_id = if prev_table.name == current_table.name {
+                    format!("__tbl_idx_{}__", i)
+                } else {
+                    current_table.name.clone()
+                };
+
                 for col_name in using_cols {
                     // Generate: prev_table.col = current_table.col
                     let left_expr = Expr::Column(ColumnRef {
                         database: None,
-                        table: Some(self.tables[i - 1].name.clone()),
+                        table: Some(left_table_id.clone()),
                         column: col_name.clone(),
                         column_index: None,
                     });
                     let right_expr = Expr::Column(ColumnRef {
                         database: None,
-                        table: Some(current_table.name.clone()),
+                        table: Some(right_table_id.clone()),
                         column: col_name.clone(),
                         column_index: None,
                     });
@@ -4925,9 +5176,26 @@ impl<'s> SelectCompiler<'s> {
                                 }
 
                                 let reg = self.alloc_reg();
-                                // Check if this is the INTEGER PRIMARY KEY column (rowid alias)
-                                // If so, emit Rowid instead of Column since IPK isn't stored in the table
-                                if let Some(ipk_idx) = schema_table.rowid_alias_column() {
+
+                                // Check if this is a VIRTUAL generated column
+                                if let Some(ref gen) = col_def.generated {
+                                    if gen.storage == GeneratedStorage::Virtual {
+                                        // Compile the generated expression
+                                        let gen_expr = Self::convert_schema_expr_to_ast(&gen.expr);
+                                        self.compile_expr(&gen_expr, reg)?;
+                                    } else {
+                                        // STORED generated column - read normally
+                                        self.emit(
+                                            Opcode::Column,
+                                            table.cursor,
+                                            col_idx as i32,
+                                            reg,
+                                            P4::Unused,
+                                        );
+                                    }
+                                } else if let Some(ipk_idx) = schema_table.rowid_alias_column() {
+                                    // Check if this is the INTEGER PRIMARY KEY column (rowid alias)
+                                    // If so, emit Rowid instead of Column since IPK isn't stored in the table
                                     if col_idx == ipk_idx {
                                         self.emit(Opcode::Rowid, table.cursor, reg, 0, P4::Unused);
                                     } else {
@@ -5005,8 +5273,27 @@ impl<'s> SelectCompiler<'s> {
                                 // Regular table - expand from schema
                                 for (col_idx, col_def) in schema_table.columns.iter().enumerate() {
                                     let reg = self.alloc_reg();
-                                    // Check if this is the INTEGER PRIMARY KEY column (rowid alias)
-                                    if let Some(ipk_idx) = schema_table.rowid_alias_column() {
+
+                                    // Check if this is a VIRTUAL generated column
+                                    if let Some(ref gen) = col_def.generated {
+                                        if gen.storage == GeneratedStorage::Virtual {
+                                            // Compile the generated expression
+                                            let gen_expr =
+                                                Self::convert_schema_expr_to_ast(&gen.expr);
+                                            self.compile_expr(&gen_expr, reg)?;
+                                        } else {
+                                            // STORED generated column - read normally
+                                            self.emit(
+                                                Opcode::Column,
+                                                table.cursor,
+                                                col_idx as i32,
+                                                reg,
+                                                P4::Unused,
+                                            );
+                                        }
+                                    } else if let Some(ipk_idx) = schema_table.rowid_alias_column()
+                                    {
+                                        // Check if this is the INTEGER PRIMARY KEY column (rowid alias)
                                         if col_idx == ipk_idx {
                                             self.emit(
                                                 Opcode::Rowid,
@@ -6134,75 +6421,110 @@ impl<'s> SelectCompiler<'s> {
 
                 // Find the table and column index
                 let (cursor, col_idx) = if let Some(table) = &col_ref.table {
-                    // Resolve table name with scoping (local first, then outer)
-                    let mut local_matches = Vec::new();
-                    for (idx, tinfo) in self
-                        .tables
-                        .iter()
-                        .enumerate()
-                        .skip(self.outer_tables_boundary)
+                    // Check for synthetic table identifier used for self-join disambiguation
+                    // Format: __tbl_idx_N__ where N is the table index
+                    if let Some(idx_str) = table
+                        .strip_prefix("__tbl_idx_")
+                        .and_then(|s| s.strip_suffix("__"))
                     {
-                        if Self::table_name_matches(tinfo, table) {
-                            local_matches.push(idx);
+                        if let Ok(table_idx) = idx_str.parse::<usize>() {
+                            if table_idx < self.tables.len() {
+                                let tinfo = &self.tables[table_idx];
+                                let col_idx = self
+                                    .column_index_in_table(tinfo, &col_ref.column)
+                                    .ok_or_else(|| {
+                                        Error::with_message(
+                                            ErrorCode::Error,
+                                            format!(
+                                                "no such column: {}.{}",
+                                                tinfo.name, col_ref.column
+                                            ),
+                                        )
+                                    })?;
+                                (tinfo.cursor, col_idx)
+                            } else {
+                                return Err(Error::with_message(
+                                    ErrorCode::Error,
+                                    format!("invalid table index: {}", table_idx),
+                                ));
+                            }
+                        } else {
+                            return Err(Error::with_message(
+                                ErrorCode::Error,
+                                format!("invalid table identifier: {}", table),
+                            ));
                         }
-                    }
-
-                    let mut matching_tables = if local_matches.is_empty() {
-                        let mut outer_matches = Vec::new();
+                    } else {
+                        // Normal table name resolution with scoping (local first, then outer)
+                        let mut local_matches = Vec::new();
                         for (idx, tinfo) in self
                             .tables
                             .iter()
                             .enumerate()
-                            .take(self.outer_tables_boundary)
+                            .skip(self.outer_tables_boundary)
                         {
                             if Self::table_name_matches(tinfo, table) {
-                                outer_matches.push(idx);
+                                local_matches.push(idx);
                             }
                         }
-                        outer_matches
-                    } else {
-                        local_matches
-                    };
 
-                    if matching_tables.len() > 1 {
-                        // Check if the column is a USING/NATURAL join column (coalesced)
-                        // Coalesced columns are not ambiguous because they have the same value
-                        // across all joined tables
-                        let col_lower = col_ref.column.to_lowercase();
-                        let is_coalesced = matching_tables.iter().any(|&idx| {
-                            self.coalesced_columns
-                                .get(&idx)
-                                .is_some_and(|cols| cols.contains(&col_lower))
-                        });
-                        if !is_coalesced {
+                        let mut matching_tables = if local_matches.is_empty() {
+                            let mut outer_matches = Vec::new();
+                            for (idx, tinfo) in self
+                                .tables
+                                .iter()
+                                .enumerate()
+                                .take(self.outer_tables_boundary)
+                            {
+                                if Self::table_name_matches(tinfo, table) {
+                                    outer_matches.push(idx);
+                                }
+                            }
+                            outer_matches
+                        } else {
+                            local_matches
+                        };
+
+                        if matching_tables.len() > 1 {
+                            // Check if the column is a USING/NATURAL join column (coalesced)
+                            // Coalesced columns are not ambiguous because they have the same value
+                            // across all joined tables
+                            let col_lower = col_ref.column.to_lowercase();
+                            let is_coalesced = matching_tables.iter().any(|&idx| {
+                                self.coalesced_columns
+                                    .get(&idx)
+                                    .is_some_and(|cols| cols.contains(&col_lower))
+                            });
+                            if !is_coalesced {
+                                return Err(Error::with_message(
+                                    ErrorCode::Error,
+                                    format!("ambiguous column name: {}.{}", table, col_ref.column),
+                                ));
+                            }
+                            // For coalesced columns, just use the first matching table
+                        }
+
+                        if let Some(table_idx) = matching_tables.pop() {
+                            let tinfo = &self.tables[table_idx];
+                            let idx = col_ref
+                                .column_index
+                                .or_else(|| self.column_index_in_table(tinfo, &col_ref.column))
+                                .ok_or_else(|| {
+                                    Error::with_message(
+                                        ErrorCode::Error,
+                                        format!("no such column: {}.{}", table, col_ref.column),
+                                    )
+                                })?;
+                            (tinfo.cursor, idx)
+                        } else if self.schema.is_none() {
+                            let cursor = self.tables.first().map(|t| t.cursor).unwrap_or(0);
+                            (cursor, col_ref.column_index.unwrap_or(0))
+                        } else {
                             return Err(Error::with_message(
                                 ErrorCode::Error,
-                                format!("ambiguous column name: {}.{}", table, col_ref.column),
+                                format!("no such column: {}.{}", table, col_ref.column),
                             ));
                         }
-                        // For coalesced columns, just use the first matching table
-                    }
-
-                    if let Some(table_idx) = matching_tables.pop() {
-                        let tinfo = &self.tables[table_idx];
-                        let idx = col_ref
-                            .column_index
-                            .or_else(|| self.column_index_in_table(tinfo, &col_ref.column))
-                            .ok_or_else(|| {
-                                Error::with_message(
-                                    ErrorCode::Error,
-                                    format!("no such column: {}.{}", table, col_ref.column),
-                                )
-                            })?;
-                        (tinfo.cursor, idx)
-                    } else if self.schema.is_none() {
-                        let cursor = self.tables.first().map(|t| t.cursor).unwrap_or(0);
-                        (cursor, col_ref.column_index.unwrap_or(0))
-                    } else {
-                        return Err(Error::with_message(
-                            ErrorCode::Error,
-                            format!("no such column: {}.{}", table, col_ref.column),
-                        ));
                     }
                 } else {
                     // No table specified - search local tables first, then outer
@@ -6276,13 +6598,30 @@ impl<'s> SelectCompiler<'s> {
                     // Other negative values - treat as rowid for compatibility
                     self.emit(Opcode::Rowid, cursor, dest_reg, 0, P4::Unused);
                 } else {
-                    self.emit(
-                        Opcode::Column,
-                        cursor,
-                        col_idx,
-                        dest_reg,
-                        P4::Text(col_ref.column.clone()),
-                    );
+                    // Check if this column is a VIRTUAL generated column
+                    // If so, we need to compile the expression instead of reading from storage
+                    let generated_expr = self
+                        .tables
+                        .iter()
+                        .find(|t| t.cursor == cursor)
+                        .and_then(|table_info| table_info.schema_table.as_ref())
+                        .and_then(|schema_table| schema_table.columns.get(col_idx as usize))
+                        .and_then(|col| col.generated.as_ref())
+                        .filter(|gen| gen.storage == GeneratedStorage::Virtual)
+                        .map(|gen| Self::convert_schema_expr_to_ast(&gen.expr));
+
+                    if let Some(gen_expr) = generated_expr {
+                        // Compile the generated column expression instead of Column opcode
+                        self.compile_expr(&gen_expr, dest_reg)?;
+                    } else {
+                        self.emit(
+                            Opcode::Column,
+                            cursor,
+                            col_idx,
+                            dest_reg,
+                            P4::Text(col_ref.column.clone()),
+                        );
+                    }
                 }
             }
             Expr::Binary { op, left, right } => {

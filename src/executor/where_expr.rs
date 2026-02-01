@@ -390,16 +390,20 @@ fn table_name_mask_with_columns(
     name: &str,
     tables: &[(String, Option<String>, u64, Vec<String>)],
 ) -> u64 {
+    // Accumulate masks for ALL tables with matching names
+    // This is important for self-joins like "t1 JOIN t1 USING(a)"
+    // where both table instances have the same name
+    let mut combined_mask = 0u64;
     for (table_name, alias, mask, _) in tables {
         let matches = match alias {
             Some(alias) => alias == name || table_name == name,
             None => table_name == name,
         };
         if matches {
-            return *mask;
+            combined_mask |= *mask;
         }
     }
-    0
+    combined_mask
 }
 
 /// Compute a table-usage mask with column resolution for unqualified columns.

@@ -1490,6 +1490,19 @@ impl<'s> StatementCompiler<'s> {
                                 ColumnConstraintKind::Null => {
                                     col_sql.push_str(" NULL");
                                 }
+                                ColumnConstraintKind::Generated { expr, storage } => {
+                                    col_sql.push_str(" AS(");
+                                    col_sql.push_str(&self.expr_to_sql(expr));
+                                    col_sql.push(')');
+                                    match storage {
+                                        crate::parser::ast::GeneratedStorage::Stored => {
+                                            col_sql.push_str(" STORED");
+                                        }
+                                        crate::parser::ast::GeneratedStorage::Virtual => {
+                                            // VIRTUAL is the default, can be omitted
+                                        }
+                                    }
+                                }
                                 _ => {}
                             }
                         }

@@ -2519,6 +2519,7 @@ mod tests {
                     table: None,
                     column: "id".to_string(),
                     column_index: None,
+                    source_text: None,
                 })),
                 right: Box::new(Expr::Literal(Literal::Integer(1))),
             })),
@@ -2656,6 +2657,7 @@ mod tests {
                         table: None,
                         column: "f3".to_string(), // f3 doesn't exist
                         column_index: None,
+                        source_text: None,
                     })),
                     right: Box::new(Expr::Literal(Literal::Integer(2))),
                 },
@@ -2700,6 +2702,7 @@ mod tests {
                         table: Some("test2".to_string()), // test2 is not our table
                         column: "f1".to_string(),
                         column_index: None,
+                        source_text: None,
                     })),
                     right: Box::new(Expr::Literal(Literal::Integer(2))),
                 },

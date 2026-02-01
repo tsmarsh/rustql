@@ -345,6 +345,7 @@ impl<'s> SelectCompiler<'s> {
                 table: table.clone(),
                 column: column.clone(),
                 column_index: None,
+                source_text: None,
             }),
             SchemaExpr::BinaryOp { left, op, right } => {
                 // Handle GLOB/MATCH/REGEXP as Like expressions, not binary ops
@@ -4782,12 +4783,14 @@ impl<'s> SelectCompiler<'s> {
                         table: Some(self.tables[i - 1].name.clone()),
                         column: col_name.clone(),
                         column_index: None,
+                        source_text: None,
                     });
                     let right_expr = Expr::Column(ColumnRef {
                         database: None,
                         table: Some(current_table.name.clone()),
                         column: col_name,
                         column_index: None,
+                        source_text: None,
                     });
                     let eq_expr = Expr::Binary {
                         op: BinaryOp::Eq,
@@ -4829,12 +4832,14 @@ impl<'s> SelectCompiler<'s> {
                         table: Some(left_table_id.clone()),
                         column: col_name.clone(),
                         column_index: None,
+                        source_text: None,
                     });
                     let right_expr = Expr::Column(ColumnRef {
                         database: None,
                         table: Some(right_table_id.clone()),
                         column: col_name.clone(),
                         column_index: None,
+                        source_text: None,
                     });
                     let eq_expr = Expr::Binary {
                         op: BinaryOp::Eq,
@@ -5707,7 +5712,11 @@ impl<'s> SelectCompiler<'s> {
                     // short_column_names=ON (default): just column name
                     col.column.clone()
                 } else {
-                    // Both OFF: use real table name (like full_column_names)
+                    // Both OFF: use original source text to preserve whitespace
+                    if let Some(ref source) = col.source_text {
+                        return source.clone();
+                    }
+                    // Fallback: reconstruct from table/column names
                     let real_table_name = if let Some(alias_or_name) = &col.table {
                         self.tables
                             .iter()
@@ -10304,6 +10313,7 @@ mod tests {
                         table: None,
                         column: "name".to_string(),
                         column_index: None,
+                        source_text: None,
                     }),
                     alias: None,
                 }],
@@ -10321,6 +10331,7 @@ mod tests {
                         table: None,
                         column: "age".to_string(),
                         column_index: None,
+                        source_text: None,
                     })),
                     right: Box::new(Expr::Literal(Literal::Integer(18))),
                 })),

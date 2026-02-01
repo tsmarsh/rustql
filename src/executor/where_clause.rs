@@ -2187,6 +2187,7 @@ mod tests {
                     table: None,
                     column: "a".to_string(),
                     column_index: None,
+                    source_text: None,
                 })),
                 right: Box::new(Expr::Literal(crate::parser::ast::Literal::Integer(1))),
             }),
@@ -2197,6 +2198,7 @@ mod tests {
                     table: None,
                     column: "b".to_string(),
                     column_index: None,
+                    source_text: None,
                 })),
                 right: Box::new(Expr::Literal(crate::parser::ast::Literal::Integer(2))),
             }),
@@ -2330,6 +2332,7 @@ mod tests {
             table: table.map(|s| s.to_string()),
             column: column.to_string(),
             column_index: None,
+            source_text: None,
         })
     }
 

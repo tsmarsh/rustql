@@ -642,12 +642,14 @@ mod tests {
                 table: Some("t1".to_string()),
                 column: "a".to_string(),
                 column_index: None,
+                source_text: None,
             })),
             right: Box::new(Expr::Column(ColumnRef {
                 database: None,
                 table: None,
                 column: "b".to_string(),
                 column_index: None,
+                source_text: None,
             })),
         };
         let mask = expr_usage(&expr, &tables);
@@ -664,6 +666,7 @@ mod tests {
                 table: Some("t2".to_string()),
                 column: "x".to_string(),
                 column_index: None,
+                source_text: None,
             })]),
             distinct: false,
             filter: Some(Box::new(Expr::Literal(Literal::Integer(1)))),

@@ -1208,6 +1208,7 @@ impl<'a> InsertCompiler<'a> {
                                 table: None,
                                 column: format!("col{}", i),
                                 column_index: Some(i as i32),
+                                source_text: None,
                             }));
                         }
                     }
@@ -1223,6 +1224,7 @@ impl<'a> InsertCompiler<'a> {
                     table: None,
                     column: "col0".to_string(),
                     column_index: Some(0),
+                    source_text: None,
                 }));
             }
             return exprs;
@@ -1233,6 +1235,7 @@ impl<'a> InsertCompiler<'a> {
             table: None,
             column: "col0".to_string(),
             column_index: Some(0),
+            source_text: None,
         })]
     }
 
@@ -3208,6 +3211,7 @@ mod tests {
                             table: None,
                             column: "a".to_string(),
                             column_index: None,
+                            source_text: None,
                         })),
                         right: Box::new(Expr::Literal(Literal::Integer(10))),
                     },
@@ -3280,6 +3284,7 @@ mod tests {
                             table: None,
                             column: "x".to_string(),
                             column_index: None,
+                            source_text: None,
                         })),
                         right: Box::new(Expr::Literal(Literal::Integer(100))),
                     },
@@ -3321,6 +3326,7 @@ mod tests {
             table: None,
             column: "a".to_string(),
             column_index: None,
+            source_text: None,
         });
 
         let dest_reg = 5;

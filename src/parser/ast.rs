@@ -1150,6 +1150,7 @@ impl Expr {
             table: None,
             column: name.into(),
             column_index: None,
+            source_text: None,
         })
     }
 }
@@ -1175,6 +1176,9 @@ pub struct ColumnRef {
     pub table: Option<String>,
     pub column: String,
     pub column_index: Option<i32>,
+    /// Original source text for this column reference (used when both
+    /// short_column_names and full_column_names are OFF to preserve spacing)
+    pub source_text: Option<String>,
 }
 
 impl ColumnRef {
@@ -1184,6 +1188,7 @@ impl ColumnRef {
             table: None,
             column: column.into(),
             column_index: None,
+            source_text: None,
         }
     }
 
@@ -1193,6 +1198,7 @@ impl ColumnRef {
             table: Some(table.into()),
             column: column.into(),
             column_index: None,
+            source_text: None,
         }
     }
 }

@@ -372,6 +372,29 @@ impl TokenKind {
                 | TokenKind::Without
         )
     }
+
+    /// Check if this keyword is "structural" - i.e., it should NOT be parsed
+    /// as an identifier in expression context because it has special meaning
+    /// in SELECT statement structure.
+    /// For example, in "SELECT WHERE", WHERE should trigger a syntax error,
+    /// not be parsed as a column name.
+    pub fn is_structural_keyword(&self) -> bool {
+        matches!(
+            self,
+            TokenKind::Where
+                | TokenKind::From
+                | TokenKind::Group
+                | TokenKind::Having
+                | TokenKind::Order
+                | TokenKind::Limit
+                | TokenKind::Offset
+                | TokenKind::Union
+                | TokenKind::Intersect
+                | TokenKind::Except
+                | TokenKind::Window
+                | TokenKind::Returning
+        )
+    }
 }
 
 // ============================================================================
@@ -818,10 +841,34 @@ impl<'a> Tokenizer<'a> {
             b';' => Ok(TokenKind::Semicolon),
             b'.' => Ok(TokenKind::Dot),
             // Note: :, ?, @, $ are handled by scan_variable before reaching here
-            _ => Err(Error::with_message(
-                ErrorCode::Error,
-                format!("unexpected character '{}' at line {}", c as char, self.line),
-            )),
+            _ => {
+                // Scan ahead to collect the illegal token for better error messages
+                // (SQLite-style "near X: syntax error")
+                let start_pos = self.pos - 1; // we already consumed one byte
+                while !self.is_eof() {
+                    let next = self.current();
+                    // Stop at whitespace, quotes, or known operators
+                    if next.is_ascii_whitespace()
+                        || next == b'"'
+                        || next == b'\''
+                        || next == b'`'
+                        || next == b'['
+                        || next == b'('
+                        || next == b')'
+                        || next == b','
+                        || next == b';'
+                    {
+                        break;
+                    }
+                    self.advance();
+                }
+                let illegal_token =
+                    String::from_utf8_lossy(&self.bytes[start_pos..self.pos]).to_string();
+                Err(Error::with_message(
+                    ErrorCode::Error,
+                    format!("near \"{}\": syntax error", illegal_token),
+                ))
+            }
         }
     }
 

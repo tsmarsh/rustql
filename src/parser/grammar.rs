@@ -1775,6 +1775,7 @@ impl<'a> Parser<'a> {
                     table: None,
                     column,
                     column_index: None,
+                    source_text: _,
                 }) => IndexedColumnKind::Name(column),
                 _ => IndexedColumnKind::Expr(Box::new(expr)),
             }
@@ -2742,7 +2743,11 @@ impl<'a> Parser<'a> {
 
         // Identifier or keyword (column reference or function call)
         // Keywords like GLOB, LIKE, REPLACE can be used as function names
-        if self.check(TokenKind::Identifier) || self.current().kind.is_keyword() {
+        // BUT structural keywords (WHERE, FROM, ORDER, etc.) should NOT be parsed
+        // as identifiers - they indicate structure in SELECT statements
+        if self.check(TokenKind::Identifier)
+            || (self.current().kind.is_keyword() && !self.current().kind.is_structural_keyword())
+        {
             return self.parse_identifier_or_function();
         }
 
@@ -2902,6 +2907,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_identifier_or_function(&mut self) -> Result<Expr> {
+        // Track start position for capturing source text
+        let start_pos = self.tokens.get(self.pos).map(|t| t.start).unwrap_or(0);
+
         let first = self.expect_identifier()?;
 
         // Check for function call
@@ -2915,19 +2923,34 @@ impl<'a> Parser<'a> {
             if self.match_token(TokenKind::Dot) {
                 // db.table.column
                 let column = self.expect_identifier()?;
+                // Capture source text including all parts
+                let end_pos = self
+                    .tokens
+                    .get(self.pos.saturating_sub(1))
+                    .map(|t| t.end)
+                    .unwrap_or(0);
+                let source_text = self.source.get(start_pos..end_pos).map(|s| s.to_string());
                 return Ok(Expr::Column(ColumnRef {
                     database: Some(first),
                     table: Some(second),
                     column,
                     column_index: None,
+                    source_text,
                 }));
             }
-            // table.column
+            // table.column - capture source text including table.column with original spacing
+            let end_pos = self
+                .tokens
+                .get(self.pos.saturating_sub(1))
+                .map(|t| t.end)
+                .unwrap_or(0);
+            let source_text = self.source.get(start_pos..end_pos).map(|s| s.to_string());
             return Ok(Expr::Column(ColumnRef {
                 database: None,
                 table: Some(first),
                 column: second,
                 column_index: None,
+                source_text,
             }));
         }
 

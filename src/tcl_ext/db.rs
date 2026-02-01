@@ -764,10 +764,23 @@ pub unsafe fn db_eval(
                 continue;
             }
 
+            // Check if empty_result_callbacks is enabled
+            let empty_callbacks = CONNECTIONS.with(|connections| {
+                let conns = connections.borrow();
+                conns
+                    .get(&db_name_owned)
+                    .map(|c| c.db_config.empty_result_callbacks)
+                    .unwrap_or(false)
+            });
+
+            // Track if we got any rows (for empty_result_callbacks)
+            let mut had_rows = false;
+
             // Step through results with streaming execution - connection is NOT borrowed here
             loop {
                 match sqlite3_step(&mut stmt) {
                     Ok(StepResult::Row) => {
+                        had_rows = true;
                         let col_count = sqlite3_column_count(&stmt);
                         let mut col_names = Vec::new();
                         let mut col_values = Vec::new();
@@ -830,6 +843,24 @@ pub unsafe fn db_eval(
                         set_result_string(interp, &msg);
                         update_search_count_var(interp);
                         return TCL_ERROR;
+                    }
+                }
+            }
+
+            // If empty_result_callbacks is ON and no rows were returned,
+            // still set array(*) with column names
+            if empty_callbacks && !had_rows {
+                if let Some(ref arr) = arr_c {
+                    let col_count = sqlite3_column_count(&stmt);
+                    if col_count > 0 {
+                        let star = CString::new("*").unwrap();
+                        let names_list = Tcl_NewListObj(0, std::ptr::null());
+                        for i in 0..col_count {
+                            let col_name = sqlite3_column_name(&stmt, i).unwrap_or("").to_string();
+                            let name_obj = string_to_obj(&col_name);
+                            Tcl_ListObjAppendElement(interp, names_list, name_obj);
+                        }
+                        Tcl_SetVar2Ex(interp, arr.as_ptr(), star.as_ptr(), names_list, 0);
                     }
                 }
             }

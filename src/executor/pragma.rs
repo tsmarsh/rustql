@@ -1429,6 +1429,7 @@ mod tests {
                     table: None,
                     column: "t".to_string(),
                     column_index: None,
+                    source_text: None,
                 },
             ))),
         };

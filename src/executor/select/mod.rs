@@ -2765,7 +2765,10 @@ impl<'s> SelectCompiler<'s> {
 
         // Compile left side into ephemeral table
         // Clear tables and result column names to avoid accumulating from parent context
+        // Also reset outer_tables_boundary since we're starting fresh - compound query bodies
+        // don't inherit the outer scope's tables (they're not correlated subqueries)
         self.tables.clear();
+        self.outer_tables_boundary = 0;
         self.result_column_names.clear();
         // For UNION, INTERSECT, EXCEPT we need to deduplicate the left side
         // For UNION ALL, we don't need deduplication
@@ -2795,12 +2798,14 @@ impl<'s> SelectCompiler<'s> {
             CompoundOp::UnionAll => {
                 // Clear tables before compiling right side (but keep column names from left)
                 self.tables.clear();
+                self.outer_tables_boundary = 0;
                 // Just add right side to same table
                 self.compile_body(right, &left_dest)?;
             }
             CompoundOp::Union => {
                 // Clear tables before compiling right side
                 self.tables.clear();
+                self.outer_tables_boundary = 0;
                 // Right side goes to separate table, then merge with distinct
                 let right_cursor = self.alloc_cursor();
                 self.emit(Opcode::OpenEphemeral, right_cursor, 0, 0, P4::Unused);
@@ -2816,6 +2821,7 @@ impl<'s> SelectCompiler<'s> {
             CompoundOp::Intersect => {
                 // Clear tables before compiling right side
                 self.tables.clear();
+                self.outer_tables_boundary = 0;
                 // Keep only rows that appear in both
                 let right_cursor = self.alloc_cursor();
                 self.emit(Opcode::OpenEphemeral, right_cursor, 0, 0, P4::Unused);
@@ -2828,6 +2834,7 @@ impl<'s> SelectCompiler<'s> {
             CompoundOp::Except => {
                 // Clear tables before compiling right side
                 self.tables.clear();
+                self.outer_tables_boundary = 0;
                 // Remove rows that appear in right
                 let right_cursor = self.alloc_cursor();
                 self.emit(Opcode::OpenEphemeral, right_cursor, 0, 0, P4::Unused);
@@ -6782,41 +6789,112 @@ impl<'s> SelectCompiler<'s> {
                     }
                     crate::parser::ast::InList::Subquery(subquery) => {
                         // Compile IN subquery using a fresh compilation context
-                        // to avoid cursor conflicts with outer query
+                        // This ensures the subquery doesn't mutate our state
                         let subq_cursor = self.alloc_cursor();
                         self.emit(Opcode::OpenEphemeral, subq_cursor, 1, 0, P4::Unused);
 
-                        // Keep outer tables for correlation - save counts to restore later
-                        let outer_tables_len = self.tables.len();
-                        let saved_boundary = self.outer_tables_boundary;
-                        let saved_has_agg = self.has_aggregates;
-                        let saved_has_window = self.has_window_functions;
-                        let saved_order_by = std::mem::take(&mut self.order_by_terms);
-                        let saved_limit_reg = self.limit_counter_reg.take();
-                        let saved_offset_reg = self.offset_counter_reg.take();
-                        let saved_limit_done = self.limit_done_label.take();
-                        let saved_result_names_len = self.result_column_names.len();
+                        // Create a fresh subcompiler for the subquery
+                        let mut subcompiler = if let Some(schema) = self.schema {
+                            SelectCompiler::with_schema(schema)
+                        } else {
+                            SelectCompiler::new()
+                        };
 
-                        // Set boundary so subquery only loops over its own tables, not outer tables
-                        self.outer_tables_boundary = outer_tables_len;
+                        // Propagate shared state
+                        if let Some(temp_schema) = self.temp_schema {
+                            subcompiler.set_temp_schema(temp_schema);
+                        }
+                        subcompiler.next_reg = self.next_reg;
+                        subcompiler.next_cursor = self.next_cursor;
+                        subcompiler.ctes = self.ctes.clone();
+                        subcompiler.recursive_ctes = self.recursive_ctes.clone();
+                        subcompiler.cte_cursors = self.cte_cursors.clone();
+                        subcompiler.expanding_views = self.expanding_views.clone();
+                        subcompiler.main_view_depth = self.main_view_depth;
+                        subcompiler.enable_view = self.enable_view;
+                        subcompiler
+                            .set_column_name_flags(self.short_column_names, self.full_column_names);
 
-                        // Compile full subquery (including ORDER BY/LIMIT) to fill ephemeral table
-                        // Outer tables remain available for correlated column references
+                        // Copy outer tables for correlation - subquery can reference these
+                        subcompiler.tables = self.tables.clone();
+                        // Set boundary so subquery knows which tables are outer (for correlation)
+                        // vs which it will add itself (for its own FROM clause)
+                        subcompiler.outer_tables_boundary = self.tables.len();
+
+                        // Compile subquery into ephemeral table
                         let subq_dest = SelectDest::EphemTable {
                             cursor: subq_cursor,
                         };
-                        self.compile_subselect(subquery, &subq_dest)?;
+                        let subquery_ops = subcompiler.compile(subquery, &subq_dest)?;
 
-                        // Restore outer query state - remove subquery's tables and reset boundary
-                        self.tables.truncate(outer_tables_len);
-                        self.outer_tables_boundary = saved_boundary;
-                        self.has_aggregates = saved_has_agg;
-                        self.has_window_functions = saved_has_window;
-                        self.order_by_terms = saved_order_by;
-                        self.limit_counter_reg = saved_limit_reg;
-                        self.offset_counter_reg = saved_offset_reg;
-                        self.limit_done_label = saved_limit_done;
-                        self.result_column_names.truncate(saved_result_names_len);
+                        // Update our register/cursor counters from subcompiler
+                        self.next_reg = subcompiler.next_reg;
+                        self.next_cursor = subcompiler.next_cursor;
+
+                        // Inline the subquery ops (skip Init, Halt, Transaction, Goto wrapper)
+                        let offset = self.ops.len() as i32;
+                        let len = subquery_ops.len();
+                        let mut skip_indices = std::collections::HashSet::new();
+
+                        // Skip Init at 0
+                        if !subquery_ops.is_empty() && subquery_ops[0].opcode == Opcode::Init {
+                            skip_indices.insert(0);
+                        }
+                        // Skip footer: Halt, Transaction, Goto at end
+                        if len >= 3 {
+                            if subquery_ops[len - 1].opcode == Opcode::Goto {
+                                skip_indices.insert(len - 1);
+                            }
+                            if subquery_ops[len - 2].opcode == Opcode::Transaction {
+                                skip_indices.insert(len - 2);
+                            }
+                            if subquery_ops[len - 3].opcode == Opcode::Halt {
+                                skip_indices.insert(len - 3);
+                            }
+                        }
+
+                        // Build address mapping: old_addr -> new_addr
+                        // Skipped instructions get mapped to the end of the inlined section
+                        let mut addr_map: Vec<i32> = Vec::with_capacity(len);
+                        let mut new_addr = offset;
+                        for i in 0..len {
+                            if skip_indices.contains(&i) {
+                                // Skipped instruction - will map to end later
+                                addr_map.push(-1);
+                            } else {
+                                addr_map.push(new_addr);
+                                new_addr += 1;
+                            }
+                        }
+
+                        // Calculate end address for the inlined section
+                        let inlined_end = new_addr;
+
+                        // Fix up -1 entries (skipped instructions) to point to end
+                        for addr in &mut addr_map {
+                            if *addr == -1 {
+                                *addr = inlined_end;
+                            }
+                        }
+
+                        for (old_addr, mut op) in subquery_ops.into_iter().enumerate() {
+                            // Skip wrapper instructions only
+                            if !skip_indices.contains(&old_addr) {
+                                // Adjust P2 for jump instructions using the address map
+                                if op.opcode.is_jump() {
+                                    let target = op.p2 as usize;
+                                    if target < addr_map.len() {
+                                        op.p2 = addr_map[target];
+                                    } else {
+                                        // Jump beyond subquery - point to end
+                                        op.p2 = inlined_end;
+                                    }
+                                    // Use P5 = 0xFFFF to mark as already resolved so resolve_labels skips it
+                                    op.p5 = 0xFFFF;
+                                }
+                                self.ops.push(op);
+                            }
+                        }
 
                         // Check if value exists in ephemeral table
                         // Make a record from the value

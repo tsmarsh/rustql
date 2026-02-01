@@ -2955,11 +2955,29 @@ impl<'s> SelectCompiler<'s> {
             }
         }
 
-        // Resolve aliases in GROUP BY expressions
-        // e.g., "SELECT x+1 AS y ... GROUP BY y" should resolve y to x+1
+        // Resolve GROUP BY expressions:
+        // 1. Column numbers (GROUP BY 1) -> the corresponding result expression
+        // 2. Aliases (GROUP BY x) -> the aliased expression
         let resolved_group_by: Vec<Expr> = group_by
             .iter()
-            .map(|expr| self.resolve_where_aliases(expr))
+            .map(|expr| {
+                // First, check if this is a column number literal
+                if let Expr::Literal(Literal::Integer(col_idx)) = expr {
+                    let col_idx = *col_idx as usize;
+                    // Column numbers are 1-based, convert to 0-based index
+                    if col_idx >= 1 && col_idx <= core.columns.len() {
+                        // Get the expression from the result column
+                        if let ResultColumn::Expr {
+                            expr: result_expr, ..
+                        } = &core.columns[col_idx - 1]
+                        {
+                            return result_expr.clone();
+                        }
+                    }
+                }
+                // Otherwise, resolve aliases
+                self.resolve_where_aliases(expr)
+            })
             .collect();
 
         // Count total columns needed in sorter: group columns + aggregate arguments + non-agg result cols
@@ -4500,6 +4518,82 @@ impl<'s> SelectCompiler<'s> {
         }
 
         false
+    }
+
+    /// Resolve aliases in ORDER BY expressions by substituting alias references
+    /// with reads from the result column registers.
+    /// For expressions like ORDER BY 10-(x+y), this substitutes x and y with their
+    /// corresponding result column values.
+    fn resolve_order_by_aliases(&self, expr: &Expr, base_reg: i32, count: usize) -> Expr {
+        use crate::parser::ast::WhenClause;
+        match expr {
+            Expr::Column(col_ref) if col_ref.table.is_none() => {
+                // Check if this matches a result column name (alias)
+                if let Some(col_idx) = self
+                    .result_column_names
+                    .iter()
+                    .position(|name| name.eq_ignore_ascii_case(&col_ref.column))
+                {
+                    // Return a column index literal that will be handled by the column index code path
+                    // We return the original since it was already handled above
+                    return expr.clone();
+                }
+                // Not an alias - return as-is
+                expr.clone()
+            }
+            Expr::Binary { op, left, right } => Expr::Binary {
+                op: *op,
+                left: Box::new(self.resolve_order_by_aliases(left, base_reg, count)),
+                right: Box::new(self.resolve_order_by_aliases(right, base_reg, count)),
+            },
+            Expr::Unary { op, expr: inner } => Expr::Unary {
+                op: *op,
+                expr: Box::new(self.resolve_order_by_aliases(inner, base_reg, count)),
+            },
+            Expr::Parens(inner) => Expr::Parens(Box::new(
+                self.resolve_order_by_aliases(inner, base_reg, count),
+            )),
+            Expr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => Expr::Case {
+                operand: operand
+                    .as_ref()
+                    .map(|e| Box::new(self.resolve_order_by_aliases(e, base_reg, count))),
+                when_clauses: when_clauses
+                    .iter()
+                    .map(|wc| WhenClause {
+                        when: Box::new(self.resolve_order_by_aliases(&wc.when, base_reg, count)),
+                        then: Box::new(self.resolve_order_by_aliases(&wc.then, base_reg, count)),
+                    })
+                    .collect(),
+                else_clause: else_clause
+                    .as_ref()
+                    .map(|e| Box::new(self.resolve_order_by_aliases(e, base_reg, count))),
+            },
+            Expr::Function(func) => {
+                let args = match &func.args {
+                    crate::parser::ast::FunctionArgs::Exprs(exprs) => {
+                        crate::parser::ast::FunctionArgs::Exprs(
+                            exprs
+                                .iter()
+                                .map(|e| self.resolve_order_by_aliases(e, base_reg, count))
+                                .collect(),
+                        )
+                    }
+                    other => other.clone(),
+                };
+                Expr::Function(crate::parser::ast::FunctionCall {
+                    name: func.name.clone(),
+                    args,
+                    distinct: func.distinct,
+                    filter: func.filter.clone(),
+                    over: func.over.clone(),
+                })
+            }
+            _ => expr.clone(),
+        }
     }
 
     /// Resolve result column aliases in a WHERE expression for query planning.
@@ -8274,10 +8368,10 @@ impl<'s> SelectCompiler<'s> {
                                 }
                             }
 
-                            // For compound selects, check if ORDER BY references a result column name
-                            // (e.g., ORDER BY x where x is an alias)
-                            if self.is_compound {
-                                if let Expr::Column(col_ref) = &term.expr {
+                            // Check if ORDER BY references a result column name (alias or column name)
+                            // This handles GROUP BY queries where ORDER BY y refers to alias y = count(*)
+                            if let Expr::Column(col_ref) = &term.expr {
+                                if col_ref.table.is_none() {
                                     // Look for matching result column name
                                     if let Some(col_idx) = self
                                         .result_column_names
@@ -8310,7 +8404,28 @@ impl<'s> SelectCompiler<'s> {
                                 }
                             }
 
+                            // For expressions containing aliases (e.g., ORDER BY 10-(x+y)),
+                            // populate group_column_regs so compile_expr can resolve aliases
+                            // to result column values
+                            let saved_group_regs = self.group_column_regs.clone();
+                            let saved_alias_exprs = self.alias_expressions.clone();
+
+                            // Clear alias_expressions to prevent it from interfering
+                            // with group_column_regs (alias_expressions is checked first
+                            // in compile_expr, which would try to compile count(*)
+                            // instead of reading from the result register)
+                            self.alias_expressions.clear();
+
+                            for (idx, name) in self.result_column_names.iter().enumerate() {
+                                let name_lower = name.to_lowercase();
+                                if !self.group_column_regs.contains_key(&name_lower) {
+                                    self.group_column_regs
+                                        .insert(name_lower, base_reg + idx as i32);
+                                }
+                            }
                             self.compile_expr(&term.expr, key_base_reg + i as i32)?;
+                            self.group_column_regs = saved_group_regs;
+                            self.alias_expressions = saved_alias_exprs;
                         }
                     }
 

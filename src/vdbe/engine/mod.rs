@@ -6059,6 +6059,8 @@ impl Vdbe {
                                 let mut has_duplicate = false;
 
                                 // Helper to check if existing record has matching prefix
+                                // Note: NULL values are considered distinct for UNIQUE constraints
+                                // (i.e., multiple NULLs don't violate UNIQUE)
                                 let check_prefix =
                                     |existing: &[u8],
                                      new_fields: &[crate::storage::btree::RecordField]|
@@ -6072,6 +6074,17 @@ impl Vdbe {
                                         }
                                         let prefix_len = new_fields.len() - 1;
                                         for i in 0..prefix_len {
+                                            // If either field is NULL, they are not considered equal
+                                            // for UNIQUE constraint purposes
+                                            if matches!(
+                                                new_fields[i],
+                                                crate::storage::btree::RecordField::Null
+                                            ) || matches!(
+                                                existing_fields[i],
+                                                crate::storage::btree::RecordField::Null
+                                            ) {
+                                                return false;
+                                            }
                                             if existing_fields[i] != new_fields[i] {
                                                 return false;
                                             }

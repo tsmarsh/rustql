@@ -2206,6 +2206,11 @@ impl<'s> SelectCompiler<'s> {
                     let tables_snapshot: Vec<_> = self.tables.clone();
                     let coalesced_snapshot = self.coalesced_columns.clone();
 
+                    // Check if there are any tables to expand - SELECT * requires at least one table
+                    if tables_snapshot.is_empty() {
+                        return Err(Error::with_message(ErrorCode::Error, "no tables specified"));
+                    }
+
                     for (table_idx, table) in tables_snapshot.iter().enumerate() {
                         let excluded_cols = coalesced_snapshot.get(&table_idx);
 
@@ -3227,7 +3232,10 @@ impl<'s> SelectCompiler<'s> {
     }
 
     fn table_name_matches(table: &TableInfo, name: &str) -> bool {
-        table.name.eq_ignore_ascii_case(name) || table.table_name.eq_ignore_ascii_case(name)
+        // Only match on table.name (which is the alias if one was provided, or the table name otherwise)
+        // When a table is aliased (e.g., "t1 AS t2"), only the alias ("t2") should match,
+        // not the original table name ("t1"). This follows SQL standard behavior.
+        table.name.eq_ignore_ascii_case(name)
     }
 
     fn column_index_in_table(&self, table: &TableInfo, column: &str) -> Option<i32> {
@@ -4897,6 +4905,11 @@ impl<'s> SelectCompiler<'s> {
                     let tables_snapshot: Vec<_> = self.tables.clone();
                     let coalesced_snapshot = self.coalesced_columns.clone();
 
+                    // Check if there are any tables to expand - SELECT * requires at least one table
+                    if tables_snapshot.is_empty() {
+                        return Err(Error::with_message(ErrorCode::Error, "no tables specified"));
+                    }
+
                     for (table_idx, table) in tables_snapshot.iter().enumerate() {
                         // Get the set of columns to exclude for this table (if any)
                         let excluded_cols = coalesced_snapshot.get(&table_idx);
@@ -6152,10 +6165,22 @@ impl<'s> SelectCompiler<'s> {
                     };
 
                     if matching_tables.len() > 1 {
-                        return Err(Error::with_message(
-                            ErrorCode::Error,
-                            format!("ambiguous column name: {}.{}", table, col_ref.column),
-                        ));
+                        // Check if the column is a USING/NATURAL join column (coalesced)
+                        // Coalesced columns are not ambiguous because they have the same value
+                        // across all joined tables
+                        let col_lower = col_ref.column.to_lowercase();
+                        let is_coalesced = matching_tables.iter().any(|&idx| {
+                            self.coalesced_columns
+                                .get(&idx)
+                                .is_some_and(|cols| cols.contains(&col_lower))
+                        });
+                        if !is_coalesced {
+                            return Err(Error::with_message(
+                                ErrorCode::Error,
+                                format!("ambiguous column name: {}.{}", table, col_ref.column),
+                            ));
+                        }
+                        // For coalesced columns, just use the first matching table
                     }
 
                     if let Some(table_idx) = matching_tables.pop() {

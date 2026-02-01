@@ -97,6 +97,10 @@ pub struct SelectCompiler<'s> {
     /// (base_reg, indices) where indices[i] is Some(offset) if result column i is non-agg
     /// base_reg + offset gives the register holding the saved non-agg value
     non_agg_saved_regs: Option<(i32, Vec<Option<usize>>)>,
+    /// Saved column registers for aggregate queries (simple aggregate mode)
+    /// Maps (cursor, col_idx) to register containing saved value
+    /// Used to substitute column reads after cursor has moved past end
+    saved_column_regs: Option<HashMap<(i32, i32), i32>>,
     /// Number of columns in compound select (for UNION, INTERSECT, EXCEPT output)
     compound_column_count: usize,
     /// Aliases from compound SELECT parts (for ORDER BY resolution)
@@ -174,6 +178,7 @@ impl<'s> SelectCompiler<'s> {
             agg_final_idx: 0,
             group_column_regs: HashMap::new(),
             non_agg_saved_regs: None,
+            saved_column_regs: None,
             compound_column_count: 0,
             short_column_names: true, // Default ON
             full_column_names: false, // Default OFF
@@ -236,6 +241,7 @@ impl<'s> SelectCompiler<'s> {
             agg_final_idx: 0,
             group_column_regs: HashMap::new(),
             non_agg_saved_regs: None,
+            saved_column_regs: None,
             compound_column_count: 0,
             short_column_names: true, // Default ON
             full_column_names: false, // Default OFF
@@ -2532,6 +2538,29 @@ impl<'s> SelectCompiler<'s> {
         // Initialize aggregate accumulators
         let agg_regs = self.init_aggregates(&core.columns)?;
 
+        // Collect all column references from result columns
+        // These need to be saved during the loop because the cursor won't be valid after
+        let mut col_refs_to_save: Vec<(i32, i32, String)> = Vec::new(); // (cursor, col_idx, col_name)
+        for col in &core.columns {
+            if let ResultColumn::Expr { expr, .. } = col {
+                self.collect_column_refs(expr, &mut col_refs_to_save);
+            }
+        }
+
+        // Deduplicate column references
+        col_refs_to_save.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        col_refs_to_save.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+
+        // Allocate registers to save column values and build mapping
+        let saved_col_base = self.next_reg;
+        let mut saved_col_map: HashMap<(i32, i32), i32> = HashMap::new();
+        for (i, (cursor, col_idx, _)) in col_refs_to_save.iter().enumerate() {
+            let reg = self.alloc_reg();
+            saved_col_map.insert((*cursor, *col_idx), reg);
+            // Suppress unused variable warning
+            let _ = i;
+        }
+
         // Collect table cursors to avoid borrow checker issues
         let table_cursors: Vec<i32> = self
             .tables
@@ -2561,6 +2590,18 @@ impl<'s> SelectCompiler<'s> {
             None
         };
 
+        // Save all column references while cursor is positioned on a row
+        for (cursor, col_idx, _col_name) in &col_refs_to_save {
+            if let Some(&dest_reg) = saved_col_map.get(&(*cursor, *col_idx)) {
+                if *col_idx == -1 {
+                    // Rowid
+                    self.emit(Opcode::Rowid, *cursor, dest_reg, 0, P4::Unused);
+                } else {
+                    self.emit(Opcode::Column, *cursor, *col_idx, dest_reg, P4::Unused);
+                }
+            }
+        }
+
         // Accumulate aggregates
         self.accumulate_aggregates(&core.columns, &agg_regs)?;
 
@@ -2575,8 +2616,14 @@ impl<'s> SelectCompiler<'s> {
             self.resolve_label(rewind_labels[i], self.current_addr());
         }
 
+        // Set up saved_column_regs for expression compilation to use
+        self.saved_column_regs = Some(saved_col_map);
+
         // Finalize aggregates
         let result_regs = self.finalize_aggregates(&core.columns, &agg_regs)?;
+
+        // Clear the saved column context
+        self.saved_column_regs = None;
 
         // Output single row
         self.output_row(dest, result_regs.0, result_regs.1)?;
@@ -2586,7 +2633,116 @@ impl<'s> SelectCompiler<'s> {
             self.emit(Opcode::Close, *cursor, 0, 0, P4::Unused);
         }
 
+        // Suppress unused variable warning
+        let _ = saved_col_base;
+
         Ok(())
+    }
+
+    /// Collect all column references from an expression
+    fn collect_column_refs(&self, expr: &Expr, refs: &mut Vec<(i32, i32, String)>) {
+        match expr {
+            Expr::Column(col_ref) => {
+                // Find the table and column index for this reference
+                if let Some((cursor, col_idx)) = self.resolve_column_ref_to_cursor(col_ref) {
+                    refs.push((cursor, col_idx, col_ref.column.clone()));
+                }
+            }
+            Expr::Binary { left, right, .. } => {
+                self.collect_column_refs(left, refs);
+                self.collect_column_refs(right, refs);
+            }
+            Expr::Unary { expr, .. } => {
+                self.collect_column_refs(expr, refs);
+            }
+            Expr::Function(func) => {
+                if let crate::parser::ast::FunctionArgs::Exprs(args) = &func.args {
+                    for arg in args {
+                        self.collect_column_refs(arg, refs);
+                    }
+                }
+                if let Some(filter) = &func.filter {
+                    self.collect_column_refs(filter, refs);
+                }
+            }
+            Expr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => {
+                if let Some(op) = operand {
+                    self.collect_column_refs(op, refs);
+                }
+                for wc in when_clauses {
+                    self.collect_column_refs(&wc.when, refs);
+                    self.collect_column_refs(&wc.then, refs);
+                }
+                if let Some(ec) = else_clause {
+                    self.collect_column_refs(ec, refs);
+                }
+            }
+            Expr::Cast { expr, .. } => {
+                self.collect_column_refs(expr, refs);
+            }
+            Expr::Collate { expr, .. } => {
+                self.collect_column_refs(expr, refs);
+            }
+            Expr::In { expr, list, .. } => {
+                self.collect_column_refs(expr, refs);
+                if let crate::parser::ast::InList::Values(vals) = list {
+                    for v in vals {
+                        self.collect_column_refs(v, refs);
+                    }
+                }
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.collect_column_refs(expr, refs);
+                self.collect_column_refs(low, refs);
+                self.collect_column_refs(high, refs);
+            }
+            Expr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => {
+                self.collect_column_refs(expr, refs);
+                self.collect_column_refs(pattern, refs);
+                if let Some(esc) = escape {
+                    self.collect_column_refs(esc, refs);
+                }
+            }
+            Expr::IsNull { expr, .. } => {
+                self.collect_column_refs(expr, refs);
+            }
+            Expr::Parens(inner) => {
+                self.collect_column_refs(inner, refs);
+            }
+            // Subqueries, literals, etc. don't contain direct column references
+            _ => {}
+        }
+    }
+
+    /// Resolve a column reference to (cursor, column_index)
+    fn resolve_column_ref_to_cursor(&self, col_ref: &ColumnRef) -> Option<(i32, i32)> {
+        // Find matching table
+        for table in &self.tables {
+            let matches = if let Some(ref tbl_name) = col_ref.table {
+                Self::table_name_matches(table, tbl_name)
+            } else {
+                // No table qualifier - check if column exists in this table
+                self.column_index_in_table(table, &col_ref.column).is_some()
+            };
+
+            if matches {
+                if let Some(col_idx) = self.column_index_in_table(table, &col_ref.column) {
+                    return Some((table.cursor, col_idx));
+                }
+            }
+        }
+        None
     }
 
     /// Try to compile using the Count opcode optimization
@@ -6586,6 +6742,15 @@ impl<'s> SelectCompiler<'s> {
                         ));
                     }
                 };
+
+                // Check if we have a saved value for this column (from simple aggregate loop)
+                if let Some(ref saved_regs) = self.saved_column_regs {
+                    if let Some(&saved_reg) = saved_regs.get(&(cursor, col_idx)) {
+                        // Use the saved value instead of reading from cursor
+                        self.emit(Opcode::SCopy, saved_reg, dest_reg, 0, P4::Unused);
+                        return Ok(());
+                    }
+                }
 
                 if col_idx == -1 {
                     // Rowid alias

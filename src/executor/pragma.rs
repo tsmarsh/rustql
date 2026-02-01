@@ -94,6 +94,17 @@ pub fn pragma_columns(pragma: &PragmaStmt) -> Option<(Vec<String>, Vec<ColumnTyp
             vec!["database", "status"],
             vec![ColumnType::Text, ColumnType::Text],
         ),
+        "table_list" => (
+            vec!["schema", "name", "type", "ncol", "wr", "strict"],
+            vec![
+                ColumnType::Text,
+                ColumnType::Text,
+                ColumnType::Text,
+                ColumnType::Integer,
+                ColumnType::Integer,
+                ColumnType::Integer,
+            ],
+        ),
         _ => return None,
     };
 
@@ -136,6 +147,7 @@ pub fn execute_pragma(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Resul
         "case_sensitive_like" => pragma_case_sensitive_like(conn, pragma),
         "freelist_count" => pragma_freelist_count(conn),
         "lock_status" => pragma_lock_status(conn),
+        "table_list" => pragma_table_list(conn, schema_name),
         "incremental_vacuum" => pragma_incremental_vacuum(conn, pragma),
         "incr_vacuum" => pragma_incremental_vacuum(conn, pragma),
         "cache_spill" => pragma_cache_spill(conn, pragma),
@@ -831,6 +843,146 @@ fn pragma_lock_status(conn: &SqliteConnection) -> Result<PragmaResult> {
     Ok(PragmaResult {
         columns: vec!["database".into(), "status".into()],
         types: vec![ColumnType::Text, ColumnType::Text],
+        rows,
+    })
+}
+
+fn pragma_table_list(conn: &SqliteConnection, schema_name: &str) -> Result<PragmaResult> {
+    let mut rows = Vec::new();
+
+    // Known shadow table suffixes for each virtual table module
+    let rtree_suffixes = ["_node", "_rowid", "_parent"];
+    let fts3_suffixes = ["_content", "_segments", "_segdir", "_stat"];
+    let fts5_suffixes = ["_content", "_data", "_idx", "_docsize", "_config"];
+
+    // Iterate over each database
+    for (db_idx, db) in conn.dbs.iter().enumerate() {
+        // Filter by schema_name if specified (non-empty)
+        let db_name = &db.name;
+        if !schema_name.is_empty()
+            && !schema_name.eq_ignore_ascii_case("main")
+            && !db_name.eq_ignore_ascii_case(schema_name)
+        {
+            continue;
+        }
+        // Skip non-main databases unless explicitly requested
+        if schema_name.eq_ignore_ascii_case("main") && db_idx != 0 {
+            continue;
+        }
+
+        if let Some(ref schema_lock) = db.schema {
+            if let Ok(schema) = schema_lock.read() {
+                // First pass: collect virtual table names and their modules
+                let mut virtual_tables: Vec<(String, String)> = Vec::new();
+                for table in schema.tables.values() {
+                    if table.is_virtual {
+                        if let Some(ref module) = table.virtual_module {
+                            virtual_tables.push((table.name.clone(), module.to_lowercase()));
+                        }
+                    }
+                }
+
+                // Second pass: emit all tables
+                for table in schema.tables.values() {
+                    // Determine table type
+                    let table_type = if table.is_virtual {
+                        "virtual"
+                    } else {
+                        // Check if this is a shadow table
+                        let lower_name = table.name.to_lowercase();
+                        let mut is_shadow = false;
+
+                        for (vtab_name, module) in &virtual_tables {
+                            let vtab_lower = vtab_name.to_lowercase();
+                            let suffixes: &[&str] = match module.as_str() {
+                                "rtree" | "rtree_i32" => &rtree_suffixes,
+                                "fts3" | "fts4" => &fts3_suffixes,
+                                "fts5" => &fts5_suffixes,
+                                _ => &[],
+                            };
+
+                            for suffix in suffixes {
+                                if lower_name == format!("{}{}", vtab_lower, suffix) {
+                                    is_shadow = true;
+                                    break;
+                                }
+                            }
+                            if is_shadow {
+                                break;
+                            }
+                        }
+
+                        if is_shadow {
+                            "shadow"
+                        } else {
+                            "table"
+                        }
+                    };
+
+                    // ncol = number of columns
+                    let ncol = table.columns.len() as i64;
+
+                    // wr = writable (1 for regular tables, 0 for views/virtual/shadow)
+                    let wr = if table_type == "table" { 1i64 } else { 0i64 };
+
+                    // strict = strict mode
+                    let strict = if table.strict { 1i64 } else { 0i64 };
+
+                    rows.push(vec![
+                        Value::Text(db_name.clone()),
+                        Value::Text(table.name.clone()),
+                        Value::Text(table_type.to_string()),
+                        Value::Integer(ncol),
+                        Value::Integer(wr),
+                        Value::Integer(strict),
+                    ]);
+                }
+            }
+        }
+    }
+
+    // Sort by schema name, then table name (SQLite orders shadow tables after main)
+    rows.sort_by(|a, b| {
+        let schema_a = if let Value::Text(s) = &a[0] {
+            s.as_str()
+        } else {
+            ""
+        };
+        let schema_b = if let Value::Text(s) = &b[0] {
+            s.as_str()
+        } else {
+            ""
+        };
+        let name_a = if let Value::Text(s) = &a[1] {
+            s.as_str()
+        } else {
+            ""
+        };
+        let name_b = if let Value::Text(s) = &b[1] {
+            s.as_str()
+        } else {
+            ""
+        };
+        (schema_a, name_a).cmp(&(schema_b, name_b))
+    });
+
+    Ok(PragmaResult {
+        columns: vec![
+            "schema".into(),
+            "name".into(),
+            "type".into(),
+            "ncol".into(),
+            "wr".into(),
+            "strict".into(),
+        ],
+        types: vec![
+            ColumnType::Text,
+            ColumnType::Text,
+            ColumnType::Text,
+            ColumnType::Integer,
+            ColumnType::Integer,
+            ColumnType::Integer,
+        ],
         rows,
     })
 }

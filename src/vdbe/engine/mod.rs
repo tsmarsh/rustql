@@ -4649,7 +4649,23 @@ impl Vdbe {
                 let mut exists = false;
 
                 if let Some(cursor) = self.cursor_mut(op.p1) {
-                    if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                    if cursor.is_virtual {
+                        // Virtual table - check if rowid exists
+                        if let Some(ref vtab_name) = cursor.vtab_name {
+                            // R-tree handling
+                            let rtree_full_name = format!("main.{}", vtab_name);
+                            if let Some(table_arc) = crate::rtree_vtab::get_table(&rtree_full_name)
+                            {
+                                if let Ok(table) = table_arc.lock() {
+                                    if table.get(rowid).is_some() {
+                                        cursor.state = CursorState::Valid;
+                                        cursor.rowid = Some(rowid);
+                                        exists = true;
+                                    }
+                                }
+                            }
+                        }
+                    } else if let Some(ref mut bt_cursor) = cursor.btree_cursor {
                         match bt_cursor.table_moveto(rowid, false) {
                             Ok(0) => {
                                 // Exact match found - row exists

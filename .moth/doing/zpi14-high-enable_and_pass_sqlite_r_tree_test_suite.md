@@ -15,6 +15,7 @@
 - [x] DROP TABLE cascades to shadow tables (xDestroy)
 - [x] Auto-rowid assignment (generate rowid when not specified)
 - [x] DELETE support with shadow table persistence
+- [x] UPDATE support with shadow table persistence
 
 ### Test Results (Manual)
 - CREATE VIRTUAL TABLE: PASS
@@ -24,8 +25,9 @@
 - Full scan: PASS
 - Spatial query: PASS
 - ID lookup: PASS
-- DROP TABLE: PASS (shadow tables now cascade)
+- DROP TABLE: PASS (shadow tables cascade)
 - DELETE: PASS (persists to shadow tables)
+- UPDATE: PASS (persists to shadow tables)
 
 ### Remaining Work
 1. **rtreedepth() function**: Extract depth from node blob
@@ -35,7 +37,6 @@
 5. **ATTACH database R-tree support**: Create R-tree in attached DB
 6. **Constraint validation**: Ensure coord[N] <= coord[N+1]
 7. **ON CONFLICT support**: Handle conflict clauses
-8. **UPDATE support**: Modify R-tree entries
 
 ### Blocking
 - Test infrastructure functions need to be registered as custom functions

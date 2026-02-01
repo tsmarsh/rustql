@@ -3943,7 +3943,14 @@ impl Vdbe {
                 });
 
                 // Call step function
-                let _ = state.step(&args);
+                // Returns true if this value became the new min/max (for bare column affinity)
+                let changed = state.step(&args).unwrap_or(false);
+
+                // If P5 is non-zero, store the "changed" flag in register P5
+                // This allows the compiler to conditionally copy bare column values
+                if op.p5 > 0 {
+                    *self.mem_mut(op.p5 as i32) = Mem::from_int(if changed { 1 } else { 0 });
+                }
             }
 
             Opcode::AggFinal | Opcode::AggValue => {

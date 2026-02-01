@@ -2568,9 +2568,12 @@ impl<'s> SelectCompiler<'s> {
         // Initialize aggregate accumulators
         let agg_regs = self.init_aggregates(&core.columns)?;
 
+        // Check if we have MIN/MAX aggregates - affects bare column affinity
+        let has_min_max = self.has_min_max_aggregate(&core.columns);
+
         // Collect column references from result columns and HAVING clause
         // For simple aggregates, SQLite uses the FIRST row's values for non-aggregate columns
-        // (both in result columns and HAVING)
+        // UNLESS there's a MIN/MAX, in which case use the min/max row's values
         let mut col_refs_to_save: Vec<(i32, i32, String)> = Vec::new(); // (cursor, col_idx, col_name)
         for col in &core.columns {
             if let ResultColumn::Expr { expr, .. } = col {
@@ -2585,7 +2588,7 @@ impl<'s> SelectCompiler<'s> {
         col_refs_to_save.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
         col_refs_to_save.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
 
-        // Allocate registers to save column values - saved on first row only
+        // Allocate registers to save column values
         let saved_col_base = self.next_reg;
         let mut saved_col_map: HashMap<(i32, i32), i32> = HashMap::new();
 
@@ -2602,11 +2605,22 @@ impl<'s> SelectCompiler<'s> {
             .map(|t| t.cursor)
             .collect();
 
-        // Allocate a flag register to track if we've saved the first row's values
-        // SQLite uses the FIRST row's column values for non-aggregate columns in simple aggregates
-        // IMPORTANT: Initialize this BEFORE the loop to preserve across iterations
-        let first_row_flag_reg = self.alloc_reg();
-        self.emit(Opcode::Integer, 0, first_row_flag_reg, 0, P4::Unused);
+        // For queries without MIN/MAX, use first-row saving semantics
+        // For queries with MIN/MAX, we'll save when min/max changes (inside aggregate accumulation)
+        let first_row_flag_reg = if !has_min_max {
+            let reg = self.alloc_reg();
+            self.emit(Opcode::Integer, 0, reg, 0, P4::Unused);
+            Some(reg)
+        } else {
+            None
+        };
+
+        // Allocate a register for tracking when MIN/MAX changes (for bare column affinity)
+        let min_max_changed_reg = if has_min_max {
+            Some(self.alloc_reg())
+        } else {
+            None
+        };
 
         // Generate Rewind for each table cursor
         let mut rewind_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
@@ -2629,33 +2643,39 @@ impl<'s> SelectCompiler<'s> {
             None
         };
 
-        // Save all column references only from the FIRST row (SQLite simple aggregate semantics)
-        // Skip saving if flag is already set (not first row)
-        let skip_save_label = self.alloc_label();
-        self.emit(
-            Opcode::If,
-            first_row_flag_reg,
-            skip_save_label,
-            0,
-            P4::Unused,
-        );
+        // For non-MIN/MAX queries: Save column refs only from the FIRST row
+        if let Some(flag_reg) = first_row_flag_reg {
+            let skip_save_label = self.alloc_label();
+            self.emit(Opcode::If, flag_reg, skip_save_label, 0, P4::Unused);
 
-        for (cursor, col_idx, _col_name) in &col_refs_to_save {
-            if let Some(&dest_reg) = saved_col_map.get(&(*cursor, *col_idx)) {
-                if *col_idx == -1 {
-                    self.emit(Opcode::Rowid, *cursor, dest_reg, 0, P4::Unused);
-                } else {
-                    self.emit(Opcode::Column, *cursor, *col_idx, dest_reg, P4::Unused);
+            for (cursor, col_idx, _col_name) in &col_refs_to_save {
+                if let Some(&dest_reg) = saved_col_map.get(&(*cursor, *col_idx)) {
+                    if *col_idx == -1 {
+                        self.emit(Opcode::Rowid, *cursor, dest_reg, 0, P4::Unused);
+                    } else {
+                        self.emit(Opcode::Column, *cursor, *col_idx, dest_reg, P4::Unused);
+                    }
                 }
             }
+
+            // Set flag to indicate first row values have been saved
+            self.emit(Opcode::Integer, 1, flag_reg, 0, P4::Unused);
+            self.resolve_label(skip_save_label, self.current_addr());
         }
 
-        // Set flag to indicate first row values have been saved
-        self.emit(Opcode::Integer, 1, first_row_flag_reg, 0, P4::Unused);
-        self.resolve_label(skip_save_label, self.current_addr());
-
         // Accumulate aggregates
-        self.accumulate_aggregates(&core.columns, &agg_regs)?;
+        // For MIN/MAX queries, pass the column refs so they get saved when min/max changes
+        if let Some(changed_reg) = min_max_changed_reg {
+            self.accumulate_aggregates_with_bare_cols(
+                &core.columns,
+                &agg_regs,
+                changed_reg,
+                &col_refs_to_save,
+                &saved_col_map,
+            )?;
+        } else {
+            self.accumulate_aggregates(&core.columns, &agg_regs)?;
+        }
 
         // WHERE skip target
         if let Some(label) = where_skip_label {
@@ -3140,6 +3160,8 @@ impl<'s> SelectCompiler<'s> {
 
         // HAVING clause
         if let Some(having) = &core.having {
+            // Reset agg_final_idx so HAVING expression can find finalized aggregates
+            self.agg_final_idx = 0;
             let skip_output_label = self.alloc_label();
             self.compile_where_condition(having, skip_output_label)?;
             self.output_row(dest, result_regs.0, result_regs.1)?;
@@ -3151,6 +3173,8 @@ impl<'s> SelectCompiler<'s> {
         // Clear group column substitution context after HAVING is compiled
         // Note: Don't clear non_agg_saved_regs here - it's needed for subsequent group outputs
         self.group_column_regs.clear();
+        // Clear agg_final_regs after HAVING is done (will be repopulated for next group)
+        self.agg_final_regs.clear();
 
         self.resolve_label(first_group_label, self.current_addr());
 
@@ -3215,6 +3239,8 @@ impl<'s> SelectCompiler<'s> {
         // Restore column names (don't double-count for final group output)
         self.result_column_names.truncate(saved_result_column_names);
         if let Some(having) = &core.having {
+            // Reset agg_final_idx so HAVING expression can find finalized aggregates
+            self.agg_final_idx = 0;
             let skip_output_label = self.alloc_label();
             self.compile_where_condition(having, skip_output_label)?;
             self.output_row(dest, result_regs.0, result_regs.1)?;
@@ -3226,6 +3252,7 @@ impl<'s> SelectCompiler<'s> {
         // Clear group column substitution context after HAVING is compiled
         self.group_column_regs.clear();
         self.non_agg_saved_regs = None;
+        self.agg_final_regs.clear();
 
         self.resolve_label(sort_done_label, self.current_addr());
 
@@ -8918,6 +8945,225 @@ impl<'s> SelectCompiler<'s> {
         Ok(())
     }
 
+    /// Accumulate aggregates with bare column affinity for MIN/MAX
+    /// When MIN/MAX changes, save all column references from the current row
+    fn accumulate_aggregates_with_bare_cols(
+        &mut self,
+        columns: &[ResultColumn],
+        agg_regs: &[i32],
+        changed_reg: i32,
+        col_refs: &[(i32, i32, String)],
+        saved_col_map: &HashMap<(i32, i32), i32>,
+    ) -> Result<()> {
+        let mut agg_idx = 0;
+        for col in columns {
+            if let ResultColumn::Expr { expr, .. } = col {
+                self.accumulate_aggregates_in_expr_with_bare_cols(
+                    expr,
+                    agg_regs,
+                    &mut agg_idx,
+                    changed_reg,
+                    col_refs,
+                    saved_col_map,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Recursively accumulate aggregates with bare column affinity tracking
+    fn accumulate_aggregates_in_expr_with_bare_cols(
+        &mut self,
+        expr: &Expr,
+        agg_regs: &[i32],
+        agg_idx: &mut usize,
+        changed_reg: i32,
+        col_refs: &[(i32, i32, String)],
+        saved_col_map: &HashMap<(i32, i32), i32>,
+    ) -> Result<()> {
+        match expr {
+            Expr::Function(func_call) => {
+                let name_upper = func_call.name.to_uppercase();
+                let arg_count = match &func_call.args {
+                    crate::parser::ast::FunctionArgs::Exprs(exprs) => exprs.len(),
+                    crate::parser::ast::FunctionArgs::Star => 0,
+                };
+
+                // Check if this is an aggregate function
+                let is_multi_arg_min_max =
+                    matches!(name_upper.as_str(), "MIN" | "MAX") && arg_count > 1;
+                if is_multi_arg_min_max {
+                    // Multi-arg min/max is scalar - recurse into arguments
+                    if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
+                        for arg in exprs {
+                            self.accumulate_aggregates_in_expr_with_bare_cols(
+                                arg,
+                                agg_regs,
+                                agg_idx,
+                                changed_reg,
+                                col_refs,
+                                saved_col_map,
+                            )?;
+                        }
+                    }
+                    return Ok(());
+                }
+
+                if matches!(
+                    name_upper.as_str(),
+                    "COUNT"
+                        | "SUM"
+                        | "AVG"
+                        | "MIN"
+                        | "MAX"
+                        | "GROUP_CONCAT"
+                        | "STRING_AGG"
+                        | "TOTAL"
+                ) {
+                    if *agg_idx >= agg_regs.len() {
+                        return Ok(()); // No more aggregate registers
+                    }
+                    let reg = agg_regs[*agg_idx];
+
+                    // Check argument count limits
+                    let (min_args, max_args, skip_if_exceeded) = match name_upper.as_str() {
+                        "COUNT" => (0, 1, false),
+                        "SUM" | "AVG" | "TOTAL" => (1, 1, false),
+                        "MIN" | "MAX" => (1, 1, true),
+                        "GROUP_CONCAT" => (1, 2, false),
+                        _ => (0, 255, false),
+                    };
+
+                    if arg_count < min_args {
+                        return Err(crate::error::Error::with_message(
+                            crate::error::ErrorCode::Error,
+                            format!("wrong number of arguments to function {}()", func_call.name),
+                        ));
+                    }
+
+                    if arg_count > max_args {
+                        if skip_if_exceeded {
+                            return Ok(());
+                        }
+                        return Err(crate::error::Error::with_message(
+                            crate::error::ErrorCode::Error,
+                            format!("wrong number of arguments to function {}()", func_call.name),
+                        ));
+                    }
+
+                    // Compile ALL arguments into consecutive registers
+                    let arg_base = self.next_reg;
+                    let mut argc = 0;
+                    if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
+                        for arg_expr in exprs {
+                            let arg_reg = self.alloc_reg();
+                            self.compile_expr(arg_expr, arg_reg)?;
+                            argc += 1;
+                        }
+                    }
+                    // For COUNT(*), initialize arg_base with 1 so it's not NULL
+                    if argc == 0 && name_upper == "COUNT" {
+                        let arg_reg = self.alloc_reg();
+                        self.emit(Opcode::Integer, 1, arg_reg, 0, P4::Unused);
+                        argc = 1;
+                    }
+
+                    // For MIN/MAX, use P5 to track when value changes
+                    let is_min_max = matches!(name_upper.as_str(), "MIN" | "MAX");
+                    if is_min_max {
+                        // Emit AggStep with P5 pointing to changed_reg
+                        self.emit(Opcode::AggStep, argc, arg_base, reg, P4::Text(name_upper));
+                        // Set P5 to the changed_reg register number
+                        if let Some(op) = self.ops.last_mut() {
+                            op.p5 = changed_reg as u16;
+                        }
+
+                        // After AggStep, if changed_reg is set, save all column refs
+                        let skip_save_label = self.alloc_label();
+                        self.emit(Opcode::IfNot, changed_reg, skip_save_label, 0, P4::Unused);
+
+                        // Save column values from current row
+                        for (cursor, col_idx, _) in col_refs {
+                            if let Some(&dest_reg) = saved_col_map.get(&(*cursor, *col_idx)) {
+                                if *col_idx == -1 {
+                                    self.emit(Opcode::Rowid, *cursor, dest_reg, 0, P4::Unused);
+                                } else {
+                                    self.emit(
+                                        Opcode::Column,
+                                        *cursor,
+                                        *col_idx,
+                                        dest_reg,
+                                        P4::Unused,
+                                    );
+                                }
+                            }
+                        }
+
+                        self.resolve_label(skip_save_label, self.current_addr());
+                    } else {
+                        // Regular aggregate - no bare column affinity
+                        self.emit(Opcode::AggStep, argc, arg_base, reg, P4::Text(name_upper));
+                    }
+                    *agg_idx += 1;
+                } else {
+                    // Non-aggregate function - recurse into arguments to find nested aggregates
+                    if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
+                        for arg in exprs {
+                            self.accumulate_aggregates_in_expr_with_bare_cols(
+                                arg,
+                                agg_regs,
+                                agg_idx,
+                                changed_reg,
+                                col_refs,
+                                saved_col_map,
+                            )?;
+                        }
+                    }
+                }
+            }
+            Expr::Binary { left, right, .. } => {
+                self.accumulate_aggregates_in_expr_with_bare_cols(
+                    left,
+                    agg_regs,
+                    agg_idx,
+                    changed_reg,
+                    col_refs,
+                    saved_col_map,
+                )?;
+                self.accumulate_aggregates_in_expr_with_bare_cols(
+                    right,
+                    agg_regs,
+                    agg_idx,
+                    changed_reg,
+                    col_refs,
+                    saved_col_map,
+                )?;
+            }
+            Expr::Unary { expr: inner, .. } => {
+                self.accumulate_aggregates_in_expr_with_bare_cols(
+                    inner,
+                    agg_regs,
+                    agg_idx,
+                    changed_reg,
+                    col_refs,
+                    saved_col_map,
+                )?;
+            }
+            Expr::Parens(inner) => {
+                self.accumulate_aggregates_in_expr_with_bare_cols(
+                    inner,
+                    agg_regs,
+                    agg_idx,
+                    changed_reg,
+                    col_refs,
+                    saved_col_map,
+                )?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn finalize_aggregates(
         &mut self,
         columns: &[ResultColumn],
@@ -9004,6 +9250,8 @@ impl<'s> SelectCompiler<'s> {
                     {
                         let agg_reg = agg_regs[agg_idx];
                         self.emit(Opcode::AggFinal, agg_reg, dest_reg, 0, P4::Text(name_upper));
+                        // Track this finalized aggregate for HAVING clause compilation
+                        self.agg_final_regs.push(dest_reg);
                         agg_idx += 1;
                     } else if self.expr_has_aggregate(expr) {
                         // Non-aggregate function with nested aggregates (e.g., coalesce(max(a), 'x'))
@@ -9224,6 +9472,75 @@ impl<'s> SelectCompiler<'s> {
             Expr::Unary { expr, .. } => self.count_aggregates_in_expr(expr),
             Expr::Parens(inner) => self.count_aggregates_in_expr(inner),
             _ => 0,
+        }
+    }
+
+    /// Check if any result column contains a MIN or MAX aggregate function
+    /// Used to determine whether bare column affinity applies
+    fn has_min_max_aggregate(&self, columns: &[ResultColumn]) -> bool {
+        for col in columns {
+            if let ResultColumn::Expr { expr, .. } = col {
+                if self.expr_has_min_max(expr) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Check if an expression contains MIN or MAX aggregate
+    fn expr_has_min_max(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Function(func_call) => {
+                let name_upper = func_call.name.to_uppercase();
+                let arg_count = match &func_call.args {
+                    crate::parser::ast::FunctionArgs::Exprs(exprs) => exprs.len(),
+                    crate::parser::ast::FunctionArgs::Star => 0,
+                };
+                // Only single-arg MIN/MAX are aggregates
+                let is_aggregate_min_max =
+                    matches!(name_upper.as_str(), "MIN" | "MAX") && arg_count == 1;
+                if is_aggregate_min_max {
+                    return true;
+                }
+                // Recurse into function arguments
+                if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
+                    for arg in exprs {
+                        if self.expr_has_min_max(arg) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            Expr::Binary { left, right, .. } => {
+                self.expr_has_min_max(left) || self.expr_has_min_max(right)
+            }
+            Expr::Unary { expr, .. } => self.expr_has_min_max(expr),
+            Expr::Parens(inner) => self.expr_has_min_max(inner),
+            Expr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => {
+                if let Some(op) = operand {
+                    if self.expr_has_min_max(op) {
+                        return true;
+                    }
+                }
+                for clause in when_clauses {
+                    if self.expr_has_min_max(&clause.when) || self.expr_has_min_max(&clause.then) {
+                        return true;
+                    }
+                }
+                if let Some(ec) = else_clause {
+                    if self.expr_has_min_max(ec) {
+                        return true;
+                    }
+                }
+                false
+            }
+            _ => false,
         }
     }
 

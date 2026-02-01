@@ -69,13 +69,15 @@ impl AggregateState {
     }
 
     /// Step: add a value to the aggregate
-    pub fn step(&mut self, args: &[Value]) -> Result<()> {
+    /// Returns true if this value became the new min/max (for bare column affinity)
+    pub fn step(&mut self, args: &[Value]) -> Result<bool> {
         match self {
             AggregateState::Count { count } => {
                 // COUNT(*) counts all rows, COUNT(x) counts non-NULL x
                 if args.is_empty() || !matches!(args.first(), Some(Value::Null)) {
                     *count += 1;
                 }
+                Ok(false)
             }
 
             AggregateState::Sum {
@@ -104,6 +106,7 @@ impl AggregateState {
                         }
                     }
                 }
+                Ok(false)
             }
 
             AggregateState::Avg { sum, count } => {
@@ -122,34 +125,43 @@ impl AggregateState {
                         }
                     }
                 }
+                Ok(false)
             }
 
             AggregateState::Min { value } => {
+                let mut changed = false;
                 if let Some(val) = args.first() {
                     if !matches!(val, Value::Null) {
                         if let Some(current) = value {
                             if compare_values(val, current) < 0 {
                                 *value = Some(val.clone());
+                                changed = true;
                             }
                         } else {
                             *value = Some(val.clone());
+                            changed = true;
                         }
                     }
                 }
+                Ok(changed)
             }
 
             AggregateState::Max { value } => {
+                let mut changed = false;
                 if let Some(val) = args.first() {
                     if !matches!(val, Value::Null) {
                         if let Some(current) = value {
                             if compare_values(val, current) > 0 {
                                 *value = Some(val.clone());
+                                changed = true;
                             }
                         } else {
                             *value = Some(val.clone());
+                            changed = true;
                         }
                     }
                 }
+                Ok(changed)
             }
 
             AggregateState::Total { sum } => {
@@ -165,6 +177,7 @@ impl AggregateState {
                         _ => {}
                     }
                 }
+                Ok(false)
             }
 
             AggregateState::GroupConcat { values, separator } => {
@@ -183,6 +196,7 @@ impl AggregateState {
                         *separator = value_to_string(sep);
                     }
                 }
+                Ok(false)
             }
 
             AggregateState::Md5Sum { data } => {
@@ -196,10 +210,9 @@ impl AggregateState {
                         Value::Blob(b) => data.extend_from_slice(b),
                     }
                 }
+                Ok(false)
             }
         }
-
-        Ok(())
     }
 
     /// Finalize: return the final aggregate value

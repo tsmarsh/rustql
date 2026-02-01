@@ -864,30 +864,30 @@ impl<'s> StatementCompiler<'s> {
     // ========================================================================
 
     /// Extract column names and types from a SELECT statement
+    /// For compound queries, uses the leftmost SELECT for column info
     fn extract_select_columns(&self, select: &SelectStmt) -> (Vec<String>, Vec<ColumnType>) {
         let mut names = Vec::new();
         let mut types = Vec::new();
 
-        if let SelectBody::Select(core) = &select.body {
-            for (i, col) in core.columns.iter().enumerate() {
-                match col {
-                    ResultColumn::Star => {
-                        names.push(format!("column{}", i));
-                        types.push(ColumnType::Null);
-                    }
-                    ResultColumn::TableStar(table) => {
-                        names.push(format!("{}.*", table));
-                        types.push(ColumnType::Null);
-                    }
-                    ResultColumn::Expr { expr, alias } => {
-                        let name = if let Some(alias) = alias {
-                            alias.clone()
-                        } else {
-                            self.expr_name(expr, i)
-                        };
-                        names.push(name);
-                        types.push(self.infer_type(expr));
-                    }
+        let core = select.body.leftmost_core();
+        for (i, col) in core.columns.iter().enumerate() {
+            match col {
+                ResultColumn::Star => {
+                    names.push(format!("column{}", i));
+                    types.push(ColumnType::Null);
+                }
+                ResultColumn::TableStar(table) => {
+                    names.push(format!("{}.*", table));
+                    types.push(ColumnType::Null);
+                }
+                ResultColumn::Expr { expr, alias } => {
+                    let name = if let Some(alias) = alias {
+                        alias.clone()
+                    } else {
+                        self.expr_name(expr, i)
+                    };
+                    names.push(name);
+                    types.push(self.infer_type(expr));
                 }
             }
         }
@@ -1241,6 +1241,9 @@ impl<'s> StatementCompiler<'s> {
             } else {
                 SelectCompiler::new()
             };
+            // Start cursor allocation from 2 to avoid conflicts:
+            // cursor 0 = sqlite_master, cursor 1 = target table
+            select_compiler.set_next_cursor(2);
 
             // Compile the SELECT with Table destination to insert directly
             let dest = SelectDest::Table {
@@ -1248,18 +1251,22 @@ impl<'s> StatementCompiler<'s> {
             };
             let select_ops = select_compiler.compile(select, &dest)?;
 
-            // Append select ops, adjusting jump targets
+            // The SELECT compiler generates: Init(0) -> jump to body, ..., Halt
+            // We need to:
+            // 1. Skip the Init instruction (we already have program flow)
+            // 2. Adjust all jump targets by (offset - 1) since we're skipping Init
+            // 3. Replace Halt with Close + Goto to our Halt at position 1
             let offset = ops.len() as i32;
-            for op in select_ops {
+            let adjust = offset - 1; // -1 because we skip Init
+
+            for (i, op) in select_ops.into_iter().enumerate() {
+                // Skip the Init instruction at position 0
+                if i == 0 && op.opcode == Opcode::Init {
+                    continue;
+                }
+
                 let mut new_op = op;
-                // Patch jump targets to account for the offset
-                // But skip Init since it's already at the start
-                if new_op.opcode.is_jump() && new_op.p2 > 0 {
-                    new_op.p2 += offset;
-                }
-                if new_op.opcode == Opcode::Init && new_op.p2 > 0 {
-                    new_op.p2 += offset;
-                }
+
                 // Convert Halt to Close + Goto to our Halt at position 1
                 if new_op.opcode == Opcode::Halt {
                     ops.push(Self::make_op(
@@ -1272,6 +1279,36 @@ impl<'s> StatementCompiler<'s> {
                     ops.push(Self::make_op(Opcode::Goto, 0, 1, 0, P4::Unused));
                     continue;
                 }
+
+                // Patch jump targets to account for the offset
+                // All P2 jump targets need adjustment
+                if new_op.opcode.is_jump() && new_op.p2 > 0 {
+                    new_op.p2 += adjust;
+                }
+                // Some opcodes use P2 for jumps even if not classified as "jump"
+                // (like Rewind, Next, etc. which jump on condition)
+                if matches!(
+                    new_op.opcode,
+                    Opcode::Rewind
+                        | Opcode::Next
+                        | Opcode::Prev
+                        | Opcode::IfNot
+                        | Opcode::If
+                        | Opcode::IfNullRow
+                        | Opcode::IsNull
+                        | Opcode::NotNull
+                        | Opcode::Once
+                        | Opcode::SorterNext
+                        | Opcode::VNext
+                ) && new_op.p2 > 0
+                {
+                    // Already handled by is_jump() check above for most,
+                    // but ensure these are caught
+                    if !new_op.opcode.is_jump() {
+                        new_op.p2 += adjust;
+                    }
+                }
+
                 ops.push(new_op);
             }
         } else {
@@ -1429,72 +1466,73 @@ impl<'s> StatementCompiler<'s> {
 
     /// Resolve column names from a SELECT statement for CREATE TABLE AS SELECT
     /// This handles star expansion using schema information
+    /// For compound queries (UNION, etc.), column names come from the leftmost SELECT
     fn resolve_select_columns_for_create(&self, select: &SelectStmt) -> Vec<(String, String)> {
         let mut columns = Vec::new();
 
-        if let SelectBody::Select(core) = &select.body {
-            // Get source table info for star expansion
-            let from_tables: Vec<String> = if let Some(from) = &core.from {
-                from.tables
-                    .iter()
-                    .filter_map(|t| match t {
-                        TableRef::Table { name, .. } => Some(name.name.clone()),
-                        _ => None,
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+        // Use leftmost_core() to handle both simple and compound queries
+        let core = select.body.leftmost_core();
 
-            for (i, col) in core.columns.iter().enumerate() {
-                match col {
-                    ResultColumn::Star => {
-                        // Expand * using schema if available
-                        if let Some(schema) = self.schema {
-                            for table_name in &from_tables {
-                                if let Some(table) = schema.table(table_name) {
-                                    for col_def in &table.columns {
-                                        let type_str =
-                                            col_def.type_name.clone().unwrap_or_default();
-                                        columns.push((col_def.name.clone(), type_str));
-                                    }
-                                }
-                            }
-                        }
-                        if columns.is_empty() {
-                            // Fallback if no schema
-                            columns.push((format!("column{}", i), String::new()));
-                        }
-                    }
-                    ResultColumn::TableStar(table) => {
-                        // Expand table.* using schema
-                        if let Some(schema) = self.schema {
-                            if let Some(schema_table) = schema.table(table) {
-                                for col_def in &schema_table.columns {
+        // Get source table info for star expansion
+        let from_tables: Vec<String> = if let Some(from) = &core.from {
+            from.tables
+                .iter()
+                .filter_map(|t| match t {
+                    TableRef::Table { name, .. } => Some(name.name.clone()),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        for (i, col) in core.columns.iter().enumerate() {
+            match col {
+                ResultColumn::Star => {
+                    // Expand * using schema if available
+                    if let Some(schema) = self.schema {
+                        for table_name in &from_tables {
+                            if let Some(table) = schema.table(table_name) {
+                                for col_def in &table.columns {
                                     let type_str = col_def.type_name.clone().unwrap_or_default();
                                     columns.push((col_def.name.clone(), type_str));
                                 }
                             }
                         }
-                        if columns.is_empty() {
-                            columns.push((format!("{}_{}", table, i), String::new()));
+                    }
+                    if columns.is_empty() {
+                        // Fallback if no schema
+                        columns.push((format!("column{}", i), String::new()));
+                    }
+                }
+                ResultColumn::TableStar(table) => {
+                    // Expand table.* using schema
+                    if let Some(schema) = self.schema {
+                        if let Some(schema_table) = schema.table(table) {
+                            for col_def in &schema_table.columns {
+                                let type_str = col_def.type_name.clone().unwrap_or_default();
+                                columns.push((col_def.name.clone(), type_str));
+                            }
                         }
                     }
-                    ResultColumn::Expr { expr, alias } => {
-                        let name = if let Some(alias) = alias {
-                            alias.clone()
-                        } else {
-                            self.expr_name(expr, i)
-                        };
-                        let type_name = match self.infer_type(expr) {
-                            ColumnType::Integer => "INTEGER",
-                            ColumnType::Float => "REAL",
-                            ColumnType::Text => "TEXT",
-                            ColumnType::Blob => "BLOB",
-                            _ => "",
-                        };
-                        columns.push((name, type_name.to_string()));
+                    if columns.is_empty() {
+                        columns.push((format!("{}_{}", table, i), String::new()));
                     }
+                }
+                ResultColumn::Expr { expr, alias } => {
+                    let name = if let Some(alias) = alias {
+                        alias.clone()
+                    } else {
+                        self.expr_name(expr, i)
+                    };
+                    let type_name = match self.infer_type(expr) {
+                        ColumnType::Integer => "INTEGER",
+                        ColumnType::Float => "REAL",
+                        ColumnType::Text => "TEXT",
+                        ColumnType::Blob => "BLOB",
+                        _ => "",
+                    };
+                    columns.push((name, type_name.to_string()));
                 }
             }
         }

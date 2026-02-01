@@ -209,6 +209,11 @@ impl<'s> SelectCompiler<'s> {
         self.enable_view = enable;
     }
 
+    /// Set starting cursor number (to avoid conflicts with pre-allocated cursors)
+    pub fn set_next_cursor(&mut self, cursor: i32) {
+        self.next_cursor = cursor;
+    }
+
     /// Set parameter names for Variable compilation
     pub fn set_param_names(&mut self, param_names: Vec<Option<String>>) {
         self.param_names = param_names;
@@ -2563,27 +2568,30 @@ impl<'s> SelectCompiler<'s> {
         // Initialize aggregate accumulators
         let agg_regs = self.init_aggregates(&core.columns)?;
 
-        // Collect all column references from result columns
-        // These need to be saved during the loop because the cursor won't be valid after
+        // Collect column references from result columns and HAVING clause
+        // For simple aggregates, SQLite uses the FIRST row's values for non-aggregate columns
+        // (both in result columns and HAVING)
         let mut col_refs_to_save: Vec<(i32, i32, String)> = Vec::new(); // (cursor, col_idx, col_name)
         for col in &core.columns {
             if let ResultColumn::Expr { expr, .. } = col {
                 self.collect_column_refs(expr, &mut col_refs_to_save);
             }
         }
+        if let Some(having) = &core.having {
+            self.collect_column_refs(having, &mut col_refs_to_save);
+        }
 
         // Deduplicate column references
         col_refs_to_save.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
         col_refs_to_save.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
 
-        // Allocate registers to save column values and build mapping
+        // Allocate registers to save column values - saved on first row only
         let saved_col_base = self.next_reg;
         let mut saved_col_map: HashMap<(i32, i32), i32> = HashMap::new();
-        for (i, (cursor, col_idx, _)) in col_refs_to_save.iter().enumerate() {
+
+        for (cursor, col_idx, _) in &col_refs_to_save {
             let reg = self.alloc_reg();
             saved_col_map.insert((*cursor, *col_idx), reg);
-            // Suppress unused variable warning
-            let _ = i;
         }
 
         // Collect table cursors to avoid borrow checker issues
@@ -2593,6 +2601,12 @@ impl<'s> SelectCompiler<'s> {
             .skip(self.outer_tables_boundary)
             .map(|t| t.cursor)
             .collect();
+
+        // Allocate a flag register to track if we've saved the first row's values
+        // SQLite uses the FIRST row's column values for non-aggregate columns in simple aggregates
+        // IMPORTANT: Initialize this BEFORE the loop to preserve across iterations
+        let first_row_flag_reg = self.alloc_reg();
+        self.emit(Opcode::Integer, 0, first_row_flag_reg, 0, P4::Unused);
 
         // Generate Rewind for each table cursor
         let mut rewind_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
@@ -2615,17 +2629,30 @@ impl<'s> SelectCompiler<'s> {
             None
         };
 
-        // Save all column references while cursor is positioned on a row
+        // Save all column references only from the FIRST row (SQLite simple aggregate semantics)
+        // Skip saving if flag is already set (not first row)
+        let skip_save_label = self.alloc_label();
+        self.emit(
+            Opcode::If,
+            first_row_flag_reg,
+            skip_save_label,
+            0,
+            P4::Unused,
+        );
+
         for (cursor, col_idx, _col_name) in &col_refs_to_save {
             if let Some(&dest_reg) = saved_col_map.get(&(*cursor, *col_idx)) {
                 if *col_idx == -1 {
-                    // Rowid
                     self.emit(Opcode::Rowid, *cursor, dest_reg, 0, P4::Unused);
                 } else {
                     self.emit(Opcode::Column, *cursor, *col_idx, dest_reg, P4::Unused);
                 }
             }
         }
+
+        // Set flag to indicate first row values have been saved
+        self.emit(Opcode::Integer, 1, first_row_flag_reg, 0, P4::Unused);
+        self.resolve_label(skip_save_label, self.current_addr());
 
         // Accumulate aggregates
         self.accumulate_aggregates(&core.columns, &agg_regs)?;
@@ -2647,11 +2674,22 @@ impl<'s> SelectCompiler<'s> {
         // Finalize aggregates
         let result_regs = self.finalize_aggregates(&core.columns, &agg_regs)?;
 
-        // Clear the saved column context
-        self.saved_column_regs = None;
-
-        // Output single row
-        self.output_row(dest, result_regs.0, result_regs.1)?;
+        // HAVING clause - evaluated after aggregates are finalized
+        // For simple aggregate (no GROUP BY), HAVING filters the single result row
+        if let Some(having) = &core.having {
+            let skip_output_label = self.alloc_label();
+            self.compile_where_condition(having, skip_output_label)?;
+            // Clear the saved column context
+            self.saved_column_regs = None;
+            // Output single row only if HAVING condition is true
+            self.output_row(dest, result_regs.0, result_regs.1)?;
+            self.resolve_label(skip_output_label, self.current_addr());
+        } else {
+            // Clear the saved column context
+            self.saved_column_regs = None;
+            // Output single row
+            self.output_row(dest, result_regs.0, result_regs.1)?;
+        }
 
         // Close cursors
         for cursor in &table_cursors {
@@ -2778,9 +2816,15 @@ impl<'s> SelectCompiler<'s> {
         // 2. Single table (no joins)
         // 3. Result is just COUNT(*) (no other columns)
         // 4. No DISTINCT
+        // 5. No HAVING clause (HAVING may need to reference non-aggregate columns)
 
         // Must have no WHERE clause
         if core.where_clause.is_some() {
+            return Ok(false);
+        }
+
+        // Must have no HAVING clause (HAVING needs full row loop to save column values)
+        if core.having.is_some() {
             return Ok(false);
         }
 
@@ -2864,6 +2908,32 @@ impl<'s> SelectCompiler<'s> {
         // Pre-scan result columns to extract alias expressions (for GROUP BY alias resolution)
         // SQLite allows GROUP BY to reference result column aliases
         self.prescan_result_aliases(&core.columns);
+
+        // Count result columns for GROUP BY column number validation
+        let num_result_cols = core.columns.len();
+
+        // Validate and resolve GROUP BY column numbers
+        // GROUP BY integer literals refer to result columns (1-based index)
+        for (i, expr) in group_by.iter().enumerate() {
+            if let Expr::Literal(Literal::Integer(col_idx)) = expr {
+                let col_idx = *col_idx as i32;
+                if col_idx < 1 || col_idx > num_result_cols as i32 {
+                    let ordinal = match i + 1 {
+                        1 => "1st".to_string(),
+                        2 => "2nd".to_string(),
+                        3 => "3rd".to_string(),
+                        n => format!("{}th", n),
+                    };
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        format!(
+                            "{} GROUP BY term out of range - should be between 1 and {}",
+                            ordinal, num_result_cols
+                        ),
+                    ));
+                }
+            }
+        }
 
         // Resolve aliases in GROUP BY expressions
         // e.g., "SELECT x+1 AS y ... GROUP BY y" should resolve y to x+1
@@ -3173,6 +3243,25 @@ impl<'s> SelectCompiler<'s> {
         right: &SelectBody,
         dest: &SelectDest,
     ) -> Result<()> {
+        // Validate that left and right have the same number of columns
+        let left_cols = self.count_select_body_columns(left);
+        let right_cols = self.count_select_body_columns(right);
+        if left_cols != right_cols {
+            let op_name = match op {
+                CompoundOp::Union => "UNION",
+                CompoundOp::UnionAll => "UNION ALL",
+                CompoundOp::Intersect => "INTERSECT",
+                CompoundOp::Except => "EXCEPT",
+            };
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                format!(
+                    "SELECTs to the left and right of {} do not have the same number of result columns",
+                    op_name
+                ),
+            ));
+        }
+
         self.is_compound = true;
 
         // Save LIMIT/OFFSET counters - they should be applied to the final output, not individual bodies
@@ -3328,6 +3417,60 @@ impl<'s> SelectCompiler<'s> {
         self.emit(Opcode::Close, result_cursor, 0, 0, P4::Unused);
 
         Ok(())
+    }
+
+    /// Count the number of result columns in a SelectBody (for compound query validation)
+    fn count_select_body_columns(&self, body: &SelectBody) -> usize {
+        match body {
+            SelectBody::Select(core) => self.count_select_core_columns(core),
+            SelectBody::Compound { left, .. } => {
+                // For compound queries, column count comes from the leftmost SELECT
+                self.count_select_body_columns(left)
+            }
+        }
+    }
+
+    /// Count columns in a SelectCore, handling * expansion
+    fn count_select_core_columns(&self, core: &SelectCore) -> usize {
+        let mut count = 0;
+        for col in &core.columns {
+            match col {
+                ResultColumn::Star => {
+                    // For *, count all columns from all tables in FROM
+                    if let Some(from) = &core.from {
+                        if let Some(schema) = self.schema {
+                            for table_ref in &from.tables {
+                                if let TableRef::Table { name, .. } = table_ref {
+                                    if let Some(table) = schema.table(&name.name) {
+                                        count += table.columns.len();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // If we couldn't determine, assume 1
+                    if count == 0 {
+                        count = 1;
+                    }
+                }
+                ResultColumn::TableStar(table_name) => {
+                    // For table.*, count columns from that table
+                    if let Some(schema) = self.schema {
+                        if let Some(table) = schema.table(table_name) {
+                            count += table.columns.len();
+                        } else {
+                            count += 1; // Fallback
+                        }
+                    } else {
+                        count += 1; // Fallback
+                    }
+                }
+                ResultColumn::Expr { .. } => {
+                    count += 1;
+                }
+            }
+        }
+        count.max(1) // At least 1 column
     }
 
     /// Compile FROM clause - open cursors for tables

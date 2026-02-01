@@ -175,6 +175,80 @@ pub enum SelectBody {
     },
 }
 
+impl SelectBody {
+    /// Get the leftmost SelectCore (used for column names in compound queries)
+    /// In SQL, column names/types come from the first SELECT in a UNION
+    pub fn leftmost_core(&self) -> &SelectCore {
+        match self {
+            SelectBody::Select(core) => core,
+            SelectBody::Compound { left, .. } => left.leftmost_core(),
+        }
+    }
+
+    /// Get a mutable reference to the leftmost SelectCore
+    pub fn leftmost_core_mut(&mut self) -> &mut SelectCore {
+        match self {
+            SelectBody::Select(core) => core,
+            SelectBody::Compound { left, .. } => left.leftmost_core_mut(),
+        }
+    }
+
+    /// Collect all SelectCores in this body (for validation, analysis)
+    pub fn all_cores(&self) -> Vec<&SelectCore> {
+        let mut cores = Vec::new();
+        self.collect_cores(&mut cores);
+        cores
+    }
+
+    fn collect_cores<'a>(&'a self, cores: &mut Vec<&'a SelectCore>) {
+        match self {
+            SelectBody::Select(core) => cores.push(core),
+            SelectBody::Compound { left, right, .. } => {
+                left.collect_cores(cores);
+                right.collect_cores(cores);
+            }
+        }
+    }
+
+    /// Apply a function to each SelectCore
+    pub fn for_each_core<F>(&self, mut f: F)
+    where
+        F: FnMut(&SelectCore),
+    {
+        match self {
+            SelectBody::Select(core) => f(core),
+            SelectBody::Compound { left, right, .. } => {
+                left.for_each_core(&mut f);
+                right.for_each_core(f);
+            }
+        }
+    }
+
+    /// Apply a fallible function to each SelectCore
+    pub fn try_for_each_core<F, E>(&self, mut f: F) -> Result<(), E>
+    where
+        F: FnMut(&SelectCore) -> Result<(), E>,
+    {
+        match self {
+            SelectBody::Select(core) => f(core),
+            SelectBody::Compound { left, right, .. } => {
+                left.try_for_each_core(&mut f)?;
+                right.try_for_each_core(f)
+            }
+        }
+    }
+
+    /// Check if this is a compound query
+    pub fn is_compound(&self) -> bool {
+        matches!(self, SelectBody::Compound { .. })
+    }
+
+    /// Get the number of result columns (from leftmost core)
+    pub fn column_count(&self) -> usize {
+        self.leftmost_core().columns.len()
+    }
+}
+
 /// Core SELECT without ORDER BY and LIMIT
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectCore {

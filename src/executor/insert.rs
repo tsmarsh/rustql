@@ -552,23 +552,22 @@ impl<'a> InsertCompiler<'a> {
     }
 
     /// Count columns in SELECT result
+    /// For compound queries, uses the leftmost SELECT for column count
     fn count_select_columns(&self, select: &SelectStmt) -> usize {
-        if let SelectBody::Select(core) = &select.body {
-            let mut count = 0;
-            for col in &core.columns {
-                match col {
-                    ResultColumn::Star => {
-                        // For *, we don't know the count without schema
-                        // Use a reasonable default
-                        return 10;
-                    }
-                    ResultColumn::TableStar(_) => return 10,
-                    ResultColumn::Expr { .. } => count += 1,
+        let core = select.body.leftmost_core();
+        let mut count = 0;
+        for col in &core.columns {
+            match col {
+                ResultColumn::Star => {
+                    // For *, we don't know the count without schema
+                    // Use a reasonable default
+                    return 10;
                 }
+                ResultColumn::TableStar(_) => return 10,
+                ResultColumn::Expr { .. } => count += 1,
             }
-            return count.max(1);
         }
-        10 // Default fallback
+        count.max(1)
     }
 
     /// Compile INSERT...SELECT
@@ -1134,14 +1133,14 @@ impl<'a> InsertCompiler<'a> {
     }
 
     /// Extract source table name from SELECT for simple cases
+    /// For compound queries, uses the leftmost SELECT
     fn get_source_table(&self, select: &SelectStmt) -> Result<String> {
-        // Handle SELECT...FROM table
-        if let SelectBody::Select(core) = &select.body {
-            if let Some(from) = &core.from {
-                if let Some(table_ref) = from.tables.first() {
-                    if let TableRef::Table { name, .. } = table_ref {
-                        return Ok(name.name.clone());
-                    }
+        // Handle SELECT...FROM table (use leftmost core for compound queries)
+        let core = select.body.leftmost_core();
+        if let Some(from) = &core.from {
+            if let Some(table_ref) = from.tables.first() {
+                if let TableRef::Table { name, .. } = table_ref {
+                    return Ok(name.name.clone());
                 }
             }
         }
@@ -1194,49 +1193,41 @@ impl<'a> InsertCompiler<'a> {
     }
 
     /// Extract expressions from SELECT clause
+    /// For compound queries, uses the leftmost SELECT
     fn get_select_expressions(&self, select: &SelectStmt) -> Vec<Expr> {
-        if let SelectBody::Select(core) = &select.body {
-            let mut exprs = Vec::new();
-            for col in &core.columns {
-                match col {
-                    ResultColumn::Star | ResultColumn::TableStar(_) => {
-                        // For SELECT *, generate column references for all columns in SOURCE table
-                        let source_col_count = self.get_source_table_column_count(select);
-                        for i in 0..source_col_count {
-                            exprs.push(Expr::Column(crate::parser::ast::ColumnRef {
-                                database: None,
-                                table: None,
-                                column: format!("col{}", i),
-                                column_index: Some(i as i32),
-                                source_text: None,
-                            }));
-                        }
-                    }
-                    ResultColumn::Expr { expr, .. } => {
-                        exprs.push(expr.clone());
+        let core = select.body.leftmost_core();
+        let mut exprs = Vec::new();
+        for col in &core.columns {
+            match col {
+                ResultColumn::Star | ResultColumn::TableStar(_) => {
+                    // For SELECT *, generate column references for all columns in SOURCE table
+                    let source_col_count = self.get_source_table_column_count(select);
+                    for i in 0..source_col_count {
+                        exprs.push(Expr::Column(crate::parser::ast::ColumnRef {
+                            database: None,
+                            table: None,
+                            column: format!("col{}", i),
+                            column_index: Some(i as i32),
+                            source_text: None,
+                        }));
                     }
                 }
+                ResultColumn::Expr { expr, .. } => {
+                    exprs.push(expr.clone());
+                }
             }
-            if exprs.is_empty() {
-                // Fallback: return a single column reference
-                exprs.push(Expr::Column(crate::parser::ast::ColumnRef {
-                    database: None,
-                    table: None,
-                    column: "col0".to_string(),
-                    column_index: Some(0),
-                    source_text: None,
-                }));
-            }
-            return exprs;
         }
-        // Fallback for compound selects
-        vec![Expr::Column(crate::parser::ast::ColumnRef {
-            database: None,
-            table: None,
-            column: "col0".to_string(),
-            column_index: Some(0),
-            source_text: None,
-        })]
+        if exprs.is_empty() {
+            // Fallback: return a single column reference
+            exprs.push(Expr::Column(crate::parser::ast::ColumnRef {
+                database: None,
+                table: None,
+                column: "col0".to_string(),
+                column_index: Some(0),
+                source_text: None,
+            }));
+        }
+        exprs
     }
 
     /// Build column name to index map for source table

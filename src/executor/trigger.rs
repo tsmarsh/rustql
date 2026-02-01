@@ -1038,11 +1038,12 @@ impl<'s> TriggerBodyCompiler<'s> {
 
     /// Compile a SELECT statement in a trigger body
     fn compile_select(&mut self, select: &crate::parser::ast::SelectStmt) -> Result<()> {
-        use crate::parser::ast::{ResultColumn, SelectBody};
+        use crate::parser::ast::ResultColumn;
 
         // SELECT in trigger body is executed for side effects (like RAISE)
         // We need to evaluate each expression in the SELECT list
-        if let SelectBody::Select(core) = &select.body {
+        // For compound queries, process all SELECT cores
+        for core in select.body.all_cores() {
             for col in &core.columns {
                 if let ResultColumn::Expr { expr, .. } = col {
                     let dest_reg = self.alloc_reg();

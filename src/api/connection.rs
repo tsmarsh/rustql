@@ -976,8 +976,8 @@ impl SqliteConnection {
                     schema.indexes.clear();
                     schema.triggers.clear();
                     schema.views.clear();
-                    // Reload from sqlite_master
-                    load_schema_from_btree(btree, &mut schema)?;
+                    // Reload from sqlite_master (db_idx=0 for main database)
+                    load_schema_from_btree(btree, &mut schema, 0, "main")?;
                 }
                 if autocommit {
                     if let Ok(mut shared) = btree.shared.write() {
@@ -1380,9 +1380,10 @@ impl SqliteConnection {
         }
         let btree = self.dbs[db_idx].btree.clone();
         let schema_arc = self.dbs[db_idx].schema.clone();
+        let db_name = self.dbs[db_idx].name.clone();
         if let (Some(ref btree), Some(ref schema)) = (btree.as_ref(), schema_arc.as_ref()) {
             if let Ok(mut schema_guard) = schema.write() {
-                load_schema_from_btree(btree, &mut schema_guard)?;
+                load_schema_from_btree(btree, &mut schema_guard, db_idx as i32, &db_name)?;
             }
         }
         Ok(())
@@ -1478,7 +1479,8 @@ pub fn sqlite3_open_v2(
                     (main_db.btree.as_ref(), main_db.schema.as_ref())
                 {
                     if let Ok(mut schema_guard) = schema.write() {
-                        load_schema_from_btree(btree, &mut schema_guard)?;
+                        // db_idx=0 for main database
+                        load_schema_from_btree(btree, &mut schema_guard, 0, "main")?;
                     }
                 }
             }
@@ -1502,7 +1504,12 @@ pub fn sqlite3_open16(filename: &[u16]) -> Result<Box<SqliteConnection>> {
     sqlite3_open(&filename)
 }
 
-fn load_schema_from_btree(btree: &Arc<Btree>, schema: &mut Schema) -> Result<()> {
+fn load_schema_from_btree(
+    btree: &Arc<Btree>,
+    schema: &mut Schema,
+    db_idx: i32,
+    db_name: &str,
+) -> Result<()> {
     let mut cursor = btree.cursor(1, BtreeCursorFlags::empty(), None)?;
     let empty = cursor.first()?;
     if empty {
@@ -1520,7 +1527,9 @@ fn load_schema_from_btree(btree: &Arc<Btree>, schema: &mut Schema) -> Result<()>
 
         match obj_type.as_str() {
             "table" => {
-                if let Some(table) = parse_create_sql(&sql, root_page) {
+                if let Some(mut table) = parse_create_sql(&sql, root_page) {
+                    // Set db_idx from the database this schema was loaded from
+                    table.db_idx = db_idx;
                     let name = table.name.to_lowercase();
                     schema.tables.entry(name).or_insert_with(|| Arc::new(table));
                 }
@@ -1551,13 +1560,13 @@ fn load_schema_from_btree(btree: &Arc<Btree>, schema: &mut Schema) -> Result<()>
     }
 
     // Load R-tree data from shadow tables
-    load_rtree_shadow_data(btree, schema)?;
+    load_rtree_shadow_data(btree, schema, db_name)?;
 
     Ok(())
 }
 
 /// Load R-tree virtual tables from shadow tables (_node, _rowid, _parent)
-fn load_rtree_shadow_data(btree: &Arc<Btree>, schema: &Schema) -> Result<()> {
+fn load_rtree_shadow_data(btree: &Arc<Btree>, schema: &Schema, db_name: &str) -> Result<()> {
     // Find R-tree tables by looking for tables with "_node" shadow tables
     let mut rtree_names = Vec::new();
     for table_name in schema.tables.keys() {
@@ -1682,8 +1691,8 @@ fn load_rtree_shadow_data(btree: &Arc<Btree>, schema: &Schema) -> Result<()> {
                 rowid_mappings,
                 parent_mappings,
             ) {
-                // Register the loaded R-tree
-                let full_name = format!("main.{}", rtree_name);
+                // Register the loaded R-tree with the correct database name
+                let full_name = format!("{}.{}", db_name, rtree_name);
                 crate::rtree_vtab::register_table(&full_name, rtree_table);
             }
         }

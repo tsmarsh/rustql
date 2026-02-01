@@ -140,6 +140,8 @@ pub struct VdbeCursor {
     pub stat1_entries: Option<Vec<(String, Option<String>, String)>>,
     /// Virtual table name (for module lookup)
     pub vtab_name: Option<String>,
+    /// Database index for this cursor (0=main, 1=temp, 2+=attached)
+    pub db_idx: i32,
     /// Virtual table rowids for current scan
     pub vtab_rowids: Vec<i64>,
     /// Current index into virtual table rowids
@@ -230,6 +232,7 @@ impl VdbeCursor {
             schema_entries: None,
             stat1_entries: None,
             vtab_name: None,
+            db_idx: 0,
             vtab_rowids: Vec::new(),
             vtab_row_index: 0,
             #[cfg(feature = "fts3")]
@@ -841,6 +844,24 @@ impl Vdbe {
         let conn = unsafe { &*conn_ptr };
         let idx = db_idx as usize;
         conn.dbs.get(idx).and_then(|db| db.btree.as_ref().cloned())
+    }
+
+    fn db_name_for_idx(&self, db_idx: i32) -> String {
+        if db_idx == 0 {
+            return "main".to_string();
+        }
+        if db_idx == 1 {
+            return "temp".to_string();
+        }
+        let Some(conn_ptr) = self.conn_ptr else {
+            return "main".to_string();
+        };
+        let conn = unsafe { &*conn_ptr };
+        let idx = db_idx as usize;
+        conn.dbs
+            .get(idx)
+            .map(|db| db.name.clone())
+            .unwrap_or_else(|| "main".to_string())
     }
 
     fn collect_btrees(&self) -> Vec<Arc<Btree>> {
@@ -1852,6 +1873,7 @@ impl Vdbe {
                         .unwrap_or(false)
                     {
                         self.open_cursor(op.p1, 0, false)?;
+                        let vtab_db_idx = table_meta.as_ref().map(|t| t.db_idx).unwrap_or(0);
                         if let Some(cursor) = self.cursor_mut(op.p1) {
                             cursor.n_field = table_meta
                                 .as_ref()
@@ -1859,7 +1881,10 @@ impl Vdbe {
                                 .unwrap_or(op.p3);
                             cursor.table_name = table_name.clone();
                             cursor.is_virtual = true;
-                            cursor.vtab_name = table_name;
+                            // Use simple_name (without db prefix) for vtab_name
+                            cursor.vtab_name = Some(simple_name.clone());
+                            // Set db_idx for attached database virtual tables
+                            cursor.db_idx = vtab_db_idx;
                         }
                     } else {
                         // Determine which btree to use: temp tables use temp_btree
@@ -2173,7 +2198,9 @@ impl Vdbe {
                         cursor.n_field = table_columns.unwrap_or(op.p3);
                         cursor.is_virtual = true;
                         cursor.table_name = table_name.clone();
-                        cursor.vtab_name = table_name;
+                        // Use simple_name (without db prefix) for vtab lookups
+                        cursor.vtab_name = simple_name.clone().or(table_name);
+                        cursor.db_idx = table_db_idx;
                     }
                 } else {
                     // Determine which btree to use: temp tables use temp_btree
@@ -2368,6 +2395,9 @@ impl Vdbe {
                         })
                     });
 
+                    // Extract db_idx before mutable cursor borrow
+                    let cursor_db_name = self.cursor(op.p1).map(|c| self.db_name_for_idx(c.db_idx));
+
                     if let Some(cursor) = self.cursor_mut(op.p1) {
                         if cursor.is_virtual {
                             #[allow(unused_variables)]
@@ -2469,7 +2499,8 @@ impl Vdbe {
                                 // R-tree legacy path
                                 if let Some(module) = vtab_module.as_ref() {
                                     if module.eq_ignore_ascii_case("rtree") {
-                                        let rtree_full_name = format!("main.{}", vtab_name);
+                                        let db_name = cursor_db_name.as_deref().unwrap_or("main");
+                                        let rtree_full_name = format!("{}.{}", db_name, vtab_name);
                                         if let Some(table) =
                                             crate::rtree_vtab::get_table(&rtree_full_name)
                                         {
@@ -2551,6 +2582,7 @@ impl Vdbe {
                     } else if cursor.is_virtual {
                         // For virtual tables, query the table directly
                         let vtab_name = cursor.vtab_name.clone();
+                        let cursor_db_idx = cursor.db_idx;
                         let mut vtab_count: i64 = 0;
 
                         if let Some(ref name) = vtab_name {
@@ -2576,7 +2608,8 @@ impl Vdbe {
 
                             // R-tree count
                             if vtab_count == 0 {
-                                let rtree_full_name = format!("main.{}", name);
+                                let db_name = self.db_name_for_idx(cursor_db_idx);
+                                let rtree_full_name = format!("{}.{}", db_name, name);
                                 if let Some(table) = crate::rtree_vtab::get_table(&rtree_full_name)
                                 {
                                     if let Ok(table) = table.lock() {
@@ -2604,6 +2637,53 @@ impl Vdbe {
                 let mut vtab_context: Option<(Option<String>, Option<i64>)> = None;
                 let btree = self.btree.clone();
                 let schema = self.schema.clone();
+                // Extract cursor info before mutable borrow
+                let (cursor_db_name, cursor_db_idx, cursor_vtab_name) = self
+                    .cursor(op.p1)
+                    .map(|c| {
+                        (
+                            Some(self.db_name_for_idx(c.db_idx)),
+                            c.db_idx,
+                            c.vtab_name.clone(),
+                        )
+                    })
+                    .unwrap_or((None, 0, None));
+                // Look up vtab_module from the correct schema based on cursor_db_idx
+                let vtab_module = cursor_vtab_name.as_ref().and_then(|name| {
+                    if cursor_db_idx == 0 {
+                        // Main database
+                        schema.as_ref().and_then(|schema| {
+                            schema
+                                .read()
+                                .ok()
+                                .and_then(|guard| guard.table(name))
+                                .and_then(|table| table.virtual_module.clone())
+                        })
+                    } else if cursor_db_idx == 1 {
+                        // Temp database
+                        self.temp_schema.as_ref().and_then(|schema| {
+                            schema
+                                .read()
+                                .ok()
+                                .and_then(|guard| guard.table(name))
+                                .and_then(|table| table.virtual_module.clone())
+                        })
+                    } else {
+                        // Attached database
+                        self.conn_ptr.and_then(|conn_ptr| {
+                            let conn = unsafe { &*conn_ptr };
+                            conn.dbs.get(cursor_db_idx as usize).and_then(|db| {
+                                db.schema.as_ref().and_then(|schema| {
+                                    schema
+                                        .read()
+                                        .ok()
+                                        .and_then(|guard| guard.table(name))
+                                        .and_then(|table| table.virtual_module.clone())
+                                })
+                            })
+                        })
+                    }
+                });
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     // Invalidate column cache on cursor movement
                     cursor.cached_columns = None;
@@ -2643,15 +2723,7 @@ impl Vdbe {
                             cursor.state = CursorState::AtEnd;
                         }
                     } else if cursor.is_virtual {
-                        let vtab_module = cursor.vtab_name.as_ref().and_then(|name| {
-                            schema.as_ref().and_then(|schema| {
-                                schema
-                                    .read()
-                                    .ok()
-                                    .and_then(|guard| guard.table(name))
-                                    .and_then(|table| table.virtual_module.clone())
-                            })
-                        });
+                        // vtab_module was looked up before the mutable borrow
                         if cursor.vtab_rowids.is_empty() {
                             if let Some(ref vtab_name) = cursor.vtab_name {
                                 #[cfg(feature = "fts3")]
@@ -2691,7 +2763,8 @@ impl Vdbe {
                                 // R-tree handling
                                 if let Some(module) = vtab_module.as_ref() {
                                     if module.eq_ignore_ascii_case("rtree") {
-                                        let rtree_full_name = format!("main.{}", vtab_name);
+                                        let db_name = cursor_db_name.as_deref().unwrap_or("main");
+                                        let rtree_full_name = format!("{}.{}", db_name, vtab_name);
                                         if let Some(table_arc) =
                                             crate::rtree_vtab::get_table(&rtree_full_name)
                                         {
@@ -3093,6 +3166,7 @@ impl Vdbe {
                 let vtab_value: Option<Mem> = if let Some(cursor) = self.cursor(op.p1) {
                     if cursor.is_virtual {
                         let mut result = Mem::new();
+                        let cursor_db_idx = cursor.db_idx;
                         if let (Some(rowid), Some(vtab_name)) =
                             (cursor.rowid, cursor.vtab_name.as_ref())
                         {
@@ -3195,17 +3269,41 @@ impl Vdbe {
 
                             // R-tree Column handler
                             if result.is_null() {
-                                let schema = self.schema.clone();
-                                let module = schema.as_ref().and_then(|schema| {
-                                    schema
-                                        .read()
-                                        .ok()
-                                        .and_then(|guard| guard.table(vtab_name))
-                                        .and_then(|table| table.virtual_module.clone())
-                                });
+                                // Look up module from the correct schema based on cursor_db_idx
+                                let module = if cursor_db_idx == 0 {
+                                    self.schema.as_ref().and_then(|schema| {
+                                        schema
+                                            .read()
+                                            .ok()
+                                            .and_then(|guard| guard.table(vtab_name))
+                                            .and_then(|table| table.virtual_module.clone())
+                                    })
+                                } else if cursor_db_idx == 1 {
+                                    self.temp_schema.as_ref().and_then(|schema| {
+                                        schema
+                                            .read()
+                                            .ok()
+                                            .and_then(|guard| guard.table(vtab_name))
+                                            .and_then(|table| table.virtual_module.clone())
+                                    })
+                                } else {
+                                    self.conn_ptr.and_then(|conn_ptr| {
+                                        let conn = unsafe { &*conn_ptr };
+                                        conn.dbs.get(cursor_db_idx as usize).and_then(|db| {
+                                            db.schema.as_ref().and_then(|schema| {
+                                                schema
+                                                    .read()
+                                                    .ok()
+                                                    .and_then(|guard| guard.table(vtab_name))
+                                                    .and_then(|table| table.virtual_module.clone())
+                                            })
+                                        })
+                                    })
+                                };
                                 if let Some(module) = module {
                                     if module.eq_ignore_ascii_case("rtree") {
-                                        let rtree_full_name = format!("main.{}", vtab_name);
+                                        let db_name = self.db_name_for_idx(cursor_db_idx);
+                                        let rtree_full_name = format!("{}.{}", db_name, vtab_name);
                                         if let Some(table) =
                                             crate::rtree_vtab::get_table(&rtree_full_name)
                                         {
@@ -4392,9 +4490,11 @@ impl Vdbe {
                 let mut need_recheck_after_trigger = false;
 
                 // Track R-tree table for persistence after cursor borrow ends
+                // (table_name, rtree_table, db_idx)
                 let mut rtree_persist_info: Option<(
                     String,
                     std::sync::Arc<std::sync::Mutex<crate::rtree::RtreeTable>>,
+                    i32,
                 )> = None;
 
                 // Pre-calculate the column name for rowid constraint errors
@@ -4421,6 +4521,9 @@ impl Vdbe {
                         })
                     })
                 };
+
+                // Extract db_idx before mutable cursor borrow for R-tree lookup
+                let cursor_db_name = self.cursor(op.p1).map(|c| self.db_name_for_idx(c.db_idx));
 
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     cursor.rowid = Some(rowid);
@@ -4489,8 +4592,10 @@ impl Vdbe {
                             }
 
                             // R-tree insert with shadow table persistence
-                            // Registry uses "main.<table>" format
-                            let rtree_full_name = format!("main.{}", vtab_name);
+                            // Registry uses "<db>.<table>" format
+                            let cursor_db_idx = cursor.db_idx;
+                            let db_name = cursor_db_name.as_deref().unwrap_or("main");
+                            let rtree_full_name = format!("{}.{}", db_name, vtab_name);
                             if std::env::var("VDBE_TRACE").is_ok() {
                                 eprintln!("  R-tree lookup: {}", rtree_full_name);
                             }
@@ -4588,8 +4693,11 @@ impl Vdbe {
                                                 }
                                                 inserted = true;
                                                 // Save info for persistence after cursor borrow ends
-                                                rtree_persist_info =
-                                                    Some((vtab_name.clone(), table_arc.clone()));
+                                                rtree_persist_info = Some((
+                                                    vtab_name.clone(),
+                                                    table_arc.clone(),
+                                                    cursor_db_idx,
+                                                ));
                                             }
                                         } else {
                                             // For IGNORE, consider it "inserted" for change count
@@ -4911,10 +5019,18 @@ impl Vdbe {
                 }
 
                 // Persist R-tree to shadow tables after cursor borrows end
-                if let Some((table_name, table_arc)) = rtree_persist_info {
-                    if let Some(ref btree) = btree_arc {
+                if let Some((table_name, table_arc, cursor_db_idx)) = rtree_persist_info {
+                    // Use the correct btree for the database where the R-tree lives
+                    let persist_btree = self.btree_for_db_idx(cursor_db_idx);
+                    if let Some(ref btree) = persist_btree {
                         if let Ok(rtree) = table_arc.lock() {
-                            if let Err(e) = self.persist_rtree_node(btree, &table_name, 0, &rtree) {
+                            if let Err(e) = self.persist_rtree_node(
+                                btree,
+                                &table_name,
+                                0,
+                                &rtree,
+                                cursor_db_idx,
+                            ) {
                                 eprintln!("R-tree persist error: {:?}", e);
                             }
                         }
@@ -4963,24 +5079,36 @@ impl Vdbe {
                 let rowid = self.mem(op.p3).to_int();
                 let mut exists = false;
 
-                if let Some(cursor) = self.cursor_mut(op.p1) {
-                    if cursor.is_virtual {
-                        // Virtual table - check if rowid exists
-                        if let Some(ref vtab_name) = cursor.vtab_name {
-                            // R-tree handling
-                            let rtree_full_name = format!("main.{}", vtab_name);
-                            if let Some(table_arc) = crate::rtree_vtab::get_table(&rtree_full_name)
-                            {
-                                if let Ok(table) = table_arc.lock() {
-                                    if table.get(rowid).is_some() {
-                                        cursor.state = CursorState::Valid;
-                                        cursor.rowid = Some(rowid);
-                                        exists = true;
-                                    }
-                                }
+                // Extract cursor info before mutable borrow for virtual table lookup
+                let vtab_info: Option<(String, i32)> = self.cursor(op.p1).and_then(|c| {
+                    if c.is_virtual {
+                        c.vtab_name.as_ref().map(|name| (name.clone(), c.db_idx))
+                    } else {
+                        None
+                    }
+                });
+
+                // Handle virtual table (R-tree) lookup before cursor mutable borrow
+                if let Some((vtab_name, cursor_db_idx)) = vtab_info {
+                    let db_name = self.db_name_for_idx(cursor_db_idx);
+                    let rtree_full_name = format!("{}.{}", db_name, vtab_name);
+                    if let Some(table_arc) = crate::rtree_vtab::get_table(&rtree_full_name) {
+                        if let Ok(table) = table_arc.lock() {
+                            if table.get(rowid).is_some() {
+                                exists = true;
                             }
                         }
-                    } else if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                    }
+                    // Update cursor state after lookup
+                    if let Some(cursor) = self.cursor_mut(op.p1) {
+                        if exists {
+                            cursor.state = CursorState::Valid;
+                            cursor.rowid = Some(rowid);
+                        }
+                    }
+                } else if let Some(cursor) = self.cursor_mut(op.p1) {
+                    // Non-virtual table path
+                    if let Some(ref mut bt_cursor) = cursor.btree_cursor {
                         match bt_cursor.table_moveto(rowid, false) {
                             Ok(0) => {
                                 // Exact match found - row exists
@@ -5091,14 +5219,34 @@ impl Vdbe {
                 let btree = btree_arc.clone();
                 let schema = self.schema.clone();
                 let mut deleted = false;
-                // For R-tree delete persistence: (table_name, rowid, table_arc)
+                // For R-tree delete persistence: (table_name, rowid, table_arc, db_idx)
                 let mut rtree_delete_info: Option<(
                     String,
                     i64,
                     Arc<std::sync::Mutex<crate::rtree::RtreeTable>>,
+                    i32,
                 )> = None;
+
+                // Extract cursor info for virtual table operations before mutable borrow
+                let vtab_delete_info: Option<(i64, String, i32)> =
+                    self.cursor(op.p1).and_then(|c| {
+                        if c.is_virtual {
+                            c.rowid.and_then(|rid| {
+                                c.vtab_name
+                                    .as_ref()
+                                    .map(|name| (rid, name.clone(), c.db_idx))
+                            })
+                        } else {
+                            None
+                        }
+                    });
+                let vtab_db_name = vtab_delete_info
+                    .as_ref()
+                    .map(|(_, _, db_idx)| self.db_name_for_idx(*db_idx));
+
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if cursor.is_virtual {
+                        let cursor_db_idx = cursor.db_idx;
                         if let Some(rowid) = cursor.rowid {
                             if let Some(ref vtab_name) = cursor.vtab_name {
                                 #[cfg(feature = "fts3")]
@@ -5162,7 +5310,8 @@ impl Vdbe {
                                 }
 
                                 // R-tree delete
-                                let rtree_full_name = format!("main.{}", vtab_name);
+                                let db_name = vtab_db_name.as_deref().unwrap_or("main");
+                                let rtree_full_name = format!("{}.{}", db_name, vtab_name);
                                 if let Some(table_arc) =
                                     crate::rtree_vtab::get_table(&rtree_full_name)
                                 {
@@ -5172,8 +5321,12 @@ impl Vdbe {
                                         } else {
                                             deleted = true;
                                             // Capture info for persistence after cursor borrow ends
-                                            rtree_delete_info =
-                                                Some((vtab_name.clone(), rowid, table_arc.clone()));
+                                            rtree_delete_info = Some((
+                                                vtab_name.clone(),
+                                                rowid,
+                                                table_arc.clone(),
+                                                cursor_db_idx,
+                                            ));
                                         }
                                     }
                                 }
@@ -5245,12 +5398,17 @@ impl Vdbe {
                 }
 
                 // Persist R-tree deletion to shadow tables after cursor borrows end
-                if let Some((table_name, rowid, table_arc)) = rtree_delete_info {
-                    if let Some(ref btree) = btree_arc {
+                if let Some((table_name, rowid, table_arc, cursor_db_idx)) = rtree_delete_info {
+                    let persist_btree = self.btree_for_db_idx(cursor_db_idx);
+                    if let Some(ref btree) = persist_btree {
                         if let Ok(table) = table_arc.lock() {
-                            if let Err(e) =
-                                self.delete_rtree_entry(btree, &table_name, rowid, &table)
-                            {
+                            if let Err(e) = self.delete_rtree_entry(
+                                btree,
+                                &table_name,
+                                rowid,
+                                &table,
+                                cursor_db_idx,
+                            ) {
                                 eprintln!("R-tree delete persist error: {:?}", e);
                             }
                         }
@@ -7057,18 +7215,17 @@ impl Vdbe {
                                         {
                                             // Only register R-tree for now (FTS3/FTS5 have separate registration)
                                             if module_name.eq_ignore_ascii_case("rtree") {
-                                                let db_name =
-                                                    if db_idx == 1 { "temp" } else { "main" };
+                                                let db_name = self.db_name_for_idx(db_idx);
                                                 // Only register if instance doesn't exist yet
                                                 let already_exists = registry
-                                                    .get_instance(db_name, &table_name)
+                                                    .get_instance(&db_name, &table_name)
                                                     .map(|opt| opt.is_some())
                                                     .unwrap_or(false);
                                                 if !already_exists {
                                                     let args: Vec<String> = virtual_args.clone();
                                                     let _ = registry.connect_virtual_table(
                                                         module_name,
-                                                        db_name,
+                                                        &db_name,
                                                         &table_name,
                                                         &args,
                                                     );
@@ -7175,7 +7332,8 @@ impl Vdbe {
 
                     // Unregister R-tree from global registry
                     if is_rtree {
-                        let full_name = format!("main.{}", name_lower);
+                        let db_name = self.db_name_for_idx(db_idx);
+                        let full_name = format!("{}.{}", db_name, name_lower);
                         crate::rtree_vtab::unregister_table(&full_name);
                     }
                 }
@@ -8128,6 +8286,7 @@ impl Vdbe {
                         // Fall back to legacy path for FTS3/FTS5
                         let vtab_name = cursor.vtab_name.clone();
                         let rowid = cursor.rowid;
+                        let cursor_db_idx = cursor.db_idx;
 
                         if let (Some(ref name), Some(rid)) = (vtab_name, rowid) {
                             let mut found_value = Mem::new();
@@ -8162,7 +8321,8 @@ impl Vdbe {
 
                             // R-tree column access
                             if found_value.is_null() {
-                                let rtree_full_name = format!("main.{}", name);
+                                let db_name = self.db_name_for_idx(cursor_db_idx);
+                                let rtree_full_name = format!("{}.{}", db_name, name);
                                 if let Some(table) = crate::rtree_vtab::get_table(&rtree_full_name)
                                 {
                                     if let Ok(table) = table.lock() {
@@ -8549,17 +8709,40 @@ impl Vdbe {
         table_name: &str,
         _node_id: i64,
         rtree: &crate::rtree::RtreeTable,
+        db_idx: i32,
     ) -> Result<()> {
         use crate::storage::btree::{BtreeCursorFlags, BtreeInsertFlags, BtreePayload};
         use crate::vdbe::auxdata::make_record;
 
-        // Get the schema to find shadow table root pages
-        let schema_guard = self
-            .schema
-            .as_ref()
-            .ok_or_else(|| Error::with_message(ErrorCode::Internal, "no schema"))?
-            .read()
-            .map_err(|_| Error::with_message(ErrorCode::Internal, "schema lock failed"))?;
+        // Get the schema for the specified database
+        let schema_guard = if db_idx == 0 {
+            self.schema
+                .as_ref()
+                .ok_or_else(|| Error::with_message(ErrorCode::Internal, "no schema"))?
+                .read()
+                .map_err(|_| Error::with_message(ErrorCode::Internal, "schema lock failed"))?
+        } else if db_idx == 1 {
+            self.temp_schema
+                .as_ref()
+                .ok_or_else(|| Error::with_message(ErrorCode::Internal, "no temp schema"))?
+                .read()
+                .map_err(|_| Error::with_message(ErrorCode::Internal, "temp schema lock failed"))?
+        } else {
+            // Attached database
+            let conn = unsafe {
+                &*self
+                    .conn_ptr
+                    .ok_or_else(|| Error::with_message(ErrorCode::Internal, "no connection"))?
+            };
+            conn.dbs
+                .get(db_idx as usize)
+                .and_then(|db| db.schema.as_ref())
+                .ok_or_else(|| Error::with_message(ErrorCode::Internal, "no attached schema"))?
+                .read()
+                .map_err(|_| {
+                    Error::with_message(ErrorCode::Internal, "attached schema lock failed")
+                })?
+        };
 
         // Find the _node shadow table
         let node_table_name = format!("{}_node", table_name);
@@ -8676,17 +8859,40 @@ impl Vdbe {
         table_name: &str,
         rowid: i64,
         rtree: &crate::rtree::RtreeTable,
+        db_idx: i32,
     ) -> Result<()> {
         use crate::storage::btree::{BtreeCursorFlags, BtreeInsertFlags, BtreePayload};
         use crate::vdbe::auxdata::make_record;
 
-        // Get the schema to find shadow table root pages
-        let schema_guard = self
-            .schema
-            .as_ref()
-            .ok_or_else(|| Error::with_message(ErrorCode::Internal, "no schema"))?
-            .read()
-            .map_err(|_| Error::with_message(ErrorCode::Internal, "schema lock failed"))?;
+        // Get the schema for the specified database
+        let schema_guard = if db_idx == 0 {
+            self.schema
+                .as_ref()
+                .ok_or_else(|| Error::with_message(ErrorCode::Internal, "no schema"))?
+                .read()
+                .map_err(|_| Error::with_message(ErrorCode::Internal, "schema lock failed"))?
+        } else if db_idx == 1 {
+            self.temp_schema
+                .as_ref()
+                .ok_or_else(|| Error::with_message(ErrorCode::Internal, "no temp schema"))?
+                .read()
+                .map_err(|_| Error::with_message(ErrorCode::Internal, "temp schema lock failed"))?
+        } else {
+            // Attached database
+            let conn = unsafe {
+                &*self
+                    .conn_ptr
+                    .ok_or_else(|| Error::with_message(ErrorCode::Internal, "no connection"))?
+            };
+            conn.dbs
+                .get(db_idx as usize)
+                .and_then(|db| db.schema.as_ref())
+                .ok_or_else(|| Error::with_message(ErrorCode::Internal, "no attached schema"))?
+                .read()
+                .map_err(|_| {
+                    Error::with_message(ErrorCode::Internal, "attached schema lock failed")
+                })?
+        };
 
         // Find the _rowid shadow table
         let rowid_table_name = format!("{}_rowid", table_name);

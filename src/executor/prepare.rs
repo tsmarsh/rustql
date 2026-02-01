@@ -1354,14 +1354,14 @@ impl<'s> StatementCompiler<'s> {
             for (table_name, sql) in shadow_tables {
                 ops.push(Self::make_op(
                     Opcode::CreateBtree,
-                    0,
+                    db_idx,
                     reg_root_page,
                     BTREE_INTKEY as i32,
                     P4::Unused,
                 ));
                 ops.push(Self::make_op(
                     Opcode::ParseSchema,
-                    0,
+                    db_idx,
                     reg_root_page,
                     0,
                     P4::Text(sql.clone()),
@@ -1387,7 +1387,7 @@ impl<'s> StatementCompiler<'s> {
         let create_sql = self.build_create_virtual_table_sql(create);
         ops.push(Self::make_op(
             Opcode::ParseSchema,
-            0,
+            db_idx,
             reg_root_page,
             0,
             P4::Text(create_sql.clone()),

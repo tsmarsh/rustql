@@ -14,12 +14,15 @@ use std::ffi::c_void;
 use std::ffi::CString;
 use std::os::raw::c_int;
 
+use std::sync::Arc;
+
 use super::ffi::{
     Tcl_CreateObjCommand, Tcl_Interp, Tcl_NewIntObj, Tcl_Obj, Tcl_SetVar, Tcl_SetVar2Ex,
     TCL_GLOBAL_ONLY, TCL_OK,
 };
 use super::helpers::{set_result_int, set_result_string};
 use super::md5::md5_cmd;
+use super::CONNECTIONS;
 
 // Database commands from db module
 use super::db::{
@@ -157,7 +160,6 @@ pub unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         "sqlite3_sql",
         "sqlite3_expanded_sql",
         "sqlite3_normalized_sql",
-        "register_echo_module",
         "register_tclvar_module",
         "register_fs_module",
         "register_wholenumber_module",
@@ -505,7 +507,7 @@ pub unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         ("view", "1"),
         ("trigger", "0"), // Triggers not fully supported yet
         ("foreignkey", "0"),
-        ("vtab", "0"), // Virtual tables not supported
+        ("vtab", "1"), // Virtual tables supported
         ("auth", "0"), // Authorization not supported
         ("like_opt", "1"),
         ("cursorhints", "0"),
@@ -688,6 +690,16 @@ pub unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         None,
     );
 
+    // Register echo module command - registers the echo test virtual table
+    let cmd_name = CString::new("register_echo_module").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(register_echo_module_cmd),
+        std::ptr::null_mut(),
+        None,
+    );
+
     // Register sqlite3_db_config_lookaside - configures per-connection lookaside memory
     // Used by printf.test, altermalloc.test, analyze9.test, dbstatus.test, and others
     let cmd_name = CString::new("sqlite3_db_config_lookaside").unwrap();
@@ -825,5 +837,33 @@ unsafe extern "C" fn test_stub_status(
     _objv: *const *mut Tcl_Obj,
 ) -> c_int {
     set_result_string(interp, "0 0 0");
+    TCL_OK
+}
+
+/// Register echo module - registers the echo test virtual table module
+///
+/// Usage: register_echo_module DB
+/// Registers the "echo" virtual table module with the database connection.
+/// The echo module creates virtual tables that mirror real tables.
+unsafe extern "C" fn register_echo_module_cmd(
+    _client_data: *mut c_void,
+    interp: *mut Tcl_Interp,
+    _objc: c_int,
+    _objv: *const *mut Tcl_Obj,
+) -> c_int {
+    // Register the echo module with the vtab registry
+    // The echo module will be available for all connections
+    CONNECTIONS.with(|connections| {
+        let connections = connections.borrow();
+        if let Some(conn) = connections.values().next() {
+            // Get the vtab registry from the connection
+            use super::echo::EchoModule;
+            if let Err(e) = conn.vtab_registry.register_module(Arc::new(EchoModule)) {
+                eprintln!("Failed to register echo module: {}", e);
+            }
+        }
+    });
+
+    set_result_int(interp, 0);
     TCL_OK
 }

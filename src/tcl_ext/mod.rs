@@ -22,6 +22,7 @@ use crate::{sqlite3_initialize, SqliteConnection};
 
 // Submodules
 pub mod db;
+pub mod echo;
 pub mod ffi;
 pub mod helpers;
 pub mod md5;

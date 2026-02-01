@@ -7636,6 +7636,11 @@ impl<'s> SelectCompiler<'s> {
                 negated,
             } => {
                 // Compile IN expression
+                // SQLite NULL handling:
+                // - If LHS is NULL → result is NULL
+                // - If LHS matches any RHS value → TRUE (1)
+                // - If LHS doesn't match and any RHS is NULL → NULL
+                // - Otherwise → FALSE (0)
                 let val_reg = self.alloc_reg();
                 self.compile_expr(val_expr, val_reg)?;
 
@@ -7652,16 +7657,34 @@ impl<'s> SelectCompiler<'s> {
                             );
                         } else {
                             let match_label = self.alloc_label();
+                            let null_label = self.alloc_label();
                             let end_label = self.alloc_label();
+
+                            // If LHS is NULL, jump to null result
+                            self.emit(Opcode::IsNull, val_reg, null_label, 0, P4::Unused);
+
+                            // Track if any RHS value is NULL (for proper NULL propagation)
+                            // We use a register to track if we've seen a NULL in RHS
+                            let saw_null_reg = self.alloc_reg();
+                            self.emit(Opcode::Integer, 0, saw_null_reg, 0, P4::Unused);
 
                             for value in values {
                                 let cmp_reg = self.alloc_reg();
                                 self.compile_expr(value, cmp_reg)?;
                                 // If equal, jump to match
                                 self.emit(Opcode::Eq, val_reg, match_label, cmp_reg, P4::Unused);
+                                // If RHS is NULL, mark that we saw a NULL
+                                // (comparison with NULL doesn't jump, so we continue)
+                                let skip_null_mark = self.alloc_label();
+                                self.emit(Opcode::NotNull, cmp_reg, skip_null_mark, 0, P4::Unused);
+                                self.emit(Opcode::Integer, 1, saw_null_reg, 0, P4::Unused);
+                                self.resolve_label(skip_null_mark, self.current_addr());
                             }
 
-                            // No match found
+                            // No match found - check if we saw any NULL in RHS
+                            self.emit(Opcode::IfPos, saw_null_reg, null_label, 1, P4::Unused);
+
+                            // No match and no NULLs - result is FALSE
                             self.emit(
                                 Opcode::Integer,
                                 if *negated { 1 } else { 0 },
@@ -7669,6 +7692,11 @@ impl<'s> SelectCompiler<'s> {
                                 0,
                                 P4::Unused,
                             );
+                            self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+
+                            // NULL result (LHS was NULL or no match but RHS had NULL)
+                            self.resolve_label(null_label, self.current_addr());
+                            self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
                             self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
 
                             // Match found

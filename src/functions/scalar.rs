@@ -164,8 +164,15 @@ pub fn func_abs(args: &[Value]) -> Result<Value> {
 }
 
 /// max(X, Y, ...) - Return the maximum value
+/// Note: The scalar max() with multiple arguments returns NULL if ANY argument is NULL.
+/// This is different from the aggregate max() which ignores NULL.
 pub fn func_max(args: &[Value]) -> Result<Value> {
     if args.is_empty() {
+        return Ok(Value::Null);
+    }
+
+    // Scalar min/max return NULL if any argument is NULL
+    if args.iter().any(|v| matches!(v, Value::Null)) {
         return Ok(Value::Null);
     }
 
@@ -179,8 +186,15 @@ pub fn func_max(args: &[Value]) -> Result<Value> {
 }
 
 /// min(X, Y, ...) - Return the minimum value
+/// Note: The scalar min() with multiple arguments returns NULL if ANY argument is NULL.
+/// This is different from the aggregate min() which ignores NULL.
 pub fn func_min(args: &[Value]) -> Result<Value> {
     if args.is_empty() {
+        return Ok(Value::Null);
+    }
+
+    // Scalar min/max return NULL if any argument is NULL
+    if args.iter().any(|v| matches!(v, Value::Null)) {
         return Ok(Value::Null);
     }
 

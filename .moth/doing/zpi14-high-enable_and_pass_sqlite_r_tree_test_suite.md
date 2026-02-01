@@ -16,6 +16,7 @@
 - [x] Auto-rowid assignment (generate rowid when not specified)
 - [x] DELETE support with shadow table persistence
 - [x] UPDATE support with shadow table persistence
+- [x] Constraint validation (coord[N] <= coord[N+1])
 
 ### Test Results (Manual)
 - CREATE VIRTUAL TABLE: PASS
@@ -28,6 +29,7 @@
 - DROP TABLE: PASS (shadow tables cascade)
 - DELETE: PASS (persists to shadow tables)
 - UPDATE: PASS (persists to shadow tables)
+- Constraint validation: PASS (rejects min > max coordinates)
 
 ### Remaining Work
 1. **rtreedepth() function**: Extract depth from node blob
@@ -35,8 +37,7 @@
 3. **rtreecheck() function**: Validate R-tree integrity
 4. **pragma table_list shadow support**: Show shadow tables in pragma
 5. **ATTACH database R-tree support**: Create R-tree in attached DB
-6. **Constraint validation**: Ensure coord[N] <= coord[N+1]
-7. **ON CONFLICT support**: Handle conflict clauses
+6. **ON CONFLICT support**: Handle conflict clauses
 
 ### Blocking
 - Test infrastructure functions need to be registered as custom functions

@@ -4265,6 +4265,21 @@ impl Vdbe {
                                         if std::env::var("VDBE_TRACE").is_ok() {
                                             eprintln!("  R-tree coords: {:?}", coords);
                                         }
+                                        // Validate that coord[2*i] <= coord[2*i+1] (min <= max)
+                                        let n_dim = coords.len() / 2;
+                                        let mut valid = true;
+                                        for i in 0..n_dim {
+                                            if coords[2 * i] > coords[2 * i + 1] {
+                                                valid = false;
+                                                break;
+                                            }
+                                        }
+                                        if !valid {
+                                            return Err(Error::with_message(
+                                                ErrorCode::Constraint,
+                                                "rtree constraint failed: coord[N] > coord[N+1]",
+                                            ));
+                                        }
                                         if let Err(e) = table.insert(rtree_rowid, &coords) {
                                             eprintln!("R-tree insert error: {:?}", e);
                                         } else {

@@ -90,6 +90,9 @@ pub struct SelectCompiler<'s> {
     agg_final_regs: Vec<i32>,
     /// Current index into agg_final_regs when compiling expressions
     agg_final_idx: usize,
+    /// GROUP BY column registers for substitution during finalization
+    /// Maps column name (lowercase) to register containing the group key value
+    group_column_regs: HashMap<String, i32>,
     /// Number of columns in compound select (for UNION, INTERSECT, EXCEPT output)
     compound_column_count: usize,
     /// Aliases from compound SELECT parts (for ORDER BY resolution)
@@ -165,6 +168,7 @@ impl<'s> SelectCompiler<'s> {
             order_by_terms: None,
             agg_final_regs: Vec::new(),
             agg_final_idx: 0,
+            group_column_regs: HashMap::new(),
             compound_column_count: 0,
             short_column_names: true, // Default ON
             full_column_names: false, // Default OFF
@@ -225,6 +229,7 @@ impl<'s> SelectCompiler<'s> {
             order_by_terms: None,
             agg_final_regs: Vec::new(),
             agg_final_idx: 0,
+            group_column_regs: HashMap::new(),
             compound_column_count: 0,
             short_column_names: true, // Default ON
             full_column_names: false, // Default OFF
@@ -6038,6 +6043,14 @@ impl<'s> SelectCompiler<'s> {
                     }
                 }
 
+                // Check if this column is a GROUP BY column during finalization
+                // This handles expressions like log*2+1 where log is the GROUP BY key
+                let col_name_lower = col_ref.column.to_lowercase();
+                if let Some(&group_reg) = self.group_column_regs.get(&col_name_lower) {
+                    self.emit(Opcode::SCopy, group_reg, dest_reg, 0, P4::Unused);
+                    return Ok(());
+                }
+
                 // Find the table and column index
                 let (cursor, col_idx) = if let Some(table) = &col_ref.table {
                     // Resolve table name with scoping (local first, then outer)
@@ -8002,6 +8015,19 @@ impl<'s> SelectCompiler<'s> {
         let mut count = 0;
         let mut agg_idx = 0;
 
+        // Populate group_column_regs for GROUP BY column substitution
+        // This allows expressions like log*2+1 to read `log` from group registers
+        if let Some(group_exprs) = group_by {
+            for (i, group_expr) in group_exprs.iter().enumerate() {
+                // Extract column name from simple column references
+                if let Expr::Column(col_ref) = group_expr {
+                    let col_name_lower = col_ref.column.to_lowercase();
+                    self.group_column_regs
+                        .insert(col_name_lower, group_regs + i as i32);
+                }
+            }
+        }
+
         for (col_idx, col) in columns.iter().enumerate() {
             let dest_reg = dest_regs[col_idx];
             if let ResultColumn::Expr { expr, alias } = col {
@@ -8118,6 +8144,9 @@ impl<'s> SelectCompiler<'s> {
             count += 1;
         }
 
+        // Clear group column substitution context
+        self.group_column_regs.clear();
+
         Ok((base_reg, count))
     }
 
@@ -8171,6 +8200,28 @@ impl<'s> SelectCompiler<'s> {
             (Expr::Parens(e1), Expr::Parens(e2)) => self.exprs_equal(e1, e2),
             (Expr::Parens(e1), e2) => self.exprs_equal(e1, e2),
             (e1, Expr::Parens(e2)) => self.exprs_equal(e1, e2),
+            (
+                Expr::Binary {
+                    op: op1,
+                    left: left1,
+                    right: right1,
+                },
+                Expr::Binary {
+                    op: op2,
+                    left: left2,
+                    right: right2,
+                },
+            ) => op1 == op2 && self.exprs_equal(left1, left2) && self.exprs_equal(right1, right2),
+            (
+                Expr::Unary {
+                    op: op1,
+                    expr: expr1,
+                },
+                Expr::Unary {
+                    op: op2,
+                    expr: expr2,
+                },
+            ) => op1 == op2 && self.exprs_equal(expr1, expr2),
             _ => false,
         }
     }

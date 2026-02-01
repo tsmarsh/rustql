@@ -37,7 +37,7 @@ pub use state::{
 use state::{
     inc_like_count, inc_search_count, inc_sort_count, inc_step_count, DEFAULT_CURSOR_SLOTS,
     DEFAULT_MEM_SIZE, OE_ABORT, OE_FAIL, OE_IGNORE, OE_MASK, OE_NONE, OE_REPLACE, OE_ROLLBACK,
-    OPFLAG_APPEND, OPFLAG_ISUPDATE, OPFLAG_LASTROWID, OPFLAG_NCHANGE, VDBE_MAGIC_DEAD,
+    OE_SHIFT, OPFLAG_APPEND, OPFLAG_ISUPDATE, OPFLAG_LASTROWID, OPFLAG_NCHANGE, VDBE_MAGIC_DEAD,
     VDBE_MAGIC_HALT, VDBE_MAGIC_INIT, VDBE_MAGIC_RUN,
 };
 
@@ -4280,16 +4280,59 @@ impl Vdbe {
                                                 "rtree constraint failed: coord[N] > coord[N+1]",
                                             ));
                                         }
-                                        if let Err(e) = table.insert(rtree_rowid, &coords) {
-                                            eprintln!("R-tree insert error: {:?}", e);
-                                        } else {
-                                            if std::env::var("VDBE_TRACE").is_ok() {
-                                                eprintln!("  R-tree insert success!");
+
+                                        // Handle ON CONFLICT for R-tree
+                                        // OE values are in upper byte of P5 (shifted by OE_SHIFT)
+                                        let on_error = match &op.p4 {
+                                            P4::Int64(flags) => (*flags as u8) & OE_MASK,
+                                            _ => ((op.p5 >> OE_SHIFT) as u8) & OE_MASK,
+                                        };
+                                        let entry_exists = table.get(rtree_rowid).is_some();
+                                        if std::env::var("VDBE_TRACE").is_ok() {
+                                            eprintln!(
+                                                "  R-tree conflict: on_error={}, entry_exists={}, p5={}",
+                                                on_error, entry_exists, op.p5
+                                            );
+                                        }
+
+                                        let should_insert = if entry_exists {
+                                            match on_error {
+                                                OE_REPLACE => {
+                                                    // Delete existing entry first
+                                                    let _ = table.delete(rtree_rowid);
+                                                    true
+                                                }
+                                                OE_IGNORE => {
+                                                    // Skip insert
+                                                    false
+                                                }
+                                                OE_ABORT | OE_ROLLBACK | OE_FAIL => {
+                                                    return Err(Error::with_message(
+                                                        ErrorCode::Constraint,
+                                                        "UNIQUE constraint failed: R-tree rowid",
+                                                    ));
+                                                }
+                                                _ => true, // OE_NONE - allow duplicate (shouldn't happen)
                                             }
-                                            inserted = true;
-                                            // Save info for persistence after cursor borrow ends
-                                            rtree_persist_info =
-                                                Some((vtab_name.clone(), table_arc.clone()));
+                                        } else {
+                                            true
+                                        };
+
+                                        if should_insert {
+                                            if let Err(e) = table.insert(rtree_rowid, &coords) {
+                                                eprintln!("R-tree insert error: {:?}", e);
+                                            } else {
+                                                if std::env::var("VDBE_TRACE").is_ok() {
+                                                    eprintln!("  R-tree insert success!");
+                                                }
+                                                inserted = true;
+                                                // Save info for persistence after cursor borrow ends
+                                                rtree_persist_info =
+                                                    Some((vtab_name.clone(), table_arc.clone()));
+                                            }
+                                        } else {
+                                            // For IGNORE, consider it "inserted" for change count
+                                            inserted = false;
                                         }
                                     }
                                 }
@@ -4300,10 +4343,10 @@ impl Vdbe {
                         if let Some(ref btree) = btree_arc {
                             if let Some(ref mut bt_cursor) = cursor.btree_cursor {
                                 // Extract conflict resolution mode from P4 (if Int64) or P5
-                                // When P4 contains the table name (for triggers), conflict mode is in P5
+                                // When P4 contains the table name (for triggers), conflict mode is in upper byte of P5
                                 let on_error = match &op.p4 {
                                     P4::Int64(flags) => (*flags as u8) & OE_MASK,
-                                    _ => (op.p5 as u8) & OE_MASK,
+                                    _ => ((op.p5 >> OE_SHIFT) as u8) & OE_MASK,
                                 };
 
                                 // Check if rowid already exists (for conflict detection)
@@ -4401,10 +4444,8 @@ impl Vdbe {
                                         n_zero: 0,
                                     };
 
-                                    // Insert flags from P5 (exclude conflict resolution bits)
-                                    let flags = BtreeInsertFlags::from_bits_truncate(
-                                        (op.p5 as u8) & !OE_MASK,
-                                    );
+                                    // Insert flags from lower byte of P5 (OE values are in upper byte)
+                                    let flags = BtreeInsertFlags::from_bits_truncate(op.p5 as u8);
 
                                     // Perform the insert
                                     btree.insert(bt_cursor, &payload, flags, 0)?;
@@ -4577,9 +4618,7 @@ impl Vdbe {
                                         n_data: record_data.len() as i32,
                                         n_zero: 0,
                                     };
-                                    let flags = BtreeInsertFlags::from_bits_truncate(
-                                        (op.p5 as u8) & !OE_MASK,
-                                    );
+                                    let flags = BtreeInsertFlags::from_bits_truncate(op.p5 as u8);
                                     btree.insert(bt_cursor, &payload, flags, 0)?;
                                     inserted = true;
                                 }
@@ -5993,11 +6032,11 @@ impl Vdbe {
                 // IdxInsert P1 P2 P3: Insert record P2 into index P1
                 // For ephemeral indexes: insert into set
                 // For btree indexes: insert into btree
-                // P5 contains conflict resolution mode (OE_ABORT, OE_IGNORE, etc.)
+                // P5 upper byte contains conflict resolution mode (OE_ABORT, OE_IGNORE, etc.)
                 let record = self.mem(op.p2).to_blob();
                 let btree_arc = self.btree.clone();
                 let schema = self.schema.clone();
-                let on_error = (op.p5 as u8) & OE_MASK;
+                let on_error = ((op.p5 >> OE_SHIFT) as u8) & OE_MASK;
 
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if cursor.is_ephemeral {

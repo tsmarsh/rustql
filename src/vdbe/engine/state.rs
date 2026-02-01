@@ -36,6 +36,10 @@ pub const OE_REPLACE: u8 = 5;
 // Mask to extract conflict resolution from P5
 pub const OE_MASK: u8 = 0x1F;
 
+// Shift amount for conflict resolution in P5
+// OE values are stored in upper byte (bits 8-15) to avoid overlap with OPFLAGS in lower byte
+pub const OE_SHIFT: u16 = 8;
+
 // ============================================================================
 // Global Search Counter (for sqlite_search_count compatibility)
 // ============================================================================

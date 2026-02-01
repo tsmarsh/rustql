@@ -26,6 +26,10 @@ fn is_rowid_alias(name: &str) -> bool {
 /// Flag to indicate that this operation should update the change counter
 const OPFLAG_NCHANGE: u16 = 0x01;
 
+/// Shift amount for conflict resolution in P5
+/// OE values are stored in upper byte (bits 8-15) to avoid overlap with OPFLAGS
+const OE_SHIFT: u16 = 8;
+
 #[derive(Debug, Clone, Copy)]
 enum InsertColumnTarget {
     Rowid,
@@ -461,8 +465,8 @@ impl<'a> InsertCompiler<'a> {
             );
 
             // Insert the record
-            // Use P4::Table for table name (for triggers), conflict flags in P5
-            let flags = self.conflict_flags(conflict_action) as u16;
+            // Use P4::Table for table name (for triggers), conflict flags in upper byte of P5
+            let flags = (self.conflict_flags(conflict_action) as u16) << OE_SHIFT;
             self.emit_with_p5(
                 Opcode::Insert,
                 self.table_cursor,
@@ -822,8 +826,8 @@ impl<'a> InsertCompiler<'a> {
             P4::Unused,
         );
 
-        // Use P4::Table for table name (for triggers), conflict flags in P5
-        let flags = self.conflict_flags(conflict_action) as u16;
+        // Use P4::Table for table name (for triggers), conflict flags in upper byte of P5
+        let flags = (self.conflict_flags(conflict_action) as u16) << OE_SHIFT;
         self.emit_with_p5(
             Opcode::Insert,
             self.table_cursor,
@@ -1097,8 +1101,8 @@ impl<'a> InsertCompiler<'a> {
             P4::Unused,
         );
 
-        // Use P4::Table for table name (for triggers), conflict flags in P5
-        let flags = self.conflict_flags(conflict_action) as u16;
+        // Use P4::Table for table name (for triggers), conflict flags in upper byte of P5
+        let flags = (self.conflict_flags(conflict_action) as u16) << OE_SHIFT;
         self.emit_with_p5(
             Opcode::Insert,
             self.table_cursor,
@@ -1617,8 +1621,8 @@ impl<'a> InsertCompiler<'a> {
             P4::Unused,
         );
 
-        // Use P4::Table for table name (for triggers), conflict flags in P5
-        let flags = self.conflict_flags(conflict_action) as u16;
+        // Use P4::Table for table name (for triggers), conflict flags in upper byte of P5
+        let flags = (self.conflict_flags(conflict_action) as u16) << OE_SHIFT;
         self.emit_with_p5(
             Opcode::Insert,
             self.table_cursor,

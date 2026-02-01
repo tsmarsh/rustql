@@ -1440,6 +1440,145 @@ fn load_schema_from_btree(btree: &Arc<Btree>, schema: &mut Schema) -> Result<()>
         }
     }
 
+    // Load R-tree data from shadow tables
+    load_rtree_shadow_data(btree, schema)?;
+
+    Ok(())
+}
+
+/// Load R-tree virtual tables from shadow tables (_node, _rowid, _parent)
+fn load_rtree_shadow_data(btree: &Arc<Btree>, schema: &Schema) -> Result<()> {
+    // Find R-tree tables by looking for tables with "_node" shadow tables
+    let mut rtree_names = Vec::new();
+    for table_name in schema.tables.keys() {
+        if table_name.ends_with("_node") {
+            // The base table name is everything before "_node"
+            let base_name = &table_name[..table_name.len() - 5];
+            // Check if this is actually an R-tree (has module = "rtree")
+            if let Some(base_table) = schema.tables.get(base_name) {
+                if base_table.is_virtual {
+                    rtree_names.push(base_name.to_string());
+                }
+            }
+        }
+    }
+
+    for rtree_name in rtree_names {
+        // Get shadow table root pages
+        let node_table_name = format!("{}_node", rtree_name);
+        let rowid_table_name = format!("{}_rowid", rtree_name);
+        let parent_table_name = format!("{}_parent", rtree_name);
+
+        let node_root = schema.table(&node_table_name).map(|t| t.root_page);
+        let rowid_root = schema.table(&rowid_table_name).map(|t| t.root_page);
+        let parent_root = schema.table(&parent_table_name).map(|t| t.root_page);
+
+        if node_root.is_none() || rowid_root.is_none() || parent_root.is_none() {
+            continue;
+        }
+        let node_root = node_root.unwrap();
+        let rowid_root = rowid_root.unwrap();
+        let parent_root = parent_root.unwrap();
+
+        // Read _node table
+        let mut node_data = Vec::new();
+        if let Ok(mut cursor) = btree.cursor(node_root, BtreeCursorFlags::empty(), None) {
+            let empty = cursor.first()?;
+            if !empty {
+                loop {
+                    let key = cursor.info.n_key;
+                    let payload = cursor.info.payload.clone().unwrap_or_default();
+                    // Record: (nodeno INTEGER, data BLOB)
+                    if let Ok(values) = decode_record_values(&payload, 2) {
+                        let nodeno = values.get(0).map(|m| m.to_int()).unwrap_or(key);
+                        let data = values.get(1).map(|m| m.to_blob()).unwrap_or_default();
+                        node_data.push((nodeno, data));
+                    }
+                    cursor.next(0)?;
+                    if cursor.state != CursorState::Valid {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Read _rowid table
+        let mut rowid_mappings = Vec::new();
+        if let Ok(mut cursor) = btree.cursor(rowid_root, BtreeCursorFlags::empty(), None) {
+            let empty = cursor.first()?;
+            if !empty {
+                loop {
+                    let key = cursor.info.n_key;
+                    let payload = cursor.info.payload.clone().unwrap_or_default();
+                    // Record: (rowid INTEGER, nodeno INTEGER)
+                    if let Ok(values) = decode_record_values(&payload, 2) {
+                        let rowid = values.get(0).map(|m| m.to_int()).unwrap_or(key);
+                        let nodeno = values.get(1).map(|m| m.to_int()).unwrap_or(1);
+                        rowid_mappings.push((rowid, nodeno));
+                    }
+                    cursor.next(0)?;
+                    if cursor.state != CursorState::Valid {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Read _parent table
+        let mut parent_mappings = Vec::new();
+        if let Ok(mut cursor) = btree.cursor(parent_root, BtreeCursorFlags::empty(), None) {
+            let empty = cursor.first()?;
+            if !empty {
+                loop {
+                    let key = cursor.info.n_key;
+                    let payload = cursor.info.payload.clone().unwrap_or_default();
+                    // Record: (nodeno INTEGER, parentnode INTEGER)
+                    if let Ok(values) = decode_record_values(&payload, 2) {
+                        let nodeno = values.get(0).map(|m| m.to_int()).unwrap_or(key);
+                        let parentnode = values.get(1).map(|m| m.to_int()).unwrap_or(0);
+                        parent_mappings.push((nodeno, parentnode));
+                    }
+                    cursor.next(0)?;
+                    if cursor.state != CursorState::Valid {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Get n_dim from the base table definition (count coordinate columns / 2)
+        let n_dim = if let Some(table) = schema.tables.get(&rtree_name) {
+            // R-tree columns: id, minX, maxX, minY, maxY, ... -> n_coord = columns - 1, n_dim = n_coord / 2
+            let n_coord = if table.columns.len() > 1 {
+                table.columns.len() - 1
+            } else {
+                0
+            };
+            n_coord / 2
+        } else {
+            2 // Default to 2D
+        };
+
+        if n_dim == 0 {
+            continue;
+        }
+
+        // Load R-tree from shadow data
+        if !node_data.is_empty() {
+            if let Ok(rtree_table) = crate::rtree::RtreeTable::load_from_shadow_data(
+                n_dim,
+                0,
+                node_data,
+                rowid_mappings,
+                parent_mappings,
+            ) {
+                // Register the loaded R-tree
+                let full_name = format!("main.{}", rtree_name);
+                crate::rtree_vtab::register_table(&full_name, rtree_table);
+            }
+        }
+    }
+
     Ok(())
 }
 

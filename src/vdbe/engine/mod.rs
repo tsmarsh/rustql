@@ -4117,6 +4117,12 @@ impl Vdbe {
                 let mut fire_delete_trigger_for: Option<String> = None;
                 let mut need_recheck_after_trigger = false;
 
+                // Track R-tree table for persistence after cursor borrow ends
+                let mut rtree_persist_info: Option<(
+                    String,
+                    std::sync::Arc<std::sync::Mutex<crate::rtree::RtreeTable>>,
+                )> = None;
+
                 // Pre-calculate the column name for rowid constraint errors
                 // For INTEGER PRIMARY KEY columns, use the column name instead of "rowid"
                 let ipk_column_name: Option<String> = {
@@ -4249,6 +4255,9 @@ impl Vdbe {
                                                 eprintln!("  R-tree insert success!");
                                             }
                                             inserted = true;
+                                            // Save info for persistence after cursor borrow ends
+                                            rtree_persist_info =
+                                                Some((vtab_name.clone(), table_arc.clone()));
                                         }
                                     }
                                 }
@@ -4566,6 +4575,17 @@ impl Vdbe {
                         self.fire_after_insert_triggers(table_name)?;
                     } else if let P4::Table(ref table_name) = op.p4 {
                         self.fire_after_insert_triggers(table_name)?;
+                    }
+                }
+
+                // Persist R-tree to shadow tables after cursor borrows end
+                if let Some((table_name, table_arc)) = rtree_persist_info {
+                    if let Some(ref btree) = btree_arc {
+                        if let Ok(rtree) = table_arc.lock() {
+                            if let Err(e) = self.persist_rtree_node(btree, &table_name, 0, &rtree) {
+                                eprintln!("R-tree persist error: {:?}", e);
+                            }
+                        }
                     }
                 }
             }
@@ -8077,8 +8097,12 @@ impl Vdbe {
             let mems = [Mem::from_int(nid), Mem::from_blob(&node_data)];
             let node_record = make_record(&mems, 0, mems.len() as i32);
 
-            // Insert into _node table
+            // Insert/replace into _node table - delete existing first
             let mut cursor = btree.cursor(node_root, BtreeCursorFlags::WRCSR, None)?;
+            if cursor.table_moveto(nid, false).ok() == Some(0) {
+                // Key exists, delete it
+                let _ = btree.delete(&mut cursor, BtreeInsertFlags::empty());
+            }
             let payload = BtreePayload {
                 key: None,
                 n_key: nid,
@@ -8089,26 +8113,31 @@ impl Vdbe {
             };
             btree.insert(&mut cursor, &payload, BtreeInsertFlags::empty(), 0)?;
 
-            // Write parent relationship to _parent table
-            let parent_id = rtree.get_parent(nid).unwrap_or(0);
-            let parent_mems = [Mem::from_int(nid), Mem::from_int(parent_id)];
-            let parent_record = make_record(&parent_mems, 0, parent_mems.len() as i32);
+            // Write parent relationship to _parent table (skip root node - it has no parent)
+            if let Some(parent_id) = rtree.get_parent(nid) {
+                let parent_mems = [Mem::from_int(nid), Mem::from_int(parent_id)];
+                let parent_record = make_record(&parent_mems, 0, parent_mems.len() as i32);
 
-            let mut parent_cursor = btree.cursor(parent_root, BtreeCursorFlags::WRCSR, None)?;
-            let parent_payload = BtreePayload {
-                key: None,
-                n_key: nid,
-                data: Some(parent_record.clone()),
-                mem: Vec::new(),
-                n_data: parent_record.len() as i32,
-                n_zero: 0,
-            };
-            btree.insert(
-                &mut parent_cursor,
-                &parent_payload,
-                BtreeInsertFlags::empty(),
-                0,
-            )?;
+                let mut parent_cursor = btree.cursor(parent_root, BtreeCursorFlags::WRCSR, None)?;
+                if parent_cursor.table_moveto(nid, false).ok() == Some(0) {
+                    // Key exists, delete it
+                    let _ = btree.delete(&mut parent_cursor, BtreeInsertFlags::empty());
+                }
+                let parent_payload = BtreePayload {
+                    key: None,
+                    n_key: nid,
+                    data: Some(parent_record.clone()),
+                    mem: Vec::new(),
+                    n_data: parent_record.len() as i32,
+                    n_zero: 0,
+                };
+                btree.insert(
+                    &mut parent_cursor,
+                    &parent_payload,
+                    BtreeInsertFlags::empty(),
+                    0,
+                )?;
+            }
         }
 
         // Write rowid mappings to _rowid table
@@ -8117,6 +8146,10 @@ impl Vdbe {
             let rowid_record = make_record(&rowid_mems, 0, rowid_mems.len() as i32);
 
             let mut rowid_cursor = btree.cursor(rowid_root, BtreeCursorFlags::WRCSR, None)?;
+            if rowid_cursor.table_moveto(rid, false).ok() == Some(0) {
+                // Key exists, delete it
+                let _ = btree.delete(&mut rowid_cursor, BtreeInsertFlags::empty());
+            }
             let rowid_payload = BtreePayload {
                 key: None,
                 n_key: rid,

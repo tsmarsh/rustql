@@ -683,14 +683,21 @@ impl RtreeTable {
     /// - For each entry:
     ///   - 8 bytes: rowid/child_id (big-endian i64)
     ///   - 4 * n_coord bytes: coordinates as big-endian f32
+    ///
+    /// Note: Output is padded to SQLite's fixed node size (RTREE_MAXCELLS=51)
     pub fn serialize_node(&self, node_id: i64) -> Result<Vec<u8>> {
         let node = self
             .nodes
             .get(&node_id)
             .ok_or_else(|| Error::with_message(ErrorCode::Error, "node not found"))?;
 
-        let bytes_per_cell = 8 + 4 * self.n_coord;
-        let mut data = Vec::with_capacity(4 + node.entries.len() * bytes_per_cell);
+        // SQLite uses fixed-size nodes: 4-byte header + MAXCELLS * bytes_per_cell
+        // RTREE_MAXCELLS = 51, bytes_per_cell = 8 + 8*n_dim
+        const RTREE_MAXCELLS: usize = 51;
+        let bytes_per_cell = 8 + 8 * self.n_dim;
+        let node_size = 4 + RTREE_MAXCELLS * bytes_per_cell;
+
+        let mut data = vec![0u8; node_size];
 
         // 2 bytes: tree depth (only meaningful for root)
         let depth = if node_id == self.root_id {
@@ -698,23 +705,27 @@ impl RtreeTable {
         } else {
             0u16
         };
-        data.extend_from_slice(&depth.to_be_bytes());
+        data[0..2].copy_from_slice(&depth.to_be_bytes());
 
         // 2 bytes: number of entries
         let n_entries = node.entries.len() as u16;
-        data.extend_from_slice(&n_entries.to_be_bytes());
+        data[2..4].copy_from_slice(&n_entries.to_be_bytes());
 
         // Each entry
+        let mut offset = 4;
         for entry in &node.entries {
             // 8 bytes: rowid or child node id
-            data.extend_from_slice(&entry.id.to_be_bytes());
+            data[offset..offset + 8].copy_from_slice(&entry.id.to_be_bytes());
+            offset += 8;
 
             // Coordinates as f32 (4 bytes each)
             for i in 0..self.n_dim {
                 let min_f32 = entry.bbox.min[i] as f32;
                 let max_f32 = entry.bbox.max[i] as f32;
-                data.extend_from_slice(&min_f32.to_be_bytes());
-                data.extend_from_slice(&max_f32.to_be_bytes());
+                data[offset..offset + 4].copy_from_slice(&min_f32.to_be_bytes());
+                offset += 4;
+                data[offset..offset + 4].copy_from_slice(&max_f32.to_be_bytes());
+                offset += 4;
             }
         }
 

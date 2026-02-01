@@ -2983,8 +2983,15 @@ impl<'s> SelectCompiler<'s> {
             .collect();
 
         // Count total columns needed in sorter: group columns + aggregate arguments + non-agg result cols
+        // Also include HAVING aggregate arguments since they need to be stored in the sorter
         let num_group_cols = resolved_group_by.len();
-        let num_agg_args = self.count_aggregate_args(&core.columns);
+        let num_col_agg_args = self.count_aggregate_args(&core.columns);
+        let num_having_agg_args = core
+            .having
+            .as_ref()
+            .map(|h| self.count_aggregate_args_in_expr(h))
+            .unwrap_or(0);
+        let num_agg_args = num_col_agg_args + num_having_agg_args;
         let num_non_agg_cols =
             self.count_non_agg_result_cols(&core.columns, Some(&resolved_group_by));
         let total_sorter_cols = num_group_cols + num_agg_args + num_non_agg_cols;
@@ -3032,8 +3039,15 @@ impl<'s> SelectCompiler<'s> {
         // Evaluate GROUP BY expressions (with aliases resolved) and store in sorter
         let group_regs = self.compile_expressions(&resolved_group_by)?;
 
-        // Evaluate aggregate arguments
+        // Evaluate aggregate arguments from result columns
         let agg_arg_regs = self.compile_aggregate_args(&core.columns)?;
+
+        // Also evaluate aggregate arguments from HAVING clause
+        let having_agg_args_count = if let Some(having) = &core.having {
+            self.compile_aggregate_args_in_expr(having)?
+        } else {
+            0
+        };
 
         // Evaluate non-aggregate result columns (these can't be read after table cursors close)
         let (non_agg_base_reg, non_agg_count, non_agg_indices) =
@@ -3043,8 +3057,8 @@ impl<'s> SelectCompiler<'s> {
         // Offset in sorter is num_group_cols + num_agg_args
         let non_agg_sorter_offset = num_group_cols + num_agg_args;
 
-        // Make record and insert into sorter (group cols + agg args + non-agg cols)
-        let total_cols = group_regs.1 + agg_arg_regs.1 + non_agg_count;
+        // Make record and insert into sorter (group cols + agg args + having agg args + non-agg cols)
+        let total_cols = group_regs.1 + agg_arg_regs.1 + having_agg_args_count + non_agg_count;
         let record_reg = self.alloc_reg();
         self.emit(
             Opcode::MakeRecord,
@@ -3087,8 +3101,20 @@ impl<'s> SelectCompiler<'s> {
             P4::Unused,
         );
 
-        // Initialize aggregates
-        let agg_regs = self.init_aggregates(&core.columns)?;
+        // Initialize aggregates from result columns
+        let mut agg_regs = self.init_aggregates(&core.columns)?;
+
+        // Also initialize HAVING aggregates
+        let num_having_aggs = core
+            .having
+            .as_ref()
+            .map(|h| self.count_aggregates_in_expr(h))
+            .unwrap_or(0);
+        for _ in 0..num_having_aggs {
+            let reg = self.alloc_reg();
+            self.emit(Opcode::Null, 0, reg, 0, P4::Unused);
+            agg_regs.push(reg);
+        }
 
         // Previous group key registers
         let prev_group_regs = self.alloc_regs(num_group_cols);
@@ -3184,6 +3210,20 @@ impl<'s> SelectCompiler<'s> {
                 .truncate(saved_result_column_names_prev);
         }
 
+        // Finalize HAVING aggregates (aggregates that appear in HAVING but not in result columns)
+        // and add them to agg_final_regs so they can be found during HAVING compilation
+        if num_having_aggs > 0 {
+            let having_agg_start_idx = agg_regs.len() - num_having_aggs;
+            for i in 0..num_having_aggs {
+                let agg_reg = agg_regs[having_agg_start_idx + i];
+                let result_reg = self.alloc_reg();
+                // Get the aggregate function name from the HAVING expression
+                let agg_name = self.get_aggregate_name_at_index(core.having.as_ref().unwrap(), i);
+                self.emit(Opcode::AggFinal, agg_reg, result_reg, 0, P4::Text(agg_name));
+                self.agg_final_regs.push(result_reg);
+            }
+        }
+
         // HAVING clause
         if let Some(having) = &core.having {
             // Reset agg_final_idx so HAVING expression can find finalized aggregates
@@ -3220,9 +3260,26 @@ impl<'s> SelectCompiler<'s> {
 
         self.resolve_label(same_group_label, self.current_addr());
 
-        // Accumulate current row into aggregates
+        // Accumulate current row into aggregates from result columns
         let agg_col_start = num_group_cols;
         self.accumulate_from_sorter(sorter_cursor, &core.columns, &agg_regs, agg_col_start)?;
+
+        // Also accumulate HAVING aggregates
+        if num_having_aggs > 0 {
+            if let Some(having) = &core.having {
+                let having_agg_start_idx = agg_regs.len() - num_having_aggs;
+                let mut having_agg_idx = having_agg_start_idx;
+                // HAVING aggregate args start after column aggregate args in the sorter
+                let mut having_col_idx = num_group_cols + num_col_agg_args;
+                self.accumulate_from_sorter_in_expr(
+                    sorter_cursor,
+                    having,
+                    &agg_regs,
+                    &mut having_agg_idx,
+                    &mut having_col_idx,
+                )?;
+            }
+        }
 
         // Copy non-aggregate values from sorter to saved registers
         // This captures the values for the current group (overwriting on each row,
@@ -3264,6 +3321,19 @@ impl<'s> SelectCompiler<'s> {
         )?;
         // Restore column names (don't double-count for final group output)
         self.result_column_names.truncate(saved_result_column_names);
+
+        // Finalize HAVING aggregates for final group
+        if num_having_aggs > 0 {
+            let having_agg_start_idx = agg_regs.len() - num_having_aggs;
+            for i in 0..num_having_aggs {
+                let agg_reg = agg_regs[having_agg_start_idx + i];
+                let result_reg = self.alloc_reg();
+                let agg_name = self.get_aggregate_name_at_index(core.having.as_ref().unwrap(), i);
+                self.emit(Opcode::AggFinal, agg_reg, result_reg, 0, P4::Text(agg_name));
+                self.agg_final_regs.push(result_reg);
+            }
+        }
+
         if let Some(having) = &core.having {
             // Reset agg_final_idx so HAVING expression can find finalized aggregates
             self.agg_final_idx = 0;

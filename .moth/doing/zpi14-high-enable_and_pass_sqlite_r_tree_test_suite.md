@@ -12,6 +12,9 @@
 - [x] R-tree data persistence across database close/reopen
 - [x] SQLite-compatible node blob format (1228 bytes for 2D)
 - [x] SQLite integrity_check passes on RustQL R-trees
+- [x] DROP TABLE cascades to shadow tables (xDestroy)
+- [x] Auto-rowid assignment (generate rowid when not specified)
+- [x] DELETE support with shadow table persistence
 
 ### Test Results (Manual)
 - CREATE VIRTUAL TABLE: PASS
@@ -21,20 +24,18 @@
 - Full scan: PASS
 - Spatial query: PASS
 - ID lookup: PASS
-- DROP TABLE: FAIL (shadow tables not cascaded)
+- DROP TABLE: PASS (shadow tables now cascade)
+- DELETE: PASS (persists to shadow tables)
 
 ### Remaining Work
-1. **xDestroy implementation**: DROP TABLE should cascade to shadow tables
-2. **rtreedepth() function**: Extract depth from node blob
-3. **rtreenode() function**: Parse node blob into TCL list
-4. **rtreecheck() function**: Validate R-tree integrity
-5. **pragma table_list shadow support**: Show shadow tables in pragma
-6. **ATTACH database R-tree support**: Create R-tree in attached DB
-7. **Constraint validation**: Ensure coord[N] <= coord[N+1]
-8. **Auto-rowid assignment**: Generate rowid when not specified
-9. **ON CONFLICT support**: Handle conflict clauses
-10. **UPDATE/DELETE support**: Modify R-tree entries
+1. **rtreedepth() function**: Extract depth from node blob
+2. **rtreenode() function**: Parse node blob into TCL list
+3. **rtreecheck() function**: Validate R-tree integrity
+4. **pragma table_list shadow support**: Show shadow tables in pragma
+5. **ATTACH database R-tree support**: Create R-tree in attached DB
+6. **Constraint validation**: Ensure coord[N] <= coord[N+1]
+7. **ON CONFLICT support**: Handle conflict clauses
+8. **UPDATE support**: Modify R-tree entries
 
 ### Blocking
-- xDestroy requires connection access to execute DROP on shadow tables
 - Test infrastructure functions need to be registered as custom functions

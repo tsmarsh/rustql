@@ -1578,7 +1578,6 @@ fn load_rtree_shadow_data(btree: &Arc<Btree>, schema: &Schema) -> Result<()> {
             }
         }
     }
-
     Ok(())
 }
 

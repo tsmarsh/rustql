@@ -2430,6 +2430,19 @@ impl Vdbe {
                                         }
                                     }
                                 }
+                                // R-tree handling
+                                if let Some(module) = vtab_module.as_ref() {
+                                    if module.eq_ignore_ascii_case("rtree") {
+                                        let rtree_full_name = format!("main.{}", vtab_name);
+                                        if let Some(table_arc) =
+                                            crate::rtree_vtab::get_table(&rtree_full_name)
+                                        {
+                                            if let Ok(table) = table_arc.lock() {
+                                                cursor.vtab_rowids = table.all_rowids();
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                         cursor.vtab_row_index = 0;
@@ -4747,6 +4760,12 @@ impl Vdbe {
                 let btree = btree_arc.clone();
                 let schema = self.schema.clone();
                 let mut deleted = false;
+                // For R-tree delete persistence: (table_name, rowid, table_arc)
+                let mut rtree_delete_info: Option<(
+                    String,
+                    i64,
+                    Arc<std::sync::Mutex<crate::rtree::RtreeTable>>,
+                )> = None;
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if cursor.is_virtual {
                         if let Some(rowid) = cursor.rowid {
@@ -4807,6 +4826,23 @@ impl Vdbe {
                                                 let _ = table.delete(rowid, &refs);
                                                 deleted = true;
                                             }
+                                        }
+                                    }
+                                }
+
+                                // R-tree delete
+                                let rtree_full_name = format!("main.{}", vtab_name);
+                                if let Some(table_arc) =
+                                    crate::rtree_vtab::get_table(&rtree_full_name)
+                                {
+                                    if let Ok(mut table) = table_arc.lock() {
+                                        if let Err(e) = table.delete(rowid) {
+                                            eprintln!("R-tree delete error: {:?}", e);
+                                        } else {
+                                            deleted = true;
+                                            // Capture info for persistence after cursor borrow ends
+                                            rtree_delete_info =
+                                                Some((vtab_name.clone(), rowid, table_arc.clone()));
                                         }
                                     }
                                 }
@@ -4872,6 +4908,19 @@ impl Vdbe {
                                         }
                                     }
                                 }
+                            }
+                        }
+                    }
+                }
+
+                // Persist R-tree deletion to shadow tables after cursor borrows end
+                if let Some((table_name, rowid, table_arc)) = rtree_delete_info {
+                    if let Some(ref btree) = btree_arc {
+                        if let Ok(table) = table_arc.lock() {
+                            if let Err(e) =
+                                self.delete_rtree_entry(btree, &table_name, rowid, &table)
+                            {
+                                eprintln!("R-tree delete persist error: {:?}", e);
                             }
                         }
                     }
@@ -8200,6 +8249,79 @@ impl Vdbe {
                 BtreeInsertFlags::empty(),
                 0,
             )?;
+        }
+
+        Ok(())
+    }
+
+    /// Delete an R-tree entry from shadow tables.
+    /// This removes the rowid from _rowid table and updates the node blob.
+    fn delete_rtree_entry(
+        &self,
+        btree: &Arc<Btree>,
+        table_name: &str,
+        rowid: i64,
+        rtree: &crate::rtree::RtreeTable,
+    ) -> Result<()> {
+        use crate::storage::btree::{BtreeCursorFlags, BtreeInsertFlags, BtreePayload};
+        use crate::vdbe::auxdata::make_record;
+
+        // Get the schema to find shadow table root pages
+        let schema_guard = self
+            .schema
+            .as_ref()
+            .ok_or_else(|| Error::with_message(ErrorCode::Internal, "no schema"))?
+            .read()
+            .map_err(|_| Error::with_message(ErrorCode::Internal, "schema lock failed"))?;
+
+        // Find the _rowid shadow table
+        let rowid_table_name = format!("{}_rowid", table_name);
+        let rowid_root = schema_guard
+            .table(&rowid_table_name)
+            .map(|t| t.root_page)
+            .ok_or_else(|| {
+                Error::with_message(ErrorCode::Error, "R-tree _rowid table not found")
+            })?;
+
+        // Find the _node shadow table
+        let node_table_name = format!("{}_node", table_name);
+        let node_root = schema_guard
+            .table(&node_table_name)
+            .map(|t| t.root_page)
+            .ok_or_else(|| Error::with_message(ErrorCode::Error, "R-tree _node table not found"))?;
+
+        drop(schema_guard);
+
+        // Delete the rowid entry from _rowid table
+        let mut rowid_cursor = btree.cursor(rowid_root, BtreeCursorFlags::WRCSR, None)?;
+        if rowid_cursor.table_moveto(rowid, false).ok() == Some(0) {
+            let _ = btree.delete(&mut rowid_cursor, BtreeInsertFlags::empty());
+        }
+
+        // Re-serialize all nodes to update the node blobs
+        // (the deleted entry is no longer in the in-memory tree)
+        for nid in rtree.all_node_ids() {
+            let node_data = rtree.serialize_node(nid)?;
+
+            // Create record for _node: (nodeno INTEGER PRIMARY KEY, data BLOB)
+            let mems = [Mem::from_int(nid), Mem::from_blob(&node_data)];
+            let node_record = make_record(&mems, 0, mems.len() as i32);
+
+            // Insert/replace into _node table - delete existing first
+            let mut cursor = btree.cursor(node_root, BtreeCursorFlags::WRCSR, None)?;
+            if cursor.table_moveto(nid, false).ok() == Some(0) {
+                // Key exists, delete it
+                let _ = btree.delete(&mut cursor, BtreeInsertFlags::empty());
+            }
+            let payload = BtreePayload {
+                key: None,
+                n_key: nid,
+                data: Some(node_record.clone()),
+                mem: Vec::new(),
+                n_data: node_record.len() as i32,
+                n_zero: 0,
+            };
+            btree.insert(&mut cursor, &payload, BtreeInsertFlags::empty(), 0)?;
         }
 
         Ok(())

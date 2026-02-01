@@ -833,6 +833,11 @@ impl RtreeTable {
         self.rowid_map.iter().map(|(k, v)| (*k, *v)).collect()
     }
 
+    /// Get all rowids in the R-tree
+    pub fn all_rowids(&self) -> Vec<i64> {
+        self.rowid_map.keys().copied().collect()
+    }
+
     /// Get parent node ID for a given node
     pub fn get_parent(&self, node_id: i64) -> Option<i64> {
         self.nodes.get(&node_id).and_then(|n| n.parent)

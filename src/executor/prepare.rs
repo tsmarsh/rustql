@@ -1260,6 +1260,32 @@ impl<'s> StatementCompiler<'s> {
                 );
             }
         }
+        if create.module.eq_ignore_ascii_case("rtree") {
+            let shadow_tables = self.build_rtree_shadow_tables(create);
+            for (table_name, sql) in shadow_tables {
+                ops.push(Self::make_op(
+                    Opcode::CreateBtree,
+                    0,
+                    reg_root_page,
+                    BTREE_INTKEY as i32,
+                    P4::Unused,
+                ));
+                ops.push(Self::make_op(
+                    Opcode::ParseSchema,
+                    0,
+                    reg_root_page,
+                    0,
+                    P4::Text(sql.clone()),
+                ));
+                self.append_sqlite_master_insert(
+                    &mut ops,
+                    sqlite_master_cursor,
+                    &table_name,
+                    reg_root_page,
+                    &sql,
+                );
+            }
+        }
 
         ops.push(Self::make_op(
             Opcode::Integer,
@@ -1659,6 +1685,50 @@ impl<'s> StatementCompiler<'s> {
         tables.push((
             config_name.clone(),
             format!("CREATE TABLE {} (k PRIMARY KEY, v)", config_name),
+        ));
+
+        tables
+    }
+
+    /// Build R-tree shadow tables for persistence
+    ///
+    /// SQLite R-tree uses three shadow tables:
+    /// - `{name}_node`: stores R-tree node data blobs
+    /// - `{name}_rowid`: maps user rowids to leaf node numbers
+    /// - `{name}_parent`: maps child nodes to parent nodes
+    fn build_rtree_shadow_tables(&self, create: &CreateVirtualTableStmt) -> Vec<(String, String)> {
+        let mut tables = Vec::new();
+        let name = &create.name.name;
+
+        // _node: stores R-tree node data blobs
+        // Root node is always nodeno=1
+        let node_name = format!("{}_node", name);
+        tables.push((
+            node_name.clone(),
+            format!(
+                "CREATE TABLE {} (nodeno INTEGER PRIMARY KEY, data BLOB)",
+                node_name
+            ),
+        ));
+
+        // _rowid: maps user rowids to the leaf node containing them
+        let rowid_name = format!("{}_rowid", name);
+        tables.push((
+            rowid_name.clone(),
+            format!(
+                "CREATE TABLE {} (rowid INTEGER PRIMARY KEY, nodeno INTEGER)",
+                rowid_name
+            ),
+        ));
+
+        // _parent: maps each node to its parent node (root has parent=NULL or 0)
+        let parent_name = format!("{}_parent", name);
+        tables.push((
+            parent_name.clone(),
+            format!(
+                "CREATE TABLE {} (nodeno INTEGER PRIMARY KEY, parentnode INTEGER)",
+                parent_name
+            ),
         ));
 
         tables

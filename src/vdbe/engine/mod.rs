@@ -2207,6 +2207,43 @@ impl Vdbe {
                                         }
                                     }
                                 }
+
+                                // R-tree legacy path
+                                if let Some(module) = vtab_module.as_ref() {
+                                    if module.eq_ignore_ascii_case("rtree") {
+                                        let rtree_full_name = format!("main.{}", vtab_name);
+                                        if let Some(table) =
+                                            crate::rtree_vtab::get_table(&rtree_full_name)
+                                        {
+                                            if let Ok(table) = table.lock() {
+                                                // Full scan for now - get all rowids
+                                                use crate::rtree::{RtreeBbox, RtreeConstraint};
+                                                let n_dim = table.n_dim;
+                                                let mut coords = Vec::with_capacity(n_dim * 2);
+                                                for _ in 0..n_dim {
+                                                    coords.push(f64::NEG_INFINITY);
+                                                    coords.push(f64::INFINITY);
+                                                }
+                                                if let Ok(bbox) = RtreeBbox::from_coords(&coords) {
+                                                    let results =
+                                                        table.query(RtreeConstraint::Overlap(bbox));
+                                                    cursor.vtab_rowids =
+                                                        results.iter().map(|r| r.rowid).collect();
+                                                } else {
+                                                    cursor.vtab_rowids = Vec::new();
+                                                }
+                                                cursor.vtab_row_index = 0;
+                                                if cursor.vtab_rowids.is_empty() {
+                                                    cursor.state = CursorState::AtEnd;
+                                                    cursor.rowid = None;
+                                                } else {
+                                                    cursor.state = CursorState::Valid;
+                                                    cursor.rowid = Some(cursor.vtab_rowids[0]);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -2275,6 +2312,17 @@ impl Vdbe {
                                         if let Ok(table) = table.lock() {
                                             vtab_count = table.all_rowids().len() as i64;
                                         }
+                                    }
+                                }
+                            }
+
+                            // R-tree count
+                            if vtab_count == 0 {
+                                let rtree_full_name = format!("main.{}", name);
+                                if let Some(table) = crate::rtree_vtab::get_table(&rtree_full_name)
+                                {
+                                    if let Ok(table) = table.lock() {
+                                        vtab_count = table.all_rowid_mappings().len() as i64;
                                     }
                                 }
                             }
@@ -2866,6 +2914,46 @@ impl Vdbe {
                                                 if let Some(values) = table.row_values(rowid) {
                                                     if let Some(value) = values.get(col_idx) {
                                                         result = Mem::from_str(value);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // R-tree Column handler
+                            if result.is_null() {
+                                let schema = self.schema.clone();
+                                let module = schema.as_ref().and_then(|schema| {
+                                    schema
+                                        .read()
+                                        .ok()
+                                        .and_then(|guard| guard.table(vtab_name))
+                                        .and_then(|table| table.virtual_module.clone())
+                                });
+                                if let Some(module) = module {
+                                    if module.eq_ignore_ascii_case("rtree") {
+                                        let rtree_full_name = format!("main.{}", vtab_name);
+                                        if let Some(table) =
+                                            crate::rtree_vtab::get_table(&rtree_full_name)
+                                        {
+                                            if let Ok(table) = table.lock() {
+                                                if let Some(rtree_result) = table.get(rowid) {
+                                                    if col_idx == 0 {
+                                                        result = Mem::from_int(rtree_result.rowid);
+                                                    } else {
+                                                        let coord_idx = col_idx - 1;
+                                                        let dim = coord_idx / 2;
+                                                        let is_max = coord_idx % 2 == 1;
+                                                        if dim < rtree_result.bbox.min.len() {
+                                                            let val = if is_max {
+                                                                rtree_result.bbox.max[dim]
+                                                            } else {
+                                                                rtree_result.bbox.min[dim]
+                                                            };
+                                                            result = Mem::from_real(val);
+                                                        }
                                                     }
                                                 }
                                             }
@@ -4116,6 +4204,52 @@ impl Vdbe {
                                             values.iter().map(|value| value.as_str()).collect();
                                         let _ = table.insert(rowid, &refs);
                                         inserted = true;
+                                    }
+                                }
+                            }
+
+                            // R-tree insert with shadow table persistence
+                            // Registry uses "main.<table>" format
+                            let rtree_full_name = format!("main.{}", vtab_name);
+                            if std::env::var("VDBE_TRACE").is_ok() {
+                                eprintln!("  R-tree lookup: {}", rtree_full_name);
+                            }
+                            if let Some(table_arc) = crate::rtree_vtab::get_table(&rtree_full_name)
+                            {
+                                if std::env::var("VDBE_TRACE").is_ok() {
+                                    eprintln!("  R-tree found!");
+                                }
+                                if let Ok(mut table) = table_arc.lock() {
+                                    // Extract coordinates from record
+                                    // R-tree columns: id, minX, maxX, minY, maxY, ...
+                                    // First column is the explicit ID, rest are coords
+                                    // Use record_mems[0] as the rowid, not the auto-generated one
+                                    let rtree_rowid = if !record_mems.is_empty() {
+                                        record_mems[0].to_int()
+                                    } else {
+                                        rowid
+                                    };
+                                    let n_coord = (record_mems.len() - 1).min(table.n_coord);
+                                    if std::env::var("VDBE_TRACE").is_ok() {
+                                        eprintln!("  R-tree insert: rowid={}, n_coord={}, record_mems.len()={}, table.n_coord={}",
+                                            rtree_rowid, n_coord, record_mems.len(), table.n_coord);
+                                    }
+                                    if n_coord >= 2 {
+                                        let coords: Vec<f64> = record_mems[1..=n_coord]
+                                            .iter()
+                                            .map(|m| m.to_real())
+                                            .collect();
+                                        if std::env::var("VDBE_TRACE").is_ok() {
+                                            eprintln!("  R-tree coords: {:?}", coords);
+                                        }
+                                        if let Err(e) = table.insert(rtree_rowid, &coords) {
+                                            eprintln!("R-tree insert error: {:?}", e);
+                                        } else {
+                                            if std::env::var("VDBE_TRACE").is_ok() {
+                                                eprintln!("  R-tree insert success!");
+                                            }
+                                            inserted = true;
+                                        }
                                     }
                                 }
                             }
@@ -7507,6 +7641,35 @@ impl Vdbe {
                                 }
                             }
 
+                            // R-tree column access
+                            if found_value.is_null() {
+                                let rtree_full_name = format!("main.{}", name);
+                                if let Some(table) = crate::rtree_vtab::get_table(&rtree_full_name)
+                                {
+                                    if let Ok(table) = table.lock() {
+                                        if let Some(result) = table.get(rid) {
+                                            if col_idx == 0 {
+                                                // id column
+                                                found_value = Mem::from_int(result.rowid);
+                                            } else {
+                                                // coordinate column
+                                                let coord_idx = col_idx - 1;
+                                                let dim = coord_idx / 2;
+                                                let is_max = coord_idx % 2 == 1;
+                                                if dim < result.bbox.min.len() {
+                                                    let val = if is_max {
+                                                        result.bbox.max[dim]
+                                                    } else {
+                                                        result.bbox.min[dim]
+                                                    };
+                                                    found_value = Mem::from_real(val);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             found_value
                         } else {
                             Mem::new()
@@ -7855,6 +8018,122 @@ impl Vdbe {
         self.cursors = saved_cursors;
 
         result
+    }
+
+    /// Persist an R-tree node and its children to shadow tables
+    ///
+    /// This writes the node data to the _node table, updates _rowid mappings,
+    /// and updates _parent relationships.
+    fn persist_rtree_node(
+        &self,
+        btree: &Arc<Btree>,
+        table_name: &str,
+        _node_id: i64,
+        rtree: &crate::rtree::RtreeTable,
+    ) -> Result<()> {
+        use crate::storage::btree::{BtreeCursorFlags, BtreeInsertFlags, BtreePayload};
+        use crate::vdbe::auxdata::make_record;
+
+        // Get the schema to find shadow table root pages
+        let schema_guard = self
+            .schema
+            .as_ref()
+            .ok_or_else(|| Error::with_message(ErrorCode::Internal, "no schema"))?
+            .read()
+            .map_err(|_| Error::with_message(ErrorCode::Internal, "schema lock failed"))?;
+
+        // Find the _node shadow table
+        let node_table_name = format!("{}_node", table_name);
+        let node_root = schema_guard
+            .table(&node_table_name)
+            .map(|t| t.root_page)
+            .ok_or_else(|| Error::with_message(ErrorCode::Error, "R-tree _node table not found"))?;
+
+        // Find the _rowid shadow table
+        let rowid_table_name = format!("{}_rowid", table_name);
+        let rowid_root = schema_guard
+            .table(&rowid_table_name)
+            .map(|t| t.root_page)
+            .ok_or_else(|| {
+                Error::with_message(ErrorCode::Error, "R-tree _rowid table not found")
+            })?;
+
+        // Find the _parent shadow table
+        let parent_table_name = format!("{}_parent", table_name);
+        let parent_root = schema_guard
+            .table(&parent_table_name)
+            .map(|t| t.root_page)
+            .ok_or_else(|| {
+                Error::with_message(ErrorCode::Error, "R-tree _parent table not found")
+            })?;
+
+        drop(schema_guard);
+
+        // Serialize and write all nodes
+        for nid in rtree.all_node_ids() {
+            let node_data = rtree.serialize_node(nid)?;
+
+            // Create record for _node: (nodeno INTEGER PRIMARY KEY, data BLOB)
+            let mems = [Mem::from_int(nid), Mem::from_blob(&node_data)];
+            let node_record = make_record(&mems, 0, mems.len() as i32);
+
+            // Insert into _node table
+            let mut cursor = btree.cursor(node_root, BtreeCursorFlags::WRCSR, None)?;
+            let payload = BtreePayload {
+                key: None,
+                n_key: nid,
+                data: Some(node_record.clone()),
+                mem: Vec::new(),
+                n_data: node_record.len() as i32,
+                n_zero: 0,
+            };
+            btree.insert(&mut cursor, &payload, BtreeInsertFlags::empty(), 0)?;
+
+            // Write parent relationship to _parent table
+            let parent_id = rtree.get_parent(nid).unwrap_or(0);
+            let parent_mems = [Mem::from_int(nid), Mem::from_int(parent_id)];
+            let parent_record = make_record(&parent_mems, 0, parent_mems.len() as i32);
+
+            let mut parent_cursor = btree.cursor(parent_root, BtreeCursorFlags::WRCSR, None)?;
+            let parent_payload = BtreePayload {
+                key: None,
+                n_key: nid,
+                data: Some(parent_record.clone()),
+                mem: Vec::new(),
+                n_data: parent_record.len() as i32,
+                n_zero: 0,
+            };
+            btree.insert(
+                &mut parent_cursor,
+                &parent_payload,
+                BtreeInsertFlags::empty(),
+                0,
+            )?;
+        }
+
+        // Write rowid mappings to _rowid table
+        for (rid, nid) in rtree.all_rowid_mappings() {
+            let rowid_mems = [Mem::from_int(rid), Mem::from_int(nid)];
+            let rowid_record = make_record(&rowid_mems, 0, rowid_mems.len() as i32);
+
+            let mut rowid_cursor = btree.cursor(rowid_root, BtreeCursorFlags::WRCSR, None)?;
+            let rowid_payload = BtreePayload {
+                key: None,
+                n_key: rid,
+                data: Some(rowid_record.clone()),
+                mem: Vec::new(),
+                n_data: rowid_record.len() as i32,
+                n_zero: 0,
+            };
+            btree.insert(
+                &mut rowid_cursor,
+                &rowid_payload,
+                BtreeInsertFlags::empty(),
+                0,
+            )?;
+        }
+
+        Ok(())
     }
 }
 

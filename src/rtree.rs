@@ -647,6 +647,329 @@ impl RtreeTable {
         }
         Ok(coords)
     }
+
+    // ========================================================================
+    // Serialization for Shadow Table Persistence
+    // ========================================================================
+
+    /// Get the tree depth (height from root to leaves)
+    pub fn tree_depth(&self) -> i32 {
+        let mut depth = 0i32;
+        let mut node_id = self.root_id;
+        while let Some(node) = self.nodes.get(&node_id) {
+            if node.is_leaf {
+                break;
+            }
+            if let Some(first_entry) = node.entries.first() {
+                depth += 1;
+                node_id = first_entry.id;
+            } else {
+                break;
+            }
+        }
+        depth
+    }
+
+    /// Get root node ID
+    pub fn root_id(&self) -> i64 {
+        self.root_id
+    }
+
+    /// Serialize a node to SQLite R-tree format
+    ///
+    /// Format:
+    /// - 2 bytes: tree depth (for root only, 0 for non-root)
+    /// - 2 bytes: number of entries (big-endian u16)
+    /// - For each entry:
+    ///   - 8 bytes: rowid/child_id (big-endian i64)
+    ///   - 4 * n_coord bytes: coordinates as big-endian f32
+    pub fn serialize_node(&self, node_id: i64) -> Result<Vec<u8>> {
+        let node = self
+            .nodes
+            .get(&node_id)
+            .ok_or_else(|| Error::with_message(ErrorCode::Error, "node not found"))?;
+
+        let bytes_per_cell = 8 + 4 * self.n_coord;
+        let mut data = Vec::with_capacity(4 + node.entries.len() * bytes_per_cell);
+
+        // 2 bytes: tree depth (only meaningful for root)
+        let depth = if node_id == self.root_id {
+            self.tree_depth() as u16
+        } else {
+            0u16
+        };
+        data.extend_from_slice(&depth.to_be_bytes());
+
+        // 2 bytes: number of entries
+        let n_entries = node.entries.len() as u16;
+        data.extend_from_slice(&n_entries.to_be_bytes());
+
+        // Each entry
+        for entry in &node.entries {
+            // 8 bytes: rowid or child node id
+            data.extend_from_slice(&entry.id.to_be_bytes());
+
+            // Coordinates as f32 (4 bytes each)
+            for i in 0..self.n_dim {
+                let min_f32 = entry.bbox.min[i] as f32;
+                let max_f32 = entry.bbox.max[i] as f32;
+                data.extend_from_slice(&min_f32.to_be_bytes());
+                data.extend_from_slice(&max_f32.to_be_bytes());
+            }
+        }
+
+        Ok(data)
+    }
+
+    /// Deserialize a node from SQLite R-tree format
+    ///
+    /// Returns (is_leaf, entries)
+    /// Note: is_leaf is determined by whether depth==0 and node has no children
+    pub fn deserialize_node(&self, data: &[u8], is_leaf: bool) -> Result<Vec<RtreeEntry>> {
+        if data.len() < 4 {
+            return Err(Error::with_message(
+                ErrorCode::Corrupt,
+                "node data too short",
+            ));
+        }
+
+        let bytes_per_cell = 8 + 4 * self.n_coord;
+
+        // Skip 2 bytes depth, read 2 bytes entry count
+        let n_entries = u16::from_be_bytes([data[2], data[3]]) as usize;
+
+        let expected_len = 4 + n_entries * bytes_per_cell;
+        if data.len() < expected_len {
+            return Err(Error::with_message(
+                ErrorCode::Corrupt,
+                "node data truncated",
+            ));
+        }
+
+        let mut entries = Vec::with_capacity(n_entries);
+        let mut offset = 4;
+
+        for _ in 0..n_entries {
+            // 8 bytes rowid
+            let id = i64::from_be_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+                data[offset + 4],
+                data[offset + 5],
+                data[offset + 6],
+                data[offset + 7],
+            ]);
+            offset += 8;
+
+            // Coordinates
+            let mut min = Vec::with_capacity(self.n_dim);
+            let mut max = Vec::with_capacity(self.n_dim);
+            for _ in 0..self.n_dim {
+                let min_f32 = f32::from_be_bytes([
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ]);
+                offset += 4;
+                let max_f32 = f32::from_be_bytes([
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ]);
+                offset += 4;
+                min.push(min_f32 as f64);
+                max.push(max_f32 as f64);
+            }
+
+            entries.push(RtreeEntry {
+                id,
+                bbox: RtreeBbox { min, max },
+            });
+        }
+
+        Ok(entries)
+    }
+
+    /// Get all node IDs in the tree
+    pub fn all_node_ids(&self) -> Vec<i64> {
+        self.nodes.keys().copied().collect()
+    }
+
+    /// Get all rowid to node mappings
+    pub fn all_rowid_mappings(&self) -> Vec<(i64, i64)> {
+        self.rowid_map.iter().map(|(k, v)| (*k, *v)).collect()
+    }
+
+    /// Get parent node ID for a given node
+    pub fn get_parent(&self, node_id: i64) -> Option<i64> {
+        self.nodes.get(&node_id).and_then(|n| n.parent)
+    }
+
+    /// Check if a node is a leaf
+    pub fn is_leaf(&self, node_id: i64) -> bool {
+        self.nodes.get(&node_id).map(|n| n.is_leaf).unwrap_or(false)
+    }
+
+    /// Load R-tree from shadow table data
+    ///
+    /// This reconstructs the in-memory R-tree from persisted shadow table data.
+    pub fn load_from_shadow_data(
+        n_dim: usize,
+        node_capacity: usize,
+        node_data: Vec<(i64, Vec<u8>)>, // (nodeno, blob)
+        rowid_data: Vec<(i64, i64)>,    // (rowid, nodeno)
+        parent_data: Vec<(i64, i64)>,   // (nodeno, parentnode)
+    ) -> Result<Self> {
+        if n_dim == 0 || n_dim > RTREE_MAX_DIMENSIONS {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                "invalid dimension count",
+            ));
+        }
+        let capacity = if node_capacity == 0 {
+            RTREE_DEFAULT_NODE_CAPACITY
+        } else {
+            node_capacity
+        };
+
+        // Build parent lookup
+        let parent_map: HashMap<i64, i64> = parent_data.into_iter().collect();
+
+        // Determine root and tree structure from depth in node 1
+        let root_id = 1i64;
+        let mut max_node_id = root_id;
+
+        // First, get the tree depth from root node
+        let tree_depth = if let Some((_, data)) = node_data.iter().find(|(id, _)| *id == root_id) {
+            if data.len() >= 2 {
+                u16::from_be_bytes([data[0], data[1]]) as usize
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        // Create empty table
+        let n_coord = n_dim * 2;
+        let mut nodes = HashMap::new();
+        let rowid_map: HashMap<i64, i64> = rowid_data.into_iter().collect();
+
+        // Parse all nodes
+        for (node_id, data) in node_data {
+            max_node_id = max_node_id.max(node_id);
+
+            // Determine if leaf based on depth from root
+            // Leaves are at depth == tree_depth
+            let node_depth = Self::compute_node_depth(node_id, &parent_map);
+            let is_leaf = node_depth == tree_depth;
+
+            // Parse entries
+            let bytes_per_cell = 8 + 4 * n_coord;
+            if data.len() < 4 {
+                continue;
+            }
+            let n_entries = u16::from_be_bytes([data[2], data[3]]) as usize;
+
+            let mut entries = Vec::with_capacity(n_entries);
+            let mut offset = 4;
+
+            for _ in 0..n_entries {
+                if offset + bytes_per_cell > data.len() {
+                    break;
+                }
+
+                let id = i64::from_be_bytes([
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                    data[offset + 4],
+                    data[offset + 5],
+                    data[offset + 6],
+                    data[offset + 7],
+                ]);
+                offset += 8;
+
+                let mut min = Vec::with_capacity(n_dim);
+                let mut max = Vec::with_capacity(n_dim);
+                for _ in 0..n_dim {
+                    let min_f32 = f32::from_be_bytes([
+                        data[offset],
+                        data[offset + 1],
+                        data[offset + 2],
+                        data[offset + 3],
+                    ]);
+                    offset += 4;
+                    let max_f32 = f32::from_be_bytes([
+                        data[offset],
+                        data[offset + 1],
+                        data[offset + 2],
+                        data[offset + 3],
+                    ]);
+                    offset += 4;
+                    min.push(min_f32 as f64);
+                    max.push(max_f32 as f64);
+                }
+
+                entries.push(RtreeEntry {
+                    id,
+                    bbox: RtreeBbox { min, max },
+                });
+            }
+
+            let parent = parent_map.get(&node_id).copied();
+
+            nodes.insert(
+                node_id,
+                RtreeNode {
+                    id: node_id,
+                    is_leaf,
+                    parent,
+                    entries,
+                },
+            );
+        }
+
+        // If no nodes were loaded, create empty tree with root
+        if nodes.is_empty() {
+            let root = RtreeNode {
+                id: root_id,
+                is_leaf: true,
+                parent: None,
+                entries: Vec::new(),
+            };
+            nodes.insert(root_id, root);
+        }
+
+        Ok(Self {
+            n_dim,
+            n_coord,
+            node_capacity: capacity,
+            root_id,
+            nodes,
+            rowid_map,
+            next_node_id: max_node_id + 1,
+        })
+    }
+
+    /// Compute depth of a node from root using parent chain
+    fn compute_node_depth(node_id: i64, parent_map: &HashMap<i64, i64>) -> usize {
+        let mut depth = 0;
+        let mut current = node_id;
+        while let Some(&parent) = parent_map.get(&current) {
+            if parent == 0 {
+                break;
+            }
+            depth += 1;
+            current = parent;
+        }
+        depth
+    }
 }
 
 #[cfg(test)]

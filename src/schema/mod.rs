@@ -817,6 +817,25 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
             }
         }
 
+        // Register R-tree table
+        if module_name.eq_ignore_ascii_case("rtree") {
+            // Parse R-tree arguments to create the table
+            // R-tree syntax: rtree(id, minX, maxX, minY, maxY, ...)
+            // First arg is ID column, rest are coordinate columns
+            let n_coord_cols = if module_args.is_empty() {
+                0
+            } else {
+                module_args.len() - 1
+            };
+            let n_dim = n_coord_cols / 2;
+            if n_dim > 0 {
+                if let Ok(rtree_table) = crate::rtree::RtreeTable::new(n_dim, 0) {
+                    let full_name = format!("main.{}", table_name);
+                    crate::rtree_vtab::register_table(&full_name, rtree_table);
+                }
+            }
+        }
+
         if module_name.eq_ignore_ascii_case("fts3tokenize") {
             columns = ["input", "token", "start", "end", "position"]
                 .iter()

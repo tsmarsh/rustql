@@ -129,6 +129,90 @@ impl VtabModule for RtreeVtabModule {
     }
 }
 
+impl RtreeVtabModule {
+    /// Connect to an existing R-tree using shadow table data
+    ///
+    /// This is used when re-opening a database that has existing R-tree tables.
+    /// The caller should query the shadow tables and pass the data here.
+    pub fn connect_with_shadow_data(
+        &self,
+        db_name: &str,
+        table_name: &str,
+        args: &[String],
+        shadow_data: RtreeShadowData,
+    ) -> Result<(String, Arc<dyn VtabTable>)> {
+        let (id_column, coord_columns) = parse_rtree_args(args)?;
+        let n_dim = coord_columns.len() / 2;
+
+        if n_dim == 0 {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                "rtree requires at least one dimension (two coordinate columns)",
+            ));
+        }
+
+        // Build schema string for sqlite_master
+        let mut schema_parts = vec![format!("{} INTEGER PRIMARY KEY", id_column)];
+        for col in &coord_columns {
+            schema_parts.push(format!("{} REAL", col));
+        }
+        let schema = format!("({})", schema_parts.join(", "));
+
+        // Load the R-tree from shadow table data
+        let rtree_table = RtreeTable::load_from_shadow_data(
+            n_dim,
+            0, // default capacity
+            shadow_data.node_data,
+            shadow_data.rowid_data,
+            shadow_data.parent_data,
+        )?;
+
+        // Register in the global registry
+        let full_name = format!("{}.{}", db_name, table_name);
+        let table_arc = register_table(&full_name, rtree_table);
+
+        // Create the adapter
+        let adapter = RtreeVtabTableAdapter {
+            name: table_name.to_string(),
+            db_name: db_name.to_string(),
+            id_column,
+            coord_columns,
+            n_dim,
+            table: table_arc,
+        };
+
+        Ok((schema, Arc::new(adapter)))
+    }
+}
+
+// ============================================================================
+// R-tree Shadow Table Data
+// ============================================================================
+
+/// Data from R-tree shadow tables for loading
+#[derive(Debug, Clone, Default)]
+pub struct RtreeShadowData {
+    /// (nodeno, data blob)
+    pub node_data: Vec<(i64, Vec<u8>)>,
+    /// (rowid, nodeno)
+    pub rowid_data: Vec<(i64, i64)>,
+    /// (nodeno, parentnode)
+    pub parent_data: Vec<(i64, i64)>,
+}
+
+/// Pending write operations for R-tree persistence
+#[derive(Debug, Clone)]
+pub struct RtreePendingWrites {
+    /// Table name for shadow table prefixes
+    pub table_name: String,
+    /// All node blobs: (nodeno, data)
+    pub nodes: Vec<(i64, Vec<u8>)>,
+    /// All rowid mappings: (rowid, nodeno)
+    pub rowids: Vec<(i64, i64)>,
+    /// All parent mappings: (nodeno, parentnode)
+    pub parents: Vec<(i64, Option<i64>)>,
+}
+
 // ============================================================================
 // R-tree Virtual Table Adapter
 // ============================================================================
@@ -141,6 +225,52 @@ pub struct RtreeVtabTableAdapter {
     coord_columns: Vec<String>,
     n_dim: usize,
     table: Arc<Mutex<RtreeTable>>,
+}
+
+impl RtreeVtabTableAdapter {
+    /// Get pending writes for persistence to shadow tables
+    pub fn get_pending_writes(&self) -> Result<RtreePendingWrites> {
+        let table = self
+            .table
+            .lock()
+            .map_err(|_| Error::with_message(ErrorCode::Internal, "failed to lock R-tree"))?;
+
+        let mut nodes = Vec::new();
+        for node_id in table.all_node_ids() {
+            let data = table.serialize_node(node_id)?;
+            nodes.push((node_id, data));
+        }
+
+        let rowids = table.all_rowid_mappings();
+
+        let parents: Vec<(i64, Option<i64>)> = table
+            .all_node_ids()
+            .into_iter()
+            .map(|node_id| (node_id, table.get_parent(node_id)))
+            .collect();
+
+        Ok(RtreePendingWrites {
+            table_name: self.name.clone(),
+            nodes,
+            rowids,
+            parents,
+        })
+    }
+
+    /// Get the table name
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Get the number of dimensions
+    pub fn n_dim(&self) -> usize {
+        self.n_dim
+    }
+
+    /// Get the underlying R-tree table (for sync operations)
+    pub fn inner(&self) -> &Arc<Mutex<RtreeTable>> {
+        &self.table
+    }
 }
 
 impl VtabTable for RtreeVtabTableAdapter {

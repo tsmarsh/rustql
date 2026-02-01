@@ -127,6 +127,7 @@ pub struct RtreeTable {
     nodes: HashMap<i64, RtreeNode>,
     rowid_map: HashMap<i64, i64>,
     next_node_id: i64,
+    next_rowid: i64,
 }
 
 impl RtreeTable {
@@ -159,7 +160,22 @@ impl RtreeTable {
             nodes,
             rowid_map: HashMap::new(),
             next_node_id: root_id + 1,
+            next_rowid: 1,
         })
+    }
+
+    /// Get the next auto-assigned rowid
+    pub fn next_rowid(&mut self) -> i64 {
+        let id = self.next_rowid;
+        self.next_rowid += 1;
+        id
+    }
+
+    /// Update next_rowid to be greater than any existing rowid
+    fn update_next_rowid(&mut self, rowid: i64) {
+        if rowid >= self.next_rowid {
+            self.next_rowid = rowid + 1;
+        }
     }
 
     pub fn insert(&mut self, rowid: i64, coords: &[f64]) -> Result<()> {
@@ -171,6 +187,8 @@ impl RtreeTable {
         let entry = RtreeEntry { id: rowid, bbox };
         self.insert_entry(leaf_id, entry)?;
         self.rowid_map.insert(rowid, leaf_id);
+        // Track next_rowid for auto-assignment
+        self.update_next_rowid(rowid);
         Ok(())
     }
 
@@ -870,6 +888,9 @@ impl RtreeTable {
         let mut nodes = HashMap::new();
         let rowid_map: HashMap<i64, i64> = rowid_data.into_iter().collect();
 
+        // Calculate next_rowid from max existing rowid
+        let max_rowid = rowid_map.keys().copied().max().unwrap_or(0);
+
         // Parse all nodes
         for (node_id, data) in node_data {
             max_node_id = max_node_id.max(node_id);
@@ -965,6 +986,7 @@ impl RtreeTable {
             nodes,
             rowid_map,
             next_node_id: max_node_id + 1,
+            next_rowid: max_rowid + 1,
         })
     }
 

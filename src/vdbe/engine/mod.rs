@@ -4229,11 +4229,15 @@ impl Vdbe {
                                     // Extract coordinates from record
                                     // R-tree columns: id, minX, maxX, minY, maxY, ...
                                     // First column is the explicit ID, rest are coords
-                                    // Use record_mems[0] as the rowid, not the auto-generated one
-                                    let rtree_rowid = if !record_mems.is_empty() {
+                                    // Use record_mems[0] as the rowid, or auto-generate if NULL/0
+                                    let rtree_rowid = if !record_mems.is_empty()
+                                        && !record_mems[0].is_null()
+                                        && record_mems[0].to_int() != 0
+                                    {
                                         record_mems[0].to_int()
                                     } else {
-                                        rowid
+                                        // Auto-generate rowid
+                                        table.next_rowid()
                                     };
                                     let n_coord = (record_mems.len() - 1).min(table.n_coord);
                                     if std::env::var("VDBE_TRACE").is_ok() {

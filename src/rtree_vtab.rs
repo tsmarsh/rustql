@@ -42,6 +42,13 @@ pub fn get_table(name: &str) -> Option<Arc<Mutex<RtreeTable>>> {
         .and_then(|registry| registry.get(&name.to_lowercase()).cloned())
 }
 
+/// Unregister an R-tree table from the global registry
+pub fn unregister_table(name: &str) {
+    if let Ok(mut registry) = RTREE_REGISTRY.write() {
+        registry.remove(&name.to_lowercase());
+    }
+}
+
 // ============================================================================
 // R-tree Virtual Table Module
 // ============================================================================

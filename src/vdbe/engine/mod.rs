@@ -6635,9 +6635,30 @@ impl Vdbe {
                 if let P4::Text(name) = &op.p4 {
                     let name_lower = name.to_lowercase();
 
+                    // Check if this is a virtual table (R-tree) and collect shadow table names
+                    let mut is_rtree = false;
+                    let mut shadow_tables: Vec<String> = Vec::new();
+                    if let Some(ref schema) = self.schema {
+                        if let Ok(schema_guard) = schema.read() {
+                            if let Some(table) = schema_guard.tables.get(&name_lower) {
+                                if table.is_virtual {
+                                    if let Some(ref module) = table.virtual_module {
+                                        if module.eq_ignore_ascii_case("rtree") {
+                                            is_rtree = true;
+                                            shadow_tables.push(format!("{}_node", name_lower));
+                                            shadow_tables.push(format!("{}_rowid", name_lower));
+                                            shadow_tables.push(format!("{}_parent", name_lower));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Helper to drop from a schema
                     let drop_from_schema =
-                        |schema: &std::sync::Arc<std::sync::RwLock<crate::schema::Schema>>| {
+                        |schema: &std::sync::Arc<std::sync::RwLock<crate::schema::Schema>>,
+                         tables_to_drop: &[String]| {
                             if let Ok(mut schema_guard) = schema.write() {
                                 // Check if it's actually a view (DROP VIEW uses DropTable in SQLite)
                                 if schema_guard.views.contains_key(&name_lower) {
@@ -6654,6 +6675,11 @@ impl Vdbe {
                                     schema_guard
                                         .triggers
                                         .retain(|_, trig| trig.table.to_lowercase() != name_lower);
+
+                                    // Drop shadow tables for virtual tables
+                                    for shadow in tables_to_drop {
+                                        schema_guard.tables.remove(shadow);
+                                    }
                                     return true;
                                 }
                             }
@@ -6664,20 +6690,26 @@ impl Vdbe {
                     if db_idx == 1 {
                         // Temp database
                         if let Some(ref temp_schema) = self.temp_schema {
-                            drop_from_schema(temp_schema);
+                            drop_from_schema(temp_schema, &shadow_tables);
                         }
                     } else {
                         // Main database (or default: try main first, then temp)
                         let mut dropped = false;
                         if let Some(ref schema) = self.schema {
-                            dropped = drop_from_schema(schema);
+                            dropped = drop_from_schema(schema, &shadow_tables);
                         }
                         // If not found in main schema, try temp schema
                         if !dropped {
                             if let Some(ref temp_schema) = self.temp_schema {
-                                drop_from_schema(temp_schema);
+                                drop_from_schema(temp_schema, &shadow_tables);
                             }
                         }
+                    }
+
+                    // Unregister R-tree from global registry
+                    if is_rtree {
+                        let full_name = format!("main.{}", name_lower);
+                        crate::rtree_vtab::unregister_table(&full_name);
                     }
                 }
             }

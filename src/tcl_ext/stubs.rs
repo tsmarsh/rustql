@@ -81,6 +81,7 @@ pub unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         "sqlite3_wal_autocheckpoint",
         "autoinstall_test_functions",
         "install_malloc_faultsim",
+        "faultsim_delete_and_reopen",
         "sqlite3_memdebug_fail",
         "sqlite3_memdebug_pending",
         "database_never_corrupt",
@@ -664,6 +665,16 @@ pub unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         interp,
         like_count_name.as_ptr(),
         like_count_val.as_ptr(),
+        TCL_GLOBAL_ONLY,
+    );
+
+    // Initialize sqlite_pending_byte for multi-client tests
+    let pending_byte_name = CString::new("::sqlite_pending_byte").unwrap();
+    let pending_byte_val = CString::new("0").unwrap();
+    Tcl_SetVar(
+        interp,
+        pending_byte_name.as_ptr(),
+        pending_byte_val.as_ptr(),
         TCL_GLOBAL_ONLY,
     );
 

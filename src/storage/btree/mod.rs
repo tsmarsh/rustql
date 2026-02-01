@@ -41,6 +41,12 @@ pub use types::{
 // Use types from submodules locally
 use types::BtTableLockEntry;
 
+fn trace_btree(message: &str) {
+    if std::env::var("RUSTQL_BTREE_TRACE").is_ok() {
+        eprintln!("{}", message);
+    }
+}
+
 thread_local! {
     static SHARED_CACHE_REGISTRY: RefCell<HashMap<String, Weak<RwLock<BtShared>>>> =
         RefCell::new(HashMap::new());
@@ -1618,7 +1624,56 @@ fn build_leaf_page_data(limits: PageLimits, flags: u8, cells: &[Vec<u8>]) -> Res
         return Err(Error::new(ErrorCode::Full));
     }
     write_u16(&mut data, header_start + 5, content_start as u16)?;
+    if std::env::var("RUSTQL_BTREE_TRACE").is_ok() {
+        eprintln!(
+            "btree: build_leaf_page_data flags=0x{:02x} cells={} content_start={} ptr_end={}",
+            flags,
+            cells.len(),
+            content_start,
+            ptr_end
+        );
+    }
     Ok(data)
+}
+
+fn split_leaf_cells(limits: PageLimits, cells: &[Vec<u8>]) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
+    if cells.len() < 2 {
+        return Err(Error::new(ErrorCode::Corrupt));
+    }
+    let header_start = limits.header_start();
+    let header_size = 8usize;
+    let usable = limits.usable_size as usize;
+    let mut prefix = Vec::with_capacity(cells.len() + 1);
+    prefix.push(0usize);
+    for cell in cells {
+        let next = prefix
+            .last()
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(cell.len());
+        prefix.push(next);
+    }
+    let mut best_split = None;
+    let mut best_balance = usize::MAX;
+    for split in 1..cells.len() {
+        let left_sum = prefix[split];
+        let right_sum = prefix[cells.len()] - left_sum;
+        let left_used = header_start + header_size + (split * 2) + left_sum;
+        let right_used = header_start + header_size + ((cells.len() - split) * 2) + right_sum;
+        if left_used <= usable && right_used <= usable {
+            let balance = if left_used > right_used {
+                left_used - right_used
+            } else {
+                right_used - left_used
+            };
+            if balance < best_balance {
+                best_balance = balance;
+                best_split = Some(split);
+            }
+        }
+    }
+    let split = best_split.ok_or_else(|| Error::new(ErrorCode::Full))?;
+    Ok((cells[..split].to_vec(), cells[split..].to_vec()))
 }
 
 fn build_internal_cell(child_pgno: Pgno, key: &CellInfo, is_index: bool) -> Result<Vec<u8>> {
@@ -2427,9 +2482,7 @@ fn split_root_leaf(
     let insert_at = insert_index.min(mem_page.n_cell) as usize;
     cells.insert(insert_at, new_cell);
 
-    let mid = cells.len() / 2;
-    let left_cells = cells[..mid].to_vec();
-    let right_cells = cells[mid..].to_vec();
+    let (left_cells, right_cells) = split_leaf_cells(limits, &cells)?;
     if right_cells.is_empty() {
         return Err(Error::new(ErrorCode::Corrupt));
     }
@@ -2513,9 +2566,7 @@ fn split_leaf_with_parent(
     }
     let insert_at = insert_index.min(mem_page.n_cell) as usize;
     cells.insert(insert_at, new_cell);
-    let mid = cells.len() / 2;
-    let left_cells = cells[..mid].to_vec();
-    let right_cells = cells[mid..].to_vec();
+    let (left_cells, right_cells) = split_leaf_cells(limits, &cells)?;
     if right_cells.is_empty() {
         return Err(Error::new(ErrorCode::Corrupt));
     }
@@ -2685,6 +2736,10 @@ impl MemPage {
             (limits.header_start() + self.header_size() + (self.n_cell as usize * 2)) as u16;
         let cell_last = limits.usable_end() as u16 - 4;
         if ptr < cell_first || ptr > cell_last {
+            trace_btree(&format!(
+                "btree: invalid cell pointer pgno={} index={} ptr={} range=[{},{}]",
+                self.pgno, index, ptr, cell_first, cell_last
+            ));
             return Err(Error::new(ErrorCode::Corrupt));
         }
 
@@ -2811,6 +2866,12 @@ impl MemPage {
     pub fn parse_cell(&self, cell_offset: u16, limits: PageLimits) -> Result<CellInfo> {
         let start = cell_offset as usize;
         if start >= self.data.len() {
+            trace_btree(&format!(
+                "btree: cell offset out of range pgno={} offset={} len={}",
+                self.pgno,
+                start,
+                self.data.len()
+            ));
             return Err(Error::new(ErrorCode::Corrupt));
         }
 
@@ -2868,6 +2929,13 @@ impl MemPage {
                 .checked_add(payload_size as usize)
                 .ok_or(Error::new(ErrorCode::Corrupt))?;
             if payload_end > self.data.len() {
+                trace_btree(&format!(
+                    "btree: payload end out of range pgno={} offset={} end={} len={}",
+                    self.pgno,
+                    start,
+                    payload_end,
+                    self.data.len()
+                ));
                 return Err(Error::new(ErrorCode::Corrupt));
             }
             info.n_local = payload_size as u16;
@@ -3013,12 +3081,17 @@ impl MemPage {
 
         let header_start = limits.header_start();
         let usable_end = limits.usable_end();
+        let cell_content_start = self.cell_content_offset(limits).ok()? as usize;
+        let header_size = self.header_size();
+        let ptr_array_end = header_start + header_size + (self.n_cell as usize * 2);
+        let gap = cell_content_start.saturating_sub(ptr_array_end);
 
         // Search free block chain for a block large enough
         let mut prev_ptr_offset = header_start + 1; // Points to first_freeblock field
         let mut pc = self.first_freeblock as usize;
 
-        while pc != 0 {
+        let can_use_freelist = pc != 0 && ptr_array_end + 2 <= cell_content_start;
+        while can_use_freelist && pc != 0 {
             if pc >= usable_end || pc + 4 > self.data.len() {
                 // Corrupt free block pointer
                 return None;
@@ -3060,13 +3133,7 @@ impl MemPage {
         }
 
         // No suitable free block found - allocate from cell content area
-        let cell_content_start = self.cell_content_offset(limits).ok()? as usize;
-        let header_size = self.header_size();
-        let ptr_array_end = header_start + header_size + (self.n_cell as usize * 2);
-
         // Gap is the space between end of cell pointers and start of cell content
-        let gap = cell_content_start.saturating_sub(ptr_array_end);
-
         if gap >= n_byte {
             let new_cell_offset = cell_content_start - n_byte;
             // Update cell_offset in page header (bytes 5-6)
@@ -3090,87 +3157,138 @@ impl MemPage {
         }
 
         let header_start = limits.header_start();
-        let start = offset as usize;
+        let mut start = offset as usize;
         let mut size = size as usize;
 
         // If size is less than 4, add to fragmented bytes
         if size < 4 {
             let new_frag = self.free_bytes.saturating_add(size as u16);
             self.free_bytes = new_frag;
-            // Update fragmented bytes in header (byte 7), capped at 255
             self.data[header_start + 7] = new_frag.min(255) as u8;
             self.n_free = self.n_free.saturating_add(size as i32);
             return;
         }
 
-        // Find insertion point in the sorted free block chain
-        let mut prev_ptr_offset = header_start + 1;
-        let mut pc = self.first_freeblock as usize;
-
-        // Find where to insert (chain is sorted by offset)
-        while pc != 0 && pc < start {
-            prev_ptr_offset = pc;
-            pc = read_u16(&self.data, pc).unwrap_or(0) as usize;
+        let usable_end = limits.usable_end();
+        let mut end = start + size;
+        if start < header_start + 6 + self.child_ptr_size as usize {
+            trace_btree(&format!(
+                "btree: free_space start before cell area pgno={} start={}",
+                self.pgno, start
+            ));
+            return;
         }
-
-        // Try to coalesce with previous block
-        if prev_ptr_offset != header_start + 1 {
-            // prev_ptr_offset points to a free block, not the header
-            let prev_size = read_u16(&self.data, prev_ptr_offset + 2).unwrap_or(0) as usize;
-            if prev_ptr_offset + prev_size == start {
-                // Coalesce with previous block
-                size += prev_size;
-                // Update prev's next pointer to be the new block's next (pc)
-                // The new block extends the previous block
-                let new_start = prev_ptr_offset;
-
-                // Try to also coalesce with next block
-                if pc != 0 && new_start + size == pc {
-                    let next_size = read_u16(&self.data, pc + 2).unwrap_or(0) as usize;
-                    let next_next = read_u16(&self.data, pc).unwrap_or(0);
-                    size += next_size;
-                    write_u16(&mut self.data, new_start, next_next).ok();
-                    write_u16(&mut self.data, new_start + 2, size as u16).ok();
-                } else {
-                    // Just coalesce with previous
-                    write_u16(&mut self.data, new_start + 2, size as u16).ok();
-                }
-                self.n_free = self.n_free.saturating_add(
-                    (offset as usize + (size - prev_size)) as i32 - (offset as i32),
-                );
-                self.n_free = self.n_free.saturating_add(size as i32 - prev_size as i32);
-                return;
-            }
-        }
-
-        // Try to coalesce with next block
-        if pc != 0 && start + size == pc {
-            let next_size = read_u16(&self.data, pc + 2).unwrap_or(0) as usize;
-            let next_next = read_u16(&self.data, pc).unwrap_or(0);
-            size += next_size;
-            // Write new combined block at start
-            write_u16(&mut self.data, start, next_next).ok();
-            write_u16(&mut self.data, start + 2, size as u16).ok();
-            // Update previous pointer to point to new block
-            write_u16(&mut self.data, prev_ptr_offset, start as u16).ok();
-            if prev_ptr_offset == header_start + 1 {
-                self.first_freeblock = start as u16;
-            }
-            self.n_free = self.n_free.saturating_add(offset as i32);
-            // Subtract the old free block size that was already counted
-            self.n_free = self.n_free.saturating_sub(next_size as i32);
-            self.n_free = self.n_free.saturating_add(size as i32);
+        if end > usable_end {
+            trace_btree(&format!(
+                "btree: free_space end out of range pgno={} end={} usable={}",
+                self.pgno, end, usable_end
+            ));
             return;
         }
 
-        // No coalescing possible - insert new free block into chain
-        write_u16(&mut self.data, start, pc as u16).ok();
-        write_u16(&mut self.data, start + 2, size as u16).ok();
-        write_u16(&mut self.data, prev_ptr_offset, start as u16).ok();
-        if prev_ptr_offset == header_start + 1 {
-            self.first_freeblock = start as u16;
+        let orig_size = size;
+        let mut ptr = header_start + 1;
+        let mut freeblk = if self.data[ptr] == 0 && self.data[ptr + 1] == 0 {
+            0usize
+        } else {
+            let mut next = read_u16(&self.data, ptr).unwrap_or(0) as usize;
+            while next != 0 && next < start {
+                if next <= ptr {
+                    trace_btree(&format!(
+                        "btree: free_space corrupt freelist pgno={} next={} ptr={}",
+                        self.pgno, next, ptr
+                    ));
+                    return;
+                }
+                ptr = next;
+                next = read_u16(&self.data, ptr).unwrap_or(0) as usize;
+            }
+            if next > usable_end.saturating_sub(4) {
+                trace_btree(&format!(
+                    "btree: free_space freelist out of range pgno={} next={}",
+                    self.pgno, next
+                ));
+                return;
+            }
+            next
+        };
+
+        let mut n_frag = 0usize;
+        if freeblk != 0 && end + 3 >= freeblk {
+            if end > freeblk {
+                trace_btree(&format!(
+                    "btree: free_space overlap pgno={} end={} freeblk={}",
+                    self.pgno, end, freeblk
+                ));
+                return;
+            }
+            n_frag = freeblk - end;
+            let free_size = read_u16(&self.data, freeblk + 2).unwrap_or(0) as usize;
+            end = freeblk + free_size;
+            if end > usable_end {
+                trace_btree(&format!(
+                    "btree: free_space merged end out of range pgno={} end={}",
+                    self.pgno, end
+                ));
+                return;
+            }
+            size = end - start;
+            freeblk = read_u16(&self.data, freeblk).unwrap_or(0) as usize;
         }
-        self.n_free = self.n_free.saturating_add(size as i32);
+
+        if ptr > header_start + 1 {
+            let prev_size = read_u16(&self.data, ptr + 2).unwrap_or(0) as usize;
+            let prev_end = ptr + prev_size;
+            if prev_end + 3 >= start {
+                if prev_end > start {
+                    trace_btree(&format!(
+                        "btree: free_space overlap prev pgno={} prev_end={} start={}",
+                        self.pgno, prev_end, start
+                    ));
+                    return;
+                }
+                n_frag = n_frag.saturating_add(start - prev_end);
+                size = end - ptr;
+                start = ptr;
+            }
+        }
+
+        if n_frag > self.free_bytes as usize {
+            trace_btree(&format!(
+                "btree: free_space fragment underflow pgno={} n_frag={} free_bytes={}",
+                self.pgno, n_frag, self.free_bytes
+            ));
+            return;
+        }
+        if n_frag > 0 {
+            let new_frag = self.free_bytes.saturating_sub(n_frag as u16);
+            self.free_bytes = new_frag;
+            self.data[header_start + 7] = new_frag.min(255) as u8;
+        }
+
+        let cell_offset = read_u16(&self.data, header_start + 5).unwrap_or(self.cell_offset);
+        if start <= cell_offset as usize {
+            if start < cell_offset as usize || ptr != header_start + 1 {
+                trace_btree(&format!(
+                    "btree: free_space invalid cell start pgno={} start={} cell_offset={}",
+                    self.pgno, start, cell_offset
+                ));
+                return;
+            }
+            write_u16(&mut self.data, header_start + 1, freeblk as u16).ok();
+            write_u16(&mut self.data, header_start + 5, end as u16).ok();
+            self.first_freeblock = freeblk as u16;
+            self.cell_offset = end as u16;
+        } else {
+            write_u16(&mut self.data, ptr, start as u16).ok();
+            write_u16(&mut self.data, start, freeblk as u16).ok();
+            write_u16(&mut self.data, start + 2, size as u16).ok();
+            if ptr == header_start + 1 {
+                self.first_freeblock = start as u16;
+            }
+        }
+
+        self.n_free = self.n_free.saturating_add(orig_size as i32);
     }
 
     /// Defragment the page by moving all cells to the end of the page,
@@ -3187,7 +3305,16 @@ impl MemPage {
 
         for i in 0..self.n_cell {
             let cell_offset = self.cell_ptr(i, limits)?;
-            let info = self.parse_cell(cell_offset, limits)?;
+            let info = match self.parse_cell(cell_offset, limits) {
+                Ok(info) => info,
+                Err(err) => {
+                    trace_btree(&format!(
+                        "btree: defragment parse_cell failed pgno={} cell={} offset={}",
+                        self.pgno, i, cell_offset
+                    ));
+                    return Err(err);
+                }
+            };
             let cell_size = info.n_size as usize;
             let cell_data =
                 self.data[cell_offset as usize..cell_offset as usize + cell_size].to_vec();
@@ -3765,6 +3892,8 @@ impl Btree {
             .write()
             .map_err(|_| Error::new(ErrorCode::Internal))?;
         shared.pager.rollback()?;
+        shared.free_pages.clear();
+        let _ = load_freelist(&mut shared);
         shared.in_transaction = TransState::None;
         self.in_trans
             .store(TransState::None as u8, Ordering::SeqCst);
@@ -3832,6 +3961,7 @@ impl Btree {
         _flags: BtreeInsertFlags,
         _seek_result: i32,
     ) -> Result<()> {
+        let trace_enabled = std::env::var("RUSTQL_BTREE_TRACE").is_ok();
         // Handle PREFORMAT: use pre-formatted cell from cursor if flag is set
         let use_preformat = _flags.contains(BtreeInsertFlags::PREFORMAT);
         let preformat_cell = if use_preformat {
@@ -3885,7 +4015,14 @@ impl Btree {
 
         // Skip seek if USESEEKRESULT is set and we have a valid seek result
         // (cursor is already positioned from a prior seek operation)
-        let need_seek = !use_seek_result || effective_seek_result == 0;
+        let mut need_seek = !use_seek_result || effective_seek_result == 0;
+        if use_seek_result {
+            if _cursor.state != CursorState::Valid {
+                need_seek = true;
+            } else if _cursor.cursor_data_version != shared_guard.shared_data_version {
+                need_seek = true;
+            }
+        }
 
         if !mem_page.is_leaf && need_seek {
             if mem_page.is_intkey {
@@ -3929,6 +4066,19 @@ impl Btree {
         } else {
             build_cell(&mem_page, limits, _payload)?
         };
+        if trace_enabled {
+            trace_btree(&format!(
+                "btree: insert pgno={} n_cell={} n_free={} cell_len={} key={} flags=0x{:02x} seek_result={} state={:?}",
+                mem_page.pgno,
+                mem_page.n_cell,
+                mem_page.n_free,
+                cell.len(),
+                _payload.n_key,
+                _flags.bits(),
+                effective_seek_result,
+                _cursor.state
+            ));
+        }
         if !overflow.pages.is_empty() {
             let pages_len = overflow.pages.len();
             let mut pgno_list = Vec::with_capacity(pages_len);
@@ -4013,6 +4163,12 @@ impl Btree {
         let total_free = mem_page.n_free as usize;
 
         if total_free < space_needed {
+            if trace_enabled {
+                trace_btree(&format!(
+                    "btree: insert split needed pgno={} total_free={} space_needed={}",
+                    mem_page.pgno, total_free, space_needed
+                ));
+            }
             // Not enough total space - need to split
             if mem_page.is_leaf {
                 if let (Some(parent), Some(child_index)) =
@@ -4023,7 +4179,7 @@ impl Btree {
                     } else {
                         PageLimits::new(shared_guard.page_size, shared_guard.usable_size)
                     };
-                    split_leaf_with_parent(
+                    if let Err(err) = split_leaf_with_parent(
                         &mut shared_guard,
                         parent,
                         parent_limits,
@@ -4033,18 +4189,44 @@ impl Btree {
                         limits,
                         insert_index,
                         cell,
-                    )?;
+                    ) {
+                        trace_btree(&format!(
+                            "btree: split_leaf_with_parent failed pgno={} err={}",
+                            mem_page.pgno, err
+                        ));
+                        return Err(err);
+                    }
+                    _cursor.state = CursorState::RequireSeek;
+                    _cursor.seek_result = 0;
+                    _cursor.page = None;
+                    _cursor.page_stack.clear();
+                    _cursor.idx_stack.clear();
+                    shared_guard.shared_data_version =
+                        shared_guard.shared_data_version.wrapping_add(1);
                     return Ok(());
                 }
                 if root_pgno == mem_page.pgno {
-                    split_root_leaf(
+                    if let Err(err) = split_root_leaf(
                         &mut shared_guard,
                         root_pgno,
                         &mem_page,
                         limits,
                         insert_index,
                         cell,
-                    )?;
+                    ) {
+                        trace_btree(&format!(
+                            "btree: split_root_leaf failed pgno={} err={}",
+                            mem_page.pgno, err
+                        ));
+                        return Err(err);
+                    }
+                    _cursor.state = CursorState::RequireSeek;
+                    _cursor.seek_result = 0;
+                    _cursor.page = None;
+                    _cursor.page_stack.clear();
+                    _cursor.idx_stack.clear();
+                    shared_guard.shared_data_version =
+                        shared_guard.shared_data_version.wrapping_add(1);
                     return Ok(());
                 }
             } else if let (Some(parent), Some(child_index)) = (
@@ -4060,17 +4242,43 @@ impl Btree {
                 } else {
                     PageLimits::new(shared_guard.page_size, shared_guard.usable_size)
                 };
-                split_internal_with_parent(
+                if let Err(err) = split_internal_with_parent(
                     &mut shared_guard,
                     parent,
                     parent_limits,
                     *child_index,
                     &mem_page,
                     limits,
-                )?;
+                ) {
+                    trace_btree(&format!(
+                        "btree: split_internal_with_parent failed pgno={} err={}",
+                        mem_page.pgno, err
+                    ));
+                    return Err(err);
+                }
+                _cursor.state = CursorState::RequireSeek;
+                _cursor.seek_result = 0;
+                _cursor.page = None;
+                _cursor.page_stack.clear();
+                _cursor.idx_stack.clear();
+                shared_guard.shared_data_version = shared_guard.shared_data_version.wrapping_add(1);
                 return Ok(());
             } else if root_pgno == mem_page.pgno {
-                split_internal_root(&mut shared_guard, root_pgno, &mem_page, limits)?;
+                if let Err(err) =
+                    split_internal_root(&mut shared_guard, root_pgno, &mem_page, limits)
+                {
+                    trace_btree(&format!(
+                        "btree: split_internal_root failed pgno={} err={}",
+                        mem_page.pgno, err
+                    ));
+                    return Err(err);
+                }
+                _cursor.state = CursorState::RequireSeek;
+                _cursor.seek_result = 0;
+                _cursor.page = None;
+                _cursor.page_stack.clear();
+                _cursor.idx_stack.clear();
+                shared_guard.shared_data_version = shared_guard.shared_data_version.wrapping_add(1);
                 return Ok(());
             }
             return Err(Error::new(ErrorCode::Full));
@@ -4081,6 +4289,12 @@ impl Btree {
             Some(offset) => offset as usize,
             None => {
                 // Allocation failed but we have enough total free space - defragment and retry
+                if trace_enabled {
+                    trace_btree(&format!(
+                        "btree: insert defragment pgno={} cell_len={}",
+                        mem_page.pgno, cell_size
+                    ));
+                }
                 mem_page.defragment(limits)?;
                 match mem_page.allocate_space(cell_size, limits) {
                     Some(offset) => offset as usize,
@@ -4101,6 +4315,16 @@ impl Btree {
 
         {
             let data = &mut page.data;
+            if new_cell_offset + cell_size > data.len() {
+                trace_btree(&format!(
+                    "btree: insert cell write out of range pgno={} offset={} cell_len={} data_len={}",
+                    mem_page.pgno,
+                    new_cell_offset,
+                    cell_size,
+                    data.len()
+                ));
+                return Err(Error::new(ErrorCode::Corrupt));
+            }
             data[new_cell_offset..new_cell_offset + cell_size].copy_from_slice(&cell);
 
             let ptr_array_start = header_start + header_size;
@@ -4127,6 +4351,7 @@ impl Btree {
         _cursor.page = Some(mem_page);
         // Increment data_version to signal that btree was modified
         shared_guard.shared_data_version = shared_guard.shared_data_version.wrapping_add(1);
+        _cursor.cursor_data_version = shared_guard.shared_data_version;
         Ok(())
     }
 
@@ -4207,6 +4432,12 @@ impl Btree {
             .get(actual_pgno, PagerGetFlags::empty())?;
         shared_guard.pager.write(&mut page)?;
         page.data.copy_from_slice(&mem_page.data);
+        if std::env::var("RUSTQL_BTREE_TRACE").is_ok() {
+            trace_btree(&format!(
+                "btree: delete pgno={} ix={} cell_offset={} size={}",
+                actual_pgno, _cursor.ix, cell_offset, cell_size
+            ));
+        }
 
         // Write modified page back to cache so subsequent reads see the changes
         shared_guard.pager.write_page_to_cache(&page);
@@ -4547,6 +4778,16 @@ impl Btree {
             .write()
             .map_err(|_| Error::new(ErrorCode::Internal))?;
         shared.pager.savepoint(op, index)
+    }
+
+    pub fn reload_freelist(&self) -> Result<()> {
+        let mut shared = self
+            .shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
+        shared.free_pages.clear();
+        let _ = load_freelist(&mut shared);
+        Ok(())
     }
 
     /// sqlite3BtreeCheckpoint

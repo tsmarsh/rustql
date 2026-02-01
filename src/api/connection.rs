@@ -991,6 +991,58 @@ impl SqliteConnection {
                 }
             }
         }
+        // Merge attached schemas into main for unqualified name resolution.
+        // TODO: replace with schema-aware resolution across attached databases.
+        if let Some(main_schema) = self.dbs.get(0).and_then(|db| db.schema.as_ref()) {
+            let mut attached_tables = Vec::new();
+            let mut attached_indexes = Vec::new();
+            let mut attached_triggers = Vec::new();
+            let mut attached_views = Vec::new();
+            for db in self.dbs.iter().skip(2) {
+                if let Some(schema_arc) = db.schema.as_ref() {
+                    if let Ok(schema_guard) = schema_arc.read() {
+                        attached_tables.extend(
+                            schema_guard
+                                .tables
+                                .iter()
+                                .map(|(k, v)| (k.clone(), Arc::clone(v))),
+                        );
+                        attached_indexes.extend(
+                            schema_guard
+                                .indexes
+                                .iter()
+                                .map(|(k, v)| (k.clone(), Arc::clone(v))),
+                        );
+                        attached_triggers.extend(
+                            schema_guard
+                                .triggers
+                                .iter()
+                                .map(|(k, v)| (k.clone(), Arc::clone(v))),
+                        );
+                        attached_views.extend(
+                            schema_guard
+                                .views
+                                .iter()
+                                .map(|(k, v)| (k.clone(), Arc::clone(v))),
+                        );
+                    }
+                }
+            }
+            if let Ok(mut main_guard) = main_schema.write() {
+                for (k, v) in attached_tables {
+                    main_guard.tables.entry(k).or_insert(v);
+                }
+                for (k, v) in attached_indexes {
+                    main_guard.indexes.entry(k).or_insert(v);
+                }
+                for (k, v) in attached_triggers {
+                    main_guard.triggers.entry(k).or_insert(v);
+                }
+                for (k, v) in attached_views {
+                    main_guard.views.entry(k).or_insert(v);
+                }
+            }
+        }
         self.increment_schema_generation();
         Ok(())
     }
@@ -1237,6 +1289,8 @@ impl SqliteConnection {
             db.path = Some(filename.to_string());
         }
         self.dbs.push(db);
+        let idx = self.dbs.len() - 1;
+        self.open_attached_btree(idx)?;
         Ok(())
     }
 
@@ -1275,6 +1329,62 @@ impl SqliteConnection {
         }
 
         self.dbs.remove(idx);
+        Ok(())
+    }
+
+    fn open_attached_btree(&mut self, db_idx: usize) -> Result<()> {
+        if db_idx >= self.dbs.len() {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                "database index out of range",
+            ));
+        }
+        if self.dbs[db_idx].btree.is_some() {
+            return Ok(());
+        }
+        let is_memory = self.dbs[db_idx].path.is_none();
+        let mut btree_flags = BtreeOpenFlags::empty();
+        if is_memory {
+            btree_flags |= BtreeOpenFlags::MEMORY;
+        }
+        let open_flags = OpenFlags::READWRITE | OpenFlags::CREATE;
+        let btree_path = if is_memory {
+            ""
+        } else {
+            self.dbs[db_idx].path.as_deref().unwrap_or("")
+        };
+        let btree = if is_memory {
+            let vfs = StubVfs;
+            Btree::open(&vfs, btree_path, None, btree_flags, open_flags)?
+        } else {
+            let vfs = FileVfs;
+            Btree::open(&vfs, btree_path, None, btree_flags, open_flags)?
+        };
+        self.dbs[db_idx].btree = Some(btree);
+        let mut new_schema = None;
+        let btree = self.dbs[db_idx].btree.clone();
+        let schema_arc = self.dbs[db_idx].schema.clone();
+        if let (Some(ref btree), Some(ref schema)) = (btree.as_ref(), schema_arc.as_ref()) {
+            if btree.sharable {
+                if let Ok(mut shared) = btree.shared.write() {
+                    if let Some(shared_schema) = shared.schema_cache.clone() {
+                        new_schema = Some(shared_schema);
+                    } else {
+                        shared.schema_cache = Some(Arc::clone(schema));
+                    }
+                }
+            }
+        }
+        if let Some(schema) = new_schema {
+            self.dbs[db_idx].schema = Some(schema);
+        }
+        let btree = self.dbs[db_idx].btree.clone();
+        let schema_arc = self.dbs[db_idx].schema.clone();
+        if let (Some(ref btree), Some(ref schema)) = (btree.as_ref(), schema_arc.as_ref()) {
+            if let Ok(mut schema_guard) = schema.write() {
+                load_schema_from_btree(btree, &mut schema_guard)?;
+            }
+        }
         Ok(())
     }
 }

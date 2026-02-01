@@ -1,0 +1,10 @@
+--- src/api/stmt.rs
++++ src/api/stmt.rs
+@@ -344,6 +344,7 @@ pub fn step(stmt: &mut PreparedStmt, conn: &mut SqliteConnection) -> Result<Step
+             attached_schema_guards.push((db.name.clone(), schema));
+         }
+     }
++    eprintln!("DEBUG: attached_schema_guards count: {}", attached_schema_guards.len());
+     let attached_schemas: Vec<(String, &crate::schema::Schema)> = attached_schema_guards
+         .iter()
+         .map(|(name, schema)| (name.clone(), &**schema))

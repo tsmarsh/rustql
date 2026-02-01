@@ -195,6 +195,13 @@ impl<'s> DeleteCompiler<'s> {
             }
         }
 
+        // Build qualified name for OpenRead/OpenWrite opcodes
+        let qualified_name = if let Some(ref schema) = delete.table.schema {
+            format!("{}.{}", schema, delete.table.name)
+        } else {
+            delete.table.name.clone()
+        };
+
         // Store target table name for subquery reference detection
         self.target_table = table_name_lower.clone();
 
@@ -204,14 +211,14 @@ impl<'s> DeleteCompiler<'s> {
         // Initialize
         self.emit(Opcode::Init, 0, 0, 0, P4::Unused);
 
-        // Open table for writing (need write access to delete)
+        // Open table for writing (need write access to delete) - use qualified name for attached databases
         self.table_cursor = self.alloc_cursor();
         self.emit(
             Opcode::OpenWrite,
             self.table_cursor,
             0, // Root page (would come from schema)
             0,
-            P4::Text(delete.table.name.clone()),
+            P4::Text(qualified_name),
         );
 
         // Populate column map from schema if available

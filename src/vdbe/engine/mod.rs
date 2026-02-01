@@ -812,6 +812,56 @@ impl Vdbe {
         self.cursors.get_mut(id as usize).and_then(|c| c.as_mut())
     }
 
+    fn db_idx_for_schema(&self, schema: &str) -> Option<i32> {
+        if schema.eq_ignore_ascii_case("main") {
+            return Some(0);
+        }
+        if schema.eq_ignore_ascii_case("temp") {
+            return Some(1);
+        }
+        let Some(conn_ptr) = self.conn_ptr else {
+            return None;
+        };
+        let conn = unsafe { &*conn_ptr };
+        conn.dbs
+            .iter()
+            .position(|db| db.name.eq_ignore_ascii_case(schema))
+            .map(|idx| idx as i32)
+    }
+
+    fn btree_for_db_idx(&self, db_idx: i32) -> Option<Arc<Btree>> {
+        if db_idx == 0 {
+            return self.btree.clone();
+        }
+        if db_idx == 1 {
+            return self.temp_btree.clone();
+        }
+        let Some(conn_ptr) = self.conn_ptr else {
+            return None;
+        };
+        let conn = unsafe { &*conn_ptr };
+        let idx = db_idx as usize;
+        conn.dbs.get(idx).and_then(|db| db.btree.as_ref().cloned())
+    }
+
+    fn collect_btrees(&self) -> Vec<Arc<Btree>> {
+        let Some(conn_ptr) = self.conn_ptr else {
+            let mut btrees = Vec::new();
+            if let Some(ref btree) = self.btree {
+                btrees.push(btree.clone());
+            }
+            if let Some(ref btree) = self.temp_btree {
+                btrees.push(btree.clone());
+            }
+            return btrees;
+        };
+        let conn = unsafe { &*conn_ptr };
+        conn.dbs
+            .iter()
+            .filter_map(|db| db.btree.as_ref().cloned())
+            .collect()
+    }
+
     // ========================================================================
     // Execution Control
     // ========================================================================
@@ -1510,24 +1560,28 @@ impl Vdbe {
                 } else {
                     None
                 };
+                let (schema_name, simple_name) = if let Some(ref tname) = table_name {
+                    if let Some(dot_pos) = tname.find('.') {
+                        (
+                            Some(tname[..dot_pos].to_string()),
+                            tname[dot_pos + 1..].to_string(),
+                        )
+                    } else {
+                        (None, tname.clone())
+                    }
+                } else {
+                    (None, String::new())
+                };
 
                 // Check for sqlite_master virtual table
-                let is_sqlite_master = table_name
-                    .as_ref()
-                    .map(|n| {
-                        n.eq_ignore_ascii_case("sqlite_master")
-                            || n.eq_ignore_ascii_case("sqlite_schema")
-                    })
-                    .unwrap_or(false);
+                let is_sqlite_master = !simple_name.is_empty()
+                    && (simple_name.eq_ignore_ascii_case("sqlite_master")
+                        || simple_name.eq_ignore_ascii_case("sqlite_schema"));
 
                 // Check for sqlite_temp_master virtual table (temp schema)
-                let is_sqlite_temp_master = table_name
-                    .as_ref()
-                    .map(|n| {
-                        n.eq_ignore_ascii_case("sqlite_temp_master")
-                            || n.eq_ignore_ascii_case("sqlite_temp_schema")
-                    })
-                    .unwrap_or(false);
+                let is_sqlite_temp_master = !simple_name.is_empty()
+                    && (simple_name.eq_ignore_ascii_case("sqlite_temp_master")
+                        || simple_name.eq_ignore_ascii_case("sqlite_temp_schema"));
 
                 // Check for sqlite_stat1 virtual table
                 let is_sqlite_stat1 = table_name
@@ -1536,11 +1590,27 @@ impl Vdbe {
                     .unwrap_or(false);
 
                 if is_sqlite_master || is_sqlite_temp_master {
-                    // Filter by db_idx: 0 for main (sqlite_master), 1 for temp (sqlite_temp_master)
-                    let target_db_idx = if is_sqlite_temp_master { 1 } else { 0 };
+                    // Filter by db_idx: 0 for main, 1 for temp, 2+ for attached
+                    let target_db_idx = if is_sqlite_temp_master {
+                        1
+                    } else if let Some(ref db_name) = schema_name {
+                        self.db_idx_for_schema(db_name).ok_or_else(|| {
+                            Error::with_message(
+                                ErrorCode::Error,
+                                format!("unknown database {}", db_name),
+                            )
+                        })?
+                    } else {
+                        0
+                    };
+                    let schema_source = if target_db_idx == 1 {
+                        self.temp_schema.clone()
+                    } else {
+                        self.schema.clone()
+                    };
                     // Populate schema entries from current schema BEFORE borrowing cursor
                     let mut entries = Vec::new();
-                    if let Some(ref schema) = self.schema {
+                    if let Some(ref schema) = schema_source {
                         if let Ok(schema_guard) = schema.read() {
                             // Add tables (filter by db_idx)
                             for (_, table) in schema_guard.tables.iter() {
@@ -1628,40 +1698,32 @@ impl Vdbe {
                     let mut index_unique = false;
                     let mut index_table_name: Option<String> = None;
                     let mut index_collations: Vec<String> = Vec::new();
-                    // If root_page is 0 and we have a name in P4, look it up in schema
-                    // (could be a table or an index)
-                    if root_page == 0 {
-                        if let Some(ref tname) = table_name {
-                            // Parse qualified name (db.table or just table)
-                            let (db_name, simple_name) = if let Some(dot_pos) = tname.find('.') {
-                                (Some(&tname[..dot_pos]), &tname[dot_pos + 1..])
-                            } else {
-                                (None, tname.as_str())
-                            };
+                    // Look up table info from schema when we have a name
+                    // Even if root_page is known, we need table_meta for db_idx
+                    if let Some(ref tname) = table_name {
+                        let requested_db_idx = schema_name
+                            .as_deref()
+                            .and_then(|db_name| self.db_idx_for_schema(db_name));
 
-                            // For attached databases, we need their schemas loaded
-                            // Currently only "main" schema is available; error if different db requested
-                            if let Some(db) = db_name {
-                                if !db.eq_ignore_ascii_case("main") {
-                                    // TODO: Support attached database schema lookup
-                                    return Err(Error::with_message(
-                                        ErrorCode::Error,
-                                        format!("no such table: {}", tname),
-                                    ));
-                                }
-                            }
+                        let tname_lower = simple_name.to_lowercase();
 
-                            if let Some(ref schema) = self.schema {
-                                if let Ok(schema_guard) = schema.read() {
-                                    // First try as a table (case-insensitive lookup)
-                                    let tname_lower = simple_name.to_lowercase();
-                                    if let Some(table) = schema_guard.tables.get(&tname_lower) {
+                        // Only do full lookup if root_page not yet known
+                        let need_root_lookup = root_page == 0;
+
+                        // First check main schema
+                        if let Some(ref schema) = self.schema {
+                            if let Ok(schema_guard) = schema.read() {
+                                // First try as a table (case-insensitive lookup)
+                                if let Some(table) = schema_guard.tables.get(&tname_lower) {
+                                    if requested_db_idx.map_or(true, |idx| table.db_idx == idx) {
                                         root_page = table.root_page;
                                         table_meta = Some(std::sync::Arc::clone(table));
                                     }
-                                    // If not found as table, try as index
-                                    if root_page == 0 {
-                                        if let Some(index) = schema_guard.indexes.get(&tname_lower)
+                                }
+                                // If not found as table, try as index
+                                if root_page == 0 {
+                                    if let Some(index) = schema_guard.indexes.get(&tname_lower) {
+                                        if requested_db_idx.map_or(true, |idx| index.db_idx == idx)
                                         {
                                             root_page = index.root_page;
                                             is_index = true;
@@ -1675,10 +1737,12 @@ impl Vdbe {
                                                 .collect();
                                         }
                                     }
+                                }
 
-                                    // Also search for auto-indexes in table.indexes
-                                    if root_page == 0 && !is_index {
-                                        for (_table_name, tbl) in schema_guard.tables.iter() {
+                                // Also search for auto-indexes in table.indexes
+                                if root_page == 0 && !is_index {
+                                    for (_table_name, tbl) in schema_guard.tables.iter() {
+                                        if requested_db_idx.map_or(true, |idx| tbl.db_idx == idx) {
                                             for idx in &tbl.indexes {
                                                 if idx.name.to_lowercase() == tname_lower {
                                                     root_page = idx.root_page;
@@ -1701,16 +1765,85 @@ impl Vdbe {
                                     }
                                 }
                             }
-                            // Not found as table or index - return error
-                            // (but not if it's a virtual table)
-                            let is_virtual =
-                                table_meta.as_ref().map(|t| t.is_virtual).unwrap_or(false);
-                            if root_page == 0 && !is_virtual && table_meta.is_none() && !is_index {
-                                return Err(Error::with_message(
-                                    ErrorCode::Error,
-                                    format!("no such table: {}", tname),
-                                ));
+                        }
+
+                        // If not found in main schema and we have a specific db_idx, check attached schemas
+                        // Also check if table_meta is None even when root_page is known (for correct db_idx)
+                        if (need_root_lookup || table_meta.is_none()) && requested_db_idx.is_some()
+                        {
+                            if let Some(conn_ptr) = self.conn_ptr {
+                                let conn = unsafe { &*conn_ptr };
+                                if let Some(db) = conn.dbs.get(requested_db_idx.unwrap() as usize) {
+                                    if let Some(ref schema_arc) = db.schema {
+                                        if let Ok(schema_guard) = schema_arc.read() {
+                                            // Try as a table
+                                            if let Some(table) =
+                                                schema_guard.tables.get(&tname_lower)
+                                            {
+                                                if need_root_lookup {
+                                                    root_page = table.root_page;
+                                                }
+                                                table_meta = Some(std::sync::Arc::clone(table));
+                                            }
+                                            // Try as an index (only if we need root_page)
+                                            if need_root_lookup && root_page == 0 {
+                                                if let Some(index) =
+                                                    schema_guard.indexes.get(&tname_lower)
+                                                {
+                                                    root_page = index.root_page;
+                                                    is_index = true;
+                                                    index_unique = index.unique;
+                                                    index_table_name = Some(index.table.clone());
+                                                    index_collations = index
+                                                        .columns
+                                                        .iter()
+                                                        .map(|c| c.collation.clone())
+                                                        .collect();
+                                                }
+                                            }
+                                            // Also check auto-indexes
+                                            if need_root_lookup && root_page == 0 && !is_index {
+                                                for (_table_name, tbl) in schema_guard.tables.iter()
+                                                {
+                                                    for idx in &tbl.indexes {
+                                                        if idx.name.to_lowercase() == tname_lower {
+                                                            root_page = idx.root_page;
+                                                            is_index = true;
+                                                            index_unique = idx.unique;
+                                                            index_table_name =
+                                                                Some(idx.table.clone());
+                                                            index_collations = idx
+                                                                .columns
+                                                                .iter()
+                                                                .map(|c| c.collation.clone())
+                                                                .collect();
+                                                            break;
+                                                        }
+                                                    }
+                                                    if is_index {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
+                        }
+
+                        // Not found as table or index - return error
+                        // (but not if it's a virtual table)
+                        let is_virtual = table_meta.as_ref().map(|t| t.is_virtual).unwrap_or(false);
+                        if need_root_lookup
+                            && root_page == 0
+                            && !is_virtual
+                            && table_meta.is_none()
+                            && !is_index
+                        {
+                            return Err(Error::with_message(
+                                ErrorCode::Error,
+                                format!("no such table: {}", tname),
+                            ));
                         }
                     }
 
@@ -1731,18 +1864,18 @@ impl Vdbe {
                         }
                     } else {
                         // Determine which btree to use: temp tables use temp_btree
-                        let is_temp = table_meta.as_ref().map(|t| t.db_idx == 1).unwrap_or(false);
-                        let btree = if is_temp {
-                            self.temp_btree.clone()
-                        } else {
-                            self.btree.clone()
-                        };
-                        if !is_temp {
-                            if let Some(conn_ptr) = self.conn_ptr {
-                                let conn = unsafe { &mut *conn_ptr };
-                                if conn.transaction_state == TransactionState::None {
-                                    if let Some(ref btree) = btree {
-                                        btree.begin_trans(false)?;
+                        let table_db_idx = table_meta.as_ref().map(|t| t.db_idx).unwrap_or(0);
+                        let btree = self.btree_for_db_idx(table_db_idx);
+                        if let Some(conn_ptr) = self.conn_ptr {
+                            let conn = unsafe { &mut *conn_ptr };
+                            if let Some(ref btree) = btree {
+                                if conn.transaction_state == TransactionState::Write {
+                                    if !btree.is_in_write_trans() {
+                                        btree.begin_trans(true)?;
+                                    }
+                                } else {
+                                    btree.begin_trans(false)?;
+                                    if conn.transaction_state == TransactionState::None {
                                         conn.transaction_state = TransactionState::Read;
                                     }
                                 }
@@ -1813,9 +1946,12 @@ impl Vdbe {
                 let mut table_columns = None;
                 let mut table_found = false;
                 let mut is_temp_table = false;
+                let mut table_db_idx = 0;
                 let mut index_collations: Vec<String> = Vec::new();
                 let mut provided_key_info: Option<std::sync::Arc<crate::storage::btree::KeyInfo>> =
                     None;
+                let mut schema_name: Option<String> = None;
+                let mut simple_name: Option<String> = None;
 
                 // Check for directly provided KeyInfo (e.g., during CREATE INDEX)
                 if let P4::KeyInfo(ki) = &op.p4 {
@@ -1839,57 +1975,180 @@ impl Vdbe {
                         collseqs,
                     )));
                     is_index = true; // KeyInfo implies index
+                    let db_idx = (op.p5 >> 8) as i32;
+                    if db_idx != 0 {
+                        table_db_idx = db_idx;
+                    }
                 } else if let P4::Text(name) = &op.p4 {
                     table_name = Some(name.clone());
+                    if let Some(dot_pos) = name.find('.') {
+                        schema_name = Some(name[..dot_pos].to_string());
+                        simple_name = Some(name[dot_pos + 1..].to_string());
+                    } else {
+                        simple_name = Some(name.clone());
+                    }
+                    if let Some(ref base_name) = simple_name {
+                        if base_name.eq_ignore_ascii_case("sqlite_temp_master")
+                            || base_name.eq_ignore_ascii_case("sqlite_temp_schema")
+                        {
+                            is_temp_table = true;
+                            table_db_idx = 1;
+                        } else if base_name.eq_ignore_ascii_case("sqlite_master")
+                            || base_name.eq_ignore_ascii_case("sqlite_schema")
+                        {
+                            if let Some(ref db_name) = schema_name {
+                                if let Some(db_idx) = self.db_idx_for_schema(db_name) {
+                                    table_db_idx = db_idx;
+                                }
+                            }
+                        }
+                    }
                     if let Some(ref schema) = self.schema {
                         if let Ok(schema_guard) = schema.read() {
+                            let requested_db_idx = schema_name
+                                .as_deref()
+                                .and_then(|db_name| self.db_idx_for_schema(db_name));
+                            let name_lower = simple_name
+                                .as_ref()
+                                .map(|n| n.to_lowercase())
+                                .unwrap_or_else(|| name.to_lowercase());
                             // First try tables
-                            if let Some(table) = schema_guard.tables.get(&name.to_lowercase()) {
-                                table_found = true;
-                                is_virtual = table.is_virtual;
-                                is_temp_table = table.db_idx == 1;
-                                table_columns = Some(table.columns.len() as i32);
-                                if root_page == 0 {
-                                    root_page = table.root_page;
+                            if let Some(table) = schema_guard.tables.get(&name_lower) {
+                                if requested_db_idx.map_or(true, |idx| table.db_idx == idx) {
+                                    table_found = true;
+                                    is_virtual = table.is_virtual;
+                                    is_temp_table = table.db_idx == 1;
+                                    table_db_idx = table.db_idx;
+                                    table_columns = Some(table.columns.len() as i32);
+                                    if root_page == 0 {
+                                        root_page = table.root_page;
+                                    }
                                 }
                             }
                             // If not found as table, try indexes
                             if root_page == 0 && !table_found {
-                                if let Some(index) = schema_guard.indexes.get(&name.to_lowercase())
-                                {
-                                    table_found = true;
-                                    is_index = true;
-                                    index_unique = index.unique;
-                                    is_temp_table = index.db_idx == 1;
-                                    root_page = index.root_page;
-                                    // Capture collations for KeyInfo
-                                    index_collations =
-                                        index.columns.iter().map(|c| c.collation.clone()).collect();
+                                if let Some(index) = schema_guard.indexes.get(&name_lower) {
+                                    if requested_db_idx.map_or(true, |idx| index.db_idx == idx) {
+                                        table_found = true;
+                                        is_index = true;
+                                        index_unique = index.unique;
+                                        is_temp_table = index.db_idx == 1;
+                                        table_db_idx = index.db_idx;
+                                        root_page = index.root_page;
+                                        // Capture collations for KeyInfo
+                                        index_collations = index
+                                            .columns
+                                            .iter()
+                                            .map(|c| c.collation.clone())
+                                            .collect();
+                                    }
                                 }
                             }
 
                             // Also search for auto-indexes in table.indexes
                             if root_page == 0 && !table_found {
-                                let name_lower = name.to_lowercase();
                                 for (_tbl_name, tbl) in schema_guard.tables.iter() {
-                                    for idx in &tbl.indexes {
-                                        if idx.name.to_lowercase() == name_lower {
-                                            table_found = true;
-                                            is_index = true;
-                                            index_unique = idx.unique;
-                                            is_temp_table = tbl.db_idx == 1;
-                                            root_page = idx.root_page;
-                                            // Capture collations for KeyInfo
-                                            index_collations = idx
-                                                .columns
-                                                .iter()
-                                                .map(|c| c.collation.clone())
-                                                .collect();
+                                    if requested_db_idx.map_or(true, |idx| tbl.db_idx == idx) {
+                                        for idx in &tbl.indexes {
+                                            if idx.name.to_lowercase() == name_lower {
+                                                table_found = true;
+                                                is_index = true;
+                                                index_unique = idx.unique;
+                                                is_temp_table = tbl.db_idx == 1;
+                                                table_db_idx = tbl.db_idx;
+                                                root_page = idx.root_page;
+                                                // Capture collations for KeyInfo
+                                                index_collations = idx
+                                                    .columns
+                                                    .iter()
+                                                    .map(|c| c.collation.clone())
+                                                    .collect();
+                                                break;
+                                            }
+                                        }
+                                        if table_found {
                                             break;
                                         }
                                     }
-                                    if table_found {
-                                        break;
+                                }
+                            }
+                        }
+                    }
+
+                    // If not found in main schema and we have a specific db_idx, check attached schemas
+                    // Also check when root_page is known but table_found is false (for correct db_idx)
+                    if !table_found {
+                        let requested_db_idx = schema_name
+                            .as_deref()
+                            .and_then(|db_name| self.db_idx_for_schema(db_name));
+                        let name_lower = simple_name
+                            .as_ref()
+                            .map(|n| n.to_lowercase())
+                            .unwrap_or_default();
+                        let need_root_lookup = root_page == 0;
+
+                        if requested_db_idx.is_some() {
+                            if let Some(conn_ptr) = self.conn_ptr {
+                                let conn = unsafe { &*conn_ptr };
+                                if let Some(db) = conn.dbs.get(requested_db_idx.unwrap() as usize) {
+                                    if let Some(ref schema_arc) = db.schema {
+                                        if let Ok(schema_guard) = schema_arc.read() {
+                                            // Try as a table
+                                            if let Some(table) =
+                                                schema_guard.tables.get(&name_lower)
+                                            {
+                                                table_found = true;
+                                                is_virtual = table.is_virtual;
+                                                is_temp_table = table.db_idx == 1;
+                                                table_db_idx = table.db_idx;
+                                                table_columns = Some(table.columns.len() as i32);
+                                                if need_root_lookup {
+                                                    root_page = table.root_page;
+                                                }
+                                            }
+                                            // Try as an index
+                                            if need_root_lookup && root_page == 0 && !table_found {
+                                                if let Some(index) =
+                                                    schema_guard.indexes.get(&name_lower)
+                                                {
+                                                    table_found = true;
+                                                    is_index = true;
+                                                    index_unique = index.unique;
+                                                    is_temp_table = index.db_idx == 1;
+                                                    table_db_idx = index.db_idx;
+                                                    root_page = index.root_page;
+                                                    index_collations = index
+                                                        .columns
+                                                        .iter()
+                                                        .map(|c| c.collation.clone())
+                                                        .collect();
+                                                }
+                                            }
+                                            // Also check auto-indexes
+                                            if need_root_lookup && root_page == 0 && !table_found {
+                                                for (_tbl_name, tbl) in schema_guard.tables.iter() {
+                                                    for idx in &tbl.indexes {
+                                                        if idx.name.to_lowercase() == name_lower {
+                                                            table_found = true;
+                                                            is_index = true;
+                                                            index_unique = idx.unique;
+                                                            is_temp_table = tbl.db_idx == 1;
+                                                            table_db_idx = tbl.db_idx;
+                                                            root_page = idx.root_page;
+                                                            index_collations = idx
+                                                                .columns
+                                                                .iter()
+                                                                .map(|c| c.collation.clone())
+                                                                .collect();
+                                                            break;
+                                                        }
+                                                    }
+                                                    if table_found {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1922,17 +2181,15 @@ impl Vdbe {
                     let btree = if is_temp_table {
                         self.temp_btree.clone()
                     } else {
-                        self.btree.clone()
+                        self.btree_for_db_idx(table_db_idx)
                     };
-                    if !is_temp_table {
-                        if let Some(conn_ptr) = self.conn_ptr {
-                            let conn = unsafe { &mut *conn_ptr };
-                            if conn.transaction_state != TransactionState::Write {
-                                if let Some(ref btree) = btree {
-                                    btree.begin_trans(true)?;
-                                    conn.transaction_state = TransactionState::Write;
-                                }
+                    if let Some(conn_ptr) = self.conn_ptr {
+                        let conn = unsafe { &mut *conn_ptr };
+                        if let Some(ref btree) = btree {
+                            if !btree.is_in_write_trans() {
+                                btree.begin_trans(true)?;
                             }
+                            conn.transaction_state = TransactionState::Write;
                         }
                     }
                     if let Some(ref btree) = btree {
@@ -1979,7 +2236,9 @@ impl Vdbe {
                                     bt_cursor.cur_int_key = !is_index;
                                     cursor.btree_cursor = Some(bt_cursor);
                                 }
-                                Err(_) => {} // Failed to create cursor
+                                Err(e) => {
+                                    eprintln!("DEBUG OpenWrite: cursor creation failed for root_page={}: {:?}", root_page, e);
+                                }
                             }
                         }
                     }
@@ -3485,7 +3744,8 @@ impl Vdbe {
                     if let Some(ref registry) = self.vtab_registry {
                         let _ = registry.rollback_all();
                     }
-                    if let Some(ref btree) = self.btree {
+                    let btrees = self.collect_btrees();
+                    for btree in &btrees {
                         let _ = btree.rollback(0, false);
                     }
                     // Reload schema from sqlite_master after rollback.
@@ -3511,7 +3771,8 @@ impl Vdbe {
                     }
                     if let Some(hook) = conn.commit_hook.as_ref() {
                         if hook() {
-                            if let Some(ref btree) = self.btree {
+                            let btrees = self.collect_btrees();
+                            for btree in &btrees {
                                 let _ = btree.rollback(0, false);
                             }
                             if let Some(hook) = conn.rollback_hook.as_ref() {
@@ -3532,7 +3793,8 @@ impl Vdbe {
                     if let Some(ref registry) = self.vtab_registry {
                         registry.sync_all()?;
                     }
-                    if let Some(ref btree) = self.btree {
+                    let btrees = self.collect_btrees();
+                    for btree in &btrees {
                         btree.commit()?;
                     }
                     // Commit virtual tables after btree commit succeeds
@@ -5455,12 +5717,13 @@ impl Vdbe {
                     ));
                 };
                 let conn = unsafe { &mut *conn_ptr };
-                let Some(ref btree) = self.btree else {
+                let btrees = self.collect_btrees();
+                if btrees.is_empty() {
                     return Err(Error::with_message(
                         ErrorCode::Error,
                         "missing btree for savepoint",
                     ));
-                };
+                }
 
                 match op.p1 {
                     0 => {
@@ -5470,7 +5733,9 @@ impl Vdbe {
                             conn.is_transaction_savepoint = true;
                         }
                         let idx = conn.savepoints.len() as i32;
-                        btree.savepoint(SavepointOp::Begin, idx)?;
+                        for btree in &btrees {
+                            btree.savepoint(SavepointOp::Begin, idx)?;
+                        }
                         conn.savepoints.push(name.to_string());
                         // Notify virtual tables about savepoint
                         if let Some(ref registry) = self.vtab_registry {
@@ -5491,7 +5756,9 @@ impl Vdbe {
                         let idx = pos as i32;
                         if op.p1 == 1 {
                             // Release savepoint
-                            btree.savepoint(SavepointOp::Release, idx)?;
+                            for btree in &btrees {
+                                btree.savepoint(SavepointOp::Release, idx)?;
+                            }
                             // Notify virtual tables about release
                             if let Some(ref registry) = self.vtab_registry {
                                 let _ = registry.release_all(idx);
@@ -5510,7 +5777,9 @@ impl Vdbe {
                                         if let Some(ref registry) = self.vtab_registry {
                                             let _ = registry.rollback_all();
                                         }
-                                        let _ = btree.rollback(0, false);
+                                        for btree in &btrees {
+                                            let _ = btree.rollback(0, false);
+                                        }
                                         if let Some(hook) = conn.rollback_hook.as_ref() {
                                             hook();
                                         }
@@ -5528,7 +5797,9 @@ impl Vdbe {
                                 if let Some(ref registry) = self.vtab_registry {
                                     registry.sync_all()?;
                                 }
-                                btree.commit()?;
+                                for btree in &btrees {
+                                    btree.commit()?;
+                                }
                                 // Commit virtual tables after btree commit
                                 if let Some(ref registry) = self.vtab_registry {
                                     let _ = registry.commit_all();
@@ -5543,8 +5814,13 @@ impl Vdbe {
                             if let Some(ref registry) = self.vtab_registry {
                                 let _ = registry.rollback_to_all(idx);
                             }
-                            btree.savepoint(SavepointOp::Rollback, idx)?;
+                            for btree in &btrees {
+                                btree.savepoint(SavepointOp::Rollback, idx)?;
+                            }
                             conn.reload_schema()?;
+                            for btree in &btrees {
+                                btree.reload_freelist()?;
+                            }
                             conn.savepoints.truncate(pos + 1);
                             self.deferred_fk_counter = 0;
                         }
@@ -6409,6 +6685,16 @@ impl Vdbe {
                         let root_pgno = btree.create_table(flags)?;
                         self.mem_mut(op.p2).set_int(root_pgno as i64);
                     }
+                } else if db_idx > 1 {
+                    if let Some(btree) = self.btree_for_db_idx(db_idx) {
+                        let root_pgno = btree.create_table(flags)?;
+                        self.mem_mut(op.p2).set_int(root_pgno as i64);
+                    } else {
+                        return Err(Error::with_message(
+                            ErrorCode::Error,
+                            format!("unknown database {}", db_idx),
+                        ));
+                    }
                 } else {
                     // Main database
                     if let Some(ref btree) = self.btree {
@@ -6432,6 +6718,16 @@ impl Vdbe {
                     // Select the correct schema based on db_idx
                     let target_schema = if db_idx == 1 {
                         self.temp_schema.clone()
+                    } else if db_idx > 1 {
+                        // Attached database - get schema from connection
+                        if let Some(conn_ptr) = self.conn_ptr {
+                            let conn = unsafe { &*conn_ptr };
+                            conn.dbs
+                                .get(db_idx as usize)
+                                .and_then(|db| db.schema.clone())
+                        } else {
+                            None
+                        }
                     } else {
                         self.schema.clone()
                     };
@@ -6544,7 +6840,7 @@ impl Vdbe {
                                         let trigger = crate::schema::Trigger {
                                             name: create.name.name.clone(),
                                             table: create.table.clone(),
-                                            db_idx: if create.temporary { 1 } else { 0 },
+                                            db_idx,
                                             timing,
                                             event,
                                             for_each_row: create.for_each_row,
@@ -6634,6 +6930,7 @@ impl Vdbe {
                                 {
                                     // Set the root page from register P2
                                     index.root_page = root_page;
+                                    index.db_idx = db_idx;
 
                                     let index_name_lower = index.name.to_lowercase();
                                     let table_name_lower = index.table.to_lowercase();
@@ -6714,7 +7011,9 @@ impl Vdbe {
                             let if_not_exists = sql_upper.contains("IF NOT EXISTS");
 
                             // Parse CREATE TABLE SQL and register the table
-                            if let Some(table) = crate::schema::parse_create_sql(sql, root_page) {
+                            if let Some(mut table) = crate::schema::parse_create_sql(sql, root_page)
+                            {
+                                table.db_idx = db_idx;
                                 let table_name_lower = table.name.to_lowercase();
 
                                 // Check for reserved internal names (sqlite_*)
@@ -6746,7 +7045,7 @@ impl Vdbe {
                                 let virtual_module = table.virtual_module.clone();
                                 let virtual_args = table.virtual_args.clone();
                                 if let std::collections::hash_map::Entry::Vacant(e) =
-                                    schema_guard.tables.entry(table_name_lower)
+                                    schema_guard.tables.entry(table_name_lower.clone())
                                 {
                                     e.insert(std::sync::Arc::new(table));
 

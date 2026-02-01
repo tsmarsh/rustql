@@ -35,10 +35,24 @@ pub fn read_varint_at(data: &[u8], start: usize) -> (u64, usize) {
 /// Read a varint from the given offset in a byte slice
 pub fn read_varint(data: &[u8], offset: usize) -> Result<(u64, usize)> {
     if offset >= data.len() {
+        if std::env::var("RUSTQL_BTREE_TRACE").is_ok() {
+            eprintln!(
+                "btree: read_varint out of range offset={} len={}",
+                offset,
+                data.len()
+            );
+        }
         return Err(Error::new(ErrorCode::Corrupt));
     }
     let (value, consumed) = read_varint_at(data, offset);
     if consumed == 0 {
+        if std::env::var("RUSTQL_BTREE_TRACE").is_ok() {
+            eprintln!(
+                "btree: read_varint failed offset={} len={}",
+                offset,
+                data.len()
+            );
+        }
         return Err(Error::new(ErrorCode::Corrupt));
     }
     Ok((value, consumed))
@@ -126,6 +140,13 @@ pub fn write_varint(value: u64, out: &mut Vec<u8>) {
 /// Read a u16 from a byte slice at the given offset
 pub fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
     if offset + 2 > data.len() {
+        if std::env::var("RUSTQL_BTREE_TRACE").is_ok() {
+            eprintln!(
+                "btree: read_u16 out of range offset={} len={}",
+                offset,
+                data.len()
+            );
+        }
         return None;
     }
     Some(u16::from_be_bytes([data[offset], data[offset + 1]]))
@@ -134,6 +155,13 @@ pub fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
 /// Read a u32 from a byte slice at the given offset
 pub fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
     if offset + 4 > data.len() {
+        if std::env::var("RUSTQL_BTREE_TRACE").is_ok() {
+            eprintln!(
+                "btree: read_u32 out of range offset={} len={}",
+                offset,
+                data.len()
+            );
+        }
         return None;
     }
     Some(u32::from_be_bytes([
@@ -147,6 +175,13 @@ pub fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
 /// Write a u32 to a byte slice at the given offset
 pub fn write_u32(data: &mut [u8], offset: usize, value: u32) -> Result<()> {
     if offset + 4 > data.len() {
+        if std::env::var("RUSTQL_BTREE_TRACE").is_ok() {
+            eprintln!(
+                "btree: write_u32 out of range offset={} len={}",
+                offset,
+                data.len()
+            );
+        }
         return Err(Error::new(ErrorCode::Corrupt));
     }
     let bytes = value.to_be_bytes();
@@ -160,6 +195,13 @@ pub fn write_u32(data: &mut [u8], offset: usize, value: u32) -> Result<()> {
 /// Write a u16 to a byte slice at the given offset
 pub fn write_u16(data: &mut [u8], offset: usize, value: u16) -> Result<()> {
     if offset + 2 > data.len() {
+        if std::env::var("RUSTQL_BTREE_TRACE").is_ok() {
+            eprintln!(
+                "btree: write_u16 out of range offset={} len={}",
+                offset,
+                data.len()
+            );
+        }
         return Err(Error::new(ErrorCode::Corrupt));
     }
     let bytes = value.to_be_bytes();

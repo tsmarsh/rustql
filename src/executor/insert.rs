@@ -196,14 +196,19 @@ impl<'a> InsertCompiler<'a> {
         // Initialize
         self.emit(Opcode::Init, 0, 0, 0, P4::Unused);
 
-        // Open table for writing
+        // Open table for writing - use qualified name if schema prefix is present
+        let qualified_name = if let Some(ref schema) = insert.table.schema {
+            format!("{}.{}", schema, insert.table.name)
+        } else {
+            insert.table.name.clone()
+        };
         self.table_cursor = self.alloc_cursor();
         self.emit(
             Opcode::OpenWrite,
             self.table_cursor,
             0, // Root page (would come from schema)
             0,
-            P4::Text(insert.table.name.clone()),
+            P4::Text(qualified_name),
         );
 
         self.num_columns = self.infer_num_columns(insert);

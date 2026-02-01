@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::error::Result;
+use crate::error::{Error, ErrorCode, Result};
 use crate::parser::ast::*;
 use crate::parser::grammar::Parser;
 use crate::types::ColumnType;
@@ -124,6 +124,8 @@ pub struct StatementCompiler<'s> {
     enable_view: bool,
     /// Virtual table registry for xBestIndex calls
     vtab_registry: Option<std::sync::Arc<crate::vtab::VtabRegistry>>,
+    /// Attached database schemas (name, schema) in attach order
+    attached_schemas: Vec<(String, &'s crate::schema::Schema)>,
 }
 
 impl<'s> StatementCompiler<'s> {
@@ -140,6 +142,7 @@ impl<'s> StatementCompiler<'s> {
             case_sensitive_like: false,
             enable_view: true,
             vtab_registry: None,
+            attached_schemas: Vec::new(),
         }
     }
 
@@ -156,6 +159,47 @@ impl<'s> StatementCompiler<'s> {
             case_sensitive_like: false,
             enable_view: true,
             vtab_registry: None,
+            attached_schemas: Vec::new(),
+        }
+    }
+
+    pub fn set_attached_schemas(&mut self, schemas: Vec<(String, &'s crate::schema::Schema)>) {
+        self.attached_schemas = schemas;
+    }
+
+    fn resolve_db_idx(&self, name: &QualifiedName, temporary: bool) -> Result<i32> {
+        if temporary {
+            return Ok(1);
+        }
+        match name.schema.as_deref() {
+            None | Some("main") => Ok(0),
+            Some("temp") => Ok(1),
+            Some(schema) => {
+                let pos = self
+                    .attached_schemas
+                    .iter()
+                    .position(|(db, _)| db.eq_ignore_ascii_case(schema));
+                if let Some(idx) = pos {
+                    Ok((idx + 2) as i32)
+                } else {
+                    Err(Error::with_message(
+                        ErrorCode::Error,
+                        format!("unknown database {}", schema),
+                    ))
+                }
+            }
+        }
+    }
+
+    fn db_name_for_idx(&self, db_idx: i32) -> Option<&str> {
+        match db_idx {
+            0 => Some("main"),
+            1 => Some("temp"),
+            idx if idx > 1 => self
+                .attached_schemas
+                .get((idx - 2) as usize)
+                .map(|(name, _)| name.as_str()),
+            _ => None,
         }
     }
 
@@ -183,6 +227,21 @@ impl<'s> StatementCompiler<'s> {
     /// Set virtual table registry for xBestIndex calls
     pub fn set_vtab_registry(&mut self, registry: std::sync::Arc<crate::vtab::VtabRegistry>) {
         self.vtab_registry = Some(registry);
+    }
+
+    fn make_select_compiler(&self) -> SelectCompiler<'s> {
+        let mut compiler = if let Some(schema) = self.schema {
+            SelectCompiler::with_schema(schema)
+        } else {
+            SelectCompiler::new()
+        };
+        if let Some(temp_schema) = self.temp_schema {
+            compiler.set_temp_schema(temp_schema);
+        }
+        if !self.attached_schemas.is_empty() {
+            compiler.set_attached_schemas(self.attached_schemas.clone());
+        }
+        compiler
     }
 
     /// Compile a SQL string to VDBE bytecode
@@ -223,15 +282,7 @@ impl<'s> StatementCompiler<'s> {
     ) -> Result<(Vec<VdbeOp>, StmtType, Vec<String>, Vec<ColumnType>)> {
         match stmt {
             Stmt::Select(select) => {
-                let mut compiler = if let Some(schema) = self.schema {
-                    SelectCompiler::with_schema(schema)
-                } else {
-                    SelectCompiler::new()
-                };
-                // Pass temp schema for TEMP tables/views
-                if let Some(temp_schema) = self.temp_schema {
-                    compiler.set_temp_schema(temp_schema);
-                }
+                let mut compiler = self.make_select_compiler();
                 // Pass column naming flags from PRAGMA settings
                 compiler.set_column_name_flags(self.short_column_names, self.full_column_names);
                 // Pass parameter names for Variable compilation
@@ -257,7 +308,20 @@ impl<'s> StatementCompiler<'s> {
             }
 
             Stmt::Insert(insert) => {
-                let mut compiler = if let Some(schema) = self.schema {
+                // Resolve schema: check for schema prefix (attached database)
+                let target_schema: Option<&crate::schema::Schema> =
+                    if let Some(ref schema_name) = insert.table.schema {
+                        // Look up in attached_schemas
+                        self.attached_schemas
+                            .iter()
+                            .find(|(name, _)| name.eq_ignore_ascii_case(schema_name))
+                            .map(|(_, schema)| *schema)
+                            .or(self.schema) // Fallback to main if not found
+                    } else {
+                        self.schema
+                    };
+
+                let mut compiler = if let Some(schema) = target_schema {
                     super::insert::InsertCompiler::with_schema(schema)
                 } else {
                     super::insert::InsertCompiler::new()
@@ -269,7 +333,19 @@ impl<'s> StatementCompiler<'s> {
             }
 
             Stmt::Update(update) => {
-                let mut compiler = if let Some(schema) = self.schema {
+                // Resolve schema: check for schema prefix (attached database)
+                let target_schema: Option<&crate::schema::Schema> =
+                    if let Some(ref schema_name) = update.table.schema {
+                        self.attached_schemas
+                            .iter()
+                            .find(|(name, _)| name.eq_ignore_ascii_case(schema_name))
+                            .map(|(_, schema)| *schema)
+                            .or(self.schema)
+                    } else {
+                        self.schema
+                    };
+
+                let mut compiler = if let Some(schema) = target_schema {
                     super::update::UpdateCompiler::with_schema(schema)
                 } else {
                     super::update::UpdateCompiler::new()
@@ -281,7 +357,19 @@ impl<'s> StatementCompiler<'s> {
             }
 
             Stmt::Delete(delete) => {
-                let mut compiler = if let Some(schema) = self.schema {
+                // Resolve schema: check for schema prefix (attached database)
+                let target_schema: Option<&crate::schema::Schema> =
+                    if let Some(ref schema_name) = delete.table.schema {
+                        self.attached_schemas
+                            .iter()
+                            .find(|(name, _)| name.eq_ignore_ascii_case(schema_name))
+                            .map(|(_, schema)| *schema)
+                            .or(self.schema)
+                    } else {
+                        self.schema
+                    };
+
+                let mut compiler = if let Some(schema) = target_schema {
                     super::delete::DeleteCompiler::with_schema(schema)
                 } else {
                     super::delete::DeleteCompiler::new()
@@ -898,9 +986,9 @@ impl<'s> StatementCompiler<'s> {
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
 
         // 2: CreateBtree - create the table's root page
-        // P1 = database index (0 for main, 1 for temp)
+        // P1 = database index (0 for main, 1 for temp, 2+ attached)
         // P2 = register for root page, P3 = BTREE_INTKEY for table
-        let db_idx = if create.temporary { 1 } else { 0 };
+        let db_idx = self.resolve_db_idx(&create.name, false)?;
         ops.push(Self::make_op(
             Opcode::CreateBtree,
             db_idx,
@@ -916,14 +1004,14 @@ impl<'s> StatementCompiler<'s> {
         // P4 contains the SQL text
         ops.push(Self::make_op(
             Opcode::ParseSchema,
-            0,
+            db_idx,
             reg_root_page, // root page register
             0,
             P4::Text(create_sql.clone()),
         ));
 
         let cursor_id = 0;
-        self.append_sqlite_master_open(&mut ops, cursor_id);
+        self.append_sqlite_master_open(&mut ops, cursor_id, db_idx);
         self.append_sqlite_master_insert(
             &mut ops,
             cursor_id,
@@ -986,7 +1074,7 @@ impl<'s> StatementCompiler<'s> {
                         // ParseSchema to register the index in schema cache
                         ops.push(Self::make_op(
                             Opcode::ParseSchema,
-                            0,
+                            db_idx,
                             reg_index_page,
                             0,
                             P4::Text(index_sql.clone()),
@@ -1205,22 +1293,23 @@ impl<'s> StatementCompiler<'s> {
         let reg_root_page = 1;
         ops.push(Self::make_op(Opcode::Init, 0, 2, 0, P4::Unused));
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
+        let db_idx = self.resolve_db_idx(&create.name, false)?;
         let sqlite_master_cursor = 0;
-        self.append_sqlite_master_open(&mut ops, sqlite_master_cursor);
+        self.append_sqlite_master_open(&mut ops, sqlite_master_cursor, db_idx);
 
         if create.module.eq_ignore_ascii_case("fts3") {
             let shadow_tables = self.build_fts3_shadow_tables(create);
             for (table_name, sql) in shadow_tables {
                 ops.push(Self::make_op(
                     Opcode::CreateBtree,
-                    0,
+                    db_idx,
                     reg_root_page,
                     BTREE_INTKEY as i32,
                     P4::Unused,
                 ));
                 ops.push(Self::make_op(
                     Opcode::ParseSchema,
-                    0,
+                    db_idx,
                     reg_root_page,
                     0,
                     P4::Text(sql.clone()),
@@ -1239,14 +1328,14 @@ impl<'s> StatementCompiler<'s> {
             for (table_name, sql) in shadow_tables {
                 ops.push(Self::make_op(
                     Opcode::CreateBtree,
-                    0,
+                    db_idx,
                     reg_root_page,
                     BTREE_INTKEY as i32,
                     P4::Unused,
                 ));
                 ops.push(Self::make_op(
                     Opcode::ParseSchema,
-                    0,
+                    db_idx,
                     reg_root_page,
                     0,
                     P4::Text(sql.clone()),
@@ -1839,13 +1928,18 @@ impl<'s> StatementCompiler<'s> {
         (columns, has_content, internal_content)
     }
 
-    fn append_sqlite_master_open(&self, ops: &mut Vec<VdbeOp>, cursor_id: i32) {
+    fn append_sqlite_master_open(&self, ops: &mut Vec<VdbeOp>, cursor_id: i32, db_idx: i32) {
+        let table_name = match self.db_name_for_idx(db_idx) {
+            Some("temp") => "sqlite_temp_master".to_string(),
+            Some(db_name) if db_idx > 1 => format!("{}.sqlite_master", db_name),
+            _ => "sqlite_master".to_string(),
+        };
         ops.push(Self::make_op(
             Opcode::OpenWrite,
             cursor_id,
             1,
             5,
-            P4::Text("sqlite_master".to_string()),
+            P4::Text(table_name),
         ));
     }
 
@@ -2002,6 +2096,7 @@ impl<'s> StatementCompiler<'s> {
         let index_name_lower = index_name.to_lowercase();
         let table_name = &create.table;
         let table_name_lower = table_name.to_lowercase();
+        let db_idx = self.resolve_db_idx(&create.name, false)?;
 
         // Check if index already exists
         if let Some(schema) = self.schema {
@@ -2112,7 +2207,7 @@ impl<'s> StatementCompiler<'s> {
         // CreateBtree - create the index's btree page (BLOBKEY for index)
         ops.push(Self::make_op(
             Opcode::CreateBtree,
-            0,
+            db_idx,
             reg_root_page,
             BTREE_BLOBKEY as i32,
             P4::Unused,
@@ -2121,7 +2216,7 @@ impl<'s> StatementCompiler<'s> {
         // ParseSchema to register the index in schema cache
         ops.push(Self::make_op(
             Opcode::ParseSchema,
-            0,
+            db_idx,
             reg_root_page,
             0,
             P4::Text(sql.clone()),
@@ -2211,13 +2306,14 @@ impl<'s> StatementCompiler<'s> {
             };
 
             // OpenWrite index cursor using root page from register
+            let keyinfo_p5 = 0x02 | ((db_idx as u16) << 8);
             ops.push(Self::make_op_with_p5(
                 Opcode::OpenWrite,
                 index_cursor,
                 reg_root_page,
                 (num_key_cols + 1) as i32, // +1 for rowid
                 P4::KeyInfo(std::sync::Arc::new(key_info)),
-                0x02, // P2 is register
+                keyinfo_p5, // P2 is register; high bits carry db_idx
             ));
 
             // Rewind table cursor - jump to after_loop if table is empty
@@ -2285,7 +2381,7 @@ impl<'s> StatementCompiler<'s> {
 
         // Insert into sqlite_master (explicit CREATE INDEX has SQL)
         let cursor_id = 0;
-        self.append_sqlite_master_open(&mut ops, cursor_id);
+        self.append_sqlite_master_open(&mut ops, cursor_id, db_idx);
         self.append_sqlite_master_insert_index(
             &mut ops,
             cursor_id,
@@ -2427,9 +2523,10 @@ impl<'s> StatementCompiler<'s> {
 
         // Only insert into sqlite_master for non-temp views
         // Temp views are transient and only exist in the in-memory schema
+        let db_idx = self.resolve_db_idx(&create.name, create.temporary)?;
         if !create.temporary {
             let cursor_id = 0;
-            self.append_sqlite_master_open(&mut ops, cursor_id);
+            self.append_sqlite_master_open(&mut ops, cursor_id, db_idx);
             self.append_sqlite_master_insert_view(&mut ops, cursor_id, &create.name.name, &sql);
             self.append_sqlite_master_close(&mut ops, cursor_id);
         }
@@ -2437,7 +2534,6 @@ impl<'s> StatementCompiler<'s> {
         // Use ParseSchema to register the view in the schema at runtime
         // P1=db_idx (0 for main, 1 for temp)
         // P2=0 (views don't need a root page), P4=SQL text
-        let db_idx = if create.temporary { 1 } else { 0 };
         ops.push(Self::make_op(
             Opcode::ParseSchema,
             db_idx,
@@ -2570,7 +2666,14 @@ impl<'s> StatementCompiler<'s> {
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
         // Use ParseSchema to register the trigger in the schema at runtime
         // P2=0 (triggers don't need a root page), P4=SQL text
-        ops.push(Self::make_op(Opcode::ParseSchema, 0, 0, 0, P4::Text(sql)));
+        let db_idx = self.resolve_db_idx(&create.name, create.temporary)?;
+        ops.push(Self::make_op(
+            Opcode::ParseSchema,
+            db_idx,
+            0,
+            0,
+            P4::Text(sql),
+        ));
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
         Ok(ops)
     }
@@ -3356,7 +3459,7 @@ impl<'s> StatementCompiler<'s> {
     fn compile_drop(&mut self, drop: &DropStmt, kind: &str) -> Result<Vec<VdbeOp>> {
         let name = &drop.name.name;
         let name_lower = name.to_lowercase();
-        let db_idx = drop.name.database_idx();
+        let db_idx = self.resolve_db_idx(&drop.name, false)?;
 
         // Build qualified name for error messages (include schema if specified)
         let display_name = if let Some(ref schema) = drop.name.schema {
@@ -3470,7 +3573,7 @@ impl<'s> StatementCompiler<'s> {
         if actual_db_idx != 1 {
             // Delete from sqlite_master
             let cursor_id = 0;
-            self.append_sqlite_master_open(&mut ops, cursor_id);
+            self.append_sqlite_master_open(&mut ops, cursor_id, actual_db_idx);
             self.append_sqlite_master_delete(&mut ops, cursor_id, name);
             self.append_sqlite_master_close(&mut ops, cursor_id);
         }
@@ -4894,6 +4997,7 @@ pub fn compile_sql_with_full_config<'a>(
     sql: &'a str,
     schema: &crate::schema::Schema,
     temp_schema: Option<&crate::schema::Schema>,
+    attached_schemas: Vec<(String, &crate::schema::Schema)>,
     short_column_names: bool,
     full_column_names: bool,
     case_sensitive_like: bool,
@@ -4904,6 +5008,7 @@ pub fn compile_sql_with_full_config<'a>(
     if let Some(ts) = temp_schema {
         compiler.set_temp_schema(ts);
     }
+    compiler.set_attached_schemas(attached_schemas);
     compiler.set_column_name_flags(short_column_names, full_column_names);
     compiler.set_case_sensitive_like(case_sensitive_like);
     compiler.set_enable_view(enable_view);

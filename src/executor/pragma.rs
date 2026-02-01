@@ -689,12 +689,14 @@ fn pragma_journal_mode(
     pragma: &PragmaStmt,
 ) -> Result<PragmaResult> {
     let db = lookup_db_mut(conn, schema_name)?;
+    let mut saw_value = false;
     if let Some(value) = pragma_value_string(pragma) {
+        saw_value = true;
         if let Some(mode) = journal_mode_from_str(&value) {
             db.journal_mode = mode;
         }
     }
-    if pragma.value.is_none() {
+    if pragma.value.is_none() || saw_value {
         let mode = journal_mode_name(db.journal_mode);
         return Ok(single_text_result(mode.to_string()));
     }

@@ -78,6 +78,8 @@ pub struct SelectCompiler<'s> {
     schema: Option<&'s crate::schema::Schema>,
     /// Temp schema for name resolution (optional, for TEMP tables/views)
     temp_schema: Option<&'s crate::schema::Schema>,
+    /// Attached database schemas (name, schema) in attach order
+    attached_schemas: Vec<(String, &'s crate::schema::Schema)>,
     /// Register holding the remaining LIMIT counter (None if no limit)
     limit_counter_reg: Option<i32>,
     /// Register holding the remaining OFFSET counter (None if no offset)
@@ -170,6 +172,7 @@ impl<'s> SelectCompiler<'s> {
             alias_expressions: HashMap::new(),
             schema: None,
             temp_schema: None,
+            attached_schemas: Vec::new(),
             limit_counter_reg: None,
             offset_counter_reg: None,
             limit_done_label: None,
@@ -233,6 +236,7 @@ impl<'s> SelectCompiler<'s> {
             alias_expressions: HashMap::new(),
             schema: Some(schema),
             temp_schema: None,
+            attached_schemas: Vec::new(),
             limit_counter_reg: None,
             offset_counter_reg: None,
             limit_done_label: None,
@@ -277,6 +281,10 @@ impl<'s> SelectCompiler<'s> {
     /// Set the virtual table registry for xBestIndex calls
     pub fn set_vtab_registry(&mut self, registry: std::sync::Arc<VtabRegistry>) {
         self.vtab_registry = Some(registry);
+    }
+
+    pub fn set_attached_schemas(&mut self, schemas: Vec<(String, &'s crate::schema::Schema)>) {
+        self.attached_schemas = schemas;
     }
 
     /// Set column naming flags from PRAGMA settings
@@ -3363,6 +3371,7 @@ impl<'s> SelectCompiler<'s> {
             TableSource::Table(name) => {
                 let table_name = &name.name;
                 let table_name_lower = table_name.to_lowercase();
+                let open_name = name.to_string();
 
                 if let Some((cursor, columns)) = self.cte_cursors.get(&table_name_lower) {
                     let display_name = item.alias.clone().unwrap_or_else(|| table_name.clone());
@@ -3505,7 +3514,11 @@ impl<'s> SelectCompiler<'s> {
                 }
 
                 // Look up table in schema if available
-                let schema_table = self.lookup_table_schema(&table_name_lower);
+                let schema_table = if name.schema.is_some() {
+                    self.lookup_table_schema_qualified(name)
+                } else {
+                    self.lookup_table_schema(&table_name_lower)
+                };
 
                 // If we have a schema and the table doesn't exist, return error
                 // (Skip this check if no schema is set - for backwards compatibility with unit tests)
@@ -3528,7 +3541,7 @@ impl<'s> SelectCompiler<'s> {
                 }
 
                 // Emit OpenRead for the table
-                self.emit(Opcode::OpenRead, cursor, 0, 0, P4::Text(table_name.clone()));
+                self.emit(Opcode::OpenRead, cursor, 0, 0, P4::Text(open_name));
 
                 let display_name = item.alias.clone().unwrap_or_else(|| table_name.clone());
                 self.tables.push(TableInfo {
@@ -3572,70 +3585,121 @@ impl<'s> SelectCompiler<'s> {
 
     /// Look up table schema, returning None if not found
     fn lookup_table_schema(&self, table_name_lower: &str) -> Option<std::sync::Arc<Table>> {
-        use crate::schema::Column;
+        if let Some(db_idx) = self.sqlite_master_db_idx(table_name_lower, None) {
+            return Some(self.sqlite_master_table(table_name_lower, db_idx));
+        }
 
-        // Handle sqlite_master, sqlite_schema, sqlite_temp_master, sqlite_temp_schema
-        if table_name_lower == "sqlite_master"
+        if let Some(temp_schema) = self.temp_schema {
+            if let Some(table) = temp_schema.table(table_name_lower) {
+                return Some(table.clone());
+            }
+        }
+        if let Some(schema) = self.schema {
+            if let Some(table) = schema.table(table_name_lower) {
+                return Some(table.clone());
+            }
+        }
+        for (_name, schema) in &self.attached_schemas {
+            if let Some(table) = schema.table(table_name_lower) {
+                return Some(table.clone());
+            }
+        }
+        None
+    }
+
+    fn lookup_table_schema_qualified(
+        &self,
+        name: &crate::parser::ast::QualifiedName,
+    ) -> Option<std::sync::Arc<Table>> {
+        let table_name_lower = name.name.to_lowercase();
+        if let Some(db_idx) = self.sqlite_master_db_idx(&table_name_lower, name.schema.as_deref()) {
+            return Some(self.sqlite_master_table(&table_name_lower, db_idx));
+        }
+        match name.schema.as_deref() {
+            Some("temp") => self
+                .temp_schema
+                .and_then(|schema| schema.table(&table_name_lower).map(|t| t.clone())),
+            Some("main") => self
+                .schema
+                .and_then(|schema| schema.table(&table_name_lower).map(|t| t.clone())),
+            Some(schema_name) => self
+                .attached_schemas
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(schema_name))
+                .and_then(|(_, schema)| schema.table(&table_name_lower).map(|t| t.clone())),
+            None => self.lookup_table_schema(&table_name_lower),
+        }
+    }
+
+    fn sqlite_master_db_idx(&self, table_name_lower: &str, schema: Option<&str>) -> Option<i32> {
+        let is_sqlite_master = table_name_lower == "sqlite_master"
             || table_name_lower == "sqlite_schema"
             || table_name_lower == "sqlite_temp_master"
-            || table_name_lower == "sqlite_temp_schema"
-        {
-            // Create a virtual schema for sqlite_master/sqlite_temp_master
-            let is_temp = table_name_lower.contains("temp");
-            Some(std::sync::Arc::new(Table {
-                name: table_name_lower.to_string(),
-                db_idx: if is_temp { 1 } else { 0 },
-                root_page: 1,
-                columns: vec![
-                    Column {
-                        name: "type".to_string(),
-                        type_name: Some("TEXT".to_string()),
-                        affinity: Affinity::Text,
-                        ..Default::default()
-                    },
-                    Column {
-                        name: "name".to_string(),
-                        type_name: Some("TEXT".to_string()),
-                        affinity: Affinity::Text,
-                        ..Default::default()
-                    },
-                    Column {
-                        name: "tbl_name".to_string(),
-                        type_name: Some("TEXT".to_string()),
-                        affinity: Affinity::Text,
-                        ..Default::default()
-                    },
-                    Column {
-                        name: "rootpage".to_string(),
-                        type_name: Some("INTEGER".to_string()),
-                        affinity: Affinity::Integer,
-                        ..Default::default()
-                    },
-                    Column {
-                        name: "sql".to_string(),
-                        type_name: Some("TEXT".to_string()),
-                        affinity: Affinity::Text,
-                        ..Default::default()
-                    },
-                ],
-                primary_key: None,
-                indexes: Vec::new(),
-                without_rowid: false,
-                strict: false,
-                is_virtual: false,
-                virtual_module: None,
-                virtual_args: Vec::new(),
-                foreign_keys: Vec::new(),
-                checks: Vec::new(),
-                autoincrement: false,
-                sql: None,
-                row_estimate: 0,
-            }))
-        } else if let Some(schema) = self.schema {
-            schema.table(table_name_lower).map(|t| t.clone())
-        } else {
-            None
+            || table_name_lower == "sqlite_temp_schema";
+        if !is_sqlite_master {
+            return None;
         }
+        if table_name_lower.contains("temp") {
+            return Some(1);
+        }
+        match schema {
+            Some("temp") => Some(1),
+            _ => Some(0),
+        }
+    }
+
+    fn sqlite_master_table(&self, table_name_lower: &str, db_idx: i32) -> std::sync::Arc<Table> {
+        use crate::schema::Column;
+
+        std::sync::Arc::new(Table {
+            name: table_name_lower.to_string(),
+            db_idx,
+            root_page: 1,
+            columns: vec![
+                Column {
+                    name: "type".to_string(),
+                    type_name: Some("TEXT".to_string()),
+                    affinity: Affinity::Text,
+                    ..Default::default()
+                },
+                Column {
+                    name: "name".to_string(),
+                    type_name: Some("TEXT".to_string()),
+                    affinity: Affinity::Text,
+                    ..Default::default()
+                },
+                Column {
+                    name: "tbl_name".to_string(),
+                    type_name: Some("TEXT".to_string()),
+                    affinity: Affinity::Text,
+                    ..Default::default()
+                },
+                Column {
+                    name: "rootpage".to_string(),
+                    type_name: Some("INTEGER".to_string()),
+                    affinity: Affinity::Integer,
+                    ..Default::default()
+                },
+                Column {
+                    name: "sql".to_string(),
+                    type_name: Some("TEXT".to_string()),
+                    affinity: Affinity::Text,
+                    ..Default::default()
+                },
+            ],
+            primary_key: None,
+            indexes: Vec::new(),
+            without_rowid: false,
+            strict: false,
+            is_virtual: false,
+            virtual_module: None,
+            virtual_args: Vec::new(),
+            foreign_keys: Vec::new(),
+            checks: Vec::new(),
+            autoincrement: false,
+            sql: None,
+            row_estimate: 0,
+        })
     }
 
     fn table_name_matches(table: &TableInfo, name: &str) -> bool {
@@ -5164,7 +5228,14 @@ impl<'s> SelectCompiler<'s> {
                                 .temp_schema
                                 .map(|s| s.tables.contains_key(&table_name_lower))
                                 .unwrap_or(false);
-                            if !in_temp {
+                            // Also check attached schemas
+                            let in_attached = name.schema.as_ref().map_or(false, |schema_name| {
+                                self.attached_schemas.iter().any(|(db_name, db_schema)| {
+                                    db_name.eq_ignore_ascii_case(schema_name)
+                                        && db_schema.tables.contains_key(&table_name_lower)
+                                })
+                            });
+                            if !in_temp && !in_attached {
                                 return Err(Error::with_message(
                                     ErrorCode::Error,
                                     format!("no such table: {}", qualified_name),

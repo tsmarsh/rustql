@@ -947,8 +947,11 @@ impl Pager {
         // Read database size from file
         if let Some(ref fd) = self.fd {
             let size = fd.file_size()?;
-            self.db_size = (size / self.page_size as i64) as Pgno;
-            self.db_file_size = self.db_size;
+            let file_pages = (size / self.page_size as i64) as Pgno;
+            self.db_file_size = file_pages;
+            if self.db_size < file_pages {
+                self.db_size = file_pages;
+            }
         }
 
         self.state = PagerState::Reader;
@@ -1081,8 +1084,25 @@ impl Pager {
         // cycles when pages are re-dirtied in subsequent transactions.
         self.pcache.clean_all();
 
+        if let Ok(file_pages) = self.file_page_count() {
+            self.db_file_size = file_pages;
+        }
+
         // Restore original database size
         self.db_size = self.db_orig_size;
+
+        if self.db_size > self.db_file_size {
+            self.db_file_size = self.db_size;
+        }
+
+        // Truncate database file if needed (rollback can restore a smaller size)
+        if self.db_size < self.db_file_size {
+            if let Some(ref mut fd) = self.fd {
+                let new_size = (self.db_size as i64) * (self.page_size as i64);
+                fd.truncate(new_size)?;
+            }
+            self.db_file_size = self.db_size;
+        }
 
         // End journal
         self.end_journal()?;
@@ -1114,7 +1134,15 @@ impl Pager {
     /// Open a new savepoint (sqlite3PagerOpenSavepoint)
     pub fn open_savepoint(&mut self, n: i32) -> Result<()> {
         while self.savepoints.len() < n as usize {
-            let orig_db_size = self.db_size.max(self.pcache.page_count() as Pgno);
+            let file_pages = self.file_page_count().unwrap_or(0);
+            if self.db_size < file_pages {
+                self.db_size = file_pages;
+            }
+            let mut orig_db_size = self.db_size.max(self.pcache.page_count() as Pgno);
+            if orig_db_size == 0 && !self.mem_db {
+                orig_db_size = 1;
+                self.db_size = 1;
+            }
             if orig_db_size != self.db_size {
                 self.db_size = orig_db_size;
             }

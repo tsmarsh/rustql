@@ -588,9 +588,14 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
                 if let Some(conn_ptr) = stmt.conn_ptr {
                     let conn = unsafe { &mut *conn_ptr };
                     if conn.get_autocommit() {
-                        // Commit all btrees (main, temp, and attached databases)
-                        for db in conn.dbs.iter() {
-                            if let Some(ref btree) = db.btree {
+                        if let Some(main_db) = conn.find_db("main") {
+                            if let Some(ref btree) = main_db.btree {
+                                let _ = btree.commit();
+                            }
+                        }
+                        // Also commit temp btree if it exists
+                        if conn.dbs.len() > 1 {
+                            if let Some(ref btree) = conn.dbs[1].btree {
                                 let _ = btree.commit();
                             }
                         }

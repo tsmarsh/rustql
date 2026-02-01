@@ -156,6 +156,13 @@ impl<'s> UpdateCompiler<'s> {
         self.table_name = update.table.name.clone();
         self.table_alias = update.alias.clone();
 
+        // Build qualified name for OpenRead/OpenWrite opcodes
+        let qualified_name = if let Some(ref schema) = update.table.schema {
+            format!("{}.{}", schema, update.table.name)
+        } else {
+            update.table.name.clone()
+        };
+
         // Check for system tables that cannot be modified
         let table_name_lower = update.table.name.to_lowercase();
         if table_name_lower == "sqlite_master"
@@ -258,7 +265,7 @@ impl<'s> UpdateCompiler<'s> {
         let conflict_action = update.or_action.unwrap_or(ConflictAction::Abort);
 
         // Compile the two-phase UPDATE
-        self.compile_update_two_phase(update, root_page, conflict_action)?;
+        self.compile_update_two_phase(update, root_page, conflict_action, &qualified_name)?;
 
         // Handle RETURNING clause
         if let Some(returning) = &update.returning {
@@ -292,6 +299,7 @@ impl<'s> UpdateCompiler<'s> {
         update: &UpdateStmt,
         root_page: u32,
         conflict_action: ConflictAction,
+        qualified_name: &str,
     ) -> Result<()> {
         // Allocate cursors
         let read_cursor = self.alloc_cursor(); // For phase 1 scanning
@@ -315,13 +323,13 @@ impl<'s> UpdateCompiler<'s> {
         // Phase 1: Collection - Scan table and collect rowids
         // ========================================================================
 
-        // Open table for reading
+        // Open table for reading - use qualified name for attached databases
         self.emit(
             Opcode::OpenRead,
             read_cursor,
             root_page as i32,
             self.num_columns as i32,
-            P4::Text(update.table.name.clone()),
+            P4::Text(qualified_name.to_string()),
         );
 
         // Open ephemeral table to store rowids
@@ -397,13 +405,13 @@ impl<'s> UpdateCompiler<'s> {
         // Phase 2: Update - Iterate through collected rowids and update
         // ========================================================================
 
-        // Open table for writing
+        // Open table for writing - use qualified name for attached databases
         self.emit(
             Opcode::OpenWrite,
             write_cursor,
             root_page as i32,
             self.num_columns as i32,
-            P4::Text(update.table.name.clone()),
+            P4::Text(qualified_name.to_string()),
         );
 
         // Rewind ephemeral cursor to start

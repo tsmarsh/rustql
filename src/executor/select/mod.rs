@@ -2324,17 +2324,22 @@ impl<'s> SelectCompiler<'s> {
             .map(|t| t.cursor)
             .collect();
 
-        // Generate Rewind for each table cursor
-        let mut rewind_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
+        // Generate proper nested loop structure for cross joins
+        let mut loop_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
+        let mut done_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
         for cursor in &table_cursors {
-            let label = self.alloc_label();
-            self.emit(Opcode::Rewind, *cursor, label, 0, P4::Unused);
-            rewind_labels.push(label);
+            let done_label = self.alloc_label();
+            self.emit(Opcode::Rewind, *cursor, done_label, 0, P4::Unused);
+            done_labels.push(done_label);
+
+            // Mark loop start for this level
+            let loop_label = self.alloc_label();
+            self.resolve_label(loop_label, self.current_addr());
+            loop_labels.push(loop_label);
         }
 
-        // Use label to avoid collision with resolve_labels
-        let loop_start_label = self.alloc_label();
-        self.resolve_label(loop_start_label, self.current_addr());
+        // The innermost loop label is used for WHERE skip target
+        let loop_start_label = *loop_labels.last().unwrap_or(&self.alloc_label());
 
         // Evaluate WHERE clause
         let where_skip_label = if let Some(where_expr) = &core.where_clause {
@@ -2371,10 +2376,16 @@ impl<'s> SelectCompiler<'s> {
             self.resolve_label(label, self.current_addr());
         }
 
-        // Next loop
-        for (i, cursor) in table_cursors.iter().enumerate().rev() {
-            self.emit(Opcode::Next, *cursor, loop_start_label, 0, P4::Unused);
-            self.resolve_label(rewind_labels[i], self.current_addr());
+        // Generate Next for each table in reverse order (innermost first)
+        for i in (0..table_cursors.len()).rev() {
+            let cursor = table_cursors[i];
+            let loop_label = loop_labels[i];
+
+            // Next on this cursor, jump back to its loop start
+            self.emit(Opcode::Next, cursor, loop_label, 0, P4::Unused);
+
+            // Resolve done label for this level
+            self.resolve_label(done_labels[i], self.current_addr());
         }
 
         // Step 3: Now process window functions
@@ -2624,17 +2635,32 @@ impl<'s> SelectCompiler<'s> {
             None
         };
 
-        // Generate Rewind for each table cursor
-        let mut rewind_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
+        // Generate proper nested loop structure for cross joins
+        // For N tables, we need:
+        //   Rewind t0, done0
+        // loop0:
+        //   Rewind t1, done1
+        // loop1:
+        //   ... body ...
+        //   Next t1, loop1
+        // done1:
+        //   Next t0, loop0
+        // done0:
+        let mut loop_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
+        let mut done_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
         for cursor in &table_cursors {
-            let label = self.alloc_label();
-            self.emit(Opcode::Rewind, *cursor, label, 0, P4::Unused);
-            rewind_labels.push(label);
+            let done_label = self.alloc_label();
+            self.emit(Opcode::Rewind, *cursor, done_label, 0, P4::Unused);
+            done_labels.push(done_label);
+
+            // Mark loop start for this level
+            let loop_label = self.alloc_label();
+            self.resolve_label(loop_label, self.current_addr());
+            loop_labels.push(loop_label);
         }
 
-        // Use label to avoid collision with resolve_labels
-        let loop_start_label = self.alloc_label();
-        self.resolve_label(loop_start_label, self.current_addr());
+        // The innermost loop label is used for WHERE skip target
+        let loop_start_label = *loop_labels.last().unwrap_or(&self.alloc_label());
 
         // Evaluate WHERE clause
         let where_skip_label = if let Some(where_expr) = &core.where_clause {
@@ -2684,10 +2710,18 @@ impl<'s> SelectCompiler<'s> {
             self.resolve_label(label, self.current_addr());
         }
 
-        // Next loop
-        for (i, cursor) in table_cursors.iter().enumerate().rev() {
-            self.emit(Opcode::Next, *cursor, loop_start_label, 0, P4::Unused);
-            self.resolve_label(rewind_labels[i], self.current_addr());
+        // Generate Next for each table in reverse order (innermost first)
+        // Each table's Next jumps back to its own loop start
+        // When a table's Next fails, fall through to resolve done label, then try Next on outer
+        for i in (0..table_cursors.len()).rev() {
+            let cursor = table_cursors[i];
+            let loop_label = loop_labels[i];
+
+            // Next on this cursor, jump back to its loop start
+            self.emit(Opcode::Next, cursor, loop_label, 0, P4::Unused);
+
+            // Resolve done label for this level (where Rewind jumps when empty)
+            self.resolve_label(done_labels[i], self.current_addr());
         }
 
         // Set up saved_column_regs for expression compilation to use
@@ -3015,17 +3049,23 @@ impl<'s> SelectCompiler<'s> {
             .map(|t| t.cursor)
             .collect();
 
-        // Generate Rewind for each table cursor
-        let mut rewind_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
+        // Generate proper nested loop structure for cross joins
+        // Same structure as compile_simple_aggregate
+        let mut loop_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
+        let mut done_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
         for cursor in &table_cursors {
-            let label = self.alloc_label();
-            self.emit(Opcode::Rewind, *cursor, label, 0, P4::Unused);
-            rewind_labels.push(label);
+            let done_label = self.alloc_label();
+            self.emit(Opcode::Rewind, *cursor, done_label, 0, P4::Unused);
+            done_labels.push(done_label);
+
+            // Mark loop start for this level
+            let loop_label = self.alloc_label();
+            self.resolve_label(loop_label, self.current_addr());
+            loop_labels.push(loop_label);
         }
 
-        // Use label to avoid collision with resolve_labels
-        let loop_start_label = self.alloc_label();
-        self.resolve_label(loop_start_label, self.current_addr());
+        // The innermost loop label is used for WHERE skip target
+        let loop_start_label = *loop_labels.last().unwrap_or(&self.alloc_label());
 
         // Evaluate WHERE clause
         let where_skip_label = if let Some(where_expr) = &core.where_clause {
@@ -3080,10 +3120,16 @@ impl<'s> SelectCompiler<'s> {
             self.resolve_label(label, self.current_addr());
         }
 
-        // Next loop (in reverse order)
-        for (i, cursor) in table_cursors.iter().enumerate().rev() {
-            self.emit(Opcode::Next, *cursor, loop_start_label, 0, P4::Unused);
-            self.resolve_label(rewind_labels[i], self.current_addr());
+        // Generate Next for each table in reverse order (innermost first)
+        for i in (0..table_cursors.len()).rev() {
+            let cursor = table_cursors[i];
+            let loop_label = loop_labels[i];
+
+            // Next on this cursor, jump back to its loop start
+            self.emit(Opcode::Next, cursor, loop_label, 0, P4::Unused);
+
+            // Resolve done label for this level
+            self.resolve_label(done_labels[i], self.current_addr());
         }
 
         // Close table cursors

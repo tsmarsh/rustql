@@ -41,6 +41,163 @@ use state::{
 };
 
 // ============================================================================
+// Database Context for Virtual Table Modules
+// ============================================================================
+
+use crate::api::{
+    sqlite3_column_count, sqlite3_column_double, sqlite3_column_int64, sqlite3_column_text,
+    sqlite3_column_type, sqlite3_prepare_v2, sqlite3_step,
+};
+use crate::types::StepResult;
+use crate::vtab::DbContext;
+
+/// Database context implementation using a Connection pointer
+///
+/// This allows virtual table modules to query the database during creation
+/// without needing to access thread-local state.
+struct ConnectionDbContext {
+    conn_ptr: *mut SqliteConnection,
+}
+
+// Safety: This struct is only used within a single VDBE execution context
+// and the connection pointer remains valid for the duration of module.create_with_ctx()
+unsafe impl Send for ConnectionDbContext {}
+unsafe impl Sync for ConnectionDbContext {}
+
+impl DbContext for ConnectionDbContext {
+    fn query(&self, sql: &str) -> Result<Vec<Vec<Value>>> {
+        let conn = unsafe { &mut *self.conn_ptr };
+        let (mut stmt, _) = sqlite3_prepare_v2(conn, sql)?;
+        let mut rows = Vec::new();
+
+        while let Ok(StepResult::Row) = sqlite3_step(&mut stmt) {
+            let col_count = sqlite3_column_count(&stmt);
+            let mut row = Vec::new();
+
+            for i in 0..col_count {
+                let col_type = sqlite3_column_type(&stmt, i);
+                let value = match col_type {
+                    ColumnType::Null => Value::Null,
+                    ColumnType::Integer => Value::Integer(sqlite3_column_int64(&stmt, i)),
+                    ColumnType::Float => Value::Real(sqlite3_column_double(&stmt, i)),
+                    ColumnType::Text => Value::Text(sqlite3_column_text(&stmt, i)),
+                    ColumnType::Blob => Value::Blob(crate::api::sqlite3_column_blob(&stmt, i)),
+                };
+                row.push(value);
+            }
+            rows.push(row);
+        }
+
+        Ok(rows)
+    }
+
+    fn exec(&self, sql: &str) -> Result<()> {
+        let conn = unsafe { &mut *self.conn_ptr };
+        let (mut stmt, _) = sqlite3_prepare_v2(conn, sql)?;
+        sqlite3_step(&mut stmt)?;
+        Ok(())
+    }
+}
+
+/// Parse columns from a virtual table schema declaration
+///
+/// The schema string is like "(a, b, c)" or "(a INTEGER, b TEXT, c REAL)"
+fn parse_vtab_schema_columns(schema: &str) -> Vec<crate::schema::Column> {
+    use crate::schema::{Affinity, Column, DEFAULT_COLLATION};
+
+    let mut columns = Vec::new();
+
+    // Find the part between parentheses
+    let start = schema.find('(');
+    let end = schema.rfind(')');
+
+    if let (Some(start), Some(end)) = (start, end) {
+        let cols_str = &schema[start + 1..end];
+
+        // Split by comma, being careful about nested parentheses
+        let mut depth = 0;
+        let mut current = String::new();
+        let mut col_defs = Vec::new();
+
+        for c in cols_str.chars() {
+            match c {
+                '(' => {
+                    depth += 1;
+                    current.push(c);
+                }
+                ')' => {
+                    depth -= 1;
+                    current.push(c);
+                }
+                ',' if depth == 0 => {
+                    col_defs.push(current.trim().to_string());
+                    current.clear();
+                }
+                _ => current.push(c),
+            }
+        }
+        if !current.trim().is_empty() {
+            col_defs.push(current.trim().to_string());
+        }
+
+        for col_def in col_defs {
+            // Skip constraints (PRIMARY KEY, UNIQUE, etc.)
+            let upper = col_def.to_uppercase();
+            if upper.starts_with("PRIMARY KEY")
+                || upper.starts_with("UNIQUE")
+                || upper.starts_with("CHECK")
+                || upper.starts_with("FOREIGN KEY")
+                || upper.starts_with("CONSTRAINT")
+            {
+                continue;
+            }
+
+            // Parse column name and type
+            let parts: Vec<&str> = col_def.split_whitespace().collect();
+            if let Some(name) = parts.first() {
+                let name = name.trim_matches(|c| c == '"' || c == '\'' || c == '[' || c == ']');
+
+                // Determine affinity from type
+                let type_str = parts.get(1).map(|s| s.to_uppercase()).unwrap_or_default();
+                let affinity = if type_str.contains("INT") {
+                    Affinity::Integer
+                } else if type_str.contains("TEXT")
+                    || type_str.contains("CHAR")
+                    || type_str.contains("CLOB")
+                {
+                    Affinity::Text
+                } else if type_str.contains("BLOB") || type_str.is_empty() {
+                    Affinity::Blob
+                } else if type_str.contains("REAL")
+                    || type_str.contains("FLOA")
+                    || type_str.contains("DOUB")
+                {
+                    Affinity::Real
+                } else {
+                    Affinity::Numeric
+                };
+
+                columns.push(Column {
+                    name: name.to_string(),
+                    type_name: parts.get(1).map(|s| s.to_string()),
+                    affinity,
+                    not_null: false,
+                    not_null_conflict: None,
+                    default_value: None,
+                    collation: DEFAULT_COLLATION.to_string(),
+                    is_primary_key: false,
+                    is_unique: false,
+                    is_hidden: false,
+                    generated: None,
+                });
+            }
+        }
+    }
+
+    columns
+}
+
+// ============================================================================
 // Execution Result
 // ============================================================================
 
@@ -2321,6 +2478,8 @@ impl Vdbe {
 
                 // Try to use the registry first (new generic path)
                 let mut handled_by_registry = false;
+                // Extract conn_ptr before mutable borrow of cursor
+                let conn_ptr_opt = self.conn_ptr;
                 if let Some(ref registry) = self.vtab_registry {
                     if let Some(ref name) = vtab_name {
                         // Get the database name (default to "main")
@@ -2362,10 +2521,20 @@ impl Vdbe {
                                         };
 
                                     // Call filter with the determined index and constraints
-                                    if vtab_cursor
-                                        .filter(index_num, index_str, &constraints)
-                                        .is_ok()
-                                    {
+                                    // Use filter_with_ctx if we have a connection pointer
+                                    let filter_result = if let Some(conn_ptr) = conn_ptr_opt {
+                                        let db_ctx = ConnectionDbContext { conn_ptr };
+                                        vtab_cursor.filter_with_ctx(
+                                            index_num,
+                                            index_str,
+                                            &constraints,
+                                            &db_ctx,
+                                        )
+                                    } else {
+                                        vtab_cursor.filter(index_num, index_str, &constraints)
+                                    };
+
+                                    if filter_result.is_ok() {
                                         if vtab_cursor.eof() {
                                             cursor.state = CursorState::AtEnd;
                                             cursor.rowid = None;
@@ -8372,7 +8541,110 @@ impl Vdbe {
 
             Opcode::VCreate => {
                 // Create virtual table
-                // P4 = module arguments
+                // P4 = VtabCreateInfo with module name, table name, db_idx, and args
+                if let P4::VtabCreate(info) = &op.p4 {
+                    // Get the vtab registry from connection
+                    if let Some(conn_ptr) = self.conn_ptr {
+                        let conn = unsafe { &*conn_ptr };
+                        let registry = &conn.vtab_registry;
+
+                        // Look up the module
+                        if let Ok(Some(module)) = registry.get_module(&info.module_name) {
+                            // Determine database name from db_idx
+                            let db_name = if info.db_idx == 0 {
+                                "main"
+                            } else if info.db_idx == 1 {
+                                "temp"
+                            } else {
+                                conn.dbs
+                                    .get(info.db_idx as usize)
+                                    .map(|db| db.name.as_str())
+                                    .unwrap_or("main")
+                            };
+
+                            // Create database context for module to query database
+                            let db_ctx = ConnectionDbContext { conn_ptr };
+
+                            // Call module's create_with_ctx() method
+                            match module.create_with_ctx(
+                                db_name,
+                                &info.table_name,
+                                &info.args,
+                                &db_ctx,
+                            ) {
+                                Ok((schema, table)) => {
+                                    // Verify schema was declared
+                                    if schema.is_empty() {
+                                        return Err(Error::with_message(
+                                            ErrorCode::Error,
+                                            format!(
+                                                "vtable constructor did not declare schema: {}",
+                                                info.table_name
+                                            ),
+                                        ));
+                                    }
+
+                                    // Register the table instance
+                                    if let Err(e) = registry.register_instance(
+                                        db_name,
+                                        &info.table_name,
+                                        table.clone(),
+                                    ) {
+                                        return Err(Error::with_message(
+                                            ErrorCode::Error,
+                                            format!("vtable constructor failed: {}", e),
+                                        ));
+                                    }
+
+                                    // Update the Schema with the columns declared by the module
+                                    // The schema string is like "(a, b, c)" or "(a INTEGER, b TEXT)"
+                                    // Skip this for built-in modules that have their own column handling
+                                    let module_lower = info.module_name.to_lowercase();
+                                    let is_builtin = matches!(
+                                        module_lower.as_str(),
+                                        "fts3" | "fts4" | "fts5" | "rtree" | "fts3tokenize"
+                                    );
+                                    if !is_builtin {
+                                        if let Some(ref schema_lock) = self.schema {
+                                            if let Ok(mut schema_guard) = schema_lock.write() {
+                                                let table_name_lower =
+                                                    info.table_name.to_lowercase();
+                                                // Tables are stored in Arc, so we need to clone, modify, and replace
+                                                if let Some(old_table) =
+                                                    schema_guard.tables.get(&table_name_lower)
+                                                {
+                                                    let columns =
+                                                        parse_vtab_schema_columns(&schema);
+                                                    if !columns.is_empty() {
+                                                        // Clone the table, modify columns, and replace
+                                                        let mut new_table = (**old_table).clone();
+                                                        new_table.columns = columns;
+                                                        schema_guard.tables.insert(
+                                                            table_name_lower,
+                                                            Arc::new(new_table),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(_e) => {
+                                    // Module's create() returned an error
+                                    return Err(Error::with_message(
+                                        ErrorCode::Error,
+                                        format!("vtable constructor failed: {}", info.table_name),
+                                    ));
+                                }
+                            }
+                        } else {
+                            return Err(Error::with_message(
+                                ErrorCode::Error,
+                                format!("no such module: {}", info.module_name),
+                            ));
+                        }
+                    }
+                }
             }
 
             Opcode::VDestroy => {

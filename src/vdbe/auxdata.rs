@@ -547,6 +547,7 @@ fn format_p4(p4: &P4) -> String {
         P4::Table(t) => format!("table({})", t),
         P4::IntArray(a) => format!("[{} ints]", a.len()),
         P4::VFilterPlan(p) => format!("vfplan(idx={})", p.idx_num),
+        P4::VtabCreate(v) => format!("vcreate({}.{})", v.module_name, v.table_name),
     }
 }
 

@@ -21,10 +21,10 @@ use crate::schema::Affinity;
 use crate::types::{ColumnType, StepResult, Value};
 use crate::vdbe::mem::Mem;
 use crate::vtab::{
-    ConstraintValue, IndexInfo, VtabCursor, VtabModule, VtabTable, SQLITE_INDEX_CONSTRAINT_EQ,
-    SQLITE_INDEX_CONSTRAINT_GE, SQLITE_INDEX_CONSTRAINT_GLOB, SQLITE_INDEX_CONSTRAINT_GT,
-    SQLITE_INDEX_CONSTRAINT_LE, SQLITE_INDEX_CONSTRAINT_LIKE, SQLITE_INDEX_CONSTRAINT_LT,
-    SQLITE_INDEX_CONSTRAINT_MATCH,
+    ConstraintValue, DbContext, IndexInfo, VtabCursor, VtabModule, VtabTable,
+    SQLITE_INDEX_CONSTRAINT_EQ, SQLITE_INDEX_CONSTRAINT_GE, SQLITE_INDEX_CONSTRAINT_GLOB,
+    SQLITE_INDEX_CONSTRAINT_GT, SQLITE_INDEX_CONSTRAINT_LE, SQLITE_INDEX_CONSTRAINT_LIKE,
+    SQLITE_INDEX_CONSTRAINT_LT, SQLITE_INDEX_CONSTRAINT_MATCH,
 };
 
 use super::CONNECTIONS;
@@ -39,9 +39,24 @@ impl VtabModule for EchoModule {
 
     fn create(
         &self,
+        _db_name: &str,
+        _table_name: &str,
+        _args: &[String],
+    ) -> Result<(String, Arc<dyn VtabTable>)> {
+        // This method is not used when create_with_ctx is available
+        // Return an error indicating that DbContext is required
+        Err(Error::with_message(
+            ErrorCode::Error,
+            "echo module requires database context (create_with_ctx)",
+        ))
+    }
+
+    fn create_with_ctx(
+        &self,
         db_name: &str,
         table_name: &str,
         args: &[String],
+        ctx: &dyn DbContext,
     ) -> Result<(String, Arc<dyn VtabTable>)> {
         // First argument should be the name of the real table to mirror
         let real_table = args.first().ok_or_else(|| {
@@ -51,52 +66,38 @@ impl VtabModule for EchoModule {
             )
         })?;
 
-        // Look up the schema of the real table using CONNECTIONS
-        let (schema, columns, _has_rowid_alias) =
-            CONNECTIONS.with(|connections| -> Result<(String, Vec<EchoColumn>, bool)> {
-                let mut connections = connections.borrow_mut();
+        // Query the schema for the real table using DbContext
+        let sql = format!(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='{}'",
+            real_table
+        );
 
-                // Try to find a connection - we'll use any available one
-                // In practice, there's usually just one in TCL tests
-                let conn = connections.values_mut().next().ok_or_else(|| {
-                    Error::with_message(ErrorCode::Error, "no database connection available")
-                })?;
+        let rows = ctx.query(&sql)?;
 
-                // Query the schema for the real table
-                let sql = format!(
-                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='{}'",
-                    real_table
-                );
-                let (mut stmt, _) = sqlite3_prepare_v2(conn, &sql)?;
+        if let Some(row) = rows.first() {
+            if let Some(Value::Text(create_sql)) = row.first() {
+                // Parse column info from the CREATE statement
+                let columns = parse_columns_from_sql(create_sql);
 
-                if let Ok(StepResult::Row) = sqlite3_step(&mut stmt) {
-                    let create_sql = sqlite3_column_text(&stmt, 0);
+                // The schema for sqlite_master is the CREATE statement itself
+                // but we need just the column definitions part
+                let schema = extract_column_defs(create_sql);
 
-                    // Parse column info from the CREATE statement
-                    let columns = parse_columns_from_sql(&create_sql);
-                    let has_rowid_alias = columns.iter().any(|c| c.is_rowid_alias);
+                let table = EchoTable {
+                    name: table_name.to_string(),
+                    db_name: db_name.to_string(),
+                    real_table: real_table.to_string(),
+                    columns,
+                };
 
-                    // The schema for sqlite_master is the CREATE statement itself
-                    // but we need just the column definitions part
-                    let schema = extract_column_defs(&create_sql);
+                return Ok((schema, Arc::new(table)));
+            }
+        }
 
-                    Ok((schema, columns, has_rowid_alias))
-                } else {
-                    Err(Error::with_message(
-                        ErrorCode::Error,
-                        format!("table {} does not exist", real_table),
-                    ))
-                }
-            })?;
-
-        let table = EchoTable {
-            name: table_name.to_string(),
-            db_name: db_name.to_string(),
-            real_table: real_table.to_string(),
-            columns,
-        };
-
-        Ok((schema, Arc::new(table)))
+        Err(Error::with_message(
+            ErrorCode::Error,
+            format!("table {} does not exist", real_table),
+        ))
     }
 
     fn connect(
@@ -106,6 +107,7 @@ impl VtabModule for EchoModule {
         args: &[String],
     ) -> Result<(String, Arc<dyn VtabTable>)> {
         // For echo, connect is the same as create
+        // But connect doesn't have DbContext, so we need CONNECTIONS fallback
         self.create(db_name, table_name, args)
     }
 }
@@ -399,8 +401,23 @@ impl VtabCursor for EchoCursor {
     fn filter(
         &mut self,
         _index_num: i32,
+        _index_str: Option<&str>,
+        _constraints: &[ConstraintValue],
+    ) -> Result<()> {
+        // This method is not used when filter_with_ctx is available
+        // Return an error indicating that DbContext is required
+        Err(Error::with_message(
+            ErrorCode::Error,
+            "echo cursor requires database context (filter_with_ctx)",
+        ))
+    }
+
+    fn filter_with_ctx(
+        &mut self,
+        _index_num: i32,
         index_str: Option<&str>,
-        constraints: &[ConstraintValue],
+        _constraints: &[ConstraintValue],
+        ctx: &dyn DbContext,
     ) -> Result<()> {
         self.rows.clear();
         self.position = 0;
@@ -410,47 +427,21 @@ impl VtabCursor for EchoCursor {
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("SELECT rowid, * FROM {}", self.real_table));
 
-        CONNECTIONS.with(|connections| -> Result<()> {
-            let mut connections = connections.borrow_mut();
-            let conn = connections.values_mut().next().ok_or_else(|| {
-                Error::with_message(ErrorCode::Error, "no database connection available")
-            })?;
+        // Execute query using DbContext
+        let query_rows = ctx.query(&sql)?;
 
-            let (mut stmt, _) = sqlite3_prepare_v2(conn, &sql)?;
+        for row in query_rows {
+            // First column is rowid, rest are data columns
+            let rowid = match row.first() {
+                Some(Value::Integer(i)) => *i,
+                _ => 0,
+            };
 
-            // Bind constraint values
-            for (i, cv) in constraints.iter().enumerate() {
-                let idx = (i + 1) as i32;
-                bind_constraint_value(&mut stmt, idx, cv)?;
-            }
+            let row_data: Vec<Value> = row.into_iter().skip(1).collect();
+            self.rows.push((rowid, row_data));
+        }
 
-            // Fetch all rows
-            while let Ok(StepResult::Row) = sqlite3_step(&mut stmt) {
-                let rowid = sqlite3_column_int64(&stmt, 0);
-                let col_count = sqlite3_column_count(&stmt);
-                let mut row_data = Vec::new();
-
-                for col_idx in 1..col_count {
-                    let col_type = sqlite3_column_type(&stmt, col_idx);
-                    let value = match col_type {
-                        ColumnType::Null => Value::Null,
-                        ColumnType::Integer => Value::Integer(sqlite3_column_int64(&stmt, col_idx)),
-                        ColumnType::Float => {
-                            Value::Real(crate::api::sqlite3_column_double(&stmt, col_idx))
-                        }
-                        ColumnType::Text => Value::Text(sqlite3_column_text(&stmt, col_idx)),
-                        ColumnType::Blob => {
-                            Value::Blob(crate::api::sqlite3_column_blob(&stmt, col_idx))
-                        }
-                    };
-                    row_data.push(value);
-                }
-
-                self.rows.push((rowid, row_data));
-            }
-
-            Ok(())
-        })
+        Ok(())
     }
 
     fn next(&mut self) -> Result<()> {

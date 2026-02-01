@@ -1443,6 +1443,8 @@ impl<'s> StatementCompiler<'s> {
             P4::Unused,
         ));
 
+        // First, create the table entry in schema via ParseSchema
+        // This must happen BEFORE VCreate so VCreate can update the columns
         let create_sql = self.build_create_virtual_table_sql(create);
         ops.push(Self::make_op(
             Opcode::ParseSchema,
@@ -1451,6 +1453,27 @@ impl<'s> StatementCompiler<'s> {
             0,
             P4::Text(create_sql.clone()),
         ));
+
+        // For custom modules (not built-in), call VCreate to register the module instance
+        // and update schema columns. Skip this for built-in modules that handle their own
+        // initialization (fts3, fts5, rtree, etc.)
+        if !is_builtin {
+            let vtab_info = crate::vdbe::ops::VtabCreateInfo {
+                module_name: create.module.clone(),
+                table_name: create.name.name.clone(),
+                db_idx,
+                args: create.args.clone(),
+            };
+            ops.push(Self::make_op(
+                Opcode::VCreate,
+                db_idx,
+                0,
+                0,
+                P4::VtabCreate(vtab_info),
+            ));
+        }
+
+        // Finally, insert into sqlite_master
         self.append_sqlite_master_insert(
             &mut ops,
             sqlite_master_cursor,

@@ -74,6 +74,7 @@ fn format_p4(p4: &P4) -> String {
             format!("[{}]", vals.join(","))
         }
         P4::VFilterPlan(p) => format!("vfplan(idx={})", p.idx_num),
+        P4::VtabCreate(v) => format!("vcreate({}.{})", v.module_name, v.table_name),
     }
 }
 

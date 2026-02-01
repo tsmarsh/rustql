@@ -1037,6 +1037,21 @@ pub enum P4 {
     IntArray(Vec<i64>),
     /// Virtual table filter plan (from xBestIndex)
     VFilterPlan(VFilterPlan),
+    /// Virtual table creation info (module_name, db_idx, args)
+    VtabCreate(VtabCreateInfo),
+}
+
+/// Information for creating a virtual table
+#[derive(Debug, Clone, PartialEq)]
+pub struct VtabCreateInfo {
+    /// Module name
+    pub module_name: String,
+    /// Virtual table name
+    pub table_name: String,
+    /// Database index (0=main, 1=temp, 2+=attached)
+    pub db_idx: i32,
+    /// Module arguments
+    pub args: Vec<String>,
 }
 
 /// Virtual table filter plan from xBestIndex
@@ -1202,6 +1217,7 @@ impl fmt::Display for VdbeOp {
             P4::Table(t) => write!(f, "  table({})", t)?,
             P4::IntArray(a) => write!(f, "  [{} ints]", a.len())?,
             P4::VFilterPlan(p) => write!(f, "  vfplan(idx={})", p.idx_num)?,
+            P4::VtabCreate(v) => write!(f, "  vcreate({}.{})", v.module_name, v.table_name)?,
         }
 
         if let Some(ref comment) = self.comment {

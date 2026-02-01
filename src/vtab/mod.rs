@@ -45,5 +45,5 @@ pub use index_info::{
     SQLITE_INDEX_CONSTRAINT_MATCH, SQLITE_INDEX_CONSTRAINT_NE, SQLITE_INDEX_CONSTRAINT_OFFSET,
     SQLITE_INDEX_CONSTRAINT_REGEXP,
 };
-pub use module::{VtabModule, VtabTable};
+pub use module::{DbContext, VtabModule, VtabTable};
 pub use registry::VtabRegistry;

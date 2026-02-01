@@ -3,15 +3,36 @@
 //! This module defines the core traits for virtual table modules:
 //! - `VtabModule`: Factory trait for creating virtual table instances
 //! - `VtabTable`: Trait for a single virtual table instance
+//! - `DbContext`: Database access context passed to modules during creation
 
 use std::sync::Arc;
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::schema::Affinity;
+use crate::types::Value;
 use crate::vdbe::mem::Mem;
 
 use super::cursor::VtabCursor;
 use super::index_info::IndexInfo;
+
+// ============================================================================
+// Database Context for Virtual Table Module Access
+// ============================================================================
+
+/// Database context passed to virtual table modules during creation
+///
+/// This trait allows modules to query the database during xCreate/xConnect
+/// without needing to access global state. The implementation is provided
+/// by the VDBE engine when executing VCreate opcodes.
+pub trait DbContext: Send + Sync {
+    /// Execute a query and return the result rows
+    ///
+    /// Each row is a Vec of Values for the columns.
+    fn query(&self, sql: &str) -> Result<Vec<Vec<Value>>>;
+
+    /// Execute a statement that doesn't return rows (INSERT, UPDATE, DELETE)
+    fn exec(&self, sql: &str) -> Result<()>;
+}
 
 /// A virtual table module (mirrors sqlite3_module)
 ///
@@ -84,6 +105,24 @@ pub trait VtabModule: Send + Sync {
         table_name: &str,
         args: &[String],
     ) -> Result<(String, Arc<dyn VtabTable>)>;
+
+    /// Create a new virtual table with database context (xCreate)
+    ///
+    /// This variant is called when a database context is available (e.g., during
+    /// VCreate opcode execution). Modules that need to query the database during
+    /// creation should override this method.
+    ///
+    /// The default implementation calls `create()`.
+    fn create_with_ctx(
+        &self,
+        db_name: &str,
+        table_name: &str,
+        args: &[String],
+        _ctx: &dyn DbContext,
+    ) -> Result<(String, Arc<dyn VtabTable>)> {
+        // Default: ignore context and call regular create
+        self.create(db_name, table_name, args)
+    }
 
     /// Connect to an existing virtual table (xConnect)
     ///

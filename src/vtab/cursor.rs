@@ -5,6 +5,7 @@
 use crate::error::Result;
 use crate::vdbe::mem::Mem;
 
+use super::module::DbContext;
 use super::ConstraintValue;
 
 /// Cursor for iterating over virtual table rows
@@ -55,6 +56,24 @@ pub trait VtabCursor: Send + Sync {
         index_str: Option<&str>,
         constraints: &[ConstraintValue],
     ) -> Result<()>;
+
+    /// Initialize or reset the cursor with filter constraints and database context
+    ///
+    /// This variant is called when a database context is available.
+    /// Cursors that need to query the database during filtering should
+    /// override this method.
+    ///
+    /// The default implementation calls `filter()`.
+    fn filter_with_ctx(
+        &mut self,
+        index_num: i32,
+        index_str: Option<&str>,
+        constraints: &[ConstraintValue],
+        _ctx: &dyn DbContext,
+    ) -> Result<()> {
+        // Default: ignore context and call regular filter
+        self.filter(index_num, index_str, constraints)
+    }
 
     /// Advance to the next row
     ///

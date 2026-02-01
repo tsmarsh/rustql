@@ -7600,26 +7600,27 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Pre-existing failure: free block chain structure differs from expectation"]
     fn test_free_space_creates_free_block() {
         let (mut page, limits) = create_test_page(4096);
-        let header_start = limits.header_start();
 
-        // Allocate and free space
-        let offset = page.allocate_space(100, limits).unwrap();
+        // Allocate two blocks - the second one will be at cell_offset boundary
+        let offset1 = page.allocate_space(100, limits).unwrap();
+        let offset2 = page.allocate_space(100, limits).unwrap();
         let initial_free = page.n_free;
 
-        page.free_space(offset, 100, limits);
+        // Free the first one (which is NOT at cell_offset boundary)
+        // This should create an actual free block
+        page.free_space(offset1, 100, limits);
 
         // Free block should be in the chain
-        assert_eq!(page.first_freeblock, offset);
+        assert_eq!(page.first_freeblock, offset1);
         // n_free should increase
         assert_eq!(page.n_free, initial_free + 100);
 
         // Verify free block structure
         let chain = page.get_free_block_chain(limits);
         assert_eq!(chain.len(), 1);
-        assert_eq!(chain[0], (offset, 100));
+        assert_eq!(chain[0], (offset1, 100));
     }
 
     #[test]
@@ -7658,20 +7659,22 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Pre-existing failure: coalescing logic differs from expectation"]
     fn test_free_block_coalesce_next() {
         let (mut page, limits) = create_test_page(4096);
 
-        // Allocate two adjacent blocks
+        // Allocate three adjacent blocks
+        // After allocation: offset3 (highest), offset2 (middle), offset1 (lowest = cell_offset)
+        let offset3 = page.allocate_space(100, limits).unwrap();
         let offset2 = page.allocate_space(100, limits).unwrap();
         let offset1 = page.allocate_space(100, limits).unwrap();
 
-        // offset1 is lower (allocated later from shrinking gap)
-        // Free them in reverse order - offset2 first (higher), then offset1
+        // Free the highest first (creates a free block, not absorbed into gap)
+        page.free_space(offset3, 100, limits);
+        // Free the middle one - should coalesce with offset3's free block
         page.free_space(offset2, 100, limits);
-        page.free_space(offset1, 100, limits);
 
-        // Should coalesce into single 200-byte block
+        // Should coalesce into single 200-byte block (offset2 + offset3)
+        // offset1 is still allocated at cell_offset
         let chain = page.get_free_block_chain(limits);
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].1, 200);

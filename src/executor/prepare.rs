@@ -1288,6 +1288,28 @@ impl<'s> StatementCompiler<'s> {
     ) -> Result<Vec<VdbeOp>> {
         use crate::storage::btree::BTREE_INTKEY;
 
+        // Validate that the module exists
+        // Built-in modules: fts3, fts5, rtree are always available
+        // Other modules must be registered in the vtab_registry
+        let module_name = create.module.to_lowercase();
+        let is_builtin = matches!(module_name.as_str(), "fts3" | "fts5" | "rtree");
+
+        if !is_builtin {
+            // Check if module is registered
+            let module_exists = self
+                .vtab_registry
+                .as_ref()
+                .map(|registry| registry.has_module(&module_name))
+                .unwrap_or(false);
+
+            if !module_exists {
+                return Err(Error::with_message(
+                    ErrorCode::Error,
+                    format!("no such module: {}", create.module),
+                ));
+            }
+        }
+
         let mut ops = Vec::new();
 
         let reg_root_page = 1;

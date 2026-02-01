@@ -848,6 +848,11 @@ impl RtreeTable {
         self.nodes.get(&node_id).map(|n| n.is_leaf).unwrap_or(false)
     }
 
+    /// Get entries for a node
+    pub fn get_node_entries(&self, node_id: i64) -> Option<&Vec<RtreeEntry>> {
+        self.nodes.get(&node_id).map(|n| &n.entries)
+    }
+
     /// Load R-tree from shadow table data
     ///
     /// This reconstructs the in-memory R-tree from persisted shadow table data.

@@ -17,6 +17,8 @@
 - [x] DELETE support with shadow table persistence
 - [x] UPDATE support with shadow table persistence
 - [x] Constraint validation (coord[N] <= coord[N+1])
+- [x] rtreedepth() function - extract depth from node blob
+- [x] rtreenode() function - parse node blob into TCL list
 
 ### Test Results (Manual)
 - CREATE VIRTUAL TABLE: PASS
@@ -30,14 +32,14 @@
 - DELETE: PASS (persists to shadow tables)
 - UPDATE: PASS (persists to shadow tables)
 - Constraint validation: PASS (rejects min > max coordinates)
+- rtreedepth(): PASS (matches SQLite output)
+- rtreenode(): PASS (matches SQLite output)
 
 ### Remaining Work
-1. **rtreedepth() function**: Extract depth from node blob
-2. **rtreenode() function**: Parse node blob into TCL list
-3. **rtreecheck() function**: Validate R-tree integrity
-4. **pragma table_list shadow support**: Show shadow tables in pragma
-5. **ATTACH database R-tree support**: Create R-tree in attached DB
-6. **ON CONFLICT support**: Handle conflict clauses
+1. **rtreecheck() function**: Validate R-tree integrity
+2. **pragma table_list shadow support**: Show shadow tables in pragma
+3. **ATTACH database R-tree support**: Create R-tree in attached DB
+4. **ON CONFLICT support**: Handle conflict clauses
 
 ### Blocking
-- Test infrastructure functions need to be registered as custom functions
+- rtreecheck() is complex - needs to verify parent/child relationships and bounding boxes

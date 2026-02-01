@@ -106,6 +106,10 @@ pub fn get_scalar_function(name: &str) -> Option<ScalarFunc> {
         "CALLCNT" => Some(func_callcnt),
         "RANDSTR" => Some(func_randstr),
 
+        // R-tree test infrastructure functions
+        "RTREEDEPTH" => Some(func_rtreedepth),
+        "RTREENODE" => Some(func_rtreenode),
+
         _ => None,
     }
 }
@@ -1521,6 +1525,144 @@ fn func_randstr(args: &[Value]) -> Result<Value> {
         .collect();
 
     Ok(Value::Text(s))
+}
+
+// ============================================================================
+// R-tree Test Infrastructure Functions
+// ============================================================================
+
+/// rtreedepth(blob) - Extract the depth value from an R-tree node blob
+///
+/// The depth is stored in the first 2 bytes of the node blob as a big-endian u16.
+/// Depth 0 indicates a leaf node, higher values indicate internal nodes.
+fn func_rtreedepth(args: &[Value]) -> Result<Value> {
+    if args.is_empty() {
+        return Ok(Value::Null);
+    }
+
+    match &args[0] {
+        Value::Null => Ok(Value::Null),
+        Value::Blob(blob) => {
+            if blob.len() < 2 {
+                Ok(Value::Null)
+            } else {
+                // Depth is stored as big-endian u16 in first 2 bytes
+                let depth = u16::from_be_bytes([blob[0], blob[1]]) as i64;
+                Ok(Value::Integer(depth))
+            }
+        }
+        _ => {
+            // Try to convert to blob
+            let s = args[0].to_text();
+            let bytes = s.as_bytes();
+            if bytes.len() < 2 {
+                Ok(Value::Null)
+            } else {
+                let depth = u16::from_be_bytes([bytes[0], bytes[1]]) as i64;
+                Ok(Value::Integer(depth))
+            }
+        }
+    }
+}
+
+/// rtreenode(n_dim, blob) - Parse an R-tree node blob into a human-readable format
+///
+/// Returns a TCL-style list of entries: "{id minX maxX minY maxY} {id minX maxX minY maxY} ..."
+/// The n_dim parameter specifies the number of dimensions (e.g., 2 for 2D R-tree).
+fn func_rtreenode(args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function rtreenode()",
+        ));
+    }
+
+    let n_dim = match &args[0] {
+        Value::Integer(n) => *n as usize,
+        Value::Real(f) => *f as usize,
+        _ => {
+            return Err(Error::with_message(
+                crate::error::ErrorCode::Error,
+                "first argument to rtreenode() must be an integer",
+            ));
+        }
+    };
+
+    if n_dim == 0 || n_dim > 5 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "invalid dimension count for rtreenode()",
+        ));
+    }
+
+    let blob = match &args[1] {
+        Value::Null => return Ok(Value::Null),
+        Value::Blob(b) => b.clone(),
+        Value::Text(s) => s.as_bytes().to_vec(),
+        _ => {
+            return Err(Error::with_message(
+                crate::error::ErrorCode::Error,
+                "second argument to rtreenode() must be a blob",
+            ));
+        }
+    };
+
+    if blob.len() < 4 {
+        return Ok(Value::Text(String::new()));
+    }
+
+    // Parse the node blob:
+    // Bytes 0-1: depth (big-endian u16)
+    // Bytes 2-3: n_entries (big-endian u16)
+    // Then for each entry: id (8 bytes) + coords (n_dim * 2 * 4 bytes)
+    let n_entries = u16::from_be_bytes([blob[2], blob[3]]) as usize;
+    let n_coord = n_dim * 2;
+    let bytes_per_cell = 8 + n_coord * 4; // 8 for id, 4 per coordinate
+
+    let mut entries = Vec::new();
+    let mut offset = 4;
+
+    for _ in 0..n_entries {
+        if offset + bytes_per_cell > blob.len() {
+            break;
+        }
+
+        // Read id (big-endian i64)
+        let id = i64::from_be_bytes([
+            blob[offset],
+            blob[offset + 1],
+            blob[offset + 2],
+            blob[offset + 3],
+            blob[offset + 4],
+            blob[offset + 5],
+            blob[offset + 6],
+            blob[offset + 7],
+        ]);
+        offset += 8;
+
+        // Read coordinates (big-endian f32, stored as min/max pairs)
+        let mut coords = Vec::with_capacity(n_coord);
+        for _ in 0..n_coord {
+            let f = f32::from_be_bytes([
+                blob[offset],
+                blob[offset + 1],
+                blob[offset + 2],
+                blob[offset + 3],
+            ]);
+            coords.push(f);
+            offset += 4;
+        }
+
+        // Format as TCL list entry: {id minX maxX minY maxY ...}
+        let mut entry = format!("{{{}", id);
+        for coord in coords {
+            entry.push_str(&format!(" {}", coord));
+        }
+        entry.push('}');
+        entries.push(entry);
+    }
+
+    Ok(Value::Text(entries.join(" ")))
 }
 
 // ============================================================================

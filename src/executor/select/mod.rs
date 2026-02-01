@@ -1216,7 +1216,9 @@ impl<'s> SelectCompiler<'s> {
         // Generate the main query loop
         if self.has_window_functions {
             self.compile_with_window_functions(core, dest)
-        } else if self.has_aggregates && core.group_by.is_some() {
+        } else if core.group_by.is_some() {
+            // GROUP BY always uses grouped aggregate, even without aggregate functions
+            // (returns one row per group)
             self.compile_grouped_aggregate(core, dest)
         } else if self.has_aggregates {
             self.compile_simple_aggregate(core, dest)
@@ -2998,7 +3000,13 @@ impl<'s> SelectCompiler<'s> {
         );
 
         // Collect table cursors to avoid borrow checker issues
-        let table_cursors: Vec<i32> = self.tables.iter().map(|t| t.cursor).collect();
+        // Skip outer tables (for correlated subqueries) - only close this query's tables
+        let table_cursors: Vec<i32> = self
+            .tables
+            .iter()
+            .skip(self.outer_tables_boundary)
+            .map(|t| t.cursor)
+            .collect();
 
         // Generate Rewind for each table cursor
         let mut rewind_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());

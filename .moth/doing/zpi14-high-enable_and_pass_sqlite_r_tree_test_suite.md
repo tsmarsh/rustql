@@ -20,6 +20,7 @@
 - [x] rtreedepth() function - extract depth from node blob
 - [x] rtreenode() function - parse node blob into TCL list
 - [x] rtreecheck() function - validate R-tree integrity
+- [x] ON CONFLICT support (INSERT OR IGNORE, INSERT OR REPLACE)
 
 ### Test Results (Manual)
 - CREATE VIRTUAL TABLE: PASS
@@ -36,11 +37,12 @@
 - rtreedepth(): PASS (matches SQLite output)
 - rtreenode(): PASS (matches SQLite output)
 - rtreecheck(): PASS (matches SQLite output)
+- INSERT OR IGNORE: PASS (ignores duplicate rowid)
+- INSERT OR REPLACE: PASS (replaces existing entry)
 
 ### Remaining Work
 1. **pragma table_list shadow support**: Show shadow tables in pragma
 2. **ATTACH database R-tree support**: Create R-tree in attached DB
-3. **ON CONFLICT support**: Handle conflict clauses
 
 ### Notes
 - All core R-tree functionality is now complete

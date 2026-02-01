@@ -93,6 +93,10 @@ pub struct SelectCompiler<'s> {
     /// GROUP BY column registers for substitution during finalization
     /// Maps column name (lowercase) to register containing the group key value
     group_column_regs: HashMap<String, i32>,
+    /// Non-aggregate result column saved registers for GROUP BY finalization
+    /// (base_reg, indices) where indices[i] is Some(offset) if result column i is non-agg
+    /// base_reg + offset gives the register holding the saved non-agg value
+    non_agg_saved_regs: Option<(i32, Vec<Option<usize>>)>,
     /// Number of columns in compound select (for UNION, INTERSECT, EXCEPT output)
     compound_column_count: usize,
     /// Aliases from compound SELECT parts (for ORDER BY resolution)
@@ -169,6 +173,7 @@ impl<'s> SelectCompiler<'s> {
             agg_final_regs: Vec::new(),
             agg_final_idx: 0,
             group_column_regs: HashMap::new(),
+            non_agg_saved_regs: None,
             compound_column_count: 0,
             short_column_names: true, // Default ON
             full_column_names: false, // Default OFF
@@ -230,6 +235,7 @@ impl<'s> SelectCompiler<'s> {
             agg_final_regs: Vec::new(),
             agg_final_idx: 0,
             group_column_regs: HashMap::new(),
+            non_agg_saved_regs: None,
             compound_column_count: 0,
             short_column_names: true, // Default ON
             full_column_names: false, // Default OFF
@@ -2445,10 +2451,12 @@ impl<'s> SelectCompiler<'s> {
             .map(|expr| self.resolve_where_aliases(expr))
             .collect();
 
-        // Count total columns needed in sorter: group columns + aggregate arguments
+        // Count total columns needed in sorter: group columns + aggregate arguments + non-agg result cols
         let num_group_cols = resolved_group_by.len();
         let num_agg_args = self.count_aggregate_args(&core.columns);
-        let total_sorter_cols = num_group_cols + num_agg_args;
+        let num_non_agg_cols =
+            self.count_non_agg_result_cols(&core.columns, Some(&resolved_group_by));
+        let total_sorter_cols = num_group_cols + num_agg_args + num_non_agg_cols;
 
         // Open sorter for grouping
         let sorter_cursor = self.alloc_cursor();
@@ -2490,8 +2498,16 @@ impl<'s> SelectCompiler<'s> {
         // Evaluate aggregate arguments
         let agg_arg_regs = self.compile_aggregate_args(&core.columns)?;
 
-        // Make record and insert into sorter
-        let total_cols = group_regs.1 + agg_arg_regs.1;
+        // Evaluate non-aggregate result columns (these can't be read after table cursors close)
+        let (non_agg_base_reg, non_agg_count, non_agg_indices) =
+            self.compile_non_agg_result_cols(&core.columns, Some(&resolved_group_by))?;
+
+        // Store non-agg sorter offset for use during accumulation
+        // Offset in sorter is num_group_cols + num_agg_args
+        let non_agg_sorter_offset = num_group_cols + num_agg_args;
+
+        // Make record and insert into sorter (group cols + agg args + non-agg cols)
+        let total_cols = group_regs.1 + agg_arg_regs.1 + non_agg_count;
         let record_reg = self.alloc_reg();
         self.emit(
             Opcode::MakeRecord,
@@ -2546,6 +2562,24 @@ impl<'s> SelectCompiler<'s> {
             prev_group_regs + num_group_cols as i32 - 1,
             P4::Unused,
         );
+
+        // Allocate registers to store non-aggregate values for the current group
+        // These are updated during accumulation and used during finalization
+        let prev_non_agg_regs = if non_agg_count > 0 {
+            let regs = self.alloc_regs(non_agg_count);
+            self.emit(
+                Opcode::Null,
+                0,
+                regs,
+                regs + non_agg_count as i32 - 1,
+                P4::Unused,
+            );
+            // Store the base register and indices for finalization
+            self.non_agg_saved_regs = Some((regs, non_agg_indices.clone()));
+            Some(regs)
+        } else {
+            None
+        };
 
         // Use label to avoid collision with resolve_labels
         let sorter_loop_start_label = self.alloc_label();
@@ -2623,6 +2657,10 @@ impl<'s> SelectCompiler<'s> {
             self.output_row(dest, result_regs.0, result_regs.1)?;
         }
 
+        // Clear group column substitution context after HAVING is compiled
+        // Note: Don't clear non_agg_saved_regs here - it's needed for subsequent group outputs
+        self.group_column_regs.clear();
+
         self.resolve_label(first_group_label, self.current_addr());
 
         // Reset aggregates for new group
@@ -2644,6 +2682,25 @@ impl<'s> SelectCompiler<'s> {
         // Accumulate current row into aggregates
         let agg_col_start = num_group_cols;
         self.accumulate_from_sorter(sorter_cursor, &core.columns, &agg_regs, agg_col_start)?;
+
+        // Copy non-aggregate values from sorter to saved registers
+        // This captures the values for the current group (overwriting on each row,
+        // so we get one representative value per group)
+        if let Some(prev_regs) = prev_non_agg_regs {
+            for (idx, maybe_offset) in non_agg_indices.iter().enumerate() {
+                if let Some(offset) = maybe_offset {
+                    let sorter_col = (non_agg_sorter_offset + offset) as i32;
+                    let dest_reg = prev_regs + *offset as i32;
+                    self.emit(
+                        Opcode::Column,
+                        sorter_cursor,
+                        sorter_col,
+                        dest_reg,
+                        P4::Unused,
+                    );
+                }
+            }
+        }
 
         // Next sorter row
         self.emit(
@@ -2674,6 +2731,10 @@ impl<'s> SelectCompiler<'s> {
         } else {
             self.output_row(dest, result_regs.0, result_regs.1)?;
         }
+
+        // Clear group column substitution context after HAVING is compiled
+        self.group_column_regs.clear();
+        self.non_agg_saved_regs = None;
 
         self.resolve_label(sort_done_label, self.current_addr());
 
@@ -8109,7 +8170,22 @@ impl<'s> SelectCompiler<'s> {
                         self.agg_final_regs.clear();
                         self.agg_final_idx = 0;
                     } else {
-                        self.compile_expr(expr, dest_reg)?;
+                        // Non-aggregate function - check if it was saved in registers
+                        if let Some((base_reg, ref indices)) = self.non_agg_saved_regs {
+                            if col_idx < indices.len() {
+                                if let Some(offset) = indices[col_idx] {
+                                    // Copy from saved register
+                                    let src_reg = base_reg + offset as i32;
+                                    self.emit(Opcode::SCopy, src_reg, dest_reg, 0, P4::Unused);
+                                } else {
+                                    self.compile_expr(expr, dest_reg)?;
+                                }
+                            } else {
+                                self.compile_expr(expr, dest_reg)?;
+                            }
+                        } else {
+                            self.compile_expr(expr, dest_reg)?;
+                        }
                     }
                 } else if self.expr_has_aggregate(expr) {
                     // Expression contains nested aggregates - finalize them first
@@ -8138,14 +8214,29 @@ impl<'s> SelectCompiler<'s> {
                     self.agg_final_regs.clear();
                     self.agg_final_idx = 0;
                 } else {
-                    self.compile_expr(expr, dest_reg)?;
+                    // Non-aggregate expression - check if it was saved in registers
+                    if let Some((base_reg, ref indices)) = self.non_agg_saved_regs {
+                        if col_idx < indices.len() {
+                            if let Some(offset) = indices[col_idx] {
+                                // Copy from saved register
+                                let src_reg = base_reg + offset as i32;
+                                self.emit(Opcode::SCopy, src_reg, dest_reg, 0, P4::Unused);
+                            } else {
+                                self.compile_expr(expr, dest_reg)?;
+                            }
+                        } else {
+                            self.compile_expr(expr, dest_reg)?;
+                        }
+                    } else {
+                        self.compile_expr(expr, dest_reg)?;
+                    }
                 }
             }
             count += 1;
         }
 
-        // Clear group column substitution context
-        self.group_column_regs.clear();
+        // NOTE: Do NOT clear group_column_regs here - HAVING clause needs it
+        // The caller is responsible for clearing it after HAVING is compiled
 
         Ok((base_reg, count))
     }
@@ -8503,6 +8594,66 @@ impl<'s> SelectCompiler<'s> {
             Expr::Collate { expr, .. } => self.compile_aggregate_args_in_expr(expr),
             _ => Ok(0),
         }
+    }
+
+    /// Count non-aggregate result columns that are not GROUP BY columns
+    /// These need to be stored in the sorter for later retrieval
+    fn count_non_agg_result_cols(
+        &self,
+        columns: &[ResultColumn],
+        group_by: Option<&[Expr]>,
+    ) -> usize {
+        let mut count = 0;
+        for col in columns {
+            if let ResultColumn::Expr { expr, .. } = col {
+                if !self.expr_has_aggregate(expr) {
+                    // Check if this is a GROUP BY column
+                    let is_group_col = group_by
+                        .map(|gb| self.find_matching_group_expr(expr, gb).is_some())
+                        .unwrap_or(false);
+                    if !is_group_col {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    /// Compile non-aggregate result expressions into registers (to store in sorter)
+    /// Returns (base_reg, count, indices) where indices maps result column index to sorter column offset
+    fn compile_non_agg_result_cols(
+        &mut self,
+        columns: &[ResultColumn],
+        group_by: Option<&[Expr]>,
+    ) -> Result<(i32, usize, Vec<Option<usize>>)> {
+        let base_reg = self.next_reg;
+        let mut count = 0;
+        let mut indices = Vec::with_capacity(columns.len());
+
+        for col in columns {
+            if let ResultColumn::Expr { expr, .. } = col {
+                if !self.expr_has_aggregate(expr) {
+                    // Check if this is a GROUP BY column
+                    let is_group_col = group_by
+                        .map(|gb| self.find_matching_group_expr(expr, gb).is_some())
+                        .unwrap_or(false);
+                    if !is_group_col {
+                        let reg = self.alloc_reg();
+                        self.compile_expr(expr, reg)?;
+                        indices.push(Some(count));
+                        count += 1;
+                    } else {
+                        indices.push(None);
+                    }
+                } else {
+                    indices.push(None);
+                }
+            } else {
+                indices.push(None);
+            }
+        }
+        Ok((base_reg, count, indices))
     }
 
     fn accumulate_from_sorter(

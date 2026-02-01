@@ -59,12 +59,20 @@ impl VtabModule for EchoModule {
         ctx: &dyn DbContext,
     ) -> Result<(String, Arc<dyn VtabTable>)> {
         // First argument should be the name of the real table to mirror
-        let real_table = args.first().ok_or_else(|| {
-            Error::with_message(
-                ErrorCode::Error,
-                "echo module requires underlying table name as argument",
-            )
-        })?;
+        // If no args, return empty schema to trigger "did not declare schema" error
+        let real_table = match args.first() {
+            Some(name) => name,
+            None => {
+                // Return empty schema - VCreate will return "did not declare schema" error
+                let table = EchoTable {
+                    name: table_name.to_string(),
+                    db_name: db_name.to_string(),
+                    real_table: String::new(),
+                    columns: Vec::new(),
+                };
+                return Ok((String::new(), Arc::new(table)));
+            }
+        };
 
         // Query the schema for the real table using DbContext
         let sql = format!(
@@ -109,6 +117,17 @@ impl VtabModule for EchoModule {
         // For echo, connect is the same as create
         // But connect doesn't have DbContext, so we need CONNECTIONS fallback
         self.create(db_name, table_name, args)
+    }
+
+    fn connect_with_ctx(
+        &self,
+        db_name: &str,
+        table_name: &str,
+        args: &[String],
+        ctx: &dyn DbContext,
+    ) -> Result<(String, Arc<dyn VtabTable>)> {
+        // For echo, connect is the same as create
+        self.create_with_ctx(db_name, table_name, args, ctx)
     }
 }
 

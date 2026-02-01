@@ -2484,7 +2484,85 @@ impl Vdbe {
                     if let Some(ref name) = vtab_name {
                         // Get the database name (default to "main")
                         let db_name = "main";
-                        if let Ok(Some(vtab_instance)) = registry.get_instance(db_name, name) {
+
+                        // First, check if we have an instance. If not, try to connect.
+                        let vtab_instance = match registry.get_instance(db_name, name) {
+                            Ok(Some(instance)) => Some(instance),
+                            _ => {
+                                // No instance - try lazy connect
+                                // Get module info from schema
+                                let lazy_instance = self.schema.as_ref().and_then(|schema| {
+                                    schema.read().ok().and_then(|guard| {
+                                        guard.table(name).and_then(|table| {
+                                            if !table.is_virtual {
+                                                return None;
+                                            }
+                                            let module_name = table.virtual_module.as_ref()?;
+                                            let args = table.virtual_args.clone();
+
+                                            // Get module from registry
+                                            let module =
+                                                registry.get_module(module_name).ok()??;
+
+                                            // Create db context and call connect_with_ctx
+                                            if let Some(conn_ptr) = conn_ptr_opt {
+                                                let db_ctx = ConnectionDbContext { conn_ptr };
+                                                if let Ok((schema_str, instance)) = module
+                                                    .connect_with_ctx(db_name, name, &args, &db_ctx)
+                                                {
+                                                    // Register the instance
+                                                    if registry
+                                                        .register_instance(
+                                                            db_name,
+                                                            name,
+                                                            instance.clone(),
+                                                        )
+                                                        .is_ok()
+                                                    {
+                                                        // Update schema columns
+                                                        if !schema_str.is_empty() {
+                                                            drop(guard); // Release read lock before write
+                                                            if let Ok(mut schema_guard) =
+                                                                schema.write()
+                                                            {
+                                                                let table_name_lower =
+                                                                    name.to_lowercase();
+                                                                if let Some(old_table) =
+                                                                    schema_guard
+                                                                        .tables
+                                                                        .get(&table_name_lower)
+                                                                {
+                                                                    let columns =
+                                                                        parse_vtab_schema_columns(
+                                                                            &schema_str,
+                                                                        );
+                                                                    if !columns.is_empty() {
+                                                                        let mut new_table =
+                                                                            (**old_table).clone();
+                                                                        new_table.columns = columns;
+                                                                        schema_guard.tables.insert(
+                                                                            table_name_lower,
+                                                                            std::sync::Arc::new(
+                                                                                new_table,
+                                                                            ),
+                                                                        );
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        return Some(instance);
+                                                    }
+                                                }
+                                            }
+                                            None
+                                        })
+                                    })
+                                });
+                                lazy_instance
+                            }
+                        };
+
+                        if let Some(vtab_instance) = vtab_instance {
                             // Open or reuse cursor
                             if let Some(cursor) = self.cursor_mut(op.p1) {
                                 if cursor.vtab_cursor.is_none() {
@@ -2551,6 +2629,7 @@ impl Vdbe {
                 }
 
                 // Fall back to legacy hardcoded path if registry didn't handle it
+                let mut handled_by_legacy = false;
                 if !handled_by_registry {
                     let btree = self.btree.clone();
                     let schema = self.schema.clone();
@@ -2597,6 +2676,7 @@ impl Vdbe {
                                                         cursor.state = CursorState::Valid;
                                                         cursor.rowid = Some(cursor.vtab_rowids[0]);
                                                     }
+                                                    handled_by_legacy = true;
                                                 }
                                             }
                                         } else if module.eq_ignore_ascii_case("fts3") {
@@ -2630,6 +2710,7 @@ impl Vdbe {
                                                         cursor.state = CursorState::Valid;
                                                         cursor.rowid = Some(cursor.vtab_rowids[0]);
                                                     }
+                                                    handled_by_legacy = true;
                                                 }
                                             }
                                         }
@@ -2659,6 +2740,7 @@ impl Vdbe {
                                                         cursor.state = CursorState::Valid;
                                                         cursor.rowid = Some(cursor.vtab_rowids[0]);
                                                     }
+                                                    handled_by_legacy = true;
                                                 }
                                             }
                                         }
@@ -2700,7 +2782,40 @@ impl Vdbe {
                                                 }
                                             }
                                         }
+                                        handled_by_legacy = true;
                                     }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Check if a virtual table was not handled by either path
+                // This means the module is not registered
+                if !handled_by_registry && !handled_by_legacy {
+                    if let Some(cursor) = self.cursor(op.p1) {
+                        if cursor.is_virtual {
+                            // Get the module name from the schema
+                            let module_name = vtab_name.as_ref().and_then(|name| {
+                                self.schema.as_ref().and_then(|schema| {
+                                    schema
+                                        .read()
+                                        .ok()
+                                        .and_then(|guard| guard.table(name))
+                                        .and_then(|table| table.virtual_module.clone())
+                                })
+                            });
+                            if let Some(module) = module_name {
+                                // Check if this is a known builtin that the legacy path handles
+                                let is_builtin = module.eq_ignore_ascii_case("fts3")
+                                    || module.eq_ignore_ascii_case("fts3tokenize")
+                                    || module.eq_ignore_ascii_case("fts5")
+                                    || module.eq_ignore_ascii_case("rtree");
+                                if !is_builtin {
+                                    return Err(Error::with_message(
+                                        crate::error::ErrorCode::Error,
+                                        format!("no such module: {}", module),
+                                    ));
                                 }
                             }
                         }
@@ -7414,7 +7529,7 @@ impl Vdbe {
                                         // Return error: table already exists
                                         return Err(crate::error::Error::with_message(
                                             crate::error::ErrorCode::Error,
-                                            format!("table \"{}\" already exists", table_name),
+                                            format!("table {} already exists", table_name),
                                         ));
                                     }
                                     // IF NOT EXISTS was specified, silently succeed
@@ -8575,6 +8690,14 @@ impl Vdbe {
                                 Ok((schema, table)) => {
                                     // Verify schema was declared
                                     if schema.is_empty() {
+                                        // Clean up the table entry that ParseSchema created
+                                        if let Some(ref schema_lock) = self.schema {
+                                            if let Ok(mut schema_guard) = schema_lock.write() {
+                                                let table_name_lower =
+                                                    info.table_name.to_lowercase();
+                                                schema_guard.tables.remove(&table_name_lower);
+                                            }
+                                        }
                                         return Err(Error::with_message(
                                             ErrorCode::Error,
                                             format!(
@@ -8631,6 +8754,13 @@ impl Vdbe {
                                 }
                                 Err(_e) => {
                                     // Module's create() returned an error
+                                    // Clean up the table entry that ParseSchema created
+                                    if let Some(ref schema_lock) = self.schema {
+                                        if let Ok(mut schema_guard) = schema_lock.write() {
+                                            let table_name_lower = info.table_name.to_lowercase();
+                                            schema_guard.tables.remove(&table_name_lower);
+                                        }
+                                    }
                                     return Err(Error::with_message(
                                         ErrorCode::Error,
                                         format!("vtable constructor failed: {}", info.table_name),

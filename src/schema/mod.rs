@@ -1889,7 +1889,7 @@ impl Schema {
             }
             return Err(Error::with_message(
                 ErrorCode::Error,
-                format!("table \"{}\" already exists", stmt.name.name),
+                format!("table {} already exists", stmt.name.name),
             ));
         }
 

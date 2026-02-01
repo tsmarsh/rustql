@@ -141,6 +141,24 @@ pub trait VtabModule: Send + Sync {
         self.create(db_name, table_name, args)
     }
 
+    /// Connect to an existing virtual table with database context (xConnect)
+    ///
+    /// This variant is called when a database context is available.
+    /// Modules that need to query the database during connection should
+    /// override this method.
+    ///
+    /// The default implementation calls `connect()`.
+    fn connect_with_ctx(
+        &self,
+        db_name: &str,
+        table_name: &str,
+        args: &[String],
+        _ctx: &dyn DbContext,
+    ) -> Result<(String, Arc<dyn VtabTable>)> {
+        // Default: ignore context and call regular connect
+        self.connect(db_name, table_name, args)
+    }
+
     /// Destroy a virtual table (xDestroy)
     ///
     /// Called for `DROP TABLE`. The module should remove any storage/shadow

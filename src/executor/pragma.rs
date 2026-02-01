@@ -199,8 +199,114 @@ fn pragma_table_info(
 ) -> Result<PragmaResult> {
     let table_name = pragma_arg_string(pragma)?;
     let schema = lookup_schema(conn, schema_name)?;
-    let schema = schema.read().unwrap();
-    let table = schema
+
+    // First, check if this is a virtual table and try to get column info from vtab instance
+    let vtab_columns: Option<Vec<(String, String)>> = {
+        let schema_guard = schema.read().unwrap();
+        if let Some(table) = schema_guard.table(&table_name) {
+            if table.is_virtual {
+                if let Some(ref module_name) = table.virtual_module {
+                    // Check if module is registered
+                    let is_builtin = module_name.eq_ignore_ascii_case("fts3")
+                        || module_name.eq_ignore_ascii_case("fts3tokenize")
+                        || module_name.eq_ignore_ascii_case("fts5")
+                        || module_name.eq_ignore_ascii_case("rtree");
+
+                    if !is_builtin {
+                        if !conn.vtab_registry.has_module(module_name) {
+                            return Err(Error::with_message(
+                                ErrorCode::Error,
+                                format!("no such module: {}", module_name),
+                            ));
+                        }
+
+                        // Try to get column info from vtab instance
+                        let db_name = if schema_name.is_empty() {
+                            "main"
+                        } else {
+                            schema_name
+                        };
+                        if let Ok(Some(instance)) =
+                            conn.vtab_registry.get_instance(db_name, &table_name)
+                        {
+                            let count = instance.column_count();
+                            let cols: Vec<(String, String)> = (0..count)
+                                .map(|i| {
+                                    let name = instance.column_name(i).to_string();
+                                    let affinity = instance.column_affinity(i);
+                                    let type_name = match affinity {
+                                        crate::schema::Affinity::Integer => "INTEGER".to_string(),
+                                        crate::schema::Affinity::Real => "REAL".to_string(),
+                                        crate::schema::Affinity::Text => "TEXT".to_string(),
+                                        crate::schema::Affinity::Blob => "BLOB".to_string(),
+                                        _ => String::new(),
+                                    };
+                                    (name, type_name)
+                                })
+                                .collect();
+                            Some(cols)
+                        } else {
+                            // Try lazy connect
+                            let args = table.virtual_args.clone();
+                            drop(schema_guard); // Release read lock
+
+                            if let Ok(Some(module)) = conn.vtab_registry.get_module(module_name) {
+                                // Try connect without ctx (simpler approach)
+                                if let Ok((_schema_str, instance)) =
+                                    module.connect(db_name, &table_name, &args)
+                                {
+                                    let _ = conn.vtab_registry.register_instance(
+                                        db_name,
+                                        &table_name,
+                                        instance.clone(),
+                                    );
+                                    let count = instance.column_count();
+                                    let cols: Vec<(String, String)> = (0..count)
+                                        .map(|i| {
+                                            let name = instance.column_name(i).to_string();
+                                            let affinity = instance.column_affinity(i);
+                                            let type_name = match affinity {
+                                                crate::schema::Affinity::Integer => {
+                                                    "INTEGER".to_string()
+                                                }
+                                                crate::schema::Affinity::Real => "REAL".to_string(),
+                                                crate::schema::Affinity::Text => "TEXT".to_string(),
+                                                crate::schema::Affinity::Blob => "BLOB".to_string(),
+                                                _ => String::new(),
+                                            };
+                                            (name, type_name)
+                                        })
+                                        .collect();
+                                    return pragma_table_info_from_cols(&cols);
+                                }
+                            }
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                "no such table".to_string(),
+            ));
+        }
+    };
+
+    // If we got columns from vtab instance, use those
+    if let Some(cols) = vtab_columns {
+        return pragma_table_info_from_cols(&cols);
+    }
+
+    // Otherwise fall back to schema columns
+    let schema_guard = schema.read().unwrap();
+    let table = schema_guard
         .table(&table_name)
         .ok_or_else(|| Error::with_message(ErrorCode::Error, "no such table".to_string()))?;
 
@@ -227,6 +333,44 @@ fn pragma_table_info(
             Value::Integer(pk_pos),
         ]);
     }
+
+    Ok(PragmaResult {
+        columns: vec![
+            "cid".into(),
+            "name".into(),
+            "type".into(),
+            "notnull".into(),
+            "dflt_value".into(),
+            "pk".into(),
+        ],
+        types: vec![
+            ColumnType::Integer,
+            ColumnType::Text,
+            ColumnType::Text,
+            ColumnType::Integer,
+            ColumnType::Text,
+            ColumnType::Integer,
+        ],
+        rows,
+    })
+}
+
+/// Build PragmaResult for table_info from column list
+fn pragma_table_info_from_cols(cols: &[(String, String)]) -> Result<PragmaResult> {
+    let rows: Vec<Vec<Value>> = cols
+        .iter()
+        .enumerate()
+        .map(|(idx, (name, type_name))| {
+            vec![
+                Value::Integer(idx as i64),
+                Value::Text(name.clone()),
+                Value::Text(type_name.clone()),
+                Value::Integer(0), // notnull
+                Value::Null,       // dflt_value
+                Value::Integer(0), // pk
+            ]
+        })
+        .collect();
 
     Ok(PragmaResult {
         columns: vec![

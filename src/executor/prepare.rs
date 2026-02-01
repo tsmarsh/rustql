@@ -229,6 +229,59 @@ impl<'s> StatementCompiler<'s> {
         self.vtab_registry = Some(registry);
     }
 
+    /// Check if a table is a virtual table with an unregistered module.
+    /// Returns Err with "no such module" if the module is not registered.
+    fn check_vtab_module(
+        &self,
+        table_name: &str,
+        schema: Option<&crate::schema::Schema>,
+    ) -> Result<()> {
+        let schema = match schema.or(self.schema) {
+            Some(s) => s,
+            None => return Ok(()), // No schema to check
+        };
+
+        let table_name_lower = table_name.to_lowercase();
+        let table = match schema.tables.get(&table_name_lower) {
+            Some(t) => t,
+            None => return Ok(()), // Table not found - let other error handling deal with it
+        };
+
+        // Only check virtual tables
+        if !table.is_virtual {
+            return Ok(());
+        }
+
+        // Get the module name
+        let module_name = match &table.virtual_module {
+            Some(m) => m,
+            None => return Ok(()), // No module specified
+        };
+
+        // Check if it's a built-in module that's always available
+        let is_builtin = module_name.eq_ignore_ascii_case("fts3")
+            || module_name.eq_ignore_ascii_case("fts3tokenize")
+            || module_name.eq_ignore_ascii_case("fts5")
+            || module_name.eq_ignore_ascii_case("rtree");
+
+        if is_builtin {
+            return Ok(());
+        }
+
+        // Check if the module is registered in vtab_registry
+        if let Some(ref registry) = self.vtab_registry {
+            if registry.has_module(module_name) {
+                return Ok(());
+            }
+        }
+
+        // Module is not registered
+        Err(Error::with_message(
+            ErrorCode::Error,
+            format!("no such module: {}", module_name),
+        ))
+    }
+
     fn make_select_compiler(&self) -> SelectCompiler<'s> {
         let mut compiler = if let Some(schema) = self.schema {
             SelectCompiler::with_schema(schema)
@@ -321,6 +374,9 @@ impl<'s> StatementCompiler<'s> {
                         self.schema
                     };
 
+                // Check if target is a virtual table with unregistered module
+                self.check_vtab_module(&insert.table.name, target_schema)?;
+
                 let mut compiler = if let Some(schema) = target_schema {
                     super::insert::InsertCompiler::with_schema(schema)
                 } else {
@@ -345,6 +401,9 @@ impl<'s> StatementCompiler<'s> {
                         self.schema
                     };
 
+                // Check if target is a virtual table with unregistered module
+                self.check_vtab_module(&update.table.name, target_schema)?;
+
                 let mut compiler = if let Some(schema) = target_schema {
                     super::update::UpdateCompiler::with_schema(schema)
                 } else {
@@ -368,6 +427,9 @@ impl<'s> StatementCompiler<'s> {
                     } else {
                         self.schema
                     };
+
+                // Check if target is a virtual table with unregistered module
+                self.check_vtab_module(&delete.table.name, target_schema)?;
 
                 let mut compiler = if let Some(schema) = target_schema {
                     super::delete::DeleteCompiler::with_schema(schema)
@@ -406,6 +468,8 @@ impl<'s> StatementCompiler<'s> {
             }
 
             Stmt::DropTable(drop) => {
+                // Check if target is a virtual table with unregistered module
+                self.check_vtab_module(&drop.name.name, self.schema)?;
                 let ops = self.compile_drop(drop, "table")?;
                 Ok((ops, StmtType::DropTable, Vec::new(), Vec::new()))
             }

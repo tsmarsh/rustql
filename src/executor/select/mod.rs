@@ -7141,10 +7141,15 @@ impl<'s> SelectCompiler<'s> {
 
                 // Check if this column is a GROUP BY column during finalization
                 // This handles expressions like log*2+1 where log is the GROUP BY key
-                let col_name_lower = col_ref.column.to_lowercase();
-                if let Some(&group_reg) = self.group_column_regs.get(&col_name_lower) {
-                    self.emit(Opcode::SCopy, group_reg, dest_reg, 0, P4::Unused);
-                    return Ok(());
+                // Only use group_column_regs for unqualified column references,
+                // because group_column_regs only stores unqualified names and can't
+                // distinguish between e.g. a.x and b.x in self-joins
+                if col_ref.table.is_none() {
+                    let col_name_lower = col_ref.column.to_lowercase();
+                    if let Some(&group_reg) = self.group_column_regs.get(&col_name_lower) {
+                        self.emit(Opcode::SCopy, group_reg, dest_reg, 0, P4::Unused);
+                        return Ok(());
+                    }
                 }
 
                 // Find the table and column index
@@ -8416,6 +8421,9 @@ impl<'s> SelectCompiler<'s> {
         // Store limit in a register for checking during result output
         let limit_reg = self.alloc_reg();
         self.compile_expr(&limit.limit, limit_reg)?;
+        // Validate that LIMIT is an integer - raises "datatype mismatch" for float/string
+        // Use p5=0xFFFF to prevent P2=0 from being resolved as a label
+        self.emit_with_p5(Opcode::MustBeInt, limit_reg, 0, 0, P4::Unused, 0xFFFF);
         self.limit_counter_reg = Some(limit_reg);
 
         // Allocate label to jump to when limit exhausted
@@ -8424,6 +8432,8 @@ impl<'s> SelectCompiler<'s> {
         if let Some(offset) = &limit.offset {
             let offset_reg = self.alloc_reg();
             self.compile_expr(offset, offset_reg)?;
+            // Validate that OFFSET is an integer
+            self.emit_with_p5(Opcode::MustBeInt, offset_reg, 0, 0, P4::Unused, 0xFFFF);
             self.offset_counter_reg = Some(offset_reg);
         }
 

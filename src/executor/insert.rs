@@ -923,14 +923,21 @@ impl<'a> InsertCompiler<'a> {
         // Get the cursor offset for adjusting SelectCompiler's cursor numbers
         let cursor_offset = self.next_cursor;
 
-        // Filter out Init/Halt/Transaction/Goto control flow wrapper from the subquery ops and inline them
+        // Filter out Init/Halt/Transaction/control-flow-Goto from the subquery ops and inline them
+        // Note: Only skip the control-flow Goto (the one that jumps to address 1, after Init).
+        // Internal Goto opcodes for conditional logic must be preserved.
         // Adjust jump addresses and cursor numbers
         let base_addr = self.ops.len() as i32;
         for mut op in sub_ops {
+            // Skip control flow wrappers:
+            // - Init: program initialization
+            // - Halt: program termination
+            // - Transaction: transaction handling (we're already in a transaction)
+            // - Goto with target 1: the final "Goto 0 1" that loops back after Init
             if op.opcode == Opcode::Init
                 || op.opcode == Opcode::Halt
                 || op.opcode == Opcode::Transaction
-                || op.opcode == Opcode::Goto
+                || (op.opcode == Opcode::Goto && op.p2 == 1)
             {
                 continue;
             }

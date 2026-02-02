@@ -3007,69 +3007,91 @@ impl Vdbe {
                             cursor.state = CursorState::AtEnd;
                         }
                     } else if cursor.is_virtual {
-                        // vtab_module was looked up before the mutable borrow
-                        if cursor.vtab_rowids.is_empty() {
-                            if let Some(ref vtab_name) = cursor.vtab_name {
-                                #[cfg(feature = "fts3")]
-                                {
-                                    if let Some(module) = vtab_module.as_ref() {
-                                        if module.eq_ignore_ascii_case("fts3") {
-                                            if let Some(table) = crate::fts3::get_table(vtab_name) {
-                                                if let Ok(mut table) = table.lock() {
-                                                    if let (Some(ref btree), Some(ref schema)) =
-                                                        (btree.as_ref(), schema.as_ref())
-                                                    {
-                                                        if let Ok(schema_guard) = schema.read() {
-                                                            table.ensure_loaded(
-                                                                btree,
-                                                                &schema_guard,
-                                                            )?;
+                        // Check for generic vtab_cursor first (registry-based vtabs like echo)
+                        if let Some(ref vtab_cursor) = cursor.vtab_cursor {
+                            // Use eof() from VtabCursor trait
+                            is_empty = vtab_cursor.eof();
+                            if !is_empty {
+                                cursor.state = CursorState::Valid;
+                                cursor.rowid = vtab_cursor.rowid().ok();
+                                vtab_context = Some((cursor.vtab_name.clone(), cursor.rowid));
+                            } else {
+                                cursor.state = CursorState::AtEnd;
+                                cursor.rowid = None;
+                                vtab_context = Some((None, None));
+                            }
+                        } else {
+                            // Legacy path: vtab_module was looked up before the mutable borrow
+                            if cursor.vtab_rowids.is_empty() {
+                                if let Some(ref vtab_name) = cursor.vtab_name {
+                                    #[cfg(feature = "fts3")]
+                                    {
+                                        if let Some(module) = vtab_module.as_ref() {
+                                            if module.eq_ignore_ascii_case("fts3") {
+                                                if let Some(table) =
+                                                    crate::fts3::get_table(vtab_name)
+                                                {
+                                                    if let Ok(mut table) = table.lock() {
+                                                        if let (Some(ref btree), Some(ref schema)) =
+                                                            (btree.as_ref(), schema.as_ref())
+                                                        {
+                                                            if let Ok(schema_guard) = schema.read()
+                                                            {
+                                                                table.ensure_loaded(
+                                                                    btree,
+                                                                    &schema_guard,
+                                                                )?;
+                                                            }
                                                         }
+                                                        cursor.vtab_rowids = table.all_rowids();
                                                     }
-                                                    cursor.vtab_rowids = table.all_rowids();
                                                 }
                                             }
                                         }
                                     }
-                                }
-                                #[cfg(feature = "fts5")]
-                                {
+                                    #[cfg(feature = "fts5")]
+                                    {
+                                        if let Some(module) = vtab_module.as_ref() {
+                                            if module.eq_ignore_ascii_case("fts5") {
+                                                if let Some(table) =
+                                                    crate::fts5::get_table(vtab_name)
+                                                {
+                                                    if let Ok(table) = table.lock() {
+                                                        cursor.vtab_rowids = table.all_rowids();
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // R-tree handling
                                     if let Some(module) = vtab_module.as_ref() {
-                                        if module.eq_ignore_ascii_case("fts5") {
-                                            if let Some(table) = crate::fts5::get_table(vtab_name) {
-                                                if let Ok(table) = table.lock() {
+                                        if module.eq_ignore_ascii_case("rtree") {
+                                            let db_name =
+                                                cursor_db_name.as_deref().unwrap_or("main");
+                                            let rtree_full_name =
+                                                format!("{}.{}", db_name, vtab_name);
+                                            if let Some(table_arc) =
+                                                crate::rtree_vtab::get_table(&rtree_full_name)
+                                            {
+                                                if let Ok(table) = table_arc.lock() {
                                                     cursor.vtab_rowids = table.all_rowids();
                                                 }
-                                            }
-                                        }
-                                    }
-                                }
-                                // R-tree handling
-                                if let Some(module) = vtab_module.as_ref() {
-                                    if module.eq_ignore_ascii_case("rtree") {
-                                        let db_name = cursor_db_name.as_deref().unwrap_or("main");
-                                        let rtree_full_name = format!("{}.{}", db_name, vtab_name);
-                                        if let Some(table_arc) =
-                                            crate::rtree_vtab::get_table(&rtree_full_name)
-                                        {
-                                            if let Ok(table) = table_arc.lock() {
-                                                cursor.vtab_rowids = table.all_rowids();
                                             }
                                         }
                                     }
                                 }
                             }
-                        }
-                        cursor.vtab_row_index = 0;
-                        is_empty = cursor.vtab_rowids.is_empty();
-                        if !is_empty {
-                            cursor.state = CursorState::Valid;
-                            cursor.rowid = Some(cursor.vtab_rowids[0]);
-                            vtab_context = Some((cursor.vtab_name.clone(), cursor.rowid));
-                        } else {
-                            cursor.state = CursorState::AtEnd;
-                            cursor.rowid = None;
-                            vtab_context = Some((None, None));
+                            cursor.vtab_row_index = 0;
+                            is_empty = cursor.vtab_rowids.is_empty();
+                            if !is_empty {
+                                cursor.state = CursorState::Valid;
+                                cursor.rowid = Some(cursor.vtab_rowids[0]);
+                                vtab_context = Some((cursor.vtab_name.clone(), cursor.rowid));
+                            } else {
+                                cursor.state = CursorState::AtEnd;
+                                cursor.rowid = None;
+                                vtab_context = Some((None, None));
+                            }
                         }
                     } else if let Some(ref mut bt_cursor) = cursor.btree_cursor {
                         // Count Rewind as a search operation for index cursors
@@ -3174,19 +3196,39 @@ impl Vdbe {
                             cursor.row_data = None;
                         }
                     } else if cursor.is_virtual {
-                        cursor.vtab_row_index += 1;
-                        has_more = cursor.vtab_row_index < cursor.vtab_rowids.len();
-                        cursor.state = if has_more {
-                            CursorState::Valid
+                        // Check for generic vtab_cursor first (registry-based vtabs like echo)
+                        if let Some(ref mut vtab_cursor) = cursor.vtab_cursor {
+                            // Use VtabCursor trait's next() and eof()
+                            let _ = vtab_cursor.next();
+                            has_more = !vtab_cursor.eof();
+                            cursor.state = if has_more {
+                                CursorState::Valid
+                            } else {
+                                CursorState::AtEnd
+                            };
+                            if has_more {
+                                cursor.rowid = vtab_cursor.rowid().ok();
+                                vtab_context = Some((cursor.vtab_name.clone(), cursor.rowid));
+                            } else {
+                                cursor.rowid = None;
+                                vtab_context = Some((None, None));
+                            }
                         } else {
-                            CursorState::AtEnd
-                        };
-                        if has_more {
-                            cursor.rowid = Some(cursor.vtab_rowids[cursor.vtab_row_index]);
-                            vtab_context = Some((cursor.vtab_name.clone(), cursor.rowid));
-                        } else {
-                            cursor.rowid = None;
-                            vtab_context = Some((None, None));
+                            // Legacy path for FTS/rtree
+                            cursor.vtab_row_index += 1;
+                            has_more = cursor.vtab_row_index < cursor.vtab_rowids.len();
+                            cursor.state = if has_more {
+                                CursorState::Valid
+                            } else {
+                                CursorState::AtEnd
+                            };
+                            if has_more {
+                                cursor.rowid = Some(cursor.vtab_rowids[cursor.vtab_row_index]);
+                                vtab_context = Some((cursor.vtab_name.clone(), cursor.rowid));
+                            } else {
+                                cursor.rowid = None;
+                                vtab_context = Some((None, None));
+                            }
                         }
                     } else if let Some(ref mut bt_cursor) = cursor.btree_cursor {
                         match bt_cursor.next(0) {

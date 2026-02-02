@@ -2470,6 +2470,13 @@ impl<'s> SelectCompiler<'s> {
 
                                 let reg = self.alloc_reg();
 
+                                // Use VColumn for virtual tables
+                                let col_opcode = if schema_table.is_virtual {
+                                    Opcode::VColumn
+                                } else {
+                                    Opcode::Column
+                                };
+
                                 // Check if this is a VIRTUAL generated column
                                 if let Some(ref gen) = col_def.generated {
                                     if gen.storage == GeneratedStorage::Virtual {
@@ -2479,7 +2486,7 @@ impl<'s> SelectCompiler<'s> {
                                     } else {
                                         // STORED generated columns are read normally
                                         self.emit(
-                                            Opcode::Column,
+                                            col_opcode,
                                             table.cursor,
                                             col_idx as i32,
                                             reg,
@@ -2488,7 +2495,7 @@ impl<'s> SelectCompiler<'s> {
                                     }
                                 } else {
                                     self.emit(
-                                        Opcode::Column,
+                                        col_opcode,
                                         table.cursor,
                                         col_idx as i32,
                                         reg,
@@ -2510,6 +2517,13 @@ impl<'s> SelectCompiler<'s> {
                         if table.name.eq_ignore_ascii_case(table_name) {
                             found = true;
                             if let Some(schema_table) = &table.schema_table {
+                                // Use VColumn for virtual tables
+                                let col_opcode = if schema_table.is_virtual {
+                                    Opcode::VColumn
+                                } else {
+                                    Opcode::Column
+                                };
+
                                 for (col_idx, col_def) in schema_table.columns.iter().enumerate() {
                                     let reg = self.alloc_reg();
 
@@ -2523,7 +2537,7 @@ impl<'s> SelectCompiler<'s> {
                                         } else {
                                             // STORED generated columns are read normally
                                             self.emit(
-                                                Opcode::Column,
+                                                col_opcode,
                                                 table.cursor,
                                                 col_idx as i32,
                                                 reg,
@@ -2532,7 +2546,7 @@ impl<'s> SelectCompiler<'s> {
                                         }
                                     } else {
                                         self.emit(
-                                            Opcode::Column,
+                                            col_opcode,
                                             table.cursor,
                                             col_idx as i32,
                                             reg,
@@ -5875,6 +5889,13 @@ impl<'s> SelectCompiler<'s> {
                                 let reg = self.alloc_reg();
 
                                 // Check if this is a VIRTUAL generated column
+                                // Use VColumn for virtual tables
+                                let col_opcode = if schema_table.is_virtual {
+                                    Opcode::VColumn
+                                } else {
+                                    Opcode::Column
+                                };
+
                                 if let Some(ref gen) = col_def.generated {
                                     if gen.storage == GeneratedStorage::Virtual {
                                         // Compile the generated expression
@@ -5883,7 +5904,7 @@ impl<'s> SelectCompiler<'s> {
                                     } else {
                                         // STORED generated column - read normally
                                         self.emit(
-                                            Opcode::Column,
+                                            col_opcode,
                                             table.cursor,
                                             col_idx as i32,
                                             reg,
@@ -5897,7 +5918,7 @@ impl<'s> SelectCompiler<'s> {
                                         self.emit(Opcode::Rowid, table.cursor, reg, 0, P4::Unused);
                                     } else {
                                         self.emit(
-                                            Opcode::Column,
+                                            col_opcode,
                                             table.cursor,
                                             col_idx as i32,
                                             reg,
@@ -5906,7 +5927,7 @@ impl<'s> SelectCompiler<'s> {
                                     }
                                 } else {
                                     self.emit(
-                                        Opcode::Column,
+                                        col_opcode,
                                         table.cursor,
                                         col_idx as i32,
                                         reg,
@@ -7310,19 +7331,32 @@ impl<'s> SelectCompiler<'s> {
                 } else {
                     // Check if this column is a VIRTUAL generated column
                     // If so, we need to compile the expression instead of reading from storage
-                    let generated_expr = self
-                        .tables
-                        .iter()
-                        .find(|t| t.cursor == cursor)
-                        .and_then(|table_info| table_info.schema_table.as_ref())
+                    let table_info = self.tables.iter().find(|t| t.cursor == cursor);
+                    let generated_expr = table_info
+                        .and_then(|ti| ti.schema_table.as_ref())
                         .and_then(|schema_table| schema_table.columns.get(col_idx as usize))
                         .and_then(|col| col.generated.as_ref())
                         .filter(|gen| gen.storage == GeneratedStorage::Virtual)
                         .map(|gen| Self::convert_schema_expr_to_ast(&gen.expr));
 
+                    // Check if this is a virtual table
+                    let is_virtual_table = table_info
+                        .and_then(|ti| ti.schema_table.as_ref())
+                        .map(|st| st.is_virtual)
+                        .unwrap_or(false);
+
                     if let Some(gen_expr) = generated_expr {
                         // Compile the generated column expression instead of Column opcode
                         self.compile_expr(&gen_expr, dest_reg)?;
+                    } else if is_virtual_table {
+                        // Use VColumn for virtual tables
+                        self.emit(
+                            Opcode::VColumn,
+                            cursor,
+                            col_idx,
+                            dest_reg,
+                            P4::Text(col_ref.column.clone()),
+                        );
                     } else {
                         self.emit(
                             Opcode::Column,

@@ -242,6 +242,10 @@ impl<'s> UpdateCompiler<'s> {
             for assignment in &update.assignments {
                 // Validate the target column(s)
                 for col_name in &assignment.columns {
+                    // Skip rowid aliases - they're always valid targets
+                    if is_rowid_alias(col_name) {
+                        continue;
+                    }
                     if self.get_column_index(col_name).is_none() {
                         return Err(crate::error::Error::with_message(
                             crate::error::ErrorCode::Error,

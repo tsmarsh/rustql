@@ -3447,10 +3447,18 @@ impl<'s> StatementCompiler<'s> {
         }
     }
 
-    /// Convert SELECT to SQL including ORDER BY and LIMIT
+    /// Convert SELECT to SQL including WITH, ORDER BY and LIMIT
     fn select_to_sql(&self, select: &SelectStmt) -> String {
         use crate::parser::ast::{NullsOrder, SortOrder};
-        let mut sql = self.select_body_to_sql(&select.body);
+        let mut sql = String::new();
+
+        // Add WITH clause if present
+        if let Some(ref with) = select.with {
+            sql.push_str(&self.with_clause_to_sql(with));
+            sql.push(' ');
+        }
+
+        sql.push_str(&self.select_body_to_sql(&select.body));
 
         // Add ORDER BY if present
         if let Some(ref order_by) = select.order_by {
@@ -3483,6 +3491,32 @@ impl<'s> StatementCompiler<'s> {
             }
         }
 
+        sql
+    }
+
+    /// Convert WITH clause to SQL
+    fn with_clause_to_sql(&self, with: &crate::parser::ast::WithClause) -> String {
+        let mut sql = String::from("WITH ");
+        if with.recursive {
+            sql.push_str("RECURSIVE ");
+        }
+        let ctes: Vec<String> = with
+            .ctes
+            .iter()
+            .map(|cte| {
+                let mut s = cte.name.clone();
+                if let Some(ref cols) = cte.columns {
+                    s.push('(');
+                    s.push_str(&cols.join(", "));
+                    s.push(')');
+                }
+                s.push_str(" AS (");
+                s.push_str(&self.select_to_sql(&cte.query));
+                s.push(')');
+                s
+            })
+            .collect();
+        sql.push_str(&ctes.join(", "));
         sql
     }
 

@@ -933,22 +933,64 @@ impl<'a> InsertCompiler<'a> {
         // Get the cursor offset for adjusting SelectCompiler's cursor numbers
         let cursor_offset = self.next_cursor;
 
-        // Filter out Init/Halt/Transaction/Goto control flow wrapper from the subquery ops and inline them
-        // Adjust jump addresses and cursor numbers
-        let base_addr = self.ops.len() as i32;
-        for mut op in sub_ops {
-            if op.opcode == Opcode::Init
-                || op.opcode == Opcode::Halt
+        // Filter out Init/Halt/Transaction and wrapper Goto from the subquery ops
+        // Keep internal Gotos used for expression evaluation control flow
+        let len = sub_ops.len();
+        let mut skip_indices = std::collections::HashSet::new();
+
+        // Skip Init at 0
+        if !sub_ops.is_empty() && sub_ops[0].opcode == Opcode::Init {
+            skip_indices.insert(0);
+        }
+
+        // Skip footer: Halt, Transaction, Goto at the end (working backwards)
+        for i in (0..len).rev() {
+            let op = &sub_ops[i];
+            if op.opcode == Opcode::Halt
                 || op.opcode == Opcode::Transaction
-                || op.opcode == Opcode::Goto
+                || (op.opcode == Opcode::Goto && i >= len.saturating_sub(3))
             {
+                skip_indices.insert(i);
+            } else {
+                break;
+            }
+        }
+
+        // Build address mapping: old_addr -> new_addr
+        let base_addr = self.ops.len() as i32;
+        let mut addr_map: Vec<i32> = Vec::with_capacity(len);
+        let mut new_addr = base_addr;
+        for i in 0..len {
+            if skip_indices.contains(&i) {
+                addr_map.push(-1);
+            } else {
+                addr_map.push(new_addr);
+                new_addr += 1;
+            }
+        }
+
+        // Calculate end address for the inlined section
+        let inlined_end = new_addr;
+
+        // Fix up -1 entries (skipped instructions) to point to end
+        for addr in &mut addr_map {
+            if *addr == -1 {
+                *addr = inlined_end;
+            }
+        }
+
+        for (old_addr, mut op) in sub_ops.into_iter().enumerate() {
+            if skip_indices.contains(&old_addr) {
                 continue;
             }
-            // Adjust jump addresses
-            // Since we remove Init (at address 0), all internal addresses are shifted by 1
-            // So we need to adjust by (base_addr - 1) to account for this
-            if op.opcode.is_jump() && op.p2 > 0 {
-                op.p2 += base_addr - 1;
+            // Adjust jump addresses using address map
+            if op.opcode.is_jump() {
+                let target = op.p2 as usize;
+                if target < addr_map.len() {
+                    op.p2 = addr_map[target];
+                } else {
+                    op.p2 = inlined_end;
+                }
             }
             // Adjust cursor numbers - p1 is usually the cursor for table operations
             // But we need to be careful: eph_cursor should NOT be adjusted since we
@@ -1527,11 +1569,12 @@ impl<'a> InsertCompiler<'a> {
     /// Validate ORDER BY in SELECT doesn't contain aggregates without GROUP BY
     fn validate_select_order_by(&self, select: &SelectStmt) -> Result<()> {
         if let Some(order_by) = &select.order_by {
-            let has_group_by = match &select.body {
-                SelectBody::Select(core) => core.group_by.is_some(),
+            let should_check = match &select.body {
+                SelectBody::Select(core) => !core.group_by.is_some(),
+                // For compound SELECT, don't check - ORDER BY aggregates reference result columns
                 SelectBody::Compound { .. } => false,
             };
-            if !has_group_by {
+            if should_check {
                 for term in order_by {
                     if let Some(agg_name) = self.find_aggregate_in_expr(&term.expr) {
                         return Err(crate::error::Error::with_message(

@@ -555,12 +555,16 @@ impl<'s> SelectCompiler<'s> {
         }
 
         // Check for aggregates in ORDER BY without GROUP BY
+        // Note: For compound SELECT, we skip this check because:
+        // 1. The ORDER BY references result columns from the compound result
+        // 2. Aggregates in ORDER BY match expressions from the left SELECT's result columns
         if let Some(order_by) = &select.order_by {
-            let has_group_by = match &select.body {
-                SelectBody::Select(core) => core.group_by.is_some(),
+            let should_check = match &select.body {
+                SelectBody::Select(core) => !core.group_by.is_some(),
+                // For compound SELECT, don't check - ORDER BY aggregates reference result columns
                 SelectBody::Compound { .. } => false,
             };
-            if !has_group_by {
+            if should_check {
                 for term in order_by {
                     if let Some(agg_name) = self.find_aggregate_in_expr(&term.expr) {
                         return Err(Error::with_message(
@@ -1118,17 +1122,62 @@ impl<'s> SelectCompiler<'s> {
             ));
         }
 
-        let offset = self.ops.len() as i32;
-        for mut op in recursive_ops {
-            // Filter out Init/Halt/Transaction/Goto - they're control flow for standalone queries,
-            // not needed when inlining into the recursive loop
-            if op.opcode != Opcode::Halt
-                && op.opcode != Opcode::Init
-                && op.opcode != Opcode::Transaction
-                && op.opcode != Opcode::Goto
+        // Use the same sophisticated approach as compile_subquery_to_ephemeral
+        // Identify wrapper instructions to skip (Init at start, Halt/Transaction/Goto at end)
+        let len = recursive_ops.len();
+        let mut skip_indices = std::collections::HashSet::new();
+
+        // Skip Init at 0
+        if !recursive_ops.is_empty() && recursive_ops[0].opcode == Opcode::Init {
+            skip_indices.insert(0);
+        }
+
+        // Skip footer: Halt, Transaction, Goto at the end (working backwards)
+        for i in (0..len).rev() {
+            let op = &recursive_ops[i];
+            if op.opcode == Opcode::Halt
+                || op.opcode == Opcode::Transaction
+                || (op.opcode == Opcode::Goto && i >= len.saturating_sub(3))
             {
+                skip_indices.insert(i);
+            } else {
+                break;
+            }
+        }
+
+        // Build address mapping: old_addr -> new_addr
+        let offset = self.ops.len() as i32;
+        let mut addr_map: Vec<i32> = Vec::with_capacity(len);
+        let mut new_addr = offset;
+        for i in 0..len {
+            if skip_indices.contains(&i) {
+                addr_map.push(-1);
+            } else {
+                addr_map.push(new_addr);
+                new_addr += 1;
+            }
+        }
+
+        // Calculate end address for the inlined section
+        let inlined_end = new_addr;
+
+        // Fix up -1 entries (skipped instructions) to point to end
+        for addr in &mut addr_map {
+            if *addr == -1 {
+                *addr = inlined_end;
+            }
+        }
+
+        for (old_addr, mut op) in recursive_ops.into_iter().enumerate() {
+            if !skip_indices.contains(&old_addr) {
+                // Adjust P2 for jump instructions using the address map
                 if op.opcode.is_jump() {
-                    op.p2 += offset;
+                    let target = op.p2 as usize;
+                    if target < addr_map.len() {
+                        op.p2 = addr_map[target];
+                    } else {
+                        op.p2 = inlined_end;
+                    }
                     op.p5 = 0xFFFF;
                 }
                 self.ops.push(op);
@@ -6050,12 +6099,69 @@ impl<'s> SelectCompiler<'s> {
     fn compile_table_ref(&mut self, table_ref: &TableRef, join_type: JoinType) -> Result<()> {
         match table_ref {
             TableRef::Table { name, alias, .. } => {
-                let cursor = self.alloc_cursor();
                 // Use just the table name for internal lookups
                 let table_name = &name.name;
                 let table_name_lower = table_name.to_lowercase();
                 // Use full qualified name (schema.table) for VDBE if schema is specified
                 let qualified_name = name.to_string();
+
+                // Check cte_cursors first (recursive CTE self-reference uses existing cursor)
+                if let Some((cursor, columns)) = self.cte_cursors.get(&table_name_lower) {
+                    let display_name = alias.clone().unwrap_or_else(|| table_name.clone());
+                    self.tables.push(TableInfo {
+                        name: display_name,
+                        table_name: table_name.clone(),
+                        cursor: *cursor,
+                        schema_table: None,
+                        is_subquery: true,
+                        join_type,
+                        subquery_columns: Some(columns.clone()),
+                    });
+                    return Ok(());
+                }
+
+                // Check if this is a CTE reference (before views, so CTEs take precedence)
+                if let Some(cte) = self.ctes.get(&table_name_lower).cloned() {
+                    let cursor = self.alloc_cursor();
+                    let columns = if self.recursive_ctes.contains(&table_name_lower) {
+                        self.compile_recursive_cte(&cte, cursor, &table_name_lower)?
+                    } else {
+                        let subquery_cols = self.compile_subquery_to_ephemeral(
+                            &cte.query,
+                            cursor,
+                            Some(&table_name_lower),
+                        )?;
+                        if let Some(explicit) = &cte.columns {
+                            if explicit.len() != subquery_cols.len() {
+                                return Err(Error::with_message(
+                                    ErrorCode::Error,
+                                    format!(
+                                        "table {} has {} values for {} columns",
+                                        cte.name,
+                                        subquery_cols.len(),
+                                        explicit.len()
+                                    ),
+                                ));
+                            }
+                            explicit.clone()
+                        } else {
+                            subquery_cols
+                        }
+                    };
+                    let display_name = alias.clone().unwrap_or_else(|| table_name.clone());
+                    self.tables.push(TableInfo {
+                        name: display_name,
+                        table_name: table_name.clone(),
+                        cursor,
+                        schema_table: None,
+                        is_subquery: true,
+                        join_type,
+                        subquery_columns: Some(columns),
+                    });
+                    return Ok(());
+                }
+
+                let cursor = self.alloc_cursor();
 
                 // Look up table in schema if available
                 let schema_table = if table_name_lower == "sqlite_master"

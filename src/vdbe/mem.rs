@@ -493,9 +493,20 @@ impl Mem {
                         self.set_int(i);
                     }
                 } else if self.is_str() {
-                    // Try to parse as integer
-                    if let Ok(i) = self.to_str().trim().parse::<i64>() {
+                    let s = self.to_str();
+                    let trimmed = s.trim();
+                    // Try to parse as integer first
+                    if let Ok(i) = trimmed.parse::<i64>() {
                         self.set_int(i);
+                    } else if let Ok(r) = trimmed.parse::<f64>() {
+                        // String parses as real - check if exactly representable as int
+                        let i = r as i64;
+                        if (i as f64) == r {
+                            self.set_int(i);
+                        } else {
+                            // Can't be represented as integer, store as real
+                            self.set_real(r);
+                        }
                     }
                 }
             }
@@ -510,19 +521,33 @@ impl Mem {
             }
             Affinity::Numeric | Affinity::Flexnum => {
                 // NUMERIC and FLEXNUM both prefer integer, then real
-                if self.is_str() {
+                if self.is_real() {
+                    // Check if the real can be represented exactly as int
+                    let i = self.r as i64;
+                    if (i as f64) == self.r {
+                        self.set_int(i);
+                    }
+                } else if self.is_str() {
                     let s = self.to_str();
                     let trimmed = s.trim();
                     // Try integer first
                     if let Ok(i) = trimmed.parse::<i64>() {
                         self.set_int(i);
                     } else if let Ok(r) = trimmed.parse::<f64>() {
-                        self.set_real(r);
+                        // Check if this real can be exactly represented as integer
+                        let i = r as i64;
+                        if (i as f64) == r {
+                            self.set_int(i);
+                        } else {
+                            self.set_real(r);
+                        }
                     }
                 }
             }
             Affinity::Text => {
-                if !self.is_str() && !self.is_null() {
+                // TEXT affinity converts integers and reals to text,
+                // but NOT blobs - blobs remain unchanged
+                if !self.is_str() && !self.is_null() && !self.is_blob() {
                     let s = self.to_str();
                     self.set_str(&s);
                 }

@@ -3404,7 +3404,102 @@ impl<'s> StatementCompiler<'s> {
                     format!("RAISE({})", action_str)
                 }
             }
-            _ => "?".to_string(), // Fallback for complex expressions
+            Expr::Subquery(select) => {
+                // Scalar subquery - wrap SELECT in parentheses
+                format!("({})", self.select_to_sql(select))
+            }
+            Expr::Exists { subquery, negated } => {
+                let prefix = if *negated { "NOT EXISTS" } else { "EXISTS" };
+                format!("{} ({})", prefix, self.select_to_sql(subquery))
+            }
+            Expr::In {
+                expr,
+                list,
+                negated,
+            } => {
+                let neg = if *negated { " NOT" } else { "" };
+                let list_str = match list {
+                    InList::Values(vals) => vals
+                        .iter()
+                        .map(|v| self.expr_to_sql(v))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    InList::Subquery(sel) => self.select_to_sql(sel),
+                    InList::Table(name) => name.to_string(),
+                };
+                format!("({}{}IN ({}))", self.expr_to_sql(expr), neg, list_str)
+            }
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => {
+                let neg = if *negated { " NOT" } else { "" };
+                format!(
+                    "({}{}BETWEEN {} AND {})",
+                    self.expr_to_sql(expr),
+                    neg,
+                    self.expr_to_sql(low),
+                    self.expr_to_sql(high)
+                )
+            }
+            Expr::IsNull { expr, negated } => {
+                if *negated {
+                    format!("({} IS NOT NULL)", self.expr_to_sql(expr))
+                } else {
+                    format!("({} IS NULL)", self.expr_to_sql(expr))
+                }
+            }
+            Expr::IsDistinct {
+                left,
+                right,
+                negated,
+            } => {
+                if *negated {
+                    format!(
+                        "({} IS NOT DISTINCT FROM {})",
+                        self.expr_to_sql(left),
+                        self.expr_to_sql(right)
+                    )
+                } else {
+                    format!(
+                        "({} IS DISTINCT FROM {})",
+                        self.expr_to_sql(left),
+                        self.expr_to_sql(right)
+                    )
+                }
+            }
+            Expr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => {
+                let mut sql = String::from("CASE");
+                if let Some(op) = operand {
+                    sql.push(' ');
+                    sql.push_str(&self.expr_to_sql(op));
+                }
+                for when in when_clauses {
+                    sql.push_str(" WHEN ");
+                    sql.push_str(&self.expr_to_sql(&when.when));
+                    sql.push_str(" THEN ");
+                    sql.push_str(&self.expr_to_sql(&when.then));
+                }
+                if let Some(else_expr) = else_clause {
+                    sql.push_str(" ELSE ");
+                    sql.push_str(&self.expr_to_sql(else_expr));
+                }
+                sql.push_str(" END");
+                sql
+            }
+            Expr::Cast { expr, type_name } => {
+                format!("CAST({} AS {})", self.expr_to_sql(expr), type_name.name)
+            }
+            Expr::Collate { expr, collation } => {
+                format!("{} COLLATE {}", self.expr_to_sql(expr), collation)
+            }
+            _ => "?".to_string(), // Fallback for any remaining expressions
         }
     }
 

@@ -3177,7 +3177,7 @@ impl<'s> SelectCompiler<'s> {
             P4::Unused,
         );
 
-        // Collect table cursors to avoid borrow checker issues
+        // Collect table cursors and join types to avoid borrow checker issues
         // Skip outer tables (for correlated subqueries) - only close this query's tables
         let table_cursors: Vec<i32> = self
             .tables
@@ -3185,14 +3185,54 @@ impl<'s> SelectCompiler<'s> {
             .skip(self.outer_tables_boundary)
             .map(|t| t.cursor)
             .collect();
+        let table_join_types: Vec<JoinType> = self
+            .tables
+            .iter()
+            .skip(self.outer_tables_boundary)
+            .map(|t| t.join_type)
+            .collect();
 
-        // Generate proper nested loop structure for cross joins
-        // Same structure as compile_simple_aggregate
+        // Allocate found_match registers for LEFT JOINs
+        let mut found_match_regs: Vec<Option<i32>> = Vec::with_capacity(table_cursors.len());
+        for (i, join_type) in table_join_types.iter().enumerate() {
+            let is_outer_join = join_type.is_outer();
+            let found_match_reg = if is_outer_join && i > 0 {
+                let reg = self.alloc_reg();
+                Some(reg)
+            } else {
+                None
+            };
+            found_match_regs.push(found_match_reg);
+        }
+
+        // Generate proper nested loop structure for cross joins and LEFT JOINs
         let mut loop_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
         let mut done_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
-        for cursor in &table_cursors {
+        let mut null_row_labels: Vec<Option<i32>> = Vec::with_capacity(table_cursors.len());
+        let mut after_null_labels: Vec<Option<i32>> = Vec::with_capacity(table_cursors.len());
+
+        for (i, cursor) in table_cursors.iter().enumerate() {
+            let is_left_join_inner = i > 0 && table_join_types[i].is_outer();
+
+            // Initialize found_match for THIS table if it's an outer join
+            if let Some(reg) = found_match_regs[i] {
+                self.emit(Opcode::Integer, 0, reg, 0, P4::Unused);
+            }
+
             let done_label = self.alloc_label();
-            self.emit(Opcode::Rewind, *cursor, done_label, 0, P4::Unused);
+
+            if is_left_join_inner {
+                // For LEFT JOIN inner table: Rewind jumps to null_row handling if empty
+                let null_row_label = self.alloc_label();
+                self.emit(Opcode::Rewind, *cursor, null_row_label, 0, P4::Unused);
+                null_row_labels.push(Some(null_row_label));
+                after_null_labels.push(Some(self.alloc_label()));
+            } else {
+                self.emit(Opcode::Rewind, *cursor, done_label, 0, P4::Unused);
+                null_row_labels.push(None);
+                after_null_labels.push(None);
+            }
+
             done_labels.push(done_label);
 
             // Mark loop start for this level
@@ -3202,7 +3242,7 @@ impl<'s> SelectCompiler<'s> {
         }
 
         // The innermost loop label is used for WHERE skip target
-        let loop_start_label = *loop_labels.last().unwrap_or(&self.alloc_label());
+        let _loop_start_label = *loop_labels.last().unwrap_or(&self.alloc_label());
 
         // Evaluate WHERE clause
         let where_skip_label = if let Some(where_expr) = &core.where_clause {
@@ -3296,6 +3336,11 @@ impl<'s> SelectCompiler<'s> {
             record_reg,
             P4::Unused,
         );
+        // Mark found_match=1 for any LEFT JOIN inner tables
+        for reg in found_match_regs.iter().flatten() {
+            self.emit(Opcode::Integer, 1, *reg, 0, P4::Unused);
+        }
+
         self.emit(
             Opcode::SorterInsert,
             sorter_cursor,
@@ -3316,6 +3361,119 @@ impl<'s> SelectCompiler<'s> {
 
             // Next on this cursor, jump back to its loop start
             self.emit(Opcode::Next, cursor, loop_label, 0, P4::Unused);
+
+            // For LEFT JOIN: handle empty/exhausted inner table
+            if let Some(found_match_reg) = found_match_regs[i] {
+                // If found_match > 0, skip null row handling
+                if let Some(after_null_label) = after_null_labels[i] {
+                    self.emit(Opcode::IfPos, found_match_reg, after_null_label, 0, P4::Unused);
+                }
+
+                // Resolve null_row_label here - both Rewind-when-empty AND loop-no-match land here
+                if let Some(null_row_label) = null_row_labels[i] {
+                    self.resolve_label(null_row_label, self.current_addr());
+                }
+
+                // Set cursor to null row mode
+                self.emit(Opcode::NullRow, cursor, 0, 0, P4::Unused);
+
+                // Re-evaluate expressions with NULL values and insert into sorter
+                // For GROUP BY queries, we need to re-compute the group columns, agg args, and non-agg cols
+                // with the cursor in NullRow mode, then insert into sorter
+
+                // Re-evaluate GROUP BY expressions
+                let null_group_regs = self.compile_expressions(&resolved_group_by)?;
+
+                // Re-evaluate aggregate arguments
+                let null_agg_arg_regs = self.compile_aggregate_args(&core.columns)?;
+
+                // Re-evaluate HAVING aggregate args
+                let null_having_args = if let Some(having) = &core.having {
+                    self.compile_aggregate_args_in_expr(having)?
+                } else {
+                    0
+                };
+
+                // Re-evaluate non-aggregate result columns
+                let (null_non_agg_base, null_non_agg_count, _) =
+                    self.compile_non_agg_result_cols(&core.columns, Some(&resolved_group_by))?;
+
+                // Copy to contiguous registers for MakeRecord
+                let null_total_cols =
+                    null_group_regs.1 + null_agg_arg_regs.1 + null_having_args + null_non_agg_count;
+                let null_contiguous_base = self.alloc_regs(null_total_cols);
+                let mut null_dest_offset = 0;
+
+                // Copy group columns
+                for j in 0..null_group_regs.1 {
+                    self.emit(
+                        Opcode::Copy,
+                        null_group_regs.0 + j as i32,
+                        null_contiguous_base + null_dest_offset,
+                        0,
+                        P4::Unused,
+                    );
+                    null_dest_offset += 1;
+                }
+
+                // Copy aggregate arguments
+                for j in 0..null_agg_arg_regs.1 {
+                    self.emit(
+                        Opcode::Copy,
+                        null_agg_arg_regs.0 + j as i32,
+                        null_contiguous_base + null_dest_offset,
+                        0,
+                        P4::Unused,
+                    );
+                    null_dest_offset += 1;
+                }
+
+                // Copy HAVING aggregate arguments
+                for j in 0..null_having_args {
+                    self.emit(
+                        Opcode::Copy,
+                        null_agg_arg_regs.0 + null_agg_arg_regs.1 as i32 + j as i32,
+                        null_contiguous_base + null_dest_offset,
+                        0,
+                        P4::Unused,
+                    );
+                    null_dest_offset += 1;
+                }
+
+                // Copy non-aggregate columns
+                for j in 0..null_non_agg_count {
+                    self.emit(
+                        Opcode::Copy,
+                        null_non_agg_base + j as i32,
+                        null_contiguous_base + null_dest_offset,
+                        0,
+                        P4::Unused,
+                    );
+                    null_dest_offset += 1;
+                }
+
+                // MakeRecord and SorterInsert
+                let null_record_reg = self.alloc_reg();
+                self.emit(
+                    Opcode::MakeRecord,
+                    null_contiguous_base,
+                    null_total_cols as i32,
+                    null_record_reg,
+                    P4::Unused,
+                );
+                self.emit(
+                    Opcode::SorterInsert,
+                    sorter_cursor,
+                    null_record_reg,
+                    0,
+                    P4::Unused,
+                );
+
+                // Resolve after_null_label
+                if let Some(after_null_label) = after_null_labels[i] {
+                    self.resolve_label(after_null_label, self.current_addr());
+                }
+            }
 
             // Resolve done label for this level
             self.resolve_label(done_labels[i], self.current_addr());

@@ -237,12 +237,41 @@ impl OpcodeHandler for MustBeIntHandler {
             return Ok(OpcodeResult::Continue);
         }
 
-        // Try to convert to integer using numeric affinity
-        // Real and string types that look like numbers can convert
-        if mem.is_real() || mem.is_str() {
-            let val = ctx.mem(op.p1).to_int();
-            ctx.mem_mut(op.p1).set_int(val);
-            return Ok(OpcodeResult::Continue);
+        // Real values can only convert if they are whole numbers
+        if mem.is_real() {
+            let val = mem.to_real();
+            if val.fract() == 0.0 && val >= i64::MIN as f64 && val <= i64::MAX as f64 {
+                ctx.mem_mut(op.p1).set_int(val as i64);
+                return Ok(OpcodeResult::Continue);
+            }
+            // Non-whole real - error
+            if op.p2 != 0 {
+                return Ok(OpcodeResult::Jump(op.p2));
+            } else {
+                return Err(crate::error::Error::with_message(
+                    crate::error::ErrorCode::Mismatch,
+                    "datatype mismatch",
+                ));
+            }
+        }
+
+        // Strings can convert only if they look like integers
+        if mem.is_str() {
+            let s = mem.to_string();
+            // Try to parse as integer
+            if let Ok(val) = s.trim().parse::<i64>() {
+                ctx.mem_mut(op.p1).set_int(val);
+                return Ok(OpcodeResult::Continue);
+            }
+            // String is not a valid integer - error
+            if op.p2 != 0 {
+                return Ok(OpcodeResult::Jump(op.p2));
+            } else {
+                return Err(crate::error::Error::with_message(
+                    crate::error::ErrorCode::Mismatch,
+                    "datatype mismatch",
+                ));
+            }
         }
 
         // NULL and other types cannot become integers - jump or error
@@ -252,7 +281,7 @@ impl OpcodeHandler for MustBeIntHandler {
         } else {
             Err(crate::error::Error::with_message(
                 crate::error::ErrorCode::Mismatch,
-                "type mismatch",
+                "datatype mismatch",
             ))
         }
     }
@@ -520,14 +549,26 @@ mod tests {
     }
 
     #[test]
-    fn test_mustbeint_from_real() {
+    fn test_mustbeint_from_real_whole() {
+        // Whole number real (3.0) should convert to integer
+        let handler = MustBeIntHandler;
+        let mut tc = TestContext::new(10);
+        tc.mem[1].set_real(3.0);
+        let op = make_op(Opcode::MustBeInt, 1, 100, 0, P4::Unused);
+        let result = handler.execute(&mut tc.as_context(), &op).unwrap();
+        assert_eq!(result, OpcodeResult::Continue);
+        assert_eq!(tc.mem[1].to_int(), 3);
+    }
+
+    #[test]
+    fn test_mustbeint_from_real_nonwhole() {
+        // Non-whole real (3.7) should jump to P2
         let handler = MustBeIntHandler;
         let mut tc = TestContext::new(10);
         tc.mem[1].set_real(3.7);
         let op = make_op(Opcode::MustBeInt, 1, 100, 0, P4::Unused);
         let result = handler.execute(&mut tc.as_context(), &op).unwrap();
-        assert_eq!(result, OpcodeResult::Continue);
-        assert_eq!(tc.mem[1].to_int(), 3);
+        assert_eq!(result, OpcodeResult::Jump(100));
     }
 
     #[test]

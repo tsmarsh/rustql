@@ -680,7 +680,7 @@ impl Vdbe {
             var_names: Vec::new(),
             interrupted: false,
             instruction_count: 0,
-            max_instructions: 100_000_000, // Default 100M instruction limit
+            max_instructions: 1_000_000_000, // Default 1B instruction limit
             result_start: 0,
             result_count: 0,
             column_names: Vec::new(),
@@ -8416,19 +8416,53 @@ impl Vdbe {
             // ==================================================================
             Opcode::MustBeInt => {
                 // Convert P1 to integer, jump to P2 if not possible
-                let is_convertible = self.mem(op.p1).is_int()
-                    || self.mem(op.p1).is_real()
-                    || self.mem(op.p1).is_str();
-                let is_null = self.mem(op.p1).is_null();
-                if is_convertible {
-                    let val = self.mem(op.p1).to_int();
-                    self.mem_mut(op.p1).set_int(val);
-                } else if is_null {
-                    // NULL stays NULL
+                // For LIMIT/OFFSET, non-integer types should raise "datatype mismatch"
+                let mem = self.mem(op.p1);
+                if mem.is_int() {
+                    // Already an integer, nothing to do
+                } else if mem.is_real() {
+                    // Real can only convert if it's a whole number
+                    let val = mem.to_real();
+                    if val.fract() == 0.0 && val >= i64::MIN as f64 && val <= i64::MAX as f64 {
+                        self.mem_mut(op.p1).set_int(val as i64);
+                    } else if op.p2 != 0 {
+                        self.pc = op.p2;
+                    } else {
+                        return Err(Error::with_message(
+                            ErrorCode::Mismatch,
+                            "datatype mismatch",
+                        ));
+                    }
+                } else if mem.is_str() {
+                    // String can only convert if it parses as an integer
+                    let s = mem.to_string();
+                    if let Ok(val) = s.trim().parse::<i64>() {
+                        self.mem_mut(op.p1).set_int(val);
+                    } else if op.p2 != 0 {
+                        self.pc = op.p2;
+                    } else {
+                        return Err(Error::with_message(
+                            ErrorCode::Mismatch,
+                            "datatype mismatch",
+                        ));
+                    }
+                } else if mem.is_null() {
+                    // NULL - jump or error
+                    if op.p2 != 0 {
+                        self.pc = op.p2;
+                    } else {
+                        return Err(Error::with_message(
+                            ErrorCode::Mismatch,
+                            "datatype mismatch",
+                        ));
+                    }
                 } else if op.p2 != 0 {
                     self.pc = op.p2;
                 } else {
-                    return Err(Error::with_message(ErrorCode::Mismatch, "type mismatch"));
+                    return Err(Error::with_message(
+                        ErrorCode::Mismatch,
+                        "datatype mismatch",
+                    ));
                 }
             }
 

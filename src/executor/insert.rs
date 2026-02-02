@@ -952,6 +952,7 @@ impl<'a> InsertCompiler<'a> {
 
         // Filter out Init/Halt/Transaction and wrapper Goto from the subquery ops
         // Keep internal Gotos used for expression evaluation control flow
+        // Note: Only skip the control-flow Goto (the one that jumps to address 1, after Init).
         let len = sub_ops.len();
         let mut skip_indices = std::collections::HashSet::new();
 
@@ -960,12 +961,13 @@ impl<'a> InsertCompiler<'a> {
             skip_indices.insert(0);
         }
 
-        // Skip footer: Halt, Transaction, Goto at the end (working backwards)
+        // Skip footer: Halt, Transaction, and Goto that jumps back to Init (working backwards)
         for i in (0..len).rev() {
             let op = &sub_ops[i];
             if op.opcode == Opcode::Halt
                 || op.opcode == Opcode::Transaction
-                || (op.opcode == Opcode::Goto && i >= len.saturating_sub(3))
+                || (op.opcode == Opcode::Goto && op.p2 == 1)
+            // Skip Goto that loops back to Init
             {
                 skip_indices.insert(i);
             } else {

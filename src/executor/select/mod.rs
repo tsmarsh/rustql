@@ -8149,11 +8149,30 @@ impl<'s> SelectCompiler<'s> {
                 // Initialize result to NULL in case subquery returns no rows
                 self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
 
+                // For scalar subqueries, we only want the FIRST row's value.
+                // If the subquery doesn't have a LIMIT, we apply LIMIT 1 internally.
+                // This matches SQLite behavior where (SELECT ...) returns only the first row.
+                let needs_limit_1 = select.limit.is_none();
+                if needs_limit_1 {
+                    // Set up LIMIT 1 for this subquery
+                    let limit_reg = self.alloc_reg();
+                    self.emit(Opcode::Integer, 1, limit_reg, 0, P4::Unused);
+                    self.limit_counter_reg = Some(limit_reg);
+                    self.limit_done_label = Some(self.alloc_label());
+                }
+
                 // Compile the subquery with Set destination using compile_subselect
                 // which handles ORDER BY and LIMIT properly
                 // Outer tables remain available for correlated column references
                 let sub_dest = SelectDest::Set { reg: dest_reg };
                 self.compile_subselect(select, &sub_dest)?;
+
+                // Resolve the limit done label if we added LIMIT 1
+                if needs_limit_1 {
+                    if let Some(done_label) = self.limit_done_label {
+                        self.resolve_label(done_label, self.current_addr());
+                    }
+                }
 
                 // Restore outer query state - remove subquery's tables and reset boundary
                 self.tables.truncate(outer_tables_len);

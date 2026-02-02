@@ -75,7 +75,7 @@ pub unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         "sqlite3_crashparams",
         "sqlite3_connection_pointer",
         // "sqlite3_db_config" - removed from stubs, implemented properly below
-        "sqlite3_db_filename",
+        // "sqlite3_db_filename" - removed from stubs, implemented properly below
         "sqlite3_db_status",
         "sqlite3_exec_nr",
         "sqlite3_next_stmt",
@@ -711,6 +711,18 @@ pub unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         None,
     );
 
+    // Register sqlite3_db_filename - returns the filename for an attached database
+    // Usage: sqlite3_db_filename DBHANDLE DBNAME
+    // Returns the path to the database file, or empty string if not found or temp
+    let cmd_name = CString::new("sqlite3_db_filename").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(sqlite3_db_filename_cmd),
+        std::ptr::null_mut(),
+        None,
+    );
+
     // Register sqlite3_db_config_lookaside - configures per-connection lookaside memory
     // Used by printf.test, altermalloc.test, analyze9.test, dbstatus.test, and others
     let cmd_name = CString::new("sqlite3_db_config_lookaside").unwrap();
@@ -858,6 +870,46 @@ unsafe extern "C" fn test_stub_status(
     _objv: *const *mut Tcl_Obj,
 ) -> c_int {
     set_result_string(interp, "0 0 0");
+    TCL_OK
+}
+
+/// Implementation of sqlite3_db_filename command
+///
+/// Usage: sqlite3_db_filename DBHANDLE DBNAME
+/// Returns the path to the database file for the named database (main, temp, or attached).
+/// Returns empty string if the database is not found, is temporary (:memory:), or has no filename.
+unsafe extern "C" fn sqlite3_db_filename_cmd(
+    _client_data: *mut c_void,
+    interp: *mut Tcl_Interp,
+    objc: c_int,
+    objv: *const *mut Tcl_Obj,
+) -> c_int {
+    use super::helpers::obj_to_string;
+
+    if objc < 3 {
+        set_result_string(
+            interp,
+            "wrong # args: should be \"sqlite3_db_filename DB DBNAME\"",
+        );
+        return TCL_ERROR;
+    }
+
+    let db_handle = obj_to_string(*objv.offset(1));
+    let db_name = obj_to_string(*objv.offset(2));
+
+    let filename = CONNECTIONS.with(|connections| {
+        let conns = connections.borrow();
+        if let Some(conn) = conns.get(&db_handle) {
+            // Find the database by name (case-insensitive)
+            conn.find_db(&db_name)
+                .and_then(|db| db.path.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        }
+    });
+
+    set_result_string(interp, &filename);
     TCL_OK
 }
 

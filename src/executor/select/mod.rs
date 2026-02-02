@@ -7993,12 +7993,14 @@ impl<'s> SelectCompiler<'s> {
             } => {
                 // Compile BETWEEN: val >= low AND val <= high
                 // NULL semantics: if any operand is NULL during comparison, result is NULL
-                // Specifically: (val >= low) AND (val <= high)
-                // - If val < low, result is 0 (false)
-                // - If val > high, result is 0 (false)
-                // - If val is NULL, low is NULL, or high is NULL and we reach that
-                //   comparison, result is NULL
-                // - Otherwise result is 1 (true)
+                // EXCEPT: if we can determine the value is definitely out of range, return FALSE
+                //
+                // Logic:
+                // 1. If val > high (regardless of NULLs), result is FALSE
+                // 2. If val < low (regardless of NULLs), result is FALSE
+                // 3. If val is NULL, result is NULL
+                // 4. If low is NULL or high is NULL (and we haven't jumped), result is NULL
+                // 5. Otherwise, val is in range, result is TRUE
                 let val_reg = self.alloc_reg();
                 let low_reg = self.alloc_reg();
                 let high_reg = self.alloc_reg();
@@ -8009,18 +8011,32 @@ impl<'s> SelectCompiler<'s> {
 
                 let false_label = self.alloc_label();
                 let null_label = self.alloc_label();
+                let check_low_label = self.alloc_label();
+                let check_nulls_label = self.alloc_label();
                 let end_label = self.alloc_label();
 
                 // Determine affinity for comparisons
                 let low_affinity = self.get_comparison_affinity(val_expr, low);
                 let high_affinity = self.get_comparison_affinity(val_expr, high);
 
-                // Check val >= low
-                // If val < low (definitely false), jump to false_label
-                // If either is NULL, jump to null_label (comparison is unknown)
-                // Use JUMPIFNULL flag to detect NULL operands
+                // First check if val is NULL - if so, result is NULL
                 self.emit_with_p5(Opcode::IsNull, val_reg, null_label, 0, P4::Unused, 0);
-                self.emit_with_p5(Opcode::IsNull, low_reg, null_label, 0, P4::Unused, 0);
+
+                // Check val > high first (skip if high is NULL - can't determine yet)
+                self.emit(Opcode::IsNull, high_reg, check_low_label, 0, P4::Unused);
+                // Gt P1 P2 P3: jumps if r[P3] > r[P1], so P1=high, P3=val
+                self.emit_with_p5(
+                    Opcode::Gt,
+                    high_reg,
+                    false_label,
+                    val_reg,
+                    P4::Unused,
+                    high_affinity,
+                );
+
+                // Check val < low (skip if low is NULL - can't determine yet)
+                self.resolve_label(check_low_label, self.current_addr());
+                self.emit(Opcode::IsNull, low_reg, check_nulls_label, 0, P4::Unused);
                 // Lt P1 P2 P3: jumps if r[P3] < r[P1], so P1=low, P3=val
                 self.emit_with_p5(
                     Opcode::Lt,
@@ -8031,19 +8047,11 @@ impl<'s> SelectCompiler<'s> {
                     low_affinity,
                 );
 
-                // Check val <= high
-                // If val > high (definitely false), jump to false_label
-                // If high is NULL, jump to null_label (comparison is unknown)
-                self.emit_with_p5(Opcode::IsNull, high_reg, null_label, 0, P4::Unused, 0);
-                // Gt P1 P2 P3: jumps if r[P3] > r[P1], so P1=high, P3=val
-                self.emit_with_p5(
-                    Opcode::Gt,
-                    high_reg,
-                    false_label,
-                    val_reg,
-                    P4::Unused,
-                    high_affinity,
-                );
+                // If we reach here, val is not definitively out of range
+                // Check if either bound is NULL - if so, result is NULL
+                self.resolve_label(check_nulls_label, self.current_addr());
+                self.emit(Opcode::IsNull, low_reg, null_label, 0, P4::Unused);
+                self.emit(Opcode::IsNull, high_reg, null_label, 0, P4::Unused);
 
                 // Success - in range (result is TRUE)
                 self.emit(

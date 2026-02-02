@@ -577,6 +577,10 @@ impl Mem {
 
     /// Bitwise NOT
     pub fn bit_not(&mut self) -> Result<()> {
+        if self.is_null() {
+            // NULL stays NULL under bitwise NOT
+            return Ok(());
+        }
         let i = self.to_int();
         self.set_int(!i);
         Ok(())

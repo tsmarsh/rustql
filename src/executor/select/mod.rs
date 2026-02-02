@@ -8741,6 +8741,61 @@ impl<'s> SelectCompiler<'s> {
                     crate::parser::ast::FunctionArgs::Exprs(exprs) => exprs.len(),
                     crate::parser::ast::FunctionArgs::Star => 0,
                 };
+
+                // Handle likelihood/likely/unlikely - these are optimizer hints that
+                // are completely eliminated during compilation. They just return their
+                // first argument unchanged and don't appear in the VDBE bytecode at all.
+                let is_likelihood_func =
+                    matches!(name_upper.as_str(), "LIKELIHOOD" | "LIKELY" | "UNLIKELY");
+                if is_likelihood_func {
+                    if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
+                        // likelihood(X, Y) - validate Y is a constant between 0.0 and 1.0
+                        if name_upper == "LIKELIHOOD" {
+                            if exprs.len() != 2 {
+                                return Err(Error::with_message(
+                                    ErrorCode::Error,
+                                    "wrong number of arguments to function likelihood()",
+                                ));
+                            }
+                            // Validate second argument is a numeric constant in [0.0, 1.0]
+                            let prob_expr = &exprs[1];
+                            let prob_value = match prob_expr {
+                                Expr::Literal(crate::parser::ast::Literal::Float(f)) => Some(*f),
+                                Expr::Literal(crate::parser::ast::Literal::Integer(i)) => {
+                                    Some(*i as f64)
+                                }
+                                _ => None, // Not a constant
+                            };
+                            match prob_value {
+                                Some(p) if p >= 0.0 && p <= 1.0 => {
+                                    // Valid - continue to compile first argument
+                                }
+                                Some(_) => {
+                                    return Err(Error::with_message(
+                                        ErrorCode::Error,
+                                        "second argument to likelihood() must be a constant between 0.0 and 1.0",
+                                    ));
+                                }
+                                None => {
+                                    return Err(Error::with_message(
+                                        ErrorCode::Error,
+                                        "second argument to likelihood() must be a constant between 0.0 and 1.0",
+                                    ));
+                                }
+                            }
+                        }
+                        // For all hint functions, just compile the first argument directly
+                        // into the destination register, eliminating the function call
+                        if !exprs.is_empty() {
+                            self.compile_expr(&exprs[0], dest_reg)?;
+                            return Ok(());
+                        }
+                    }
+                    // Fallback to null if no arguments
+                    self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                    return Ok(());
+                }
+
                 // MIN/MAX with multiple args are scalar functions
                 let is_multi_arg_min_max =
                     matches!(name_upper.as_str(), "MIN" | "MAX") && arg_count > 1;

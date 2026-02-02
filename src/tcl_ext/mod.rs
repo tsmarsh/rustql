@@ -50,6 +50,9 @@ thread_local! {
     pub(crate) static USER_FUNCTIONS: RefCell<HashMap<(String, String, i32), String>> = RefCell::new(HashMap::new());
     // User-defined collations per connection: (db_name, collation_name) -> tcl_proc_name
     pub(crate) static USER_COLLATIONS: RefCell<HashMap<(String, String), String>> = RefCell::new(HashMap::new());
+    // Function destructors: (db_name, func_name, encoding) -> destructor_proc_name
+    // encoding is the text encoding: "any", "utf8", "utf16le", "utf16be"
+    pub(crate) static FUNCTION_DESTRUCTORS: RefCell<HashMap<(String, String, String), String>> = RefCell::new(HashMap::new());
 }
 
 // Force the linker to keep the init functions - they're called by TCL, not Rust code

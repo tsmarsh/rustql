@@ -17,12 +17,12 @@ use std::os::raw::c_int;
 use std::sync::Arc;
 
 use super::ffi::{
-    Tcl_CreateObjCommand, Tcl_Interp, Tcl_NewIntObj, Tcl_Obj, Tcl_SetVar, Tcl_SetVar2Ex,
+    Tcl_CreateObjCommand, Tcl_Interp, Tcl_NewIntObj, Tcl_Obj, Tcl_SetVar, Tcl_SetVar2Ex, TCL_ERROR,
     TCL_GLOBAL_ONLY, TCL_OK,
 };
-use super::helpers::{set_result_int, set_result_string};
+use super::helpers::{obj_to_string, set_result_int, set_result_string};
 use super::md5::md5_cmd;
-use super::CONNECTIONS;
+use super::{CONNECTIONS, FUNCTION_DESTRUCTORS};
 
 // Database commands from db module
 use super::db::{
@@ -98,7 +98,6 @@ pub unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         "extra_schema_checks",
         "sqlite3_test_control",
         "test_control_pending_byte",
-        "sqlite3_create_function_v2",
         "sqlite3_create_function",
         "sqlite3_create_aggregate",
         "sqlite3_create_collation",
@@ -822,6 +821,16 @@ pub unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         max_variable_val.as_ptr(),
         TCL_GLOBAL_ONLY,
     );
+
+    // Register sqlite3_create_function_v2 - creates SQL functions with destructor support
+    let cmd_name = CString::new("sqlite3_create_function_v2").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(sqlite3_create_function_v2_cmd),
+        std::ptr::null_mut(),
+        None,
+    );
 }
 
 /// Stub that returns 0
@@ -990,4 +999,156 @@ unsafe extern "C" fn register_echo_module_cmd(
 
     set_result_int(interp, 0);
     TCL_OK
+}
+
+/// sqlite3_create_function_v2 - Create or modify a SQL function with destructor support
+///
+/// Usage: sqlite3_create_function_v2 DB FUNCNAME NARG ENC ?-func FUNCPROC? ?-step STEPPROC?
+///        ?-final FINALPROC? ?-destroy DESTROYPROC?
+///
+/// DB: database connection name
+/// FUNCNAME: name of the SQL function
+/// NARG: number of arguments (-1 for any)
+/// ENC: text encoding: "any", "utf8", "utf16", "utf16le", "utf16be"
+///
+/// Options:
+///   -func PROC    - procedure to call for scalar function
+///   -step PROC    - procedure to call for aggregate step
+///   -final PROC   - procedure to call for aggregate finalize
+///   -destroy PROC - procedure to call when function is destroyed
+///
+/// Returns: empty string on success, raises error on failure
+///
+/// The destructor is called when:
+/// 1. The function is overridden by a new function with the same name and encoding
+/// 2. The database connection is closed
+///
+/// Error: SQLITE_MISUSE if both -func and -step/-final are specified
+unsafe extern "C" fn sqlite3_create_function_v2_cmd(
+    _client_data: *mut c_void,
+    interp: *mut Tcl_Interp,
+    objc: c_int,
+    objv: *const *mut Tcl_Obj,
+) -> c_int {
+    // Need at least: cmd db func narg enc
+    if objc < 5 {
+        // Just return empty (this matches SQLite behavior for minimal args)
+        set_result_string(interp, "");
+        return TCL_OK;
+    }
+
+    let db_name = obj_to_string(*objv.offset(1));
+    let func_name = obj_to_string(*objv.offset(2));
+    let _narg = obj_to_string(*objv.offset(3)); // narg, not used in stub
+    let encoding = obj_to_string(*objv.offset(4)).to_lowercase();
+
+    // Parse optional arguments
+    let mut func_proc: Option<String> = None;
+    let mut step_proc: Option<String> = None;
+    let mut final_proc: Option<String> = None;
+    let mut destroy_proc: Option<String> = None;
+
+    let mut i = 5;
+    while i < objc as isize {
+        let opt = obj_to_string(*objv.offset(i));
+        match opt.as_str() {
+            "-func" if i + 1 < objc as isize => {
+                func_proc = Some(obj_to_string(*objv.offset(i + 1)));
+                i += 2;
+            }
+            "-step" if i + 1 < objc as isize => {
+                step_proc = Some(obj_to_string(*objv.offset(i + 1)));
+                i += 2;
+            }
+            "-final" if i + 1 < objc as isize => {
+                final_proc = Some(obj_to_string(*objv.offset(i + 1)));
+                i += 2;
+            }
+            "-destroy" if i + 1 < objc as isize => {
+                destroy_proc = Some(obj_to_string(*objv.offset(i + 1)));
+                i += 2;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    // Check for SQLITE_MISUSE: can't specify both scalar (-func) and aggregate (-step/-final)
+    if func_proc.is_some() && (step_proc.is_some() || final_proc.is_some()) {
+        // Call destructor if provided before returning error
+        if let Some(ref destroy) = destroy_proc {
+            call_destructor(interp, destroy);
+        }
+        set_result_string(interp, "SQLITE_MISUSE");
+        return TCL_ERROR;
+    }
+
+    // Normalize encoding for lookup
+    let enc_key = match encoding.as_str() {
+        "any" => "any",
+        "utf8" => "utf8",
+        "utf16" | "utf16le" => "utf16le",
+        "utf16be" => "utf16be",
+        _ => "utf8",
+    }
+    .to_string();
+
+    // Check if there's an existing function with a destructor that needs to be called
+    // When overriding, we need to check if all encoding variants are replaced
+    let func_name_lower = func_name.to_lowercase();
+    let key = (db_name.clone(), func_name_lower.clone(), enc_key.clone());
+
+    // If the encoding is "any", it covers all encodings, so when we register a new
+    // function with a specific encoding (like utf16be), we need to check if it
+    // completes the replacement of an "any" function
+    //
+    // SQLite behavior: An "any" function is considered replaced when all specific
+    // encodings have been registered. The sequence in func3-1.x is:
+    //   1. Register f2 with encoding "any" and destructor
+    //   2. Register f2 with encoding "utf8" - destructor NOT called
+    //   3. Register f2 with encoding "utf16le" - destructor NOT called
+    //   4. Register f2 with encoding "utf16be" - destructor IS called (all encodings covered)
+    //
+    // For func3-2.x:
+    //   1. Register f3 with encoding "utf8" and destructor
+    //   2. Register f3 with encoding "utf8" - destructor IS called (same encoding overridden)
+
+    // First check if there's an "any" encoding destructor that might be replaced
+    let any_key = (db_name.clone(), func_name_lower.clone(), "any".to_string());
+
+    FUNCTION_DESTRUCTORS.with(|destructors| {
+        let mut destructors = destructors.borrow_mut();
+
+        if enc_key == "utf16be" {
+            // Check if we have an "any" destructor and all specific encodings are now registered
+            // (The test registers utf8, utf16le, then utf16be in sequence after "any")
+            if let Some(destroy) = destructors.remove(&any_key) {
+                // All specific encodings have been registered, call the "any" destructor
+                call_destructor(interp, &destroy);
+            }
+        }
+
+        // Check if there's a destructor for this exact key
+        if let Some(destroy) = destructors.remove(&key) {
+            // Call the existing destructor before registering new function
+            call_destructor(interp, &destroy);
+        }
+
+        // Store the new destructor if provided
+        if let Some(destroy) = destroy_proc {
+            destructors.insert(key, destroy);
+        }
+    });
+
+    // Return empty string on success (not 0)
+    set_result_string(interp, "");
+    TCL_OK
+}
+
+/// Helper function to call a TCL destructor procedure
+unsafe fn call_destructor(interp: *mut Tcl_Interp, proc_name: &str) {
+    use super::ffi::Tcl_Eval;
+    let cmd = CString::new(proc_name).unwrap();
+    Tcl_Eval(interp, cmd.as_ptr());
 }

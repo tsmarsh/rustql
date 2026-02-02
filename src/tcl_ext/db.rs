@@ -19,7 +19,7 @@ use super::ffi::{
 };
 use super::helpers::{obj_to_string, set_result_int, set_result_string, string_to_obj};
 use super::user_func::{clear_current_interp, set_current_interp};
-use super::{CONNECTIONS, NULL_VALUES, USER_COLLATIONS, USER_FUNCTIONS};
+use super::{CONNECTIONS, FUNCTION_DESTRUCTORS, NULL_VALUES, USER_COLLATIONS, USER_FUNCTIONS};
 
 use crate::api::{
     sqlite3_bind_blob, sqlite3_bind_double, sqlite3_bind_int64, sqlite3_bind_null,
@@ -1363,6 +1363,25 @@ pub unsafe fn db_onecolumn(
 pub unsafe fn db_close(db_name: &str, interp: *mut Tcl_Interp) -> c_int {
     // Set the interpreter for vtab callback logging
     set_current_interp(interp);
+
+    // Call function destructors BEFORE closing the connection
+    // This ensures destructors can still access connection state if needed
+    FUNCTION_DESTRUCTORS.with(|destructors| {
+        let mut destructors = destructors.borrow_mut();
+        // Find all destructors for this database and call them
+        let keys_to_remove: Vec<_> = destructors
+            .keys()
+            .filter(|(name, _, _)| name == db_name)
+            .cloned()
+            .collect();
+        for key in keys_to_remove {
+            if let Some(destroy_proc) = destructors.remove(&key) {
+                // Call the TCL destructor procedure
+                let cmd = CString::new(destroy_proc).unwrap();
+                Tcl_Eval(interp, cmd.as_ptr());
+            }
+        }
+    });
 
     CONNECTIONS.with(|connections| {
         // First, disconnect all virtual tables before closing

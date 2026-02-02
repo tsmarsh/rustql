@@ -984,8 +984,8 @@ impl SqliteConnection {
                     schema.indexes.clear();
                     schema.triggers.clear();
                     schema.views.clear();
-                    // Reload from sqlite_master (db_idx=0 for main database)
-                    load_schema_from_btree(btree, &mut schema, 0, "main")?;
+                    // Reload from sqlite_master with correct db_idx
+                    load_schema_from_btree(btree, &mut schema, i as i32, &db.name)?;
                 }
                 if autocommit {
                     if let Ok(mut shared) = btree.shared.write() {
@@ -1598,7 +1598,10 @@ fn load_schema_from_btree(
                 }
             }
             "index" => {
-                if let Some(index) = parse_create_index_sql(&sql, &tbl_name, root_page, schema) {
+                if let Some(mut index) = parse_create_index_sql(&sql, &tbl_name, root_page, schema)
+                {
+                    // Set db_idx from the database this schema was loaded from
+                    index.db_idx = db_idx;
                     let name = index.name.to_lowercase();
                     schema
                         .indexes
@@ -1607,7 +1610,9 @@ fn load_schema_from_btree(
                 }
             }
             "view" => {
-                if let Some(view) = parse_create_view_sql(&sql) {
+                if let Some(mut view) = parse_create_view_sql(&sql) {
+                    // Set db_idx from the database this schema was loaded from
+                    view.db_idx = db_idx;
                     let name = view.name.to_lowercase();
                     schema.views.entry(name).or_insert_with(|| Arc::new(view));
                 }

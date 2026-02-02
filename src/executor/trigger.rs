@@ -269,6 +269,8 @@ pub struct TriggerBodyCompiler<'s> {
     labels: std::collections::HashMap<i32, i32>,
     /// Number of columns in the table
     num_columns: usize,
+    /// Database index for this trigger (0=main, 1=temp, 2+=attached)
+    trigger_db_idx: i32,
 }
 
 impl<'s> TriggerBodyCompiler<'s> {
@@ -278,11 +280,14 @@ impl<'s> TriggerBodyCompiler<'s> {
     /// parent program. Cursors in the subprogram will be numbered starting from cursor_offset.
     /// The reg_offset parameter is used to avoid register conflicts with the parent program.
     /// Registers in the subprogram will be numbered starting from reg_offset.
+    /// The trigger_db_idx parameter specifies which database the trigger belongs to
+    /// (0=main, 1=temp, 2+=attached). This is used to qualify table names in the trigger body.
     pub fn new(
         schema: Option<&'s Schema>,
         table_name: &str,
         cursor_offset: i32,
         reg_offset: i32,
+        trigger_db_idx: i32,
     ) -> Self {
         let mut compiler = Self {
             schema,
@@ -294,6 +299,7 @@ impl<'s> TriggerBodyCompiler<'s> {
             column_map: std::collections::HashMap::new(),
             labels: std::collections::HashMap::new(),
             num_columns: 0,
+            trigger_db_idx,
         };
 
         // Build column map from schema
@@ -429,28 +435,47 @@ impl<'s> TriggerBodyCompiler<'s> {
             .schema
             .and_then(|s| s.tables.get(&table_name_lower).cloned());
 
+        // Determine target db_idx: use explicit schema prefix if present, otherwise use trigger's db_idx
+        let target_db_idx = insert
+            .table
+            .schema
+            .as_ref()
+            .map(|s| {
+                match s.to_lowercase().as_str() {
+                    "main" => 0,
+                    "temp" => 1,
+                    _ => 2, // Attached database - would need proper lookup for multiple attached DBs
+                }
+            })
+            .unwrap_or(self.trigger_db_idx);
+
         // Open target table for writing
+        // Encode db_idx in upper byte of P5 for attached database resolution
         let cursor = self.alloc_cursor();
-        self.emit(
-            Opcode::OpenWrite,
-            cursor,
-            0,
-            0,
-            P4::Text(table_name.clone()),
-        );
+        self.ops.push(VdbeOp {
+            opcode: Opcode::OpenWrite,
+            p1: cursor,
+            p2: 0,
+            p3: 0,
+            p4: P4::Text(table_name.clone()),
+            p5: ((target_db_idx as u16) << 8),
+            comment: None,
+        });
 
         // Collect indexes for this table and open write cursors
         let mut index_cursors: Vec<(i32, Vec<i32>)> = Vec::new();
         if let Some(ref table) = table_info {
             for index in &table.indexes {
                 let idx_cursor = self.alloc_cursor();
-                self.emit(
-                    Opcode::OpenWrite,
-                    idx_cursor,
-                    index.root_page as i32,
-                    (index.columns.len() + 1) as i32,
-                    P4::Text(index.name.clone()),
-                );
+                self.ops.push(VdbeOp {
+                    opcode: Opcode::OpenWrite,
+                    p1: idx_cursor,
+                    p2: index.root_page as i32,
+                    p3: (index.columns.len() + 1) as i32,
+                    p4: P4::Text(index.name.clone()),
+                    p5: ((target_db_idx as u16) << 8),
+                    comment: None,
+                });
                 let col_indices: Vec<i32> = index.columns.iter().map(|c| c.column_idx).collect();
                 index_cursors.push((idx_cursor, col_indices));
             }
@@ -1290,7 +1315,8 @@ pub fn generate_trigger_code(
         // Pass the current cursor and register counters to avoid conflicts with parent's cursors/registers
         // IMPORTANT: Trigger body must use registers starting from *next_reg to avoid
         // overwriting parent's registers (like rowid_reg) during trigger execution.
-        let mut compiler = TriggerBodyCompiler::new(schema, table_name, *next_cursor, *next_reg);
+        let mut compiler =
+            TriggerBodyCompiler::new(schema, table_name, *next_cursor, *next_reg, trigger.db_idx);
         let subprogram = compiler.compile_body(&body_stmts)?;
 
         // Update the cursor and register counters to account for resources used by the trigger

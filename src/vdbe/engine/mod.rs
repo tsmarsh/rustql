@@ -2484,6 +2484,11 @@ impl Vdbe {
                     } else {
                         simple_name = Some(name.clone());
                     }
+                    // Also check P5 upper byte for db_idx (used by trigger body compilation)
+                    let p5_db_idx = (op.p5 >> 8) as i32;
+                    if p5_db_idx != 0 {
+                        table_db_idx = p5_db_idx;
+                    }
                     if let Some(ref base_name) = simple_name {
                         if base_name.eq_ignore_ascii_case("sqlite_temp_master")
                             || base_name.eq_ignore_ascii_case("sqlite_temp_schema")
@@ -2502,9 +2507,15 @@ impl Vdbe {
                     }
                     if let Some(ref schema) = self.schema {
                         if let Ok(schema_guard) = schema.read() {
+                            // Use requested_db_idx from schema name OR from P5
                             let requested_db_idx = schema_name
                                 .as_deref()
-                                .and_then(|db_name| self.db_idx_for_schema(db_name));
+                                .and_then(|db_name| self.db_idx_for_schema(db_name))
+                                .or(if p5_db_idx != 0 {
+                                    Some(p5_db_idx)
+                                } else {
+                                    None
+                                });
                             let name_lower = simple_name
                                 .as_ref()
                                 .map(|n| n.to_lowercase())
@@ -2575,9 +2586,15 @@ impl Vdbe {
                     // If not found in main schema and we have a specific db_idx, check attached schemas
                     // Also check when root_page is known but table_found is false (for correct db_idx)
                     if !table_found {
+                        // Use requested_db_idx from schema name OR from P5 (for trigger body compilation)
                         let requested_db_idx = schema_name
                             .as_deref()
-                            .and_then(|db_name| self.db_idx_for_schema(db_name));
+                            .and_then(|db_name| self.db_idx_for_schema(db_name))
+                            .or(if p5_db_idx != 0 {
+                                Some(p5_db_idx)
+                            } else {
+                                None
+                            });
                         let name_lower = simple_name
                             .as_ref()
                             .map(|n| n.to_lowercase())
@@ -9580,9 +9597,26 @@ impl Vdbe {
                 _ => continue, // Not a CREATE TRIGGER, skip
             };
 
+            // Get the schema for the trigger's database
+            // If trigger belongs to an attached database, use that schema
+            // Otherwise fall back to main schema
+            let trigger_schema = if trigger.db_idx >= 2 {
+                // Trigger is from an attached database
+                self.conn_ptr
+                    .and_then(|conn_ptr| {
+                        let conn = unsafe { &*conn_ptr };
+                        conn.dbs
+                            .get(trigger.db_idx as usize)
+                            .and_then(|db| db.schema.clone())
+                    })
+                    .unwrap_or_else(|| schema.clone())
+            } else {
+                schema.clone()
+            };
+
             // Compile and execute each body statement
             for body_stmt in body_stmts {
-                let schema_guard = match schema.read() {
+                let schema_guard = match trigger_schema.read() {
                     Ok(g) => g,
                     Err(_) => continue,
                 };
@@ -9671,9 +9705,26 @@ impl Vdbe {
                 _ => continue, // Not a CREATE TRIGGER, skip
             };
 
+            // Get the schema for the trigger's database
+            // If trigger belongs to an attached database, use that schema
+            // Otherwise fall back to main schema
+            let trigger_schema = if trigger.db_idx >= 2 {
+                // Trigger is from an attached database
+                self.conn_ptr
+                    .and_then(|conn_ptr| {
+                        let conn = unsafe { &*conn_ptr };
+                        conn.dbs
+                            .get(trigger.db_idx as usize)
+                            .and_then(|db| db.schema.clone())
+                    })
+                    .unwrap_or_else(|| schema.clone())
+            } else {
+                schema.clone()
+            };
+
             // Compile and execute each body statement
             for body_stmt in body_stmts {
-                let schema_guard = match schema.read() {
+                let schema_guard = match trigger_schema.read() {
                     Ok(g) => g,
                     Err(_) => continue,
                 };

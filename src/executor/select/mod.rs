@@ -12,7 +12,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::executor::where_clause::{
-    IndexInfo, QueryPlanner, TermOp, WhereInfo, WhereLevel, WherePlan, WhereTerm, WhereTermFlags,
+    IndexInfo, QueryPlanner, TermOp, WhereInfo, WhereLevel, WhereLevelFlags, WherePlan, WhereTerm,
+    WhereTermFlags,
 };
 use crate::executor::window::{select_has_window_functions, WindowCompiler};
 use crate::parser::ast::{

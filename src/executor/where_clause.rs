@@ -1724,6 +1724,8 @@ impl QueryPlanner {
             if cost < best_cost {
                 best_cost = cost;
                 best_plan = WherePlan::RowidEq;
+                // Rowid equality always returns at most one row
+                level.flags |= WhereLevelFlags::UNIQUE;
             }
         }
 
@@ -2009,6 +2011,11 @@ impl QueryPlanner {
     ) -> f64 {
         if eq_match_count <= 0 {
             return (table.estimated_rows as f64).max(1.0);
+        }
+        // A UNIQUE index with all columns matched by equality constraints
+        // guarantees at most one row. This is the most selective case possible.
+        if index.is_unique && eq_match_count >= index.columns.len() as i32 {
+            return 1.0;
         }
         if let Some(stats) = &index.stats {
             let idx = (eq_match_count as usize).saturating_sub(1);

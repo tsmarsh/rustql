@@ -24,6 +24,7 @@ use crate::schema::{Affinity, GeneratedStorage, Table};
 use crate::vdbe::ops::{
     affinity as vdbe_affinity, Opcode, VFilterConstraint, VFilterPlan, VdbeOp, P4,
 };
+use crate::vdbe::types::SQLITE_MAX_COMPOUND_SELECT;
 use crate::vtab::{
     IndexConstraint as VtabIndexConstraint, IndexInfo as VtabIndexInfo, VtabRegistry,
     SQLITE_INDEX_CONSTRAINT_EQ, SQLITE_INDEX_CONSTRAINT_GE, SQLITE_INDEX_CONSTRAINT_GT,
@@ -542,6 +543,15 @@ impl<'s> SelectCompiler<'s> {
         // Handle WITH clause (CTEs)
         if let Some(with) = &select.with {
             self.process_with_clause(with)?;
+        }
+
+        // Check compound SELECT term limit
+        let compound_terms = Self::count_compound_terms(&select.body);
+        if SQLITE_MAX_COMPOUND_SELECT > 0 && compound_terms > SQLITE_MAX_COMPOUND_SELECT as usize {
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                "too many terms in compound SELECT".to_string(),
+            ));
         }
 
         // Check for aggregates in ORDER BY without GROUP BY
@@ -4054,6 +4064,17 @@ impl<'s> SelectCompiler<'s> {
             }
         }
         count.max(1) // At least 1 column
+    }
+
+    /// Count the number of terms in a compound SELECT (UNION/INTERSECT/EXCEPT)
+    /// Returns 1 for a simple SELECT, and N for N SELECT statements joined by compound operators.
+    fn count_compound_terms(body: &SelectBody) -> usize {
+        match body {
+            SelectBody::Select(_) => 1,
+            SelectBody::Compound { left, right, .. } => {
+                Self::count_compound_terms(left) + Self::count_compound_terms(right)
+            }
+        }
     }
 
     /// Compile FROM clause - open cursors for tables
@@ -8382,6 +8403,18 @@ impl<'s> SelectCompiler<'s> {
                         }
                     }
                     crate::parser::ast::InList::Subquery(subquery) => {
+                        // Validate that subquery returns exactly 1 column
+                        let subq_col_count = self.count_select_body_columns(&subquery.body);
+                        if subq_col_count != 1 {
+                            return Err(Error::with_message(
+                                ErrorCode::Error,
+                                format!(
+                                    "sub-select returns {} columns - expected 1",
+                                    subq_col_count
+                                ),
+                            ));
+                        }
+
                         // Compile IN subquery using a fresh compilation context
                         // This ensures the subquery doesn't mutate our state
                         let subq_cursor = self.alloc_cursor();

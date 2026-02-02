@@ -33,6 +33,13 @@ pub type Tcl_ObjCmdProc =
 /// TCL command deletion callback type
 pub type Tcl_CmdDeleteProc = unsafe extern "C" fn(*mut c_void);
 
+/// TCL object type structure (partial, we only need the name)
+#[repr(C)]
+pub struct Tcl_ObjType {
+    pub name: *const c_char,
+    // ... other fields we don't need
+}
+
 extern "C" {
     pub fn Tcl_CreateObjCommand(
         interp: *mut Tcl_Interp,
@@ -53,6 +60,14 @@ extern "C" {
     pub fn Tcl_NewStringObj(bytes: *const c_char, length: c_int) -> *mut Tcl_Obj;
 
     pub fn Tcl_NewIntObj(intValue: c_int) -> *mut Tcl_Obj;
+
+    pub fn Tcl_NewWideIntObj(wideValue: i64) -> *mut Tcl_Obj;
+
+    pub fn Tcl_NewDoubleObj(doubleValue: f64) -> *mut Tcl_Obj;
+
+    pub fn Tcl_NewByteArrayObj(bytes: *const u8, length: c_int) -> *mut Tcl_Obj;
+
+    pub fn Tcl_GetByteArrayFromObj(objPtr: *mut Tcl_Obj, lengthPtr: *mut c_int) -> *const u8;
 
     pub fn Tcl_NewListObj(objc: c_int, objv: *const *mut Tcl_Obj) -> *mut Tcl_Obj;
 
@@ -91,4 +106,18 @@ extern "C" {
         varName: *const c_char,
         flags: c_int,
     ) -> *const c_char;
+
+    pub fn Tcl_GetVar2Ex(
+        interp: *mut Tcl_Interp,
+        part1: *const c_char,
+        part2: *const c_char,
+        flags: c_int,
+    ) -> *mut Tcl_Obj;
+
+    pub fn Tcl_ObjGetVar2(
+        interp: *mut Tcl_Interp,
+        part1Ptr: *mut Tcl_Obj,
+        part2Ptr: *mut Tcl_Obj,
+        flags: c_int,
+    ) -> *mut Tcl_Obj;
 }

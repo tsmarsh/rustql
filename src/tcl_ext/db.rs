@@ -13,17 +13,17 @@ use std::ffi::CString;
 use std::os::raw::c_int;
 
 use super::ffi::{
-    Tcl_CreateObjCommand, Tcl_DeleteCommand, Tcl_Eval, Tcl_GetVar, Tcl_Interp,
-    Tcl_ListObjAppendElement, Tcl_NewListObj, Tcl_Obj, Tcl_SetObjResult, Tcl_SetVar, Tcl_SetVar2Ex,
-    TCL_ERROR, TCL_GLOBAL_ONLY, TCL_OK,
+    Tcl_CreateObjCommand, Tcl_DeleteCommand, Tcl_Eval, Tcl_Interp, Tcl_ListObjAppendElement,
+    Tcl_NewListObj, Tcl_Obj, Tcl_SetObjResult, Tcl_SetVar, Tcl_SetVar2Ex, TCL_ERROR,
+    TCL_GLOBAL_ONLY, TCL_OK,
 };
 use super::helpers::{obj_to_string, set_result_int, set_result_string, string_to_obj};
 use super::user_func::{clear_current_interp, set_current_interp};
 use super::{CONNECTIONS, NULL_VALUES, USER_COLLATIONS, USER_FUNCTIONS};
 
 use crate::api::{
-    sqlite3_bind_double, sqlite3_bind_int64, sqlite3_bind_null, sqlite3_bind_parameter_count,
-    sqlite3_bind_parameter_name, sqlite3_bind_text, PreparedStmt,
+    sqlite3_bind_blob, sqlite3_bind_double, sqlite3_bind_int64, sqlite3_bind_null,
+    sqlite3_bind_parameter_count, sqlite3_bind_parameter_name, sqlite3_bind_text, PreparedStmt,
 };
 use crate::types::{ColumnType, StepResult};
 use crate::vdbe::{
@@ -307,8 +307,12 @@ pub unsafe extern "C" fn tcl_variable_type_cmd(
     _client_data: *mut std::ffi::c_void,
     interp: *mut Tcl_Interp,
     objc: c_int,
-    _objv: *const *mut Tcl_Obj,
+    objv: *const *mut Tcl_Obj,
 ) -> c_int {
+    use super::ffi::{Tcl_GetVar2Ex, TCL_GLOBAL_ONLY};
+    use super::helpers::get_tcl_obj_type_name;
+    use std::ffi::CString;
+
     if objc < 2 {
         set_result_string(
             interp,
@@ -316,8 +320,27 @@ pub unsafe extern "C" fn tcl_variable_type_cmd(
         );
         return TCL_ERROR;
     }
-    // For compatibility, just return empty string (unknown type)
-    set_result_string(interp, "");
+
+    // Get the variable name
+    let var_name = obj_to_string(*objv.offset(1));
+    let var_cstr = CString::new(var_name).unwrap_or_else(|_| CString::new("").unwrap());
+
+    // Get the variable value as a Tcl_Obj (first try local, then global)
+    let mut var_obj = Tcl_GetVar2Ex(interp, var_cstr.as_ptr(), std::ptr::null(), 0);
+    if var_obj.is_null() {
+        var_obj = Tcl_GetVar2Ex(interp, var_cstr.as_ptr(), std::ptr::null(), TCL_GLOBAL_ONLY);
+    }
+
+    if var_obj.is_null() {
+        // Variable not found, return empty string
+        set_result_string(interp, "");
+        return TCL_OK;
+    }
+
+    // Get the type name from the object
+    let type_name = get_tcl_obj_type_name(var_obj);
+
+    set_result_string(interp, &type_name);
     TCL_OK
 }
 
@@ -1110,6 +1133,9 @@ pub unsafe fn update_like_count_var(interp: *mut Tcl_Interp) {
 /// SQLite's TCL extension automatically binds $varname and :varname in SQL
 /// to corresponding TCL variables
 pub unsafe fn bind_tcl_variables(interp: *mut Tcl_Interp, stmt: &mut PreparedStmt) {
+    use super::ffi::Tcl_GetVar2Ex;
+    use super::helpers::{get_tcl_obj_type_name, obj_to_bytes};
+
     let param_count = sqlite3_bind_parameter_count(stmt);
     for i in 1..=param_count {
         if let Some(param_name) = sqlite3_bind_parameter_name(stmt, i) {
@@ -1123,27 +1149,93 @@ pub unsafe fn bind_tcl_variables(interp: *mut Tcl_Interp, stmt: &mut PreparedStm
                 continue; // Unnamed or ? parameters, skip
             };
 
-            // Look up the TCL variable - first try current scope, then global
+            // Look up the TCL variable as an object to preserve type information
             let var_cstr = CString::new(var_name).unwrap_or_else(|_| CString::new("").unwrap());
-            let mut value_ptr = Tcl_GetVar(interp, var_cstr.as_ptr(), 0);
-            if value_ptr.is_null() {
+
+            // Try to get the variable as a Tcl_Obj to preserve type info
+            let mut var_obj = Tcl_GetVar2Ex(interp, var_cstr.as_ptr(), std::ptr::null(), 0);
+            if var_obj.is_null() {
                 // Try global scope
-                value_ptr = Tcl_GetVar(interp, var_cstr.as_ptr(), TCL_GLOBAL_ONLY);
+                var_obj =
+                    Tcl_GetVar2Ex(interp, var_cstr.as_ptr(), std::ptr::null(), TCL_GLOBAL_ONLY);
             }
 
-            if value_ptr.is_null() {
+            if var_obj.is_null() {
                 // Variable not found, bind NULL
                 let _ = sqlite3_bind_null(stmt, i);
             } else {
-                let value_str = std::ffi::CStr::from_ptr(value_ptr).to_str().unwrap_or("");
+                // Check the TCL object type
+                let type_name = get_tcl_obj_type_name(var_obj);
 
-                // Try to parse as number, otherwise bind as text
-                if let Ok(int_val) = value_str.parse::<i64>() {
-                    let _ = sqlite3_bind_int64(stmt, i, int_val);
-                } else if let Ok(float_val) = value_str.parse::<f64>() {
-                    let _ = sqlite3_bind_double(stmt, i, float_val);
-                } else {
-                    let _ = sqlite3_bind_text(stmt, i, value_str);
+                match type_name.as_str() {
+                    "int" => {
+                        // Get value as string and parse as int
+                        let value_str = obj_to_string(var_obj);
+                        if let Ok(int_val) = value_str.parse::<i64>() {
+                            let _ = sqlite3_bind_int64(stmt, i, int_val);
+                        } else {
+                            let _ = sqlite3_bind_text(stmt, i, &value_str);
+                        }
+                    }
+                    "wideInt" => {
+                        // Get value as string and parse as wide int
+                        let value_str = obj_to_string(var_obj);
+                        if let Ok(int_val) = value_str.parse::<i64>() {
+                            let _ = sqlite3_bind_int64(stmt, i, int_val);
+                        } else {
+                            let _ = sqlite3_bind_text(stmt, i, &value_str);
+                        }
+                    }
+                    "double" => {
+                        // Get value as string and parse as double
+                        let value_str = obj_to_string(var_obj);
+                        if let Ok(float_val) = value_str.parse::<f64>() {
+                            let _ = sqlite3_bind_double(stmt, i, float_val);
+                        } else {
+                            let _ = sqlite3_bind_text(stmt, i, &value_str);
+                        }
+                    }
+                    "bytearray" => {
+                        // Bytearray handling for types3-1.5 and types3-1.6:
+                        // - types3-1.5: [binary format a3 abc] creates pure bytearray -> BLOB
+                        // - types3-1.6: "abc" + [binary scan] gives bytearray with string rep -> TEXT
+                        //
+                        // The key difference: a pure bytearray has NO string representation,
+                        // while one created from an existing string retains its string rep.
+                        //
+                        // We check if the TCL object has a string representation (bytes != NULL)
+                        // BEFORE we call any function that might generate one.
+
+                        use super::helpers::tcl_obj_has_string_rep;
+
+                        // Check if this bytearray has a pre-existing string representation
+                        let has_string_rep = tcl_obj_has_string_rep(var_obj);
+
+                        if has_string_rep {
+                            // Object has a string representation - bind as TEXT
+                            // This handles types3-1.6: set V "abc"; binary scan $V a3 x
+                            let value_str = obj_to_string(var_obj);
+                            let _ = sqlite3_bind_text(stmt, i, &value_str);
+                        } else {
+                            // Pure bytearray with no string representation - bind as BLOB
+                            // This handles types3-1.5: set V [binary format a3 abc]
+                            let bytes = obj_to_bytes(var_obj);
+                            let _ = sqlite3_bind_blob(stmt, i, &bytes);
+                        }
+                    }
+                    _ => {
+                        // Default: get string value and try to parse as number
+                        let value_str = obj_to_string(var_obj);
+
+                        // Try to parse as number, otherwise bind as text
+                        if let Ok(int_val) = value_str.parse::<i64>() {
+                            let _ = sqlite3_bind_int64(stmt, i, int_val);
+                        } else if let Ok(float_val) = value_str.parse::<f64>() {
+                            let _ = sqlite3_bind_double(stmt, i, float_val);
+                        } else {
+                            let _ = sqlite3_bind_text(stmt, i, &value_str);
+                        }
+                    }
                 }
             }
         }
@@ -1190,12 +1282,16 @@ pub unsafe fn db_exists(
     })
 }
 
-/// Return first column of first row
+/// Return first column of first row with typed TCL object
 pub unsafe fn db_onecolumn(
     db_name: &str,
     interp: *mut Tcl_Interp,
     objv: *const *mut Tcl_Obj,
 ) -> c_int {
+    use super::ffi::{Tcl_NewByteArrayObj, Tcl_NewDoubleObj, Tcl_NewIntObj, Tcl_NewWideIntObj};
+    use super::helpers::string_to_obj;
+    use crate::api::{sqlite3_column_blob, sqlite3_column_double, sqlite3_column_int64};
+
     let sql = obj_to_string(*objv.offset(2));
 
     CONNECTIONS.with(|connections| {
@@ -1219,21 +1315,46 @@ pub unsafe fn db_onecolumn(
         // Bind TCL variables to SQL parameters
         bind_tcl_variables(interp, &mut stmt);
 
-        let result = match sqlite3_step(&mut stmt) {
+        match sqlite3_step(&mut stmt) {
             Ok(StepResult::Row) => {
                 let col_type = sqlite3_column_type(&stmt, 0);
-                match col_type {
+                let result_obj = match col_type {
                     ColumnType::Null => {
-                        NULL_VALUES.with(|nv| nv.borrow().get(db_name).cloned().unwrap_or_default())
+                        let null_str = NULL_VALUES
+                            .with(|nv| nv.borrow().get(db_name).cloned().unwrap_or_default());
+                        string_to_obj(&null_str)
                     }
-                    _ => sqlite3_column_text(&stmt, 0),
-                }
+                    ColumnType::Integer => {
+                        let int_val = sqlite3_column_int64(&stmt, 0);
+                        // Use int for values that fit in 32 bits, wideInt for larger
+                        if int_val >= i32::MIN as i64 && int_val <= i32::MAX as i64 {
+                            Tcl_NewIntObj(int_val as i32)
+                        } else {
+                            Tcl_NewWideIntObj(int_val)
+                        }
+                    }
+                    ColumnType::Float => {
+                        let float_val = sqlite3_column_double(&stmt, 0);
+                        Tcl_NewDoubleObj(float_val)
+                    }
+                    ColumnType::Blob => {
+                        let blob = sqlite3_column_blob(&stmt, 0);
+                        Tcl_NewByteArrayObj(blob.as_ptr(), blob.len() as i32)
+                    }
+                    ColumnType::Text => {
+                        let text = sqlite3_column_text(&stmt, 0);
+                        string_to_obj(&text)
+                    }
+                };
+                let _ = sqlite3_finalize(stmt);
+                Tcl_SetObjResult(interp, result_obj);
             }
-            _ => "".to_string(),
+            _ => {
+                let _ = sqlite3_finalize(stmt);
+                set_result_string(interp, "");
+            }
         };
 
-        let _ = sqlite3_finalize(stmt);
-        set_result_string(interp, &result);
         TCL_OK
     })
 }

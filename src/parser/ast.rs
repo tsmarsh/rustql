@@ -977,7 +977,10 @@ pub struct CreateTriggerStmt {
     pub name: QualifiedName,
     pub time: TriggerTime,
     pub event: TriggerEvent,
+    /// Table name (without schema prefix - schema is in table_schema)
     pub table: String,
+    /// Optional schema prefix for the table (e.g., "orig" in "ON orig.t1")
+    pub table_schema: Option<String>,
     pub for_each_row: bool,
     pub when: Option<Box<Expr>>,
     pub body: Vec<Stmt>,

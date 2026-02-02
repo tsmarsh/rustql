@@ -3027,6 +3027,43 @@ impl<'s> StatementCompiler<'s> {
     }
 
     fn compile_create_trigger(&mut self, create: &CreateTriggerStmt) -> Result<Vec<VdbeOp>> {
+        // Determine the database for the trigger
+        let trigger_db_idx = self.resolve_db_idx(&create.name, create.temporary)?;
+
+        // Check if the trigger's target table has a schema prefix that differs from the trigger's database
+        // SQLite rule: Triggers can only reference tables in the same database as the trigger
+        // (TEMP triggers are an exception - they can reference any database, but we validate below)
+        if let Some(ref table_schema) = create.table_schema {
+            // Get the database name for the trigger
+            let trigger_db_name = self.db_name_for_idx(trigger_db_idx);
+
+            // Check if the table's schema matches the trigger's database
+            let table_schema_lower = table_schema.to_lowercase();
+            let matches = match trigger_db_name {
+                Some(name) => name.eq_ignore_ascii_case(table_schema),
+                None => false,
+            };
+
+            if !matches {
+                // The table is in a different database - this is not allowed
+                return Err(Error::with_message(
+                    ErrorCode::Error,
+                    format!(
+                        "trigger {} cannot reference objects in database {}",
+                        create.name.name, table_schema
+                    ),
+                ));
+            }
+        }
+
+        // Also validate the trigger body for cross-database references
+        // Triggers cannot reference objects in other databases (except TEMP triggers)
+        if !create.temporary {
+            if let Err(e) = self.validate_trigger_body_references(create, trigger_db_idx) {
+                return Err(e);
+            }
+        }
+
         // Reconstruct the CREATE TRIGGER SQL for storage
         // This preserves the original SQL text for later parsing
         let sql = self.reconstruct_create_trigger_sql(create);
@@ -3036,16 +3073,414 @@ impl<'s> StatementCompiler<'s> {
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
         // Use ParseSchema to register the trigger in the schema at runtime
         // P2=0 (triggers don't need a root page), P4=SQL text
-        let db_idx = self.resolve_db_idx(&create.name, create.temporary)?;
         ops.push(Self::make_op(
             Opcode::ParseSchema,
-            db_idx,
+            trigger_db_idx,
             0,
             0,
             P4::Text(sql),
         ));
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
         Ok(ops)
+    }
+
+    /// Validate that trigger body doesn't reference objects in other databases
+    fn validate_trigger_body_references(
+        &self,
+        create: &CreateTriggerStmt,
+        trigger_db_idx: i32,
+    ) -> Result<()> {
+        let trigger_db_name = self.db_name_for_idx(trigger_db_idx);
+
+        for stmt in &create.body {
+            if let Some(invalid_db) = self.find_invalid_db_reference_in_stmt(stmt, trigger_db_name)
+            {
+                return Err(Error::with_message(
+                    ErrorCode::Error,
+                    format!(
+                        "trigger {} cannot reference objects in database {}",
+                        create.name.name, invalid_db
+                    ),
+                ));
+            }
+        }
+
+        // Also check the WHEN clause
+        if let Some(ref when_expr) = create.when {
+            if let Some(invalid_db) =
+                self.find_invalid_db_reference_in_expr(when_expr, trigger_db_name)
+            {
+                return Err(Error::with_message(
+                    ErrorCode::Error,
+                    format!(
+                        "trigger {} cannot reference objects in database {}",
+                        create.name.name, invalid_db
+                    ),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Find an invalid database reference in a statement
+    fn find_invalid_db_reference_in_stmt(
+        &self,
+        stmt: &crate::parser::ast::Stmt,
+        trigger_db_name: Option<&str>,
+    ) -> Option<String> {
+        use crate::parser::ast::Stmt;
+
+        match stmt {
+            Stmt::Select(select) => self.find_invalid_db_in_select(select, trigger_db_name),
+            Stmt::Insert(insert) => {
+                // Check table reference
+                if let Some(ref schema) = insert.table.schema {
+                    if !self.db_name_matches(trigger_db_name, schema) {
+                        return Some(schema.clone());
+                    }
+                }
+                // Check source
+                if let crate::parser::ast::InsertSource::Select(select) = &insert.source {
+                    return self.find_invalid_db_in_select(select, trigger_db_name);
+                }
+                if let crate::parser::ast::InsertSource::Values(rows) = &insert.source {
+                    for row in rows {
+                        for expr in row {
+                            if let Some(db) =
+                                self.find_invalid_db_reference_in_expr(expr, trigger_db_name)
+                            {
+                                return Some(db);
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            Stmt::Update(update) => {
+                // Check table reference
+                if let Some(ref schema) = update.table.schema {
+                    if !self.db_name_matches(trigger_db_name, schema) {
+                        return Some(schema.clone());
+                    }
+                }
+                // Check WHERE clause
+                if let Some(ref where_expr) = update.where_clause {
+                    if let Some(db) =
+                        self.find_invalid_db_reference_in_expr(where_expr, trigger_db_name)
+                    {
+                        return Some(db);
+                    }
+                }
+                // Check assignments
+                for assign in &update.assignments {
+                    if let Some(db) =
+                        self.find_invalid_db_reference_in_expr(&assign.expr, trigger_db_name)
+                    {
+                        return Some(db);
+                    }
+                }
+                None
+            }
+            Stmt::Delete(delete) => {
+                // Check table reference
+                if let Some(ref schema) = delete.table.schema {
+                    if !self.db_name_matches(trigger_db_name, schema) {
+                        return Some(schema.clone());
+                    }
+                }
+                // Check WHERE clause
+                if let Some(ref where_expr) = delete.where_clause {
+                    if let Some(db) =
+                        self.find_invalid_db_reference_in_expr(where_expr, trigger_db_name)
+                    {
+                        return Some(db);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Find an invalid database reference in a SELECT statement
+    fn find_invalid_db_in_select(
+        &self,
+        select: &crate::parser::ast::SelectStmt,
+        trigger_db_name: Option<&str>,
+    ) -> Option<String> {
+        // Check all SELECT cores
+        for core in select.body.all_cores() {
+            // Check FROM clause
+            if let Some(ref from) = core.from {
+                if let Some(db) = self.find_invalid_db_in_from(from, trigger_db_name) {
+                    return Some(db);
+                }
+            }
+
+            // Check result columns for expressions
+            for col in &core.columns {
+                if let crate::parser::ast::ResultColumn::Expr { expr, .. } = col {
+                    if let Some(db) = self.find_invalid_db_reference_in_expr(expr, trigger_db_name)
+                    {
+                        return Some(db);
+                    }
+                }
+            }
+
+            // Check WHERE clause
+            if let Some(ref where_expr) = core.where_clause {
+                if let Some(db) =
+                    self.find_invalid_db_reference_in_expr(where_expr, trigger_db_name)
+                {
+                    return Some(db);
+                }
+            }
+
+            // Check GROUP BY
+            if let Some(ref group_by) = core.group_by {
+                for expr in group_by {
+                    if let Some(db) = self.find_invalid_db_reference_in_expr(expr, trigger_db_name)
+                    {
+                        return Some(db);
+                    }
+                }
+            }
+
+            // Check HAVING
+            if let Some(ref having) = core.having {
+                if let Some(db) = self.find_invalid_db_reference_in_expr(having, trigger_db_name) {
+                    return Some(db);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Find an invalid database reference in a FROM clause
+    fn find_invalid_db_in_from(
+        &self,
+        from: &crate::parser::ast::FromClause,
+        trigger_db_name: Option<&str>,
+    ) -> Option<String> {
+        for table_ref in &from.tables {
+            if let Some(db) = self.find_invalid_db_in_table_ref(table_ref, trigger_db_name) {
+                return Some(db);
+            }
+        }
+        None
+    }
+
+    /// Find an invalid database reference in a table reference
+    fn find_invalid_db_in_table_ref(
+        &self,
+        table_ref: &crate::parser::ast::TableRef,
+        trigger_db_name: Option<&str>,
+    ) -> Option<String> {
+        use crate::parser::ast::TableRef;
+
+        match table_ref {
+            TableRef::Table { name, .. } => {
+                if let Some(ref schema) = name.schema {
+                    if !self.db_name_matches(trigger_db_name, schema) {
+                        return Some(schema.clone());
+                    }
+                }
+                None
+            }
+            TableRef::Subquery { query, .. } => {
+                self.find_invalid_db_in_select(query, trigger_db_name)
+            }
+            TableRef::Join {
+                left,
+                right,
+                constraint,
+                ..
+            } => {
+                if let Some(db) = self.find_invalid_db_in_table_ref(left, trigger_db_name) {
+                    return Some(db);
+                }
+                if let Some(db) = self.find_invalid_db_in_table_ref(right, trigger_db_name) {
+                    return Some(db);
+                }
+                if let Some(crate::parser::ast::JoinConstraint::On(expr)) = constraint {
+                    if let Some(db) = self.find_invalid_db_reference_in_expr(expr, trigger_db_name)
+                    {
+                        return Some(db);
+                    }
+                }
+                None
+            }
+            TableRef::TableFunction { .. } => None,
+            TableRef::Parens(inner) => self.find_invalid_db_in_table_ref(inner, trigger_db_name),
+        }
+    }
+
+    /// Find an invalid database reference in an expression
+    fn find_invalid_db_reference_in_expr(
+        &self,
+        expr: &crate::parser::ast::Expr,
+        trigger_db_name: Option<&str>,
+    ) -> Option<String> {
+        use crate::parser::ast::{Expr, FunctionArgs, InList};
+
+        match expr {
+            Expr::Column(col_ref) => {
+                // Check if column has a database prefix that differs from trigger's database
+                if let Some(ref database) = col_ref.database {
+                    if !self.db_name_matches(trigger_db_name, database) {
+                        return Some(database.clone());
+                    }
+                }
+                None
+            }
+            Expr::Binary { left, right, .. } => {
+                if let Some(db) = self.find_invalid_db_reference_in_expr(left, trigger_db_name) {
+                    return Some(db);
+                }
+                self.find_invalid_db_reference_in_expr(right, trigger_db_name)
+            }
+            Expr::Unary { expr: inner, .. } => {
+                self.find_invalid_db_reference_in_expr(inner, trigger_db_name)
+            }
+            Expr::Parens(inner) => self.find_invalid_db_reference_in_expr(inner, trigger_db_name),
+            Expr::Function(func_call) => {
+                if let FunctionArgs::Exprs(args) = &func_call.args {
+                    for arg in args {
+                        if let Some(db) =
+                            self.find_invalid_db_reference_in_expr(arg, trigger_db_name)
+                        {
+                            return Some(db);
+                        }
+                    }
+                }
+                // Check filter clause
+                if let Some(ref filter) = func_call.filter {
+                    if let Some(db) =
+                        self.find_invalid_db_reference_in_expr(filter, trigger_db_name)
+                    {
+                        return Some(db);
+                    }
+                }
+                None
+            }
+            Expr::Subquery(select) => self.find_invalid_db_in_select(select, trigger_db_name),
+            Expr::In { expr, list, .. } => {
+                if let Some(db) = self.find_invalid_db_reference_in_expr(expr, trigger_db_name) {
+                    return Some(db);
+                }
+                match list {
+                    InList::Values(exprs) => {
+                        for e in exprs {
+                            if let Some(db) =
+                                self.find_invalid_db_reference_in_expr(e, trigger_db_name)
+                            {
+                                return Some(db);
+                            }
+                        }
+                    }
+                    InList::Subquery(select) => {
+                        return self.find_invalid_db_in_select(select, trigger_db_name);
+                    }
+                    InList::Table(qname) => {
+                        if let Some(ref schema) = qname.schema {
+                            if !self.db_name_matches(trigger_db_name, schema) {
+                                return Some(schema.clone());
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                if let Some(db) = self.find_invalid_db_reference_in_expr(expr, trigger_db_name) {
+                    return Some(db);
+                }
+                if let Some(db) = self.find_invalid_db_reference_in_expr(low, trigger_db_name) {
+                    return Some(db);
+                }
+                self.find_invalid_db_reference_in_expr(high, trigger_db_name)
+            }
+            Expr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => {
+                if let Some(ref op) = operand {
+                    if let Some(db) = self.find_invalid_db_reference_in_expr(op, trigger_db_name) {
+                        return Some(db);
+                    }
+                }
+                for when_clause in when_clauses {
+                    if let Some(db) =
+                        self.find_invalid_db_reference_in_expr(&when_clause.when, trigger_db_name)
+                    {
+                        return Some(db);
+                    }
+                    if let Some(db) =
+                        self.find_invalid_db_reference_in_expr(&when_clause.then, trigger_db_name)
+                    {
+                        return Some(db);
+                    }
+                }
+                if let Some(ref else_expr) = else_clause {
+                    return self.find_invalid_db_reference_in_expr(else_expr, trigger_db_name);
+                }
+                None
+            }
+            Expr::Cast { expr: inner, .. } => {
+                self.find_invalid_db_reference_in_expr(inner, trigger_db_name)
+            }
+            Expr::Collate { expr: inner, .. } => {
+                self.find_invalid_db_reference_in_expr(inner, trigger_db_name)
+            }
+            Expr::Exists { subquery, .. } => {
+                self.find_invalid_db_in_select(subquery, trigger_db_name)
+            }
+            Expr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => {
+                if let Some(db) = self.find_invalid_db_reference_in_expr(expr, trigger_db_name) {
+                    return Some(db);
+                }
+                if let Some(db) = self.find_invalid_db_reference_in_expr(pattern, trigger_db_name) {
+                    return Some(db);
+                }
+                if let Some(ref esc) = escape {
+                    return self.find_invalid_db_reference_in_expr(esc, trigger_db_name);
+                }
+                None
+            }
+            Expr::IsNull { expr, .. } => {
+                self.find_invalid_db_reference_in_expr(expr, trigger_db_name)
+            }
+            Expr::IsDistinct { left, right, .. } => {
+                if let Some(db) = self.find_invalid_db_reference_in_expr(left, trigger_db_name) {
+                    return Some(db);
+                }
+                self.find_invalid_db_reference_in_expr(right, trigger_db_name)
+            }
+            _ => None,
+        }
+    }
+
+    /// Check if a database name matches
+    fn db_name_matches(&self, trigger_db_name: Option<&str>, schema: &str) -> bool {
+        // "temp" references are always invalid unless the trigger is also in temp
+        if schema.eq_ignore_ascii_case("temp") {
+            return trigger_db_name == Some("temp");
+        }
+
+        match trigger_db_name {
+            Some(name) => name.eq_ignore_ascii_case(schema),
+            None => false,
+        }
     }
 
     /// Reconstruct CREATE TRIGGER SQL from the AST
@@ -3083,6 +3518,10 @@ impl<'s> StatementCompiler<'s> {
         }
 
         sql.push_str("ON ");
+        if let Some(ref schema) = create.table_schema {
+            sql.push_str(schema);
+            sql.push('.');
+        }
         sql.push_str(&create.table);
         sql.push(' ');
 

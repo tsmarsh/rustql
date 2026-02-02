@@ -6940,16 +6940,28 @@ impl<'s> SelectCompiler<'s> {
                 }
 
                 // Check if this is a comparison involving a column from this table
-                let (col_idx, value_expr, constraint_op) = if let Some((col, idx)) =
+                // Skip column-to-column comparisons within the same table - these can't be
+                // pushed down to the vtab and must be evaluated post-filter by the VDBE
+                let (col_idx, value_expr, constraint_op) = if let Some((_col, idx)) =
                     self.get_vtab_column(left, table, schema_table)
                 {
+                    // Left side is a vtab column - check right side is NOT a vtab column
+                    if self.get_vtab_column(right, table, schema_table).is_some() {
+                        // Both sides are columns from this table - can't push down
+                        return;
+                    }
                     let op = self.binary_op_to_constraint_op(op);
                     if let Some(op) = op {
                         (idx, right.as_ref(), op)
                     } else {
                         return;
                     }
-                } else if let Some((col, idx)) = self.get_vtab_column(right, table, schema_table) {
+                } else if let Some((_col, idx)) = self.get_vtab_column(right, table, schema_table) {
+                    // Right side is a vtab column - check left side is NOT a vtab column
+                    if self.get_vtab_column(left, table, schema_table).is_some() {
+                        // Both sides are columns from this table - can't push down
+                        return;
+                    }
                     // Reverse the operator for col on right side
                     let op = self.binary_op_to_constraint_op_reversed(op);
                     if let Some(op) = op {

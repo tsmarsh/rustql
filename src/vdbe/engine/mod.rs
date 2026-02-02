@@ -1053,6 +1053,195 @@ impl Vdbe {
             .collect()
     }
 
+    /// Read sqlite_master entries directly from the btree (root page 1)
+    /// This gives proper rowid ordering which matches SQLite behavior
+    fn read_sqlite_master_from_btree(
+        &self,
+        btree: &Arc<Btree>,
+    ) -> Result<Vec<(String, String, String, u32, Option<String>)>> {
+        use crate::storage::btree::{BtreeCursorFlags, CursorState};
+        use crate::vdbe::auxdata::{decode_record_header, SerialType};
+
+        let mut entries = Vec::new();
+
+        // sqlite_master is always at root page 1
+        let root_page = 1;
+
+        // Open a cursor on the sqlite_master table
+        let mut cursor = match btree.cursor(root_page, BtreeCursorFlags::empty(), None) {
+            Ok(c) => c,
+            Err(_) => return Ok(entries), // Empty database or error
+        };
+
+        // Move to first entry
+        let empty = match cursor.first() {
+            Ok(e) => e,
+            Err(_) => return Ok(entries),
+        };
+
+        if empty {
+            return Ok(entries);
+        }
+
+        // Read all entries in rowid order
+        loop {
+            let payload = cursor.info.payload.clone().unwrap_or_default();
+            if !payload.is_empty() {
+                // Decode the record: type, name, tbl_name, rootpage, sql
+                if let Ok(values) = self.decode_sqlite_master_record(&payload) {
+                    entries.push(values);
+                }
+            }
+
+            // Move to next
+            if cursor.next(0).is_err() {
+                break;
+            }
+            if cursor.state != CursorState::Valid {
+                break;
+            }
+        }
+
+        Ok(entries)
+    }
+
+    /// Decode a sqlite_master record from its payload
+    fn decode_sqlite_master_record(
+        &self,
+        payload: &[u8],
+    ) -> Result<(String, String, String, u32, Option<String>)> {
+        use crate::vdbe::auxdata::{decode_record_header, SerialType};
+
+        if payload.is_empty() {
+            return Err(Error::with_message(ErrorCode::Internal, "empty payload"));
+        }
+
+        let (types, header_size) = decode_record_header(payload)?;
+        let mut offset = header_size;
+        let mut values: Vec<Mem> = Vec::new();
+
+        for serial_type in types.iter().take(5) {
+            let size = match serial_type {
+                SerialType::Blob(n) | SerialType::Text(n) => *n as usize,
+                SerialType::Float64 => 8,
+                SerialType::Int8 => 1,
+                SerialType::Int16 => 2,
+                SerialType::Int24 => 3,
+                SerialType::Int32 => 4,
+                SerialType::Int48 => 6,
+                SerialType::Int64 => 8,
+                _ => 0,
+            };
+
+            if offset + size > payload.len() {
+                break;
+            }
+
+            let value = match serial_type {
+                SerialType::Null => Mem::new(),
+                SerialType::Zero => Mem::from_int(0),
+                SerialType::One => Mem::from_int(1),
+                SerialType::Int8 => Mem::from_int(payload[offset] as i8 as i64),
+                SerialType::Int16 => {
+                    let val = i16::from_be_bytes([payload[offset], payload[offset + 1]]);
+                    Mem::from_int(val as i64)
+                }
+                SerialType::Int24 => {
+                    let b = &payload[offset..offset + 3];
+                    let val = ((b[0] as i32) << 16) | ((b[1] as i32) << 8) | (b[2] as i32);
+                    // Sign extend
+                    let val = if val & 0x800000 != 0 {
+                        val | !0xFFFFFF
+                    } else {
+                        val
+                    };
+                    Mem::from_int(val as i64)
+                }
+                SerialType::Int32 => {
+                    let val = i32::from_be_bytes([
+                        payload[offset],
+                        payload[offset + 1],
+                        payload[offset + 2],
+                        payload[offset + 3],
+                    ]);
+                    Mem::from_int(val as i64)
+                }
+                SerialType::Int48 => {
+                    let b = &payload[offset..offset + 6];
+                    let val = ((b[0] as i64) << 40)
+                        | ((b[1] as i64) << 32)
+                        | ((b[2] as i64) << 24)
+                        | ((b[3] as i64) << 16)
+                        | ((b[4] as i64) << 8)
+                        | (b[5] as i64);
+                    // Sign extend
+                    let val = if val & 0x800000000000 != 0 {
+                        val | !0xFFFFFFFFFFFF
+                    } else {
+                        val
+                    };
+                    Mem::from_int(val)
+                }
+                SerialType::Int64 => {
+                    let val = i64::from_be_bytes([
+                        payload[offset],
+                        payload[offset + 1],
+                        payload[offset + 2],
+                        payload[offset + 3],
+                        payload[offset + 4],
+                        payload[offset + 5],
+                        payload[offset + 6],
+                        payload[offset + 7],
+                    ]);
+                    Mem::from_int(val)
+                }
+                SerialType::Float64 => {
+                    let val = f64::from_be_bytes([
+                        payload[offset],
+                        payload[offset + 1],
+                        payload[offset + 2],
+                        payload[offset + 3],
+                        payload[offset + 4],
+                        payload[offset + 5],
+                        payload[offset + 6],
+                        payload[offset + 7],
+                    ]);
+                    Mem::from_real(val)
+                }
+                SerialType::Text(n) => {
+                    let text =
+                        String::from_utf8_lossy(&payload[offset..offset + *n as usize]).to_string();
+                    Mem::from_str(&text)
+                }
+                SerialType::Blob(n) => {
+                    let blob = payload[offset..offset + *n as usize].to_vec();
+                    Mem::from_blob(&blob)
+                }
+                SerialType::Reserved(_) => Mem::new(),
+            };
+
+            offset += size;
+            values.push(value);
+        }
+
+        // Pad with nulls if we didn't get 5 columns
+        while values.len() < 5 {
+            values.push(Mem::new());
+        }
+
+        let type_str = values[0].to_str();
+        let name = values[1].to_str();
+        let tbl_name = values[2].to_str();
+        let root_page = values[3].to_int() as u32;
+        let sql = if values[4].is_null() {
+            None
+        } else {
+            Some(values[4].to_str())
+        };
+
+        Ok((type_str, name, tbl_name, root_page, sql))
+    }
+
     // ========================================================================
     // Execution Control
     // ========================================================================
@@ -1828,76 +2017,125 @@ impl Vdbe {
                     let target_db_idx = if is_sqlite_temp_master {
                         1
                     } else if let Some(ref db_name) = schema_name {
-                        self.db_idx_for_schema(db_name).ok_or_else(|| {
-                            Error::with_message(
-                                ErrorCode::Error,
-                                format!("unknown database {}", db_name),
-                            )
-                        })?
+                        // Check if this is "temp.sqlite_master"
+                        if db_name.eq_ignore_ascii_case("temp") {
+                            1
+                        } else {
+                            self.db_idx_for_schema(db_name).ok_or_else(|| {
+                                Error::with_message(
+                                    ErrorCode::Error,
+                                    format!("unknown database {}", db_name),
+                                )
+                            })?
+                        }
                     } else {
                         0
                     };
-                    let schema_source = if target_db_idx == 1 {
+
+                    // If accessing temp schema (target_db_idx == 1), ensure temp btree is initialized
+                    // This is needed so PRAGMA database_list shows temp after accessing temp.sqlite_master
+                    if target_db_idx == 1 && self.temp_btree.is_none() {
+                        // Create an in-memory temp btree
+                        let vfs = StubVfs;
+                        if let Ok(btree) = Btree::open(
+                            &vfs,
+                            "",
+                            None,
+                            BtreeOpenFlags::MEMORY,
+                            OpenFlags::CREATE | OpenFlags::READWRITE,
+                        ) {
+                            // Store in connection so PRAGMA database_list can see it
+                            if let Some(conn_ptr) = self.conn_ptr {
+                                let conn = unsafe { &mut *conn_ptr };
+                                if conn.dbs.len() > 1 {
+                                    conn.dbs[1].btree = Some(btree.clone());
+                                }
+                            }
+                            self.temp_btree = Some(btree);
+                        }
+                    }
+
+                    // Get the schema for the target database
+                    // For temp (1), use temp_schema; for main (0), use self.schema
+                    // For attached databases (2+), get from conn.dbs
+                    let schema_source: Option<Arc<RwLock<Schema>>> = if target_db_idx == 1 {
                         self.temp_schema.clone()
-                    } else {
+                    } else if target_db_idx == 0 {
                         self.schema.clone()
+                    } else {
+                        // Attached database - get schema from connection
+                        self.conn_ptr.and_then(|conn_ptr| {
+                            let conn = unsafe { &*conn_ptr };
+                            conn.dbs
+                                .get(target_db_idx as usize)
+                                .and_then(|db| db.schema.clone())
+                        })
                     };
-                    // Populate schema entries from current schema BEFORE borrowing cursor
-                    let mut entries = Vec::new();
-                    if let Some(ref schema) = schema_source {
-                        if let Ok(schema_guard) = schema.read() {
-                            // Add tables (filter by db_idx)
-                            for (_, table) in schema_guard.tables.iter() {
-                                if table.db_idx == target_db_idx {
-                                    entries.push((
-                                        "table".to_string(),
-                                        table.name.clone(),
-                                        table.name.clone(),
-                                        table.root_page,
-                                        table.sql.clone(),
-                                    ));
+
+                    // Try to read entries directly from the sqlite_master btree
+                    // This gives us proper rowid ordering
+                    let entries = if let Some(btree) = self.btree_for_db_idx(target_db_idx) {
+                        // Read directly from sqlite_master btree (root page 1)
+                        self.read_sqlite_master_from_btree(&btree)?
+                    } else {
+                        // Fallback: build from in-memory schema (less accurate ordering)
+                        let mut entries = Vec::new();
+                        if let Some(ref schema) = schema_source {
+                            if let Ok(schema_guard) = schema.read() {
+                                // Add tables (filter by db_idx)
+                                for (_, table) in schema_guard.tables.iter() {
+                                    if table.db_idx == target_db_idx {
+                                        entries.push((
+                                            "table".to_string(),
+                                            table.name.clone(),
+                                            table.name.clone(),
+                                            table.root_page,
+                                            table.sql.clone(),
+                                        ));
+                                    }
                                 }
-                            }
-                            // Add indexes (filter by db_idx)
-                            for (_, index) in schema_guard.indexes.iter() {
-                                if index.db_idx == target_db_idx {
-                                    entries.push((
-                                        "index".to_string(),
-                                        index.name.clone(),
-                                        index.table.clone(),
-                                        index.root_page,
-                                        index.sql.clone(),
-                                    ));
+                                // Add indexes (filter by db_idx)
+                                for (_, index) in schema_guard.indexes.iter() {
+                                    if index.db_idx == target_db_idx {
+                                        entries.push((
+                                            "index".to_string(),
+                                            index.name.clone(),
+                                            index.table.clone(),
+                                            index.root_page,
+                                            index.sql.clone(),
+                                        ));
+                                    }
                                 }
-                            }
-                            // Add triggers (filter by db_idx)
-                            for (_, trigger) in schema_guard.triggers.iter() {
-                                if trigger.db_idx == target_db_idx {
-                                    entries.push((
-                                        "trigger".to_string(),
-                                        trigger.name.clone(),
-                                        trigger.table.clone(),
-                                        0, // triggers don't have a root page
-                                        trigger.sql.clone(),
-                                    ));
+                                // Add triggers (filter by db_idx)
+                                for (_, trigger) in schema_guard.triggers.iter() {
+                                    if trigger.db_idx == target_db_idx {
+                                        entries.push((
+                                            "trigger".to_string(),
+                                            trigger.name.clone(),
+                                            trigger.table.clone(),
+                                            0, // triggers don't have a root page
+                                            trigger.sql.clone(),
+                                        ));
+                                    }
                                 }
-                            }
-                            // Add views (filter by db_idx)
-                            for (_, view) in schema_guard.views.iter() {
-                                if view.db_idx == target_db_idx {
-                                    entries.push((
-                                        "view".to_string(),
-                                        view.name.clone(),
-                                        view.name.clone(), // views have tbl_name = view name
-                                        0,                 // views don't have a root page
-                                        Some(view.sql.clone()),
-                                    ));
+                                // Add views (filter by db_idx)
+                                for (_, view) in schema_guard.views.iter() {
+                                    if view.db_idx == target_db_idx {
+                                        entries.push((
+                                            "view".to_string(),
+                                            view.name.clone(),
+                                            view.name.clone(), // views have tbl_name = view name
+                                            0,                 // views don't have a root page
+                                            Some(view.sql.clone()),
+                                        ));
+                                    }
                                 }
                             }
                         }
-                    }
-                    // Stabilize sqlite_master row order by root page.
-                    entries.sort_by_key(|entry| entry.3);
+                        // Fallback sort by root page (not ideal, but stable)
+                        entries.sort_by_key(|entry| entry.3);
+                        entries
+                    };
 
                     // Create virtual cursor for sqlite_master
                     self.open_cursor(op.p1, 0, false)?;

@@ -175,20 +175,13 @@ pub fn execute_pragma(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Resul
 fn pragma_database_list(conn: &SqliteConnection) -> Result<PragmaResult> {
     let mut rows = Vec::new();
     for (idx, db) in conn.dbs.iter().enumerate() {
-        // Skip temp database (index 1) if it has no btree opened and no tables in schema
-        // SQLite only shows temp in PRAGMA database_list when it's been used
+        // For temp database (index 1), only show if it has been accessed/used.
+        // SQLite shows temp in PRAGMA database_list once the temp btree is opened,
+        // which happens when any temp object is created or temp.sqlite_master is accessed.
         if db.name.eq_ignore_ascii_case("temp") {
-            let temp_is_empty = db.btree.is_none()
-                && db
-                    .schema
-                    .as_ref()
-                    .map(|s| {
-                        s.read()
-                            .map(|schema| schema.tables.is_empty())
-                            .unwrap_or(true)
-                    })
-                    .unwrap_or(true);
-            if temp_is_empty {
+            // Show temp if btree has been opened (temp database accessed)
+            let temp_accessed = db.btree.is_some();
+            if !temp_accessed {
                 continue;
             }
         }
@@ -196,7 +189,7 @@ fn pragma_database_list(conn: &SqliteConnection) -> Result<PragmaResult> {
             .path
             .as_ref()
             .map(|p| Value::Text(p.clone()))
-            .unwrap_or(Value::Null);
+            .unwrap_or_else(|| Value::Text(String::new()));
         rows.push(vec![
             Value::Integer(idx as i64),
             Value::Text(db.name.clone()),

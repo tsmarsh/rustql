@@ -1378,7 +1378,20 @@ impl SqliteConnection {
             return Err(Error::with_message(ErrorCode::Auth, "authorization denied"));
         }
 
+        // Remove entries from main schema that belong to this database
+        // (entries that were merged in merge_attached_schemas)
+        if let Some(main_schema) = self.dbs.get(0).and_then(|db| db.schema.as_ref()) {
+            if let Ok(mut schema_guard) = main_schema.write() {
+                let db_idx = idx as i32;
+                schema_guard.tables.retain(|_, t| t.db_idx != db_idx);
+                schema_guard.indexes.retain(|_, i| i.db_idx != db_idx);
+                schema_guard.triggers.retain(|_, t| t.db_idx != db_idx);
+                schema_guard.views.retain(|_, v| v.db_idx != db_idx);
+            }
+        }
+
         self.dbs.remove(idx);
+        self.increment_schema_generation();
         Ok(())
     }
 

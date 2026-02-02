@@ -1565,6 +1565,44 @@ pub fn parse_create_view_sql(sql: &str) -> Option<View> {
     }
 }
 
+/// Parse a CREATE TRIGGER SQL statement and create a Trigger object.
+///
+/// This function is used during schema loading to reconstruct Trigger objects
+/// from their stored SQL in sqlite_master.
+pub fn parse_create_trigger_sql(sql: &str, db_idx: i32) -> Option<Trigger> {
+    // Use the full parser to parse the CREATE TRIGGER statement
+    let stmt = crate::parser::grammar::parse(sql).ok()?;
+
+    if let crate::parser::ast::Stmt::CreateTrigger(create) = stmt {
+        let timing = match create.time {
+            crate::parser::ast::TriggerTime::Before => TriggerTiming::Before,
+            crate::parser::ast::TriggerTime::After => TriggerTiming::After,
+            crate::parser::ast::TriggerTime::InsteadOf => TriggerTiming::InsteadOf,
+        };
+
+        let (event, update_columns) = match &create.event {
+            crate::parser::ast::TriggerEvent::Delete => (TriggerEvent::Delete, None),
+            crate::parser::ast::TriggerEvent::Insert => (TriggerEvent::Insert, None),
+            crate::parser::ast::TriggerEvent::Update(cols) => (TriggerEvent::Update, cols.clone()),
+        };
+
+        Some(Trigger {
+            name: create.name.name.clone(),
+            table: create.table.clone(),
+            db_idx,
+            timing,
+            event,
+            for_each_row: create.for_each_row,
+            update_columns,
+            when_clause: None, // TODO: parse when clause
+            body: Vec::new(),  // Body will be compiled at runtime
+            sql: Some(sql.to_string()),
+        })
+    } else {
+        None
+    }
+}
+
 /// Parse the WHERE clause of a partial index
 fn parse_partial_index_where(s: &str) -> Option<Expr> {
     let s_upper = s.trim().to_uppercase();

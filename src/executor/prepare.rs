@@ -3071,6 +3071,22 @@ impl<'s> StatementCompiler<'s> {
         let mut ops = Vec::new();
         ops.push(Self::make_op(Opcode::Init, 0, 2, 0, P4::Unused));
         ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
+
+        // Only insert into sqlite_master for non-temp triggers
+        // Temp triggers are transient and only exist in the in-memory schema
+        if !create.temporary {
+            let cursor_id = 0;
+            self.append_sqlite_master_open(&mut ops, cursor_id, trigger_db_idx);
+            self.append_sqlite_master_insert_trigger(
+                &mut ops,
+                cursor_id,
+                &create.name.name,
+                &create.table,
+                &sql,
+            );
+            self.append_sqlite_master_close(&mut ops, cursor_id);
+        }
+
         // Use ParseSchema to register the trigger in the schema at runtime
         // P2=0 (triggers don't need a root page), P4=SQL text
         ops.push(Self::make_op(
@@ -3078,10 +3094,97 @@ impl<'s> StatementCompiler<'s> {
             trigger_db_idx,
             0,
             0,
-            P4::Text(sql),
+            P4::Text(sql.clone()),
         ));
-        ops.push(Self::make_op(Opcode::Halt, 0, 0, 0, P4::Unused));
+        ops.push(Self::make_op(Opcode::Goto, 0, 1, 0, P4::Unused));
+
         Ok(ops)
+    }
+
+    /// Insert a trigger entry into sqlite_master
+    fn append_sqlite_master_insert_trigger(
+        &self,
+        ops: &mut Vec<VdbeOp>,
+        cursor_id: i32,
+        trigger_name: &str,
+        table_name: &str,
+        sql: &str,
+    ) {
+        // sqlite_master columns: type, name, tbl_name, rootpage, sql
+        // Triggers have type='trigger', tbl_name=table the trigger is on, rootpage=0
+        // Use high register numbers to avoid conflicts with caller's registers
+        let reg_type = 20;
+        let reg_name = 21;
+        let reg_tbl_name = 22;
+        let reg_rootpage = 23;
+        let reg_sql = 24;
+        let reg_record = 25;
+        let reg_rowid = 26;
+
+        // type = 'trigger'
+        ops.push(Self::make_op(
+            Opcode::String8,
+            0,
+            reg_type,
+            0,
+            P4::Text("trigger".to_string()),
+        ));
+        // name = trigger_name
+        ops.push(Self::make_op(
+            Opcode::String8,
+            0,
+            reg_name,
+            0,
+            P4::Text(trigger_name.to_string()),
+        ));
+        // tbl_name = table the trigger is on
+        ops.push(Self::make_op(
+            Opcode::String8,
+            0,
+            reg_tbl_name,
+            0,
+            P4::Text(table_name.to_string()),
+        ));
+        // rootpage = 0 (triggers don't have a root page)
+        ops.push(Self::make_op(
+            Opcode::Integer,
+            0,
+            reg_rootpage,
+            0,
+            P4::Unused,
+        ));
+        // sql = CREATE TRIGGER statement
+        ops.push(Self::make_op(
+            Opcode::String8,
+            0,
+            reg_sql,
+            0,
+            P4::Text(sql.to_string()),
+        ));
+        // MakeRecord: create record from columns
+        ops.push(Self::make_op(
+            Opcode::MakeRecord,
+            reg_type,
+            5,
+            reg_record,
+            P4::Unused,
+        ));
+        // NewRowid
+        ops.push(Self::make_op(
+            Opcode::NewRowid,
+            cursor_id,
+            reg_rowid,
+            0,
+            P4::Unused,
+        ));
+        // Insert into sqlite_master
+        ops.push(Self::make_op(
+            Opcode::Insert,
+            cursor_id,
+            reg_record,
+            reg_rowid,
+            P4::Text("sqlite_master".to_string()),
+        ));
     }
 
     /// Validate that trigger body doesn't reference objects in other databases

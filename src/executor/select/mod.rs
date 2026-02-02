@@ -607,10 +607,10 @@ impl<'s> SelectCompiler<'s> {
                         .map(|t| t.order == SortOrder::Desc)
                         .collect();
                     // Extract collation from each ORDER BY term
-                    // If expr is `expr COLLATE name`, use `name`; otherwise use "BINARY"
+                    // If expr has explicit `COLLATE name`, use `name`; otherwise look up column schema collation
                     let collations: Vec<String> = order_by
                         .iter()
-                        .map(|t| Self::extract_collation_from_expr(&t.expr))
+                        .map(|t| self.extract_collation_from_expr(&t.expr))
                         .collect();
 
                     // Check if any custom collations are used
@@ -7641,12 +7641,87 @@ impl<'s> SelectCompiler<'s> {
 
     /// Extract the collation name from an expression.
     /// If the expression is `expr COLLATE name`, returns `name` (uppercased).
+    /// If the expression is a column reference, looks up the column's collation from schema.
     /// Otherwise returns "BINARY" as the default collation.
-    fn extract_collation_from_expr(expr: &Expr) -> String {
+    fn extract_collation_from_expr(&self, expr: &Expr) -> String {
         match expr {
             Expr::Collate { collation, .. } => collation.to_uppercase(),
+            Expr::Column(col_ref) => {
+                // Look up the column's collation from schema
+                self.lookup_column_collation(col_ref.table.as_deref(), &col_ref.column)
+            }
+            Expr::Literal(Literal::Integer(_)) => {
+                // Position-based ORDER BY (e.g., ORDER BY 1)
+                // The collation should be determined by the result column
+                // For now, return BINARY as we'd need more context
+                "BINARY".to_string()
+            }
             _ => "BINARY".to_string(),
         }
+    }
+
+    /// Look up the collation for a column from the schema.
+    fn lookup_column_collation(&self, table_name: Option<&str>, column_name: &str) -> String {
+        let col_name_lower = column_name.to_lowercase();
+
+        // First, try looking in self.tables (if populated)
+        for table_info in &self.tables {
+            // If a specific table name is given, check if it matches
+            if let Some(tbl) = table_name {
+                let tbl_lower = tbl.to_lowercase();
+                if table_info.name.to_lowercase() != tbl_lower
+                    && table_info.table_name.to_lowercase() != tbl_lower
+                {
+                    continue;
+                }
+            }
+
+            // Look up the column in the schema
+            if let Some(schema_table) = &table_info.schema_table {
+                for col in &schema_table.columns {
+                    if col.name.to_lowercase() == col_name_lower {
+                        if col.collation.is_empty() || col.collation == "BINARY" {
+                            return "BINARY".to_string();
+                        }
+                        return col.collation.to_uppercase();
+                    }
+                }
+            }
+        }
+
+        // If self.tables is empty or didn't find the column, try the global schema
+        if let Some(schema) = self.schema {
+            // If a specific table name is given, look it up directly
+            if let Some(tbl_name) = table_name {
+                let tbl_lower = tbl_name.to_lowercase();
+                if let Some(table) = schema.tables.get(&tbl_lower) {
+                    for col in &table.columns {
+                        if col.name.to_lowercase() == col_name_lower {
+                            if col.collation.is_empty() || col.collation == "BINARY" {
+                                return "BINARY".to_string();
+                            }
+                            return col.collation.to_uppercase();
+                        }
+                    }
+                }
+            } else {
+                // No table name given - search all tables for the column
+                for table in schema.tables.values() {
+                    for col in &table.columns {
+                        if col.name.to_lowercase() == col_name_lower {
+                            if col.collation.is_empty() || col.collation == "BINARY" {
+                                // Keep searching - might find another table with collation
+                                continue;
+                            }
+                            return col.collation.to_uppercase();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Column not found or no explicit collation - use BINARY
+        "BINARY".to_string()
     }
 
     /// Extract constraints from WHERE clause applicable to a virtual table

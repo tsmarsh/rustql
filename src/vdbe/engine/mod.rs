@@ -187,6 +187,7 @@ fn parse_vtab_schema_columns(schema: &str) -> Vec<crate::schema::Column> {
                     collation: DEFAULT_COLLATION.to_string(),
                     is_primary_key: false,
                     is_unique: false,
+                    unique_conflict: None,
                     is_hidden: false,
                     generated: None,
                 });
@@ -7602,13 +7603,8 @@ impl Vdbe {
                                         }
                                     }
 
-                                    // Insert into schema.indexes
-                                    schema_guard.indexes.insert(
-                                        index_name_lower,
-                                        std::sync::Arc::new(index.clone()),
-                                    );
-
-                                    // Also add to the parent table's index list
+                                    // First check the table's indexes for conflict_action
+                                    // This handles UNIQUE ON CONFLICT that was parsed in CREATE TABLE
                                     if let Some(table) =
                                         schema_guard.tables.get_mut(&table_name_lower)
                                     {
@@ -7619,11 +7615,29 @@ impl Vdbe {
                                             });
 
                                         if let Some(pos) = existing_pos {
-                                            table_mut.indexes[pos] = std::sync::Arc::new(index);
+                                            // Preserve conflict_action from existing index if new one doesn't have it
+                                            // This handles the case where column UNIQUE ON CONFLICT was processed
+                                            // before the implicit CREATE INDEX was parsed
+                                            if index.conflict_action.is_none() {
+                                                if let Some(existing_action) =
+                                                    table_mut.indexes[pos].conflict_action
+                                                {
+                                                    index.conflict_action = Some(existing_action);
+                                                }
+                                            }
+                                            table_mut.indexes[pos] =
+                                                std::sync::Arc::new(index.clone());
                                         } else {
-                                            table_mut.indexes.push(std::sync::Arc::new(index));
+                                            table_mut
+                                                .indexes
+                                                .push(std::sync::Arc::new(index.clone()));
                                         }
                                     }
+
+                                    // Now insert into schema.indexes with the updated conflict_action
+                                    schema_guard
+                                        .indexes
+                                        .insert(index_name_lower, std::sync::Arc::new(index));
                                 }
                             }
                         }

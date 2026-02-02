@@ -336,11 +336,23 @@ impl KeyInfo {
             }
         }
 
-        // If all key fields are equal but there are additional fields (like rowid in indexes),
-        // compare them using BINARY collation to maintain stable ordering.
+        // If all key fields are equal, check if both records have the same number of fields
+        // past the key. For index comparisons where the search key is a prefix (e.g., searching
+        // for a column value without rowid), treat matching prefixes as equal.
+        let n_key = self.n_key_field as usize;
+
+        // If the search key (rec_b) has exactly n_key_field fields, it's a prefix search.
+        // In this case, if all key fields matched, the result is Equal.
+        // This is important for SeekGT/SeekGE operations with search keys that don't include rowid.
+        if fields_b.len() <= n_key {
+            // Search key is a prefix - all its fields are key fields and they all matched
+            return std::cmp::Ordering::Equal;
+        }
+
+        // Both records have extra fields beyond the key columns.
+        // Compare them using BINARY collation to maintain stable ordering.
         // This ensures that when index key values are equal (e.g., 'abc' vs 'ABC' under NOCASE),
         // the rowid is used as a tiebreaker for consistent ordering.
-        let n_key = self.n_key_field as usize;
         let n_extra = fields_a.len().min(fields_b.len()).saturating_sub(n_key);
         for i in 0..n_extra {
             let cmp =

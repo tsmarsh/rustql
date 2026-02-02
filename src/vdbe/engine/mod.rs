@@ -705,6 +705,7 @@ impl Vdbe {
             trigger_depth: 0,
             max_trigger_depth: 1000,
             subprogram_stack: Vec::new(),
+            raise_ignore: false,
             agg_contexts: HashMap::new(),
             last_compare: std::cmp::Ordering::Equal,
             once_flags: std::collections::HashSet::new(),

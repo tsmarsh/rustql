@@ -1411,10 +1411,20 @@ impl<'s> SelectCompiler<'s> {
             .map(|t| t.join_type)
             .collect();
 
+        // Check if any table has an outer join (LEFT/RIGHT/FULL)
+        // If so, we cannot freely reorder tables - the outer join constraints must be respected
+        // For now, fall back to FROM clause order when outer joins are present
+        let has_outer_join = table_join_types.iter().any(|jt| jt.is_outer());
+
         // Build iteration order - use optimizer's order if available, else FROM clause order
         // The optimizer reorders tables by cost (cheapest first), so info.levels[0] is the
         // table to scan first (outer loop), and the last level is the innermost loop.
-        let iteration_order: Vec<usize> = if let Some(info) = &where_info {
+        // IMPORTANT: For outer joins, we must preserve FROM clause order to maintain
+        // correct LEFT/RIGHT JOIN semantics (left table must be in outer loop).
+        let iteration_order: Vec<usize> = if has_outer_join {
+            // Outer join present - preserve FROM clause order for correctness
+            (0..table_cursors.len()).collect()
+        } else if let Some(info) = &where_info {
             if info.levels.len() == table_cursors.len() {
                 // Use optimizer's order - level.from_idx maps to table_cursors position
                 info.levels
@@ -1552,11 +1562,19 @@ impl<'s> SelectCompiler<'s> {
             let skip_label = self.alloc_label();
 
             // Check if we have a query plan for this table
-            // levels are already in optimizer order, so loop_pos indexes directly into levels
-            let plan = where_info
-                .as_ref()
-                .and_then(|info| info.levels.get(loop_pos))
-                .map(|level| &level.plan);
+            // For outer joins, we don't use index scans from the query plan because:
+            // 1. The iteration order is forced to FROM clause order (not optimizer order)
+            // 2. Index scans on WHERE conditions would pre-filter the inner table,
+            //    which breaks LEFT JOIN semantics (WHERE should filter after join)
+            // 3. The levels[] index wouldn't match the from_idx anyway
+            let plan = if has_outer_join {
+                None // Fall back to full scan with runtime filtering
+            } else {
+                where_info
+                    .as_ref()
+                    .and_then(|info| info.levels.get(loop_pos))
+                    .map(|level| &level.plan)
+            };
 
             match plan {
                 Some(WherePlan::IndexScan {
@@ -2238,7 +2256,17 @@ impl<'s> SelectCompiler<'s> {
         let loop_start_label = *loop_labels.last().unwrap_or(&self.alloc_label());
 
         // Evaluate WHERE clause, filtering out terms consumed by index seeks
-        let where_skip_label = if let Some(info) = &where_info {
+        // For outer joins, we disabled index seeks so we must compile the full WHERE clause
+        let where_skip_label = if has_outer_join {
+            // Outer join: compile full WHERE clause (index seeks were disabled)
+            if let Some(where_expr) = remaining_where.as_ref() {
+                let label = self.alloc_label();
+                self.compile_where_condition(where_expr, label)?;
+                Some(label)
+            } else {
+                None
+            }
+        } else if let Some(info) = &where_info {
             // Use optimized path: only compile terms not consumed by index seeks
             let label = self.alloc_label();
             let any_terms = self.compile_runtime_filter_terms(info, label)?;

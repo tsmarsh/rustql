@@ -771,26 +771,8 @@ fn extract_generated_column(col_def: &str, col_def_upper: &str) -> Option<Genera
                 Expr::Null
             } else {
                 // For complex expressions, we would need to parse them properly
-                // Check if it's a simple identifier (column reference)
-                let is_simple_identifier =
-                    expr_str.chars().all(|c| c.is_alphanumeric() || c == '_')
-                        && expr_str
-                            .chars()
-                            .next()
-                            .map(|c| c.is_alphabetic() || c == '_')
-                            .unwrap_or(false);
-
-                if is_simple_identifier {
-                    // Simple column reference
-                    Expr::Column {
-                        table: None,
-                        column: expr_str.to_string(),
-                    }
-                } else {
-                    // For now, store complex expressions as strings
-                    // A proper fix would parse them using a mini expression parser
-                    Expr::String(expr_str.to_string())
-                }
+                // For now, store as a simple column reference or string
+                Expr::String(expr_str.to_string())
             };
             return Some(GeneratedColumn { expr, storage });
         }

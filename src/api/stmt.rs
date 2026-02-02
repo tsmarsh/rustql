@@ -6,7 +6,8 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::executor::analyze::execute_analyze;
 use crate::executor::pragma::{execute_pragma, pragma_columns};
 use crate::executor::prepare::{compile_sql, compile_sql_with_full_config, CompiledStmt, StmtType};
-use crate::parser::ast::{AttachStmt, Expr, Literal, QualifiedName, Variable};
+use crate::functions::get_scalar_function;
+use crate::parser::ast::{AttachStmt, Expr, FunctionArgs, Literal, QualifiedName, Variable};
 use crate::types::{ColumnType, StepResult, Value};
 use crate::vdbe::engine::Vdbe;
 use crate::vdbe::ops::VdbeOp;
@@ -800,6 +801,28 @@ fn eval_attach_expr(stmt: &PreparedStmt, expr: &Expr) -> Result<Value> {
     match expr {
         Expr::Literal(literal) => literal_to_value(literal),
         Expr::Variable(var) => resolve_attach_param(stmt, var),
+        Expr::Function(func_call) => {
+            // Evaluate function call for ATTACH expression
+            if let Some(func) = get_scalar_function(&func_call.name) {
+                // Evaluate function arguments
+                let args = match &func_call.args {
+                    FunctionArgs::Star => vec![],
+                    FunctionArgs::Exprs(exprs) => {
+                        let mut values = Vec::new();
+                        for arg in exprs {
+                            values.push(eval_attach_expr(stmt, arg)?);
+                        }
+                        values
+                    }
+                };
+                func(&args)
+            } else {
+                Err(Error::with_message(
+                    ErrorCode::Error,
+                    format!("unknown function: {}", func_call.name),
+                ))
+            }
+        }
         _ => Err(Error::with_message(
             ErrorCode::Error,
             "unsupported ATTACH expression",

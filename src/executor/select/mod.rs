@@ -637,10 +637,34 @@ impl<'s> SelectCompiler<'s> {
             }
         }
 
+        // For compound SELECTs with ORDER BY, validate ORDER BY terms BEFORE compilation
+        // This must happen before compile_body because the sorter will try to compile
+        // ORDER BY expressions and fail with "no such column" instead of the proper error
+        if let SelectBody::Compound { .. } = &select.body {
+            if let Some(order_by) = &select.order_by {
+                // Get column names from ALL parts of the compound SELECT
+                // because ORDER BY can reference columns from any part
+                let all_column_names = self.get_all_compound_column_names(&select.body);
+                // Also get the result column count from the leftmost SELECT (for numeric indices)
+                let result_column_count = self.count_select_body_columns(&select.body);
+                for (idx, term) in order_by.iter().enumerate() {
+                    if let Some(err_msg) = self.validate_order_by_for_compound(
+                        &term.expr,
+                        &all_column_names,
+                        result_column_count,
+                        idx,
+                    ) {
+                        return Err(Error::with_message(ErrorCode::Error, err_msg));
+                    }
+                }
+            }
+        }
+
         // Compile the body with appropriate destination
         self.compile_body(&select.body, &actual_dest)?;
 
         // For compound SELECTs with ORDER BY, validate that ORDER BY terms match result columns
+        // (This is a secondary check after compilation, in case the early check missed something)
         if self.is_compound {
             if let Some(order_by) = &select.order_by {
                 for (idx, term) in order_by.iter().enumerate() {
@@ -3836,24 +3860,9 @@ impl<'s> SelectCompiler<'s> {
         right: &SelectBody,
         dest: &SelectDest,
     ) -> Result<()> {
-        // Validate that left and right have the same number of columns
-        let left_cols = self.count_select_body_columns(left);
-        let right_cols = self.count_select_body_columns(right);
-        if left_cols != right_cols {
-            let op_name = match op {
-                CompoundOp::Union => "UNION",
-                CompoundOp::UnionAll => "UNION ALL",
-                CompoundOp::Intersect => "INTERSECT",
-                CompoundOp::Except => "EXCEPT",
-            };
-            return Err(Error::with_message(
-                ErrorCode::Error,
-                format!(
-                    "SELECTs to the left and right of {} do not have the same number of result columns",
-                    op_name
-                ),
-            ));
-        }
+        // Validate column count consistency for the entire compound tree
+        // This finds the first (innermost) mismatch in depth-first order
+        self.validate_compound_column_counts(op, left, right)?;
 
         self.is_compound = true;
 
@@ -4020,6 +4029,254 @@ impl<'s> SelectCompiler<'s> {
                 // For compound queries, column count comes from the leftmost SELECT
                 self.count_select_body_columns(left)
             }
+        }
+    }
+
+    /// Validate column count consistency for compound queries
+    /// Recursively validates the entire compound tree and returns error for the first (innermost) mismatch
+    fn validate_compound_column_counts(
+        &self,
+        op: CompoundOp,
+        left: &SelectBody,
+        right: &SelectBody,
+    ) -> Result<()> {
+        // First, recursively validate any nested compound queries in the left subtree
+        if let SelectBody::Compound {
+            op: left_op,
+            left: left_left,
+            right: left_right,
+        } = left
+        {
+            self.validate_compound_column_counts(*left_op, left_left, left_right)?;
+        }
+
+        // Then validate any nested compound queries in the right subtree
+        if let SelectBody::Compound {
+            op: right_op,
+            left: right_left,
+            right: right_right,
+        } = right
+        {
+            self.validate_compound_column_counts(*right_op, right_left, right_right)?;
+        }
+
+        // Now validate the current level
+        let left_cols = self.count_select_body_columns(left);
+        let right_cols = self.count_select_body_columns(right);
+        if left_cols != right_cols {
+            let op_name = match op {
+                CompoundOp::Union => "UNION",
+                CompoundOp::UnionAll => "UNION ALL",
+                CompoundOp::Intersect => "INTERSECT",
+                CompoundOp::Except => "EXCEPT",
+            };
+            return Err(Error::with_message(
+                ErrorCode::Error,
+                format!(
+                    "SELECTs to the left and right of {} do not have the same number of result columns",
+                    op_name
+                ),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Get result column names from a SelectBody without compiling
+    /// This is used for early ORDER BY validation in compound SELECTs
+    fn get_select_body_column_names(&self, body: &SelectBody) -> Vec<String> {
+        match body {
+            SelectBody::Select(core) => self.get_select_core_column_names(core),
+            SelectBody::Compound { left, .. } => {
+                // For compound queries, column names come from the leftmost SELECT
+                self.get_select_body_column_names(left)
+            }
+        }
+    }
+
+    /// Get ALL column names from a compound SelectBody (from all parts)
+    /// This is used for ORDER BY validation where columns from any part are valid
+    fn get_all_compound_column_names(&self, body: &SelectBody) -> Vec<String> {
+        let mut names = Vec::new();
+        self.collect_compound_column_names(body, &mut names);
+        names
+    }
+
+    /// Helper to collect column names from all parts of a compound SELECT
+    fn collect_compound_column_names(&self, body: &SelectBody, names: &mut Vec<String>) {
+        match body {
+            SelectBody::Select(core) => {
+                for name in self.get_select_core_column_names(core) {
+                    if !names.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                        names.push(name);
+                    }
+                }
+            }
+            SelectBody::Compound { left, right, .. } => {
+                self.collect_compound_column_names(left, names);
+                self.collect_compound_column_names(right, names);
+            }
+        }
+    }
+
+    /// Get result column names from a SelectCore without compiling
+    fn get_select_core_column_names(&self, core: &SelectCore) -> Vec<String> {
+        let mut names = Vec::new();
+        for col in &core.columns {
+            match col {
+                ResultColumn::Star => {
+                    // For *, get column names from all tables in FROM
+                    if let Some(from) = &core.from {
+                        if let Some(schema) = self.schema {
+                            for table_ref in &from.tables {
+                                if let TableRef::Table { name, .. } = table_ref {
+                                    if let Some(table) = schema.table(&name.name) {
+                                        for col_def in &table.columns {
+                                            names.push(col_def.name.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // If we couldn't get column names, add a placeholder
+                    if names.is_empty() {
+                        names.push("*".to_string());
+                    }
+                }
+                ResultColumn::TableStar(table_name) => {
+                    // For table.*, get columns from that table
+                    if let Some(schema) = self.schema {
+                        if let Some(table) = schema.table(table_name) {
+                            for col_def in &table.columns {
+                                names.push(col_def.name.clone());
+                            }
+                        } else {
+                            names.push(format!("{}.*", table_name));
+                        }
+                    } else {
+                        names.push(format!("{}.*", table_name));
+                    }
+                }
+                ResultColumn::Expr { expr, alias } => {
+                    if let Some(alias_name) = alias {
+                        names.push(alias_name.clone());
+                    } else {
+                        // Try to extract a name from the expression
+                        let name = match expr {
+                            Expr::Column(col_ref) => col_ref.column.clone(),
+                            Expr::Literal(Literal::Integer(n)) => n.to_string(),
+                            Expr::Literal(Literal::String(s)) => s.clone(),
+                            _ => format!("column{}", names.len() + 1),
+                        };
+                        names.push(name);
+                    }
+                }
+            }
+        }
+        names
+    }
+
+    /// Check if ORDER BY term is valid given a list of column names (for early validation)
+    fn is_valid_order_by_for_columns(&self, expr: &Expr, column_names: &[String]) -> bool {
+        match expr {
+            // Integer literal = column position (1-based)
+            Expr::Literal(Literal::Integer(n)) => {
+                let pos = *n as usize;
+                pos >= 1 && pos <= column_names.len()
+            }
+            // Column reference - must match a column name
+            Expr::Column(col_ref) => {
+                let col_name = &col_ref.column;
+                column_names
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(col_name))
+            }
+            // Other expressions - allow for now (will be validated during compilation)
+            _ => true,
+        }
+    }
+
+    /// Check if ORDER BY term is valid for compound SELECT (early validation)
+    /// column_names includes names from ALL parts of the compound
+    /// result_column_count is the number of result columns (from leftmost SELECT)
+    fn is_valid_order_by_for_compound(
+        &self,
+        expr: &Expr,
+        column_names: &[String],
+        result_column_count: usize,
+    ) -> bool {
+        match expr {
+            // Integer literal = column position (1-based), must be within result column count
+            Expr::Literal(Literal::Integer(n)) => {
+                let pos = *n as usize;
+                pos >= 1 && pos <= result_column_count
+            }
+            // String literal in double quotes is treated as identifier in SQLite
+            // This case is handled by the parser converting it to Column
+            Expr::Literal(Literal::String(_)) => {
+                // String literals are not valid ORDER BY terms for compound SELECTs
+                // (they should be column references if quoted with double quotes)
+                true // Let compilation handle this
+            }
+            // Column reference - must match a column name from any part of the compound
+            Expr::Column(col_ref) => {
+                let col_name = &col_ref.column;
+                column_names
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(col_name))
+            }
+            // Other expressions - allow for now (will be validated during compilation)
+            _ => true,
+        }
+    }
+
+    /// Validate ORDER BY term for compound SELECT, returning error message if invalid
+    /// Returns None if valid, Some(error_message) if invalid
+    fn validate_order_by_for_compound(
+        &self,
+        expr: &Expr,
+        column_names: &[String],
+        result_column_count: usize,
+        term_idx: usize,
+    ) -> Option<String> {
+        let ordinal = match term_idx {
+            0 => "1st".to_string(),
+            1 => "2nd".to_string(),
+            2 => "3rd".to_string(),
+            n => format!("{}th", n + 1),
+        };
+
+        match expr {
+            // Integer literal = column position (1-based), must be within result column count
+            Expr::Literal(Literal::Integer(n)) => {
+                let pos = *n as usize;
+                if pos >= 1 && pos <= result_column_count {
+                    None // Valid
+                } else {
+                    Some(format!(
+                        "{} ORDER BY term out of range - should be between 1 and {}",
+                        ordinal, result_column_count
+                    ))
+                }
+            }
+            // Column reference - must match a column name from any part of the compound
+            Expr::Column(col_ref) => {
+                let col_name = &col_ref.column;
+                if column_names
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(col_name))
+                {
+                    None // Valid
+                } else {
+                    Some(format!(
+                        "{} ORDER BY term does not match any column in the result set",
+                        ordinal
+                    ))
+                }
+            }
+            // Other expressions - allow for now (will be validated during compilation)
+            _ => None,
         }
     }
 
@@ -9385,9 +9642,26 @@ impl<'s> SelectCompiler<'s> {
                 let pos = *n as usize;
                 pos >= 1 && pos <= self.result_column_names.len()
             }
-            // Column reference (simple identifier or table.column) - always allowed
-            // SQLite allows referencing column names from any part of the UNION
-            Expr::Column(_) => true,
+            // Column reference - must match a result column name or compound alias
+            Expr::Column(col_ref) => {
+                // For compound SELECT, ORDER BY columns must reference result column names
+                // not arbitrary table columns (which may not exist in the compound result)
+                if col_ref.table.is_some() {
+                    // table.column - for compound SELECTs, this should match a result column
+                    let col_name = &col_ref.column;
+                    self.result_column_names
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(col_name))
+                        || self.compound_aliases.contains_key(&col_name.to_lowercase())
+                } else {
+                    // Simple column name - check result_column_names and compound_aliases
+                    let col_name = &col_ref.column;
+                    self.result_column_names
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(col_name))
+                        || self.compound_aliases.contains_key(&col_name.to_lowercase())
+                }
+            }
             // For complex expressions (like f2+101), check if they match a result column name
             // These must match exactly or be invalid
             _ => {

@@ -638,6 +638,10 @@ pub struct Vdbe {
     /// (parent ops, return pc, parent param_base, parent num_columns)
     subprogram_stack: Vec<(Vec<VdbeOp>, i32, i32, Option<i32>, i32)>,
 
+    /// Flag set when RAISE(IGNORE) was executed in a trigger
+    /// This signals the parent DML to skip the current row
+    raise_ignore: bool,
+
     /// Aggregate function contexts, keyed by accumulator register
     agg_contexts: HashMap<i32, AggregateState>,
 
@@ -5434,15 +5438,18 @@ impl Vdbe {
                     }
                 }
 
-                // Fire AFTER INSERT triggers if a row was successfully inserted
-                if inserted {
-                    // Get table name from P4
-                    if let P4::Text(ref table_name) = op.p4 {
-                        self.fire_after_insert_triggers(table_name)?;
-                    } else if let P4::Table(ref table_name) = op.p4 {
-                        self.fire_after_insert_triggers(table_name)?;
-                    }
-                }
+                // Note: AFTER INSERT triggers are now handled at compile time
+                // via Program opcodes emitted by insert.rs. The fire_after_insert_triggers
+                // approach was causing double trigger execution because the compiler
+                // already generates Program opcodes for triggers.
+                // Disabled to allow the compile-time approach to work correctly.
+                // if inserted {
+                //     if let P4::Text(ref table_name) = op.p4 {
+                //         self.fire_after_insert_triggers(table_name)?;
+                //     } else if let P4::Table(ref table_name) = op.p4 {
+                //         self.fire_after_insert_triggers(table_name)?;
+                //     }
+                // }
 
                 // Persist R-tree to shadow tables after cursor borrows end
                 if let Some((table_name, table_arc, cursor_db_idx)) = rtree_persist_info {

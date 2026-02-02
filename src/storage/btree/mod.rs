@@ -3550,22 +3550,34 @@ impl Btree {
         // Try to read existing database header from page 1
         let mut is_new_db = true;
         if let Ok(page) = shared.pager.get(1, PagerGetFlags::empty()) {
-            if let Ok(header) = DbHeader::parse(&page.data) {
-                is_new_db = false;
-                if header.page_size != shared.page_size {
-                    let _ = shared
-                        .pager
-                        .set_page_size(header.page_size, header.reserve as i32);
-                    shared.page_size = shared.pager.page_size;
-                    shared.usable_size = shared.pager.usable_size;
-                }
-                shared.schema_cookie = header.schema_cookie;
-                shared.file_format = header.file_format;
-                shared.auto_vacuum = header.auto_vacuum;
-                shared.incr_vacuum = header.incr_vacuum;
+            // Check if page has any content (not all zeros = file had existing data)
+            let page_has_content = page.data.iter().any(|&b| b != 0);
+            match DbHeader::parse(&page.data) {
+                Ok(header) => {
+                    is_new_db = false;
+                    if header.page_size != shared.page_size {
+                        let _ = shared
+                            .pager
+                            .set_page_size(header.page_size, header.reserve as i32);
+                        shared.page_size = shared.pager.page_size;
+                        shared.usable_size = shared.pager.usable_size;
+                    }
+                    shared.schema_cookie = header.schema_cookie;
+                    shared.file_format = header.file_format;
+                    shared.auto_vacuum = header.auto_vacuum;
+                    shared.incr_vacuum = header.incr_vacuum;
 
-                // Load persistent freelist from trunk pages
-                let _ = load_freelist(&mut shared);
+                    // Load persistent freelist from trunk pages
+                    let _ = load_freelist(&mut shared);
+                }
+                Err(e) => {
+                    // If the page had content but header parsing failed,
+                    // this is not a valid SQLite database file
+                    if page_has_content && e.code == ErrorCode::NotADb {
+                        return Err(e);
+                    }
+                    // Otherwise treat as new database (empty file or parse error for other reasons)
+                }
             }
         }
 

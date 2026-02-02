@@ -6,7 +6,8 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::executor::analyze::execute_analyze;
 use crate::executor::pragma::{execute_pragma, pragma_columns};
 use crate::executor::prepare::{compile_sql, compile_sql_with_full_config, CompiledStmt, StmtType};
-use crate::parser::ast::{AttachStmt, Expr, Literal, QualifiedName, Variable};
+use crate::functions::get_scalar_function;
+use crate::parser::ast::{AttachStmt, Expr, FunctionArgs, Literal, QualifiedName, Variable};
 use crate::types::{ColumnType, StepResult, Value};
 use crate::vdbe::engine::Vdbe;
 use crate::vdbe::ops::VdbeOp;
@@ -761,9 +762,17 @@ fn attach_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
     let filename_val = eval_attach_expr(stmt, &attach.expr)?;
     let filename = filename_val.to_text();
     let conn = unsafe { &mut *conn_ptr };
-    conn.attach_database(&filename, &attach.schema)?;
-    stmt.set_done();
-    Ok(StepResult::Done)
+    match conn.attach_database(&filename, &attach.schema) {
+        Ok(()) => {
+            stmt.set_done();
+            Ok(StepResult::Done)
+        }
+        Err(e) => {
+            // Set error on connection so sqlite3_errcode can return it
+            conn.set_error(e.code, e.message.as_deref().unwrap_or("attach error"));
+            Err(e)
+        }
+    }
 }
 
 fn detach_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
@@ -775,15 +784,45 @@ fn detach_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
         .clone()
         .ok_or_else(|| Error::with_message(ErrorCode::Error, "missing detach".to_string()))?;
     let conn = unsafe { &mut *conn_ptr };
-    conn.detach_database(&detach_name)?;
-    stmt.set_done();
-    Ok(StepResult::Done)
+    match conn.detach_database(&detach_name) {
+        Ok(()) => {
+            stmt.set_done();
+            Ok(StepResult::Done)
+        }
+        Err(e) => {
+            // Set error on connection so sqlite3_errcode can return it
+            conn.set_error(e.code, e.message.as_deref().unwrap_or("detach error"));
+            Err(e)
+        }
+    }
 }
 
 fn eval_attach_expr(stmt: &PreparedStmt, expr: &Expr) -> Result<Value> {
     match expr {
         Expr::Literal(literal) => literal_to_value(literal),
         Expr::Variable(var) => resolve_attach_param(stmt, var),
+        Expr::Function(func_call) => {
+            // Evaluate function call for ATTACH expression
+            if let Some(func) = get_scalar_function(&func_call.name) {
+                // Evaluate function arguments
+                let args = match &func_call.args {
+                    FunctionArgs::Star => vec![],
+                    FunctionArgs::Exprs(exprs) => {
+                        let mut values = Vec::new();
+                        for arg in exprs {
+                            values.push(eval_attach_expr(stmt, arg)?);
+                        }
+                        values
+                    }
+                };
+                func(&args)
+            } else {
+                Err(Error::with_message(
+                    ErrorCode::Error,
+                    format!("unknown function: {}", func_call.name),
+                ))
+            }
+        }
         _ => Err(Error::with_message(
             ErrorCode::Error,
             "unsupported ATTACH expression",

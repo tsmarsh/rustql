@@ -339,9 +339,19 @@ pub struct DbHeader {
 }
 
 impl DbHeader {
+    /// SQLite database file magic header string
+    const SQLITE_MAGIC: &'static [u8; 16] = b"SQLite format 3\0";
+
     pub fn parse(data: &[u8]) -> Result<Self> {
         if data.len() < 100 {
             return Err(Error::new(ErrorCode::Corrupt));
+        }
+        // Check the magic header string - if it doesn't match, this is not a valid SQLite database
+        if &data[0..16] != Self::SQLITE_MAGIC {
+            return Err(Error::with_message(
+                ErrorCode::NotADb,
+                "file is not a database",
+            ));
         }
         let mut page_size = read_u16(data, 16).ok_or(Error::new(ErrorCode::Corrupt))? as u32;
         if page_size == 1 {

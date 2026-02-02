@@ -597,6 +597,8 @@ pub struct DbInfo {
     pub user_version: i32,
     /// Schema version (PRAGMA schema_version) - incremented on schema changes
     pub schema_version: i32,
+    /// URI flags from ATTACH filename (mode=memory, cache=shared, etc.)
+    pub uri_flags: OpenFlags,
 }
 
 /// Default cache size in KiB (SQLite default is -2000 meaning 2000 KiB)
@@ -619,6 +621,7 @@ impl DbInfo {
             btree: None,
             user_version: 0,
             schema_version: 0,
+            uri_flags: OpenFlags::empty(),
         }
     }
 }
@@ -1295,16 +1298,50 @@ impl SqliteConnection {
         }
 
         let mut db = DbInfo::new(schema_name);
-        if !filename.is_empty() && filename != ":memory:" {
-            db.path = Some(filename.to_string());
+        // Parse URI filenames to extract mode and path
+        let (actual_path, uri_flags) = if filename.starts_with("file:") {
+            parse_uri(filename)?
+        } else {
+            (filename.to_string(), OpenFlags::empty())
+        };
+        // Check if mode=memory is specified in URI, or if filename is :memory:
+        let is_memory = uri_flags.contains(OpenFlags::MEMORY)
+            || actual_path.is_empty()
+            || actual_path == ":memory:"
+            || filename == ":memory:";
+        if !is_memory {
+            db.path = Some(actual_path);
         }
+        db.uri_flags = uri_flags;
         self.dbs.push(db);
         let idx = self.dbs.len() - 1;
-        self.open_attached_btree(idx)?;
-        // Merge attached schema into main for trigger/table/index lookup
-        self.merge_attached_schemas();
-        self.increment_schema_generation();
-        Ok(())
+        match self.open_attached_btree(idx) {
+            Ok(()) => {
+                // Merge attached schema into main for trigger/table/index lookup
+                self.merge_attached_schemas();
+                self.increment_schema_generation();
+                Ok(())
+            }
+            Err(e) => {
+                // Remove the database entry on failure
+                self.dbs.pop();
+                // Transform error messages to match SQLite's format
+                match e.code {
+                    ErrorCode::CantOpen | ErrorCode::Perm => {
+                        // SQLite uses "unable to open database: <filename>" for file access errors
+                        Err(Error::with_message(
+                            ErrorCode::CantOpen,
+                            format!("unable to open database: {}", filename),
+                        ))
+                    }
+                    ErrorCode::Busy => {
+                        // SQLite uses "database is locked" for busy errors
+                        Err(Error::with_message(ErrorCode::Busy, "database is locked"))
+                    }
+                    _ => Err(e),
+                }
+            }
+        }
     }
 
     /// Detach a database by schema name

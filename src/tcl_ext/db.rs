@@ -471,7 +471,7 @@ pub unsafe extern "C" fn db_method_cmd(
             CONNECTIONS.with(|connections| {
                 let conns = connections.borrow();
                 if let Some(conn) = conns.get(db_name) {
-                    set_result_int(interp, conn.err_code.as_i32());
+                    set_result_int(interp, crate::sqlite3_errcode(conn) as c_int);
                 } else {
                     set_result_int(interp, 0);
                 }

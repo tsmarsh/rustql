@@ -19,7 +19,7 @@ use super::ffi::{
 };
 use super::helpers::{obj_to_string, set_result_int, set_result_string, string_to_obj};
 use super::user_func::{clear_current_interp, set_current_interp};
-use super::{CONNECTIONS, NULL_VALUES, USER_FUNCTIONS};
+use super::{CONNECTIONS, NULL_VALUES, USER_COLLATIONS, USER_FUNCTIONS};
 
 use crate::api::{
     sqlite3_bind_double, sqlite3_bind_int64, sqlite3_bind_null, sqlite3_bind_parameter_count,
@@ -552,8 +552,29 @@ pub unsafe extern "C" fn db_method_cmd(
             }
             TCL_OK
         }
-        "collate"
-        | "trace"
+        "collate" => {
+            // Register a custom collation sequence
+            // Usage: db collate COLLATION_NAME TCL_PROC
+            if objc < 4 {
+                set_result_string(
+                    interp,
+                    "wrong # args: should be \"db collate COLLATION_NAME TCL_PROC\"",
+                );
+                return TCL_ERROR;
+            }
+            let collation_name = obj_to_string(*objv.offset(2));
+            let proc_name = obj_to_string(*objv.offset(3));
+
+            // Store the collation in the TCL registry
+            USER_COLLATIONS.with(|collations| {
+                collations.borrow_mut().insert(
+                    (db_name.to_string(), collation_name.to_uppercase()),
+                    proc_name,
+                );
+            });
+            TCL_OK
+        }
+        "trace"
         | "profile"
         | "progress"
         | "busy"

@@ -323,6 +323,8 @@ pub struct VdbeCursor {
     pub sorter_sorted: bool,
     /// Sort directions for each ORDER BY column (true = DESC, false = ASC)
     pub sort_desc: Vec<bool>,
+    /// Collation sequences for each ORDER BY column
+    pub sort_collations: Vec<String>,
     /// Ephemeral index data - used for DISTINCT and index operations
     pub ephemeral_set: std::collections::HashSet<Vec<u8>>,
     /// Ephemeral table rows for iteration - stores (rowid, record) pairs
@@ -403,6 +405,7 @@ impl VdbeCursor {
             index_name: None,
             sorter_sorted: false,
             sort_desc: Vec::new(),
+            sort_collations: Vec::new(),
             ephemeral_set: std::collections::HashSet::new(),
             ephemeral_rows: Vec::new(),
             ephemeral_index: 0,
@@ -2829,14 +2832,21 @@ impl Vdbe {
             Opcode::OpenEphemeral => {
                 // OpenEphemeral P1 P2 P3 P4
                 // Open ephemeral cursor P1 with P2 columns
-                // P4 may contain sort directions blob (SQLite: uses KeyInfo)
+                // P4 may contain sort directions blob or KeyInfo (with collations)
                 self.open_cursor(op.p1, 0, true)?;
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     cursor.is_ephemeral = true;
                     cursor.n_field = op.p2;
                     // Parse sort directions from P4 if present (SQLite-style)
-                    if let P4::Blob(dirs) = &op.p4 {
-                        cursor.sort_desc = dirs.iter().map(|&b| b != 0).collect();
+                    match &op.p4 {
+                        P4::Blob(dirs) => {
+                            cursor.sort_desc = dirs.iter().map(|&b| b != 0).collect();
+                        }
+                        P4::KeyInfo(info) => {
+                            cursor.sort_desc = info.sort_orders.clone();
+                            cursor.sort_collations = info.collations.clone();
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -5980,9 +5990,10 @@ impl Vdbe {
                         // Sort the data using custom comparison that decodes records
                         let num_key_cols = cursor.n_field.max(1) as usize;
                         let sort_desc = cursor.sort_desc.clone();
-                        cursor
-                            .sorter_data
-                            .sort_by(|a, b| compare_records(a, b, num_key_cols, &sort_desc));
+                        let sort_collations = cursor.sort_collations.clone();
+                        cursor.sorter_data.sort_by(|a, b| {
+                            compare_records(a, b, num_key_cols, &sort_desc, &sort_collations)
+                        });
                         cursor.sorter_sorted = true;
                         cursor.sorter_index = 0;
                         cursor.state = CursorState::Valid;
@@ -8509,9 +8520,10 @@ impl Vdbe {
                     } else {
                         let num_key_cols = cursor.n_field.max(1) as usize;
                         let sort_desc = cursor.sort_desc.clone();
-                        cursor
-                            .sorter_data
-                            .sort_by(|a, b| compare_records(a, b, num_key_cols, &sort_desc));
+                        let sort_collations = cursor.sort_collations.clone();
+                        cursor.sorter_data.sort_by(|a, b| {
+                            compare_records(a, b, num_key_cols, &sort_desc, &sort_collations)
+                        });
                         cursor.sorter_sorted = true;
                         cursor.sorter_index = 0;
                     }
@@ -9473,7 +9485,14 @@ fn compile_trigger_body_stmt(
 /// Compare two SQLite records by their first N columns (ORDER BY keys).
 /// Returns Ordering for use with sort_by.
 /// sort_desc: slice of booleans indicating DESC (true) or ASC (false) for each key column
-fn compare_records(a: &[u8], b: &[u8], num_key_cols: usize, sort_desc: &[bool]) -> Ordering {
+/// sort_collations: slice of collation names for each key column
+fn compare_records(
+    a: &[u8],
+    b: &[u8],
+    num_key_cols: usize,
+    sort_desc: &[bool],
+    sort_collations: &[String],
+) -> Ordering {
     use crate::vdbe::auxdata::{decode_record_header, deserialize_value};
 
     // Decode headers to get column types
@@ -9515,12 +9534,27 @@ fn compare_records(a: &[u8], b: &[u8], num_key_cols: usize, sort_desc: &[bool]) 
             b_offset += t.size();
         }
 
-        // Compare values
-        let cmp = match (a_mem, b_mem) {
-            (None, None) => Ordering::Equal,
-            (None, Some(_)) => Ordering::Less, // NULL sorts first
-            (Some(_), None) => Ordering::Greater,
-            (Some(a_val), Some(b_val)) => a_val.compare(&b_val),
+        // Get collation for this column (default to BINARY)
+        let collation = sort_collations
+            .get(i)
+            .map(|s| s.as_str())
+            .unwrap_or("BINARY");
+
+        // Compare values using collation
+        // Handle both deserialization failures (None) and SQL NULLs (Mem::is_null())
+        let a_is_null = a_mem.as_ref().map_or(true, |m| m.is_null());
+        let b_is_null = b_mem.as_ref().map_or(true, |m| m.is_null());
+
+        let cmp = match (a_is_null, b_is_null) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Less, // NULL sorts first
+            (false, true) => Ordering::Greater,
+            (false, false) => {
+                // Both are non-null, use collation comparison
+                let a_val = a_mem.as_ref().unwrap();
+                let b_val = b_mem.as_ref().unwrap();
+                a_val.compare_with_collation(b_val, collation)
+            }
         };
 
         if cmp != Ordering::Equal {
@@ -10432,7 +10466,7 @@ mod tests {
         let record7 = crate::vdbe::auxdata::make_record(&[Mem::from_int(7)], 0, 1);
         let record8 = crate::vdbe::auxdata::make_record(&[Mem::from_int(8)], 0, 1);
         assert_ne!(
-            compare_records(&record7, &record8, 1, &[]),
+            compare_records(&record7, &record8, 1, &[], &[]),
             std::cmp::Ordering::Equal
         );
 

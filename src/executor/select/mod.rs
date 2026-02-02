@@ -7028,12 +7028,19 @@ impl<'s> SelectCompiler<'s> {
                                 .map(|s| s.tables.contains_key(&table_name_lower))
                                 .unwrap_or(false);
                             // Also check attached schemas
-                            let in_attached = name.schema.as_ref().map_or(false, |schema_name| {
+                            // For qualified names, check only the specified schema
+                            // For unqualified names, check all attached schemas
+                            let in_attached = if let Some(ref schema_name) = name.schema {
                                 self.attached_schemas.iter().any(|(db_name, db_schema)| {
                                     db_name.eq_ignore_ascii_case(schema_name)
                                         && db_schema.tables.contains_key(&table_name_lower)
                                 })
-                            });
+                            } else {
+                                // Unqualified name - search all attached schemas
+                                self.attached_schemas.iter().any(|(_, db_schema)| {
+                                    db_schema.tables.contains_key(&table_name_lower)
+                                })
+                            };
                             if !in_temp && !in_attached {
                                 return Err(Error::with_message(
                                     ErrorCode::Error,
@@ -7043,12 +7050,18 @@ impl<'s> SelectCompiler<'s> {
                         }
                     }
 
-                    // Look up table schema from main or temp schema
+                    // Look up table schema from main, temp, or attached schemas
                     self.schema
                         .and_then(|s| s.tables.get(&table_name_lower).cloned())
                         .or_else(|| {
                             self.temp_schema
                                 .and_then(|s| s.tables.get(&table_name_lower).cloned())
+                        })
+                        .or_else(|| {
+                            // Search attached schemas for unqualified table names
+                            self.attached_schemas.iter().find_map(|(_, db_schema)| {
+                                db_schema.tables.get(&table_name_lower).cloned()
+                            })
                         })
                 };
 

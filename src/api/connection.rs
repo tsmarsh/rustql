@@ -996,8 +996,15 @@ impl SqliteConnection {
                 }
             }
         }
-        // Merge attached schemas into main for unqualified name resolution.
-        // TODO: replace with schema-aware resolution across attached databases.
+        self.merge_attached_schemas();
+        self.increment_schema_generation();
+        Ok(())
+    }
+
+    /// Merge schemas from attached databases into main schema for unqualified name resolution.
+    /// This copies tables, indexes, triggers, and views from attached databases to main schema.
+    /// Note: Only adds entries that don't already exist in main (doesn't overwrite).
+    fn merge_attached_schemas(&self) {
         if let Some(main_schema) = self.dbs.get(0).and_then(|db| db.schema.as_ref()) {
             let mut attached_tables = Vec::new();
             let mut attached_indexes = Vec::new();
@@ -1048,8 +1055,6 @@ impl SqliteConnection {
                 }
             }
         }
-        self.increment_schema_generation();
-        Ok(())
     }
 
     /// Get current memory usage for this connection
@@ -1296,6 +1301,9 @@ impl SqliteConnection {
         self.dbs.push(db);
         let idx = self.dbs.len() - 1;
         self.open_attached_btree(idx)?;
+        // Merge attached schema into main for trigger/table/index lookup
+        self.merge_attached_schemas();
+        self.increment_schema_generation();
         Ok(())
     }
 
@@ -1554,7 +1562,19 @@ fn load_schema_from_btree(
                     schema.views.entry(name).or_insert_with(|| Arc::new(view));
                 }
             }
-            // triggers not currently supported for schema reload
+            "trigger" => {
+                if let Some(mut trigger) =
+                    crate::schema::parse_create_trigger_sql(&sql, &tbl_name, db_idx)
+                {
+                    // Set db_idx from the database this schema was loaded from
+                    trigger.db_idx = db_idx;
+                    let name = trigger.name.to_lowercase();
+                    schema
+                        .triggers
+                        .entry(name)
+                        .or_insert_with(|| Arc::new(trigger));
+                }
+            }
             _ => {}
         }
 

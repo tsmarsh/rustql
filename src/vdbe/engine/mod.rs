@@ -1991,61 +1991,77 @@ impl Vdbe {
                             }
                         }
 
-                        // If not found in main schema and we have a specific db_idx, check attached schemas
-                        // Also check if table_meta is None even when root_page is known (for correct db_idx)
-                        if (need_root_lookup || table_meta.is_none()) && requested_db_idx.is_some()
-                        {
+                        // If not found in main schema, check attached schemas
+                        // For qualified names (requested_db_idx.is_some()): check only that specific database
+                        // For unqualified names (requested_db_idx.is_none()): search all attached databases in order
+                        if (need_root_lookup || table_meta.is_none()) {
                             if let Some(conn_ptr) = self.conn_ptr {
                                 let conn = unsafe { &*conn_ptr };
-                                if let Some(db) = conn.dbs.get(requested_db_idx.unwrap() as usize) {
-                                    if let Some(ref schema_arc) = db.schema {
-                                        if let Ok(schema_guard) = schema_arc.read() {
-                                            // Try as a table
-                                            if let Some(table) =
-                                                schema_guard.tables.get(&tname_lower)
-                                            {
-                                                if need_root_lookup {
-                                                    root_page = table.root_page;
-                                                }
-                                                table_meta = Some(std::sync::Arc::clone(table));
-                                            }
-                                            // Try as an index (only if we need root_page)
-                                            if need_root_lookup && root_page == 0 {
-                                                if let Some(index) =
-                                                    schema_guard.indexes.get(&tname_lower)
+
+                                // Determine which databases to search
+                                let dbs_to_search: Vec<usize> =
+                                    if let Some(db_idx) = requested_db_idx {
+                                        // Qualified name - search only the specified database
+                                        vec![db_idx as usize]
+                                    } else {
+                                        // Unqualified name - search all attached databases (skip main at 0, temp at 1)
+                                        (2..conn.dbs.len()).collect()
+                                    };
+
+                                'db_search: for db_idx in dbs_to_search {
+                                    if let Some(db) = conn.dbs.get(db_idx) {
+                                        if let Some(ref schema_arc) = db.schema {
+                                            if let Ok(schema_guard) = schema_arc.read() {
+                                                // Try as a table
+                                                if let Some(table) =
+                                                    schema_guard.tables.get(&tname_lower)
                                                 {
-                                                    root_page = index.root_page;
-                                                    is_index = true;
-                                                    index_unique = index.unique;
-                                                    index_table_name = Some(index.table.clone());
-                                                    index_collations = index
-                                                        .columns
-                                                        .iter()
-                                                        .map(|c| c.collation.clone())
-                                                        .collect();
-                                                }
-                                            }
-                                            // Also check auto-indexes
-                                            if need_root_lookup && root_page == 0 && !is_index {
-                                                for (_table_name, tbl) in schema_guard.tables.iter()
-                                                {
-                                                    for idx in &tbl.indexes {
-                                                        if idx.name.to_lowercase() == tname_lower {
-                                                            root_page = idx.root_page;
-                                                            is_index = true;
-                                                            index_unique = idx.unique;
-                                                            index_table_name =
-                                                                Some(idx.table.clone());
-                                                            index_collations = idx
-                                                                .columns
-                                                                .iter()
-                                                                .map(|c| c.collation.clone())
-                                                                .collect();
-                                                            break;
-                                                        }
+                                                    if need_root_lookup {
+                                                        root_page = table.root_page;
                                                     }
-                                                    if is_index {
-                                                        break;
+                                                    table_meta = Some(std::sync::Arc::clone(table));
+                                                    break 'db_search;
+                                                }
+                                                // Try as an index (only if we need root_page)
+                                                if need_root_lookup && root_page == 0 {
+                                                    if let Some(index) =
+                                                        schema_guard.indexes.get(&tname_lower)
+                                                    {
+                                                        root_page = index.root_page;
+                                                        is_index = true;
+                                                        index_unique = index.unique;
+                                                        index_table_name =
+                                                            Some(index.table.clone());
+                                                        index_collations = index
+                                                            .columns
+                                                            .iter()
+                                                            .map(|c| c.collation.clone())
+                                                            .collect();
+                                                        break 'db_search;
+                                                    }
+                                                }
+                                                // Also check auto-indexes
+                                                if need_root_lookup && root_page == 0 && !is_index {
+                                                    for (_table_name, tbl) in
+                                                        schema_guard.tables.iter()
+                                                    {
+                                                        for idx in &tbl.indexes {
+                                                            if idx.name.to_lowercase()
+                                                                == tname_lower
+                                                            {
+                                                                root_page = idx.root_page;
+                                                                is_index = true;
+                                                                index_unique = idx.unique;
+                                                                index_table_name =
+                                                                    Some(idx.table.clone());
+                                                                index_collations = idx
+                                                                    .columns
+                                                                    .iter()
+                                                                    .map(|c| c.collation.clone())
+                                                                    .collect();
+                                                                break 'db_search;
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }

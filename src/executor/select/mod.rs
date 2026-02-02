@@ -1358,6 +1358,12 @@ impl<'s> SelectCompiler<'s> {
             None => (None, None),
         };
 
+        // Keep a copy of the original WHERE clause (before join conditions are merged)
+        // This is needed for LEFT JOIN null-fill rows: the null-fill row should only be
+        // filtered by the original WHERE clause, not by the join conditions.
+        // Join conditions determine which right table rows match; WHERE filters the final result.
+        let original_where_for_null_fill = original_where.clone();
+
         // Merge join conditions (from NATURAL/USING/ON) with WHERE clause
         // This follows SQLite's approach of adding join conditions to pWhere
         let remaining_where = self.merge_join_conditions(original_where);
@@ -2389,6 +2395,16 @@ impl<'s> SelectCompiler<'s> {
 
                 // Set cursor to null row mode (columns will return NULL)
                 self.emit(Opcode::NullRow, cursor, 0, 0, P4::Unused);
+
+                // Re-evaluate the ORIGINAL WHERE clause (not including join conditions) with the null row
+                // This is critical for LEFT JOIN with WHERE on the left table
+                // e.g., SELECT * FROM t1 LEFT JOIN t2 ON true WHERE t1.a IS NULL
+                // The null-fill row should only be output if the original WHERE passes.
+                // Join conditions are NOT re-evaluated because they already determined that no
+                // right table rows matched - the null-fill is the correct behavior for outer joins.
+                if let Some(where_expr) = original_where_for_null_fill.as_ref() {
+                    self.compile_where_condition(where_expr, skip_null_output)?;
+                }
 
                 // Re-evaluate result columns with null row
                 // Save column metadata since compile_result_columns adds to these vectors

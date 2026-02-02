@@ -33,7 +33,8 @@ pub mod user_func;
 // Re-exports for public API
 pub use ffi::{Tcl_Interp, Tcl_Obj};
 pub use user_func::{
-    call_tcl_user_function, has_tcl_user_function, has_tcl_user_function_with_args,
+    call_tcl_collation, call_tcl_user_function, has_tcl_collation, has_tcl_user_function,
+    has_tcl_user_function_with_args,
 };
 
 use ffi::{Tcl_CreateObjCommand, TCL_ERROR, TCL_OK};
@@ -48,7 +49,7 @@ thread_local! {
     // User-defined TCL functions per connection: (db_name, func_name, argcount) -> tcl_proc_name
     // argcount of -1 means "any number of args"
     pub(crate) static USER_FUNCTIONS: RefCell<HashMap<(String, String, i32), String>> = RefCell::new(HashMap::new());
-    // User-defined collations per connection: (db_name, collation_name) -> tcl_proc_name
+    // User-defined TCL collations per connection: (db_name, collation_name) -> tcl_proc_name
     pub(crate) static USER_COLLATIONS: RefCell<HashMap<(String, String), String>> = RefCell::new(HashMap::new());
     // Function destructors: (db_name, func_name, encoding) -> destructor_proc_name
     // encoding is the text encoding: "any", "utf8", "utf16le", "utf16be"

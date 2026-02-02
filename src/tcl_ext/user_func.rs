@@ -7,7 +7,7 @@ use std::ffi::CString;
 use std::os::raw::c_int;
 
 use super::ffi::{Tcl_Eval, Tcl_GetObjResult, Tcl_GetStringFromObj, Tcl_Interp, TCL_OK};
-use super::{CURRENT_INTERP, USER_FUNCTIONS};
+use super::{CURRENT_INTERP, USER_COLLATIONS, USER_FUNCTIONS};
 
 /// Set the current TCL interpreter for user function callbacks
 pub fn set_current_interp(interp: *mut Tcl_Interp) {
@@ -117,4 +117,81 @@ pub fn has_tcl_user_function_with_args(func_name: &str, argcount: i32) -> bool {
         }
         false
     })
+}
+
+/// Check if a user-defined TCL collation exists
+pub fn has_tcl_collation(collation_name: &str) -> bool {
+    USER_COLLATIONS.with(|collations| {
+        let collations = collations.borrow();
+        for ((_, cname), _) in collations.iter() {
+            if cname.eq_ignore_ascii_case(collation_name) {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// Call a user-defined TCL collation and return the comparison result
+/// Returns None if no such collation is registered or interp is not set
+/// Returns Some(Ordering) based on TCL proc result: -1 = Less, 0 = Equal, 1 = Greater
+pub fn call_tcl_collation(
+    collation_name: &str,
+    lhs: &str,
+    rhs: &str,
+) -> Option<std::cmp::Ordering> {
+    // Get the current interpreter
+    let interp = CURRENT_INTERP.with(|cell| *cell.borrow())?;
+    if interp.is_null() {
+        return None;
+    }
+
+    // Find the collation proc - check all connections
+    let proc_name = USER_COLLATIONS.with(|collations| {
+        let collations = collations.borrow();
+        for ((_, cname), proc) in collations.iter() {
+            if cname.eq_ignore_ascii_case(collation_name) {
+                return Some(proc.clone());
+            }
+        }
+        None
+    })?;
+
+    // Build the TCL command: proc_name lhs rhs
+    let mut cmd = proc_name;
+    cmd.push(' ');
+    cmd.push('{');
+    cmd.push_str(lhs);
+    cmd.push('}');
+    cmd.push(' ');
+    cmd.push('{');
+    cmd.push_str(rhs);
+    cmd.push('}');
+
+    // Execute the TCL command
+    unsafe {
+        let cmd_cstr = CString::new(cmd).ok()?;
+        let result = Tcl_Eval(interp, cmd_cstr.as_ptr());
+        if result == TCL_OK {
+            // Get the result
+            let result_obj = Tcl_GetObjResult(interp);
+            if !result_obj.is_null() {
+                let mut len: c_int = 0;
+                let ptr = Tcl_GetStringFromObj(result_obj, &mut len);
+                if !ptr.is_null() {
+                    let slice = std::slice::from_raw_parts(ptr as *const u8, len as usize);
+                    let result_str = String::from_utf8_lossy(slice);
+                    // Parse the result as an integer: -1, 0, or 1
+                    if let Ok(cmp_result) = result_str.trim().parse::<i32>() {
+                        return Some(match cmp_result {
+                            n if n < 0 => std::cmp::Ordering::Less,
+                            0 => std::cmp::Ordering::Equal,
+                            _ => std::cmp::Ordering::Greater,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    None
 }

@@ -868,10 +868,24 @@ impl Mem {
             }
 
             // Then check built-in collations
-            return match collation.to_uppercase().as_str() {
+            let collation_upper = collation.to_uppercase();
+            return match collation_upper.as_str() {
                 "NOCASE" => sa.to_ascii_lowercase().cmp(&sb.to_ascii_lowercase()),
                 "RTRIM" => sa.trim_end().cmp(sb.trim_end()),
-                _ => sa.cmp(&sb), // BINARY or default
+                "BINARY" | "" => sa.cmp(&sb),
+                _ => {
+                    // Check for TCL-defined custom collation
+                    #[cfg(feature = "tcl")]
+                    {
+                        if let Some(ordering) =
+                            crate::tcl_ext::call_tcl_collation(&collation_upper, &sa, &sb)
+                        {
+                            return ordering;
+                        }
+                    }
+                    // Fall back to BINARY comparison
+                    sa.cmp(&sb)
+                }
             };
         }
 

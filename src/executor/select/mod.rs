@@ -22,7 +22,7 @@ use crate::parser::ast::{
 };
 use crate::schema::{Affinity, GeneratedStorage, Table};
 use crate::vdbe::ops::{
-    affinity as vdbe_affinity, Opcode, VFilterConstraint, VFilterPlan, VdbeOp, P4,
+    affinity as vdbe_affinity, KeyInfo, Opcode, VFilterConstraint, VFilterPlan, VdbeOp, P4,
 };
 use crate::vdbe::types::SQLITE_MAX_COMPOUND_SELECT;
 use crate::vtab::{
@@ -788,18 +788,25 @@ impl<'s> SelectCompiler<'s> {
         let (actual_dest, sorter_cursor, order_by_cols) = if let Some(order_by) = &select.order_by {
             let sorter_cursor = self.alloc_cursor();
             let num_cols = order_by.len();
-            // Sort directions (0=ASC, 1=DESC) passed in P4 (SQLite-style)
-            let sort_dirs: Vec<u8> = order_by
-                .iter()
-                .map(|t| if t.order == SortOrder::Desc { 1 } else { 0 })
-                .collect();
-            // Open ephemeral table for sorting with sort directions
+            // Build KeyInfo with sort directions and collations
+            let key_info = KeyInfo {
+                sort_orders: order_by
+                    .iter()
+                    .map(|t| t.order == SortOrder::Desc)
+                    .collect(),
+                collations: order_by
+                    .iter()
+                    .map(|t| Self::extract_collation(&t.expr))
+                    .collect(),
+                n_key_field: num_cols as u16,
+            };
+            // Open ephemeral table for sorting with key info
             self.emit(
                 Opcode::OpenEphemeral,
                 sorter_cursor,
                 num_cols as i32,
                 0,
-                P4::Blob(sort_dirs),
+                P4::KeyInfo(std::sync::Arc::new(key_info)),
             );
             // Store ORDER BY terms so output_row_inner can include them in records
             self.order_by_terms = Some(order_by.clone());
@@ -12370,6 +12377,25 @@ impl<'s> SelectCompiler<'s> {
         self.next_label += 1;
         self.labels.insert(label, None);
         label
+    }
+
+    /// Extract the collation name from an expression.
+    /// If the expression is Expr::Collate { collation, ... }, return the collation name.
+    /// Otherwise, return "BINARY" as the default.
+    fn extract_collation(expr: &Expr) -> String {
+        match expr {
+            Expr::Collate { collation, .. } => collation.to_uppercase(),
+            _ => "BINARY".to_string(),
+        }
+    }
+
+    /// Unwrap any COLLATE wrapper to get the inner expression.
+    /// This is used to check if an ORDER BY term is actually a column index.
+    fn unwrap_collate(expr: &Expr) -> &Expr {
+        match expr {
+            Expr::Collate { expr: inner, .. } => Self::unwrap_collate(inner),
+            _ => expr,
+        }
     }
 
     fn resolve_label(&mut self, label: i32, addr: usize) {

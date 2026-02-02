@@ -9721,7 +9721,14 @@ fn compile_trigger_body_stmt(
 /// Compare two SQLite records by their first N columns (ORDER BY keys).
 /// Returns Ordering for use with sort_by.
 /// sort_desc: slice of booleans indicating DESC (true) or ASC (false) for each key column
-fn compare_records(a: &[u8], b: &[u8], num_key_cols: usize, sort_desc: &[bool]) -> Ordering {
+/// sort_collations: slice of collation names for each key column
+fn compare_records(
+    a: &[u8],
+    b: &[u8],
+    num_key_cols: usize,
+    sort_desc: &[bool],
+    sort_collations: &[String],
+) -> Ordering {
     use crate::vdbe::auxdata::{decode_record_header, deserialize_value};
 
     // Decode headers to get column types
@@ -9763,12 +9770,27 @@ fn compare_records(a: &[u8], b: &[u8], num_key_cols: usize, sort_desc: &[bool]) 
             b_offset += t.size();
         }
 
-        // Compare values
-        let cmp = match (a_mem, b_mem) {
-            (None, None) => Ordering::Equal,
-            (None, Some(_)) => Ordering::Less, // NULL sorts first
-            (Some(_), None) => Ordering::Greater,
-            (Some(a_val), Some(b_val)) => a_val.compare(&b_val),
+        // Get collation for this column (default to BINARY)
+        let collation = sort_collations
+            .get(i)
+            .map(|s| s.as_str())
+            .unwrap_or("BINARY");
+
+        // Compare values using collation
+        // Handle both deserialization failures (None) and SQL NULLs (Mem::is_null())
+        let a_is_null = a_mem.as_ref().map_or(true, |m| m.is_null());
+        let b_is_null = b_mem.as_ref().map_or(true, |m| m.is_null());
+
+        let cmp = match (a_is_null, b_is_null) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Less, // NULL sorts first
+            (false, true) => Ordering::Greater,
+            (false, false) => {
+                // Both are non-null, use collation comparison
+                let a_val = a_mem.as_ref().unwrap();
+                let b_val = b_mem.as_ref().unwrap();
+                a_val.compare_with_collation(b_val, collation)
+            }
         };
 
         if cmp != Ordering::Equal {
@@ -10763,7 +10785,7 @@ mod tests {
         let record7 = crate::vdbe::auxdata::make_record(&[Mem::from_int(7)], 0, 1);
         let record8 = crate::vdbe::auxdata::make_record(&[Mem::from_int(8)], 0, 1);
         assert_ne!(
-            compare_records(&record7, &record8, 1, &[]),
+            compare_records(&record7, &record8, 1, &[], &[]),
             std::cmp::Ordering::Equal
         );
 

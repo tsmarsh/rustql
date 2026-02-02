@@ -814,6 +814,20 @@ impl Mem {
 
     /// Compare with another memory cell using a collation sequence
     pub fn compare_with_collation(&self, other: &Mem, collation: &str) -> Ordering {
+        let no_custom: Option<&fn(&str, &str) -> Ordering> = None;
+        self.compare_with_collation_fn(other, collation, no_custom)
+    }
+
+    /// Compare with another memory cell using a collation sequence and optional custom collation function
+    pub fn compare_with_collation_fn<F>(
+        &self,
+        other: &Mem,
+        collation: &str,
+        custom_collation: Option<&F>,
+    ) -> Ordering
+    where
+        F: Fn(&str, &str) -> Ordering + ?Sized,
+    {
         // NULL handling
         if self.is_null() && other.is_null() {
             return Ordering::Equal;
@@ -830,6 +844,12 @@ impl Mem {
             let sa = self.to_str();
             let sb = other.to_str();
 
+            // First check for custom collation function
+            if let Some(coll_fn) = custom_collation {
+                return coll_fn(&sa, &sb);
+            }
+
+            // Then check built-in collations
             return match collation.to_uppercase().as_str() {
                 "NOCASE" => sa.to_ascii_lowercase().cmp(&sb.to_ascii_lowercase()),
                 "RTRIM" => sa.trim_end().cmp(sb.trim_end()),

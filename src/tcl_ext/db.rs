@@ -19,7 +19,7 @@ use super::ffi::{
 };
 use super::helpers::{obj_to_string, set_result_int, set_result_string, string_to_obj};
 use super::user_func::{clear_current_interp, set_current_interp};
-use super::{CONNECTIONS, NULL_VALUES, USER_FUNCTIONS};
+use super::{CONNECTIONS, NULL_VALUES, USER_COLLATIONS, USER_FUNCTIONS};
 
 use crate::api::{
     sqlite3_bind_double, sqlite3_bind_int64, sqlite3_bind_null, sqlite3_bind_parameter_count,
@@ -575,8 +575,93 @@ pub unsafe extern "C" fn db_method_cmd(
             }
             TCL_OK
         }
-        "collate"
-        | "trace"
+        "collate" => {
+            // Register a collation sequence
+            // Usage: db collate NAME PROC
+            // NAME = collation name (case-insensitive)
+            // PROC = TCL procedure that takes two arguments and returns -1, 0, or 1
+            if objc < 4 {
+                set_result_string(interp, "wrong # args: should be \"db collate NAME PROC\"");
+                return TCL_ERROR;
+            }
+            let collation_name = obj_to_string(*objv.offset(2));
+            let proc_name = obj_to_string(*objv.offset(3));
+
+            // Store the collation proc for later use
+            USER_COLLATIONS.with(|collations| {
+                collations.borrow_mut().insert(
+                    (db_name.to_string(), collation_name.to_uppercase()),
+                    proc_name.clone(),
+                );
+            });
+
+            // Register the collation with the database
+            let db_name_clone = db_name.to_string();
+            let collation_upper = collation_name.to_uppercase();
+            CONNECTIONS.with(|connections| {
+                let mut conns = connections.borrow_mut();
+                if let Some(conn) = conns.get_mut(&db_name_clone) {
+                    // Create a collation that calls back to TCL
+                    // We need to capture the db_name and collation_name for the callback
+                    let coll_db = db_name_clone.clone();
+                    let coll_name = collation_upper.clone();
+                    conn.create_collation(&collation_upper, move |a, b| {
+                        // Look up the TCL proc name
+                        let proc_opt = USER_COLLATIONS.with(|collations| {
+                            collations
+                                .borrow()
+                                .get(&(coll_db.clone(), coll_name.clone()))
+                                .cloned()
+                        });
+
+                        if let Some(proc) = proc_opt {
+                            // Call the TCL proc with the two values
+                            super::CURRENT_INTERP.with(|interp_cell| {
+                                let interp_opt = interp_cell.borrow();
+                                if let Some(interp) = *interp_opt {
+                                    // Build the command: PROC a b
+                                    let cmd = format!("{} {{{}}} {{{}}}", proc, a, b);
+                                    if let Ok(c_cmd) = CString::new(cmd) {
+                                        unsafe {
+                                            if super::ffi::Tcl_Eval(interp, c_cmd.as_ptr())
+                                                == TCL_OK
+                                            {
+                                                // Get the result using Tcl_GetObjResult
+                                                let result_obj =
+                                                    super::ffi::Tcl_GetObjResult(interp);
+                                                if !result_obj.is_null() {
+                                                    let result_str = obj_to_string(result_obj);
+                                                    if let Ok(n) = result_str.parse::<i32>() {
+                                                        return match n.cmp(&0) {
+                                                            std::cmp::Ordering::Less => {
+                                                                std::cmp::Ordering::Less
+                                                            }
+                                                            std::cmp::Ordering::Greater => {
+                                                                std::cmp::Ordering::Greater
+                                                            }
+                                                            std::cmp::Ordering::Equal => {
+                                                                std::cmp::Ordering::Equal
+                                                            }
+                                                        };
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                // Fallback to lexicographic comparison
+                                a.cmp(b)
+                            })
+                        } else {
+                            // Fallback to lexicographic comparison
+                            a.cmp(b)
+                        }
+                    });
+                }
+            });
+            TCL_OK
+        }
+        "trace"
         | "profile"
         | "progress"
         | "busy"

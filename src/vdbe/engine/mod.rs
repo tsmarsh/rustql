@@ -323,6 +323,8 @@ pub struct VdbeCursor {
     pub sorter_sorted: bool,
     /// Sort directions for each ORDER BY column (true = DESC, false = ASC)
     pub sort_desc: Vec<bool>,
+    /// Collation names for each ORDER BY column
+    pub sort_collations: Vec<String>,
     /// Ephemeral index data - used for DISTINCT and index operations
     pub ephemeral_set: std::collections::HashSet<Vec<u8>>,
     /// Ephemeral table rows for iteration - stores (rowid, record) pairs
@@ -403,6 +405,7 @@ impl VdbeCursor {
             index_name: None,
             sorter_sorted: false,
             sort_desc: Vec::new(),
+            sort_collations: Vec::new(),
             ephemeral_set: std::collections::HashSet::new(),
             ephemeral_rows: Vec::new(),
             ephemeral_index: 0,
@@ -2852,14 +2855,22 @@ impl Vdbe {
             Opcode::OpenEphemeral => {
                 // OpenEphemeral P1 P2 P3 P4
                 // Open ephemeral cursor P1 with P2 columns
-                // P4 may contain sort directions blob (SQLite: uses KeyInfo)
+                // P4 may contain sort directions blob or KeyInfo with collations
                 self.open_cursor(op.p1, 0, true)?;
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     cursor.is_ephemeral = true;
                     cursor.n_field = op.p2;
-                    // Parse sort directions from P4 if present (SQLite-style)
-                    if let P4::Blob(dirs) = &op.p4 {
-                        cursor.sort_desc = dirs.iter().map(|&b| b != 0).collect();
+                    // Parse sort directions and collations from P4 if present
+                    match &op.p4 {
+                        P4::Blob(dirs) => {
+                            cursor.sort_desc = dirs.iter().map(|&b| b != 0).collect();
+                        }
+                        P4::KeyInfo(key_info) => {
+                            // Extract sort orders and collations from KeyInfo
+                            cursor.sort_desc = key_info.sort_orders.clone();
+                            cursor.sort_collations = key_info.collations.clone();
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -4520,142 +4531,183 @@ impl Vdbe {
                                 }
                             }
                         }
-                    } else if let Some(func) = crate::functions::get_scalar_function(name) {
-                        let argc = op.p1.max(0) as usize;
-                        let arg_base = op.p2;
-                        let mut args = Vec::with_capacity(argc);
-                        let btree = self.btree.clone();
-                        let schema = self.schema.clone();
-                        for i in 0..argc {
-                            let mem = self.mem(arg_base + i as i32);
-                            args.push(mem.to_value());
-                        }
-                        if name.eq_ignore_ascii_case("snippet")
-                            || name.eq_ignore_ascii_case("offsets")
-                            || name.eq_ignore_ascii_case("matchinfo")
-                        {
-                            let mut text = None;
-                            if let (Some(vtab_name), Some(rowid)) =
-                                (&self.vtab_context_name, self.vtab_context_rowid)
+                    } else {
+                        // First check for TCL user-defined function that should override built-ins
+                        #[cfg(feature = "tcl")]
+                        let tcl_result = {
+                            let argc = op.p1.max(0) as usize;
+                            let arg_base = op.p2;
+                            // Check if there's a TCL function with exact argcount, or -1 (any args)
+                            if crate::tcl_ext::has_tcl_user_function_with_args(name, argc as i32)
+                                || crate::tcl_ext::has_tcl_user_function_with_args(name, -1)
                             {
-                                #[cfg(feature = "fts3")]
+                                let mut string_args = Vec::with_capacity(argc);
+                                for i in 0..argc {
+                                    let mem = self.mem(arg_base + i as i32);
+                                    string_args.push(mem.to_value().to_text());
+                                }
+                                crate::tcl_ext::call_tcl_user_function(name, &string_args)
+                            } else {
+                                None
+                            }
+                        };
+                        #[cfg(not(feature = "tcl"))]
+                        let tcl_result: Option<String> = None;
+
+                        if let Some(result) = tcl_result {
+                            // TCL user function handled this
+                            if let Ok(i) = result.parse::<i64>() {
+                                self.mem_mut(op.p3).set_int(i);
+                            } else if let Ok(f) = result.parse::<f64>() {
+                                self.mem_mut(op.p3).set_real(f);
+                            } else {
+                                self.mem_mut(op.p3).set_str(&result);
+                            }
+                        } else if let Some(func) = crate::functions::get_scalar_function(name) {
+                            let argc = op.p1.max(0) as usize;
+                            let arg_base = op.p2;
+                            let mut args = Vec::with_capacity(argc);
+                            let btree = self.btree.clone();
+                            let schema = self.schema.clone();
+                            for i in 0..argc {
+                                let mem = self.mem(arg_base + i as i32);
+                                args.push(mem.to_value());
+                            }
+                            if name.eq_ignore_ascii_case("snippet")
+                                || name.eq_ignore_ascii_case("offsets")
+                                || name.eq_ignore_ascii_case("matchinfo")
+                            {
+                                let mut text = None;
+                                if let (Some(vtab_name), Some(rowid)) =
+                                    (&self.vtab_context_name, self.vtab_context_rowid)
                                 {
-                                    if let Some(table) = crate::fts3::get_table(vtab_name) {
-                                        if let Ok(mut table) = table.lock() {
-                                            if let (Some(ref btree), Some(ref schema)) =
-                                                (btree.as_ref(), schema.as_ref())
-                                            {
-                                                if let Ok(schema_guard) = schema.read() {
-                                                    let _ =
-                                                        table.ensure_loaded(btree, &schema_guard);
-                                                }
-                                            }
-                                            let values =
+                                    #[cfg(feature = "fts3")]
+                                    {
+                                        if let Some(table) = crate::fts3::get_table(vtab_name) {
+                                            if let Ok(mut table) = table.lock() {
                                                 if let (Some(ref btree), Some(ref schema)) =
                                                     (btree.as_ref(), schema.as_ref())
                                                 {
                                                     if let Ok(schema_guard) = schema.read() {
-                                                        table
-                                                            .load_row_values(
-                                                                btree,
-                                                                &schema_guard,
-                                                                rowid,
-                                                            )
-                                                            .ok()
-                                                            .flatten()
+                                                        let _ = table
+                                                            .ensure_loaded(btree, &schema_guard);
+                                                    }
+                                                }
+                                                let values =
+                                                    if let (Some(ref btree), Some(ref schema)) =
+                                                        (btree.as_ref(), schema.as_ref())
+                                                    {
+                                                        if let Ok(schema_guard) = schema.read() {
+                                                            table
+                                                                .load_row_values(
+                                                                    btree,
+                                                                    &schema_guard,
+                                                                    rowid,
+                                                                )
+                                                                .ok()
+                                                                .flatten()
+                                                        } else {
+                                                            table
+                                                                .row_values(rowid)
+                                                                .map(|vals| vals.to_vec())
+                                                        }
                                                     } else {
                                                         table
                                                             .row_values(rowid)
                                                             .map(|vals| vals.to_vec())
-                                                    }
-                                                } else {
-                                                    table
-                                                        .row_values(rowid)
-                                                        .map(|vals| vals.to_vec())
-                                                };
-                                            if let Some(values) = values {
-                                                text = Some(Value::Text(values.join(" ")));
+                                                    };
+                                                if let Some(values) = values {
+                                                    text = Some(Value::Text(values.join(" ")));
+                                                }
                                             }
                                         }
                                     }
                                 }
-                            }
 
-                            if args.is_empty() {
-                                if let Some(text) = text {
-                                    args.push(text);
-                                }
-                                if let Some(query) = self.vtab_query.clone() {
-                                    args.push(Value::Text(query));
-                                }
-                            } else if args.len() == 1 {
-                                if let Some(text) = text {
-                                    // Get the original query arg - but if it's NULL, use vtab_query
-                                    let query_arg = args.remove(0);
-                                    args.push(text);
-                                    // If query arg is NULL (pseudo-column placeholder), use vtab_query
-                                    if matches!(query_arg, Value::Null) {
-                                        if let Some(query) = self.vtab_query.clone() {
-                                            args.push(Value::Text(query));
-                                        }
-                                    } else {
-                                        args.push(query_arg);
+                                if args.is_empty() {
+                                    if let Some(text) = text {
+                                        args.push(text);
                                     }
-                                } else if let Some(query) = self.vtab_query.clone() {
-                                    args.push(Value::Text(query));
+                                    if let Some(query) = self.vtab_query.clone() {
+                                        args.push(Value::Text(query));
+                                    }
+                                } else if args.len() == 1 {
+                                    if let Some(text) = text {
+                                        // Get the original query arg - but if it's NULL, use vtab_query
+                                        let query_arg = args.remove(0);
+                                        args.push(text);
+                                        // If query arg is NULL (pseudo-column placeholder), use vtab_query
+                                        if matches!(query_arg, Value::Null) {
+                                            if let Some(query) = self.vtab_query.clone() {
+                                                args.push(Value::Text(query));
+                                            }
+                                        } else {
+                                            args.push(query_arg);
+                                        }
+                                    } else if let Some(query) = self.vtab_query.clone() {
+                                        args.push(Value::Text(query));
+                                    }
                                 }
                             }
-                        }
-                        match func(&args) {
-                            Ok(value) => {
-                                *self.mem_mut(op.p3) = Mem::from_value(&value);
-                            }
-                            Err(e) => return Err(e),
-                        }
-                    } else if crate::functions::is_aggregate_function(name) {
-                        // Handle aggregate function called as scalar (e.g., SELECT md5sum('hello'))
-                        // Create state, step once with args, finalize
-                        let argc = op.p1.max(0) as usize;
-                        let arg_base = op.p2;
-                        let mut args = Vec::with_capacity(argc);
-                        for i in 0..argc {
-                            let mem = self.mem(arg_base + i as i32);
-                            args.push(mem.to_value());
-                        }
-                        if let Some(mut state) = crate::functions::AggregateState::new(name) {
-                            let _ = state.step(&args);
-                            match state.finalize() {
+                            match func(&args) {
                                 Ok(value) => {
                                     *self.mem_mut(op.p3) = Mem::from_value(&value);
                                 }
                                 Err(e) => return Err(e),
                             }
-                        } else {
-                            self.mem_mut(op.p3).set_null();
-                        }
-                    } else {
-                        // Check for user-defined TCL function
-                        #[cfg(feature = "tcl")]
-                        {
+                        } else if crate::functions::is_aggregate_function(name) {
+                            // Handle aggregate function called as scalar (e.g., SELECT md5sum('hello'))
+                            // Create state, step once with args, finalize
                             let argc = op.p1.max(0) as usize;
                             let arg_base = op.p2;
-                            let mut string_args = Vec::with_capacity(argc);
+                            let mut args = Vec::with_capacity(argc);
                             for i in 0..argc {
                                 let mem = self.mem(arg_base + i as i32);
-                                string_args.push(mem.to_value().to_text());
+                                args.push(mem.to_value());
                             }
-                            if let Some(result) =
-                                crate::tcl_ext::call_tcl_user_function(name, &string_args)
-                            {
-                                // Try to parse as integer first, then float
-                                if let Ok(i) = result.parse::<i64>() {
-                                    self.mem_mut(op.p3).set_int(i);
-                                } else if let Ok(f) = result.parse::<f64>() {
-                                    self.mem_mut(op.p3).set_real(f);
-                                } else {
-                                    self.mem_mut(op.p3).set_str(&result);
+                            if let Some(mut state) = crate::functions::AggregateState::new(name) {
+                                let _ = state.step(&args);
+                                match state.finalize() {
+                                    Ok(value) => {
+                                        *self.mem_mut(op.p3) = Mem::from_value(&value);
+                                    }
+                                    Err(e) => return Err(e),
                                 }
                             } else {
+                                self.mem_mut(op.p3).set_null();
+                            }
+                        } else {
+                            // Check for user-defined TCL function
+                            #[cfg(feature = "tcl")]
+                            {
+                                let argc = op.p1.max(0) as usize;
+                                let arg_base = op.p2;
+                                let mut string_args = Vec::with_capacity(argc);
+                                for i in 0..argc {
+                                    let mem = self.mem(arg_base + i as i32);
+                                    string_args.push(mem.to_value().to_text());
+                                }
+                                if let Some(result) =
+                                    crate::tcl_ext::call_tcl_user_function(name, &string_args)
+                                {
+                                    // Try to parse as integer first, then float
+                                    if let Ok(i) = result.parse::<i64>() {
+                                        self.mem_mut(op.p3).set_int(i);
+                                    } else if let Ok(f) = result.parse::<f64>() {
+                                        self.mem_mut(op.p3).set_real(f);
+                                    } else {
+                                        self.mem_mut(op.p3).set_str(&result);
+                                    }
+                                } else {
+                                    // Unknown function - return error
+                                    return Err(crate::error::Error::with_message(
+                                        crate::error::ErrorCode::Error,
+                                        format!("no such function: {}", name),
+                                    ));
+                                }
+                            }
+                            #[cfg(not(feature = "tcl"))]
+                            {
                                 // Unknown function - return error
                                 return Err(crate::error::Error::with_message(
                                     crate::error::ErrorCode::Error,
@@ -4663,15 +4715,7 @@ impl Vdbe {
                                 ));
                             }
                         }
-                        #[cfg(not(feature = "tcl"))]
-                        {
-                            // Unknown function - return error
-                            return Err(crate::error::Error::with_message(
-                                crate::error::ErrorCode::Error,
-                                format!("no such function: {}", name),
-                            ));
-                        }
-                    }
+                    } // Close the new else block for TCL check
                 } else {
                     self.mem_mut(op.p3).set_null();
                 }
@@ -5996,21 +6040,67 @@ impl Vdbe {
             Opcode::SorterSort => {
                 // SorterSort P1 P2: Sort the sorter P1. Jump to P2 if empty.
                 // n_field contains the number of ORDER BY key columns
-                if let Some(cursor) = self.cursor_mut(op.p1) {
-                    if cursor.sorter_data.is_empty() {
+
+                // First, extract cursor info we need before mutable borrow
+                let cursor_info = self.cursor(op.p1).map(|cursor| {
+                    (
+                        cursor.sorter_data.is_empty(),
+                        cursor.n_field.max(1) as usize,
+                        cursor.sort_desc.clone(),
+                        cursor.sort_collations.clone(),
+                    )
+                });
+
+                if let Some((is_empty, num_key_cols, sort_desc, sort_collations)) = cursor_info {
+                    if is_empty {
                         self.pc = op.p2;
                     } else {
+                        // Look up custom collation functions from connection
+                        type CollFn = dyn Fn(&str, &str) -> Ordering + Send + Sync;
+                        let collation_fns: Vec<Option<Arc<CollFn>>> = if !sort_collations.is_empty()
+                        {
+                            if let Some(conn_ptr) = self.conn_ptr {
+                                let conn = unsafe { &mut *conn_ptr };
+                                sort_collations
+                                    .iter()
+                                    .map(|name| {
+                                        // Only look up non-builtin collations
+                                        let upper = name.to_uppercase();
+                                        if upper != "BINARY"
+                                            && upper != "NOCASE"
+                                            && upper != "RTRIM"
+                                        {
+                                            conn.find_collation(&upper)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect()
+                            } else {
+                                vec![]
+                            }
+                        } else {
+                            vec![]
+                        };
+
                         // Sort the data using custom comparison that decodes records
-                        let num_key_cols = cursor.n_field.max(1) as usize;
-                        let sort_desc = cursor.sort_desc.clone();
-                        cursor
-                            .sorter_data
-                            .sort_by(|a, b| compare_records(a, b, num_key_cols, &sort_desc));
-                        cursor.sorter_sorted = true;
-                        cursor.sorter_index = 0;
-                        cursor.state = CursorState::Valid;
-                        // Increment sort count (for sqlite_sort_count variable)
-                        inc_sort_count();
+                        if let Some(cursor) = self.cursor_mut(op.p1) {
+                            cursor.sorter_data.sort_by(|a, b| {
+                                compare_records_with_collations(
+                                    a,
+                                    b,
+                                    num_key_cols,
+                                    &sort_desc,
+                                    &sort_collations,
+                                    &collation_fns,
+                                )
+                            });
+                            cursor.sorter_sorted = true;
+                            cursor.sorter_index = 0;
+                            cursor.state = CursorState::Valid;
+                            // Increment sort count (for sqlite_sort_count variable)
+                            inc_sort_count();
+                        }
                     }
                 } else {
                     self.pc = op.p2;
@@ -8544,17 +8634,63 @@ impl Vdbe {
 
             Opcode::Sort => {
                 // Same as SorterSort - sort and rewind
-                if let Some(cursor) = self.cursor_mut(op.p1) {
-                    if cursor.sorter_data.is_empty() {
+                // First, extract cursor info we need before mutable borrow
+                let cursor_info = self.cursor(op.p1).map(|cursor| {
+                    (
+                        cursor.sorter_data.is_empty(),
+                        cursor.n_field.max(1) as usize,
+                        cursor.sort_desc.clone(),
+                        cursor.sort_collations.clone(),
+                    )
+                });
+
+                if let Some((is_empty, num_key_cols, sort_desc, sort_collations)) = cursor_info {
+                    if is_empty {
                         self.pc = op.p2;
                     } else {
-                        let num_key_cols = cursor.n_field.max(1) as usize;
-                        let sort_desc = cursor.sort_desc.clone();
-                        cursor
-                            .sorter_data
-                            .sort_by(|a, b| compare_records(a, b, num_key_cols, &sort_desc));
-                        cursor.sorter_sorted = true;
-                        cursor.sorter_index = 0;
+                        // Look up custom collation functions from connection
+                        type CollFn = dyn Fn(&str, &str) -> Ordering + Send + Sync;
+                        let collation_fns: Vec<Option<Arc<CollFn>>> = if !sort_collations.is_empty()
+                        {
+                            if let Some(conn_ptr) = self.conn_ptr {
+                                let conn = unsafe { &mut *conn_ptr };
+                                sort_collations
+                                    .iter()
+                                    .map(|name| {
+                                        // Only look up non-builtin collations
+                                        let upper = name.to_uppercase();
+                                        if upper != "BINARY"
+                                            && upper != "NOCASE"
+                                            && upper != "RTRIM"
+                                        {
+                                            conn.find_collation(&upper)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect()
+                            } else {
+                                vec![]
+                            }
+                        } else {
+                            vec![]
+                        };
+
+                        // Sort the data using custom comparison that decodes records
+                        if let Some(cursor) = self.cursor_mut(op.p1) {
+                            cursor.sorter_data.sort_by(|a, b| {
+                                compare_records_with_collations(
+                                    a,
+                                    b,
+                                    num_key_cols,
+                                    &sort_desc,
+                                    &sort_collations,
+                                    &collation_fns,
+                                )
+                            });
+                            cursor.sorter_sorted = true;
+                            cursor.sorter_index = 0;
+                        }
                     }
                 }
             }
@@ -9565,6 +9701,89 @@ fn compare_records(a: &[u8], b: &[u8], num_key_cols: usize, sort_desc: &[bool]) 
             (None, Some(_)) => Ordering::Less, // NULL sorts first
             (Some(_), None) => Ordering::Greater,
             (Some(a_val), Some(b_val)) => a_val.compare(&b_val),
+        };
+
+        if cmp != Ordering::Equal {
+            // Reverse comparison for DESC columns
+            let is_desc = sort_desc.get(i).copied().unwrap_or(false);
+            return if is_desc { cmp.reverse() } else { cmp };
+        }
+    }
+
+    Ordering::Equal
+}
+
+/// Compare two serialized records using custom collation functions
+fn compare_records_with_collations(
+    a: &[u8],
+    b: &[u8],
+    num_key_cols: usize,
+    sort_desc: &[bool],
+    sort_collations: &[String],
+    collation_fns: &[Option<Arc<dyn Fn(&str, &str) -> Ordering + Send + Sync>>],
+) -> Ordering {
+    use crate::vdbe::auxdata::{decode_record_header, deserialize_value};
+
+    // Decode headers to get column types
+    let (a_types, a_header_size) = match decode_record_header(a) {
+        Ok(v) => v,
+        Err(_) => return Ordering::Equal,
+    };
+    let (b_types, b_header_size) = match decode_record_header(b) {
+        Ok(v) => v,
+        Err(_) => return Ordering::Equal,
+    };
+
+    // Compare key columns
+    let mut a_offset = a_header_size;
+    let mut b_offset = b_header_size;
+
+    for i in 0..num_key_cols {
+        // Get types and values for this column
+        let a_type = a_types.get(i);
+        let b_type = b_types.get(i);
+
+        let a_mem = if let Some(t) = a_type {
+            deserialize_value(&a[a_offset..], t).ok()
+        } else {
+            None
+        };
+
+        let b_mem = if let Some(t) = b_type {
+            deserialize_value(&b[b_offset..], t).ok()
+        } else {
+            None
+        };
+
+        // Advance offsets
+        if let Some(t) = a_type {
+            a_offset += t.size();
+        }
+        if let Some(t) = b_type {
+            b_offset += t.size();
+        }
+
+        // Compare values, using custom collation if available
+        let cmp = match (a_mem, b_mem) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Less, // NULL sorts first
+            (Some(_), None) => Ordering::Greater,
+            (Some(a_val), Some(b_val)) => {
+                // Check if there's a custom collation for this column
+                let collation_name = sort_collations
+                    .get(i)
+                    .map(|s| s.as_str())
+                    .unwrap_or("BINARY");
+                let custom_fn = collation_fns.get(i).and_then(|opt| opt.as_ref());
+
+                if let Some(coll_fn) = custom_fn {
+                    // Use custom collation function
+                    a_val.compare_with_collation_fn(&b_val, collation_name, Some(coll_fn.as_ref()))
+                } else {
+                    // Use built-in collation
+                    a_val.compare_with_collation(&b_val, collation_name)
+                }
+            }
         };
 
         if cmp != Ordering::Equal {

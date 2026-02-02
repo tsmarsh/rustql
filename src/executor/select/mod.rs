@@ -601,19 +601,50 @@ impl<'s> SelectCompiler<'s> {
                 } else {
                     let sorter_cursor = self.alloc_cursor();
                     let num_cols = order_by.len();
-                    // Sort directions (0=ASC, 1=DESC) passed in P4 (SQLite-style)
-                    let sort_dirs: Vec<u8> = order_by
+                    // Sort directions (true=DESC, false=ASC)
+                    let sort_orders: Vec<bool> = order_by
                         .iter()
-                        .map(|t| if t.order == SortOrder::Desc { 1 } else { 0 })
+                        .map(|t| t.order == SortOrder::Desc)
                         .collect();
-                    // Open ephemeral table for sorting with sort directions
-                    self.emit(
-                        Opcode::OpenEphemeral,
-                        sorter_cursor,
-                        num_cols as i32,
-                        0,
-                        P4::Blob(sort_dirs),
-                    );
+                    // Extract collation from each ORDER BY term
+                    // If expr is `expr COLLATE name`, use `name`; otherwise use "BINARY"
+                    let collations: Vec<String> = order_by
+                        .iter()
+                        .map(|t| Self::extract_collation_from_expr(&t.expr))
+                        .collect();
+
+                    // Check if any custom collations are used
+                    let has_custom_collation = collations.iter().any(|c| c != "BINARY");
+
+                    // Open ephemeral table for sorting
+                    if has_custom_collation {
+                        // Use KeyInfo when custom collations are present
+                        use crate::vdbe::ops::KeyInfo;
+                        use std::sync::Arc;
+                        let key_info = Arc::new(KeyInfo {
+                            collations,
+                            sort_orders,
+                            n_key_field: num_cols as u16,
+                        });
+                        self.emit(
+                            Opcode::OpenEphemeral,
+                            sorter_cursor,
+                            num_cols as i32,
+                            0,
+                            P4::KeyInfo(key_info),
+                        );
+                    } else {
+                        // Use simple blob for sort directions (backwards compatible)
+                        let sort_dirs: Vec<u8> =
+                            sort_orders.iter().map(|&d| if d { 1 } else { 0 }).collect();
+                        self.emit(
+                            Opcode::OpenEphemeral,
+                            sorter_cursor,
+                            num_cols as i32,
+                            0,
+                            P4::Blob(sort_dirs),
+                        );
+                    }
                     // Store ORDER BY terms so output_row_inner can include them in records
                     self.order_by_terms = Some(order_by.clone());
                     (
@@ -7608,6 +7639,16 @@ impl<'s> SelectCompiler<'s> {
         }
     }
 
+    /// Extract the collation name from an expression.
+    /// If the expression is `expr COLLATE name`, returns `name` (uppercased).
+    /// Otherwise returns "BINARY" as the default collation.
+    fn extract_collation_from_expr(expr: &Expr) -> String {
+        match expr {
+            Expr::Collate { collation, .. } => collation.to_uppercase(),
+            _ => "BINARY".to_string(),
+        }
+    }
+
     /// Extract constraints from WHERE clause applicable to a virtual table
     fn extract_vtab_constraints(
         &self,
@@ -9316,8 +9357,13 @@ impl<'s> SelectCompiler<'s> {
                             };
 
                             // Handle ORDER BY column index (e.g., ORDER BY 1, ORDER BY 2)
+                            // Also handles ORDER BY 1 COLLATE xyz by unwrapping the Collate
                             // These should reference result columns, not be literal values
-                            if let Expr::Literal(Literal::Integer(col_idx)) = &term.expr {
+                            let inner_expr = match &term.expr {
+                                Expr::Collate { expr, .. } => expr.as_ref(),
+                                other => other,
+                            };
+                            if let Expr::Literal(Literal::Integer(col_idx)) = inner_expr {
                                 let col_idx = *col_idx as i32;
                                 if col_idx >= 1 && col_idx <= count as i32 {
                                     // Copy from the result column (1-based index)

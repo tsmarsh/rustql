@@ -9,8 +9,8 @@ use std::sync::{Arc, RwLock};
 use crate::error::{Error, ErrorCode, Result};
 use crate::functions::{get_aggregate_function, get_scalar_function, AggregateInfo, ScalarFunc};
 use crate::schema::{
-    parse_create_sql, parse_create_view_sql, Encoding, Index, IndexColumn, Schema, SortOrder,
-    DEFAULT_COLLATION,
+    parse_create_sql, parse_create_trigger_sql, parse_create_view_sql, Encoding, Index,
+    IndexColumn, Schema, SortOrder, DEFAULT_COLLATION,
 };
 use crate::storage::btree::{Btree, BtreeCursorFlags, BtreeOpenFlags, CursorState, TransState};
 use crate::storage::pager::{JournalMode, LockingMode, DEFAULT_PAGE_SIZE};
@@ -1563,11 +1563,7 @@ fn load_schema_from_btree(
                 }
             }
             "trigger" => {
-                if let Some(mut trigger) =
-                    crate::schema::parse_create_trigger_sql(&sql, &tbl_name, db_idx)
-                {
-                    // Set db_idx from the database this schema was loaded from
-                    trigger.db_idx = db_idx;
+                if let Some(trigger) = parse_create_trigger_sql(&sql, db_idx) {
                     let name = trigger.name.to_lowercase();
                     schema
                         .triggers

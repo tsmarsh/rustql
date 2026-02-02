@@ -1934,7 +1934,10 @@ impl<'a> Parser<'a> {
         };
 
         self.expect(TokenKind::On)?;
-        let table = self.expect_identifier()?;
+        // Parse table name which may be qualified (schema.table)
+        let table_qname = self.parse_qualified_name()?;
+        let table_schema = table_qname.schema.clone();
+        let table = table_qname.name;
 
         let for_each_row = if self.match_token(TokenKind::For) {
             self.expect(TokenKind::Each)?;
@@ -1965,6 +1968,7 @@ impl<'a> Parser<'a> {
             time,
             event,
             table,
+            table_schema,
             for_each_row,
             when,
             body,

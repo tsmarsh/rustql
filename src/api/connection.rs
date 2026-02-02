@@ -786,6 +786,10 @@ pub struct DbConfigFlags {
     pub read_uncommitted: bool,
     /// Reverse unordered selects (for testing)
     pub reverse_unordered_selects: bool,
+    /// Query planner stability guarantee (QPSG) - when enabled, query plans
+    /// won't change based on bound parameter values. This disables LIKE
+    /// optimization with bound parameters.
+    pub enable_qpsg: bool,
 }
 
 impl Default for SqliteConnection {
@@ -853,6 +857,7 @@ impl SqliteConnection {
                 checkpoint_fullfsync: false,      // Default OFF
                 read_uncommitted: false,          // Default OFF
                 reverse_unordered_selects: false, // Default OFF
+                enable_qpsg: false,               // Default OFF
             },
             schema_generation: AtomicU64::new(0),
             memory_used: AtomicI64::new(0),

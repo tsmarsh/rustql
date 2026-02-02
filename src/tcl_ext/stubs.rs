@@ -899,6 +899,7 @@ unsafe extern "C" fn sqlite3_db_config_cmd(
         "SQLITE_DBCONFIG_ENABLE_FKEY" | "1002" => 1002,
         "SQLITE_DBCONFIG_ENABLE_TRIGGER" | "1003" => 1003,
         "SQLITE_DBCONFIG_DEFENSIVE" | "1010" => 1010,
+        "SQLITE_DBCONFIG_ENABLE_QPSG" | "QPSG" | "1007" => 1007,
         _ => {
             // Unknown option - return 0 for compatibility
             set_result_int(interp, 0);
@@ -959,6 +960,14 @@ unsafe extern "C" fn sqlite3_db_config_cmd(
                     let old = conn.db_config.defensive as i32;
                     if value >= 0 {
                         conn.db_config.defensive = value != 0;
+                    }
+                    old
+                }
+                1007 => {
+                    // ENABLE_QPSG - Query Planner Stability Guarantee
+                    let old = conn.db_config.enable_qpsg as i32;
+                    if value >= 0 {
+                        conn.db_config.enable_qpsg = value != 0;
                     }
                     old
                 }

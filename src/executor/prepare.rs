@@ -1667,8 +1667,22 @@ impl<'s> StatementCompiler<'s> {
                                 ColumnConstraintKind::NotNull { .. } => {
                                     col_sql.push_str(" NOT NULL");
                                 }
-                                ColumnConstraintKind::Unique { .. } => {
+                                ColumnConstraintKind::Unique { conflict } => {
                                     col_sql.push_str(" UNIQUE");
+                                    if let Some(action) = conflict {
+                                        col_sql.push_str(" ON CONFLICT ");
+                                        col_sql.push_str(match action {
+                                            crate::parser::ast::ConflictAction::Abort => "ABORT",
+                                            crate::parser::ast::ConflictAction::Rollback => {
+                                                "ROLLBACK"
+                                            }
+                                            crate::parser::ast::ConflictAction::Fail => "FAIL",
+                                            crate::parser::ast::ConflictAction::Ignore => "IGNORE",
+                                            crate::parser::ast::ConflictAction::Replace => {
+                                                "REPLACE"
+                                            }
+                                        });
+                                    }
                                 }
                                 ColumnConstraintKind::Default(val) => {
                                     col_sql.push_str(" DEFAULT ");
@@ -1773,7 +1787,7 @@ impl<'s> StatementCompiler<'s> {
                             sql.push_str(&col_names.join(", "));
                             sql.push(')');
                         }
-                        TableConstraintKind::Unique { columns, .. } => {
+                        TableConstraintKind::Unique { columns, conflict } => {
                             sql.push_str("UNIQUE (");
                             let col_names: Vec<String> = columns
                                 .iter()
@@ -1789,6 +1803,16 @@ impl<'s> StatementCompiler<'s> {
                                 .collect();
                             sql.push_str(&col_names.join(", "));
                             sql.push(')');
+                            if let Some(action) = conflict {
+                                sql.push_str(" ON CONFLICT ");
+                                sql.push_str(match action {
+                                    crate::parser::ast::ConflictAction::Abort => "ABORT",
+                                    crate::parser::ast::ConflictAction::Rollback => "ROLLBACK",
+                                    crate::parser::ast::ConflictAction::Fail => "FAIL",
+                                    crate::parser::ast::ConflictAction::Ignore => "IGNORE",
+                                    crate::parser::ast::ConflictAction::Replace => "REPLACE",
+                                });
+                            }
                         }
                         TableConstraintKind::Check(expr) => {
                             sql.push_str("CHECK (");

@@ -360,6 +360,31 @@ impl WhereTerm {
             Some(TermOp::Lt) | Some(TermOp::Le) | Some(TermOp::Gt) | Some(TermOp::Ge)
         )
     }
+
+    /// Check if this term compares to a NULL literal
+    /// (e.g., col = NULL, col < NULL, etc.)
+    /// Such comparisons are always unknown (not TRUE) in SQL, except for IS NULL
+    pub fn compares_to_null_literal(&self) -> bool {
+        // Only check for Eq, Lt, Le, Gt, Ge - IS NULL is handled separately
+        if !matches!(
+            self.op,
+            Some(TermOp::Eq)
+                | Some(TermOp::Lt)
+                | Some(TermOp::Le)
+                | Some(TermOp::Gt)
+                | Some(TermOp::Ge)
+        ) {
+            return false;
+        }
+
+        // Check if the right side of the comparison is a NULL literal
+        if let Expr::Binary { right, .. } = self.expr.as_ref() {
+            if let Expr::Literal(Literal::Null) = right.as_ref() {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 // ============================================================================
@@ -1644,6 +1669,15 @@ impl QueryPlanner {
                 let prereqs_satisfied = (other_prereqs & !prereq_mask) == 0;
 
                 if prereqs_satisfied && term.is_index_usable() {
+                    // Skip terms that compare to NULL literal (e.g., col = NULL)
+                    // These always evaluate to UNKNOWN (not TRUE) in SQL,
+                    // so they should not be used for index optimization
+                    if term.compares_to_null_literal() {
+                        // This term will never match any rows - set selectivity to 0
+                        // but don't add to usable terms for index scan
+                        total_selectivity = 0.0;
+                        continue;
+                    }
                     if term.is_equality() {
                         usable_eq_terms.push(term);
                     } else if term.is_range() {

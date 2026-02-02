@@ -1818,6 +1818,7 @@ fn parse_create_index_sql(
         is_primary_key: false,
         sql: Some(sql.to_string()),
         stats: None,
+        conflict_action: None, // Not stored in sqlite_master SQL
     })
 }
 

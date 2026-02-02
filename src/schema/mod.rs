@@ -426,6 +426,8 @@ pub struct Column {
     pub is_primary_key: bool,
     /// Has UNIQUE constraint
     pub is_unique: bool,
+    /// Conflict action for UNIQUE constraint
+    pub unique_conflict: Option<ConflictAction>,
     /// Is hidden (generated, rowid, etc.)
     pub is_hidden: bool,
     /// Generated column expression
@@ -444,6 +446,7 @@ impl Default for Column {
             collation: DEFAULT_COLLATION.to_string(),
             is_primary_key: false,
             is_unique: false,
+            unique_conflict: None,
             is_hidden: false,
             generated: None,
         }
@@ -544,6 +547,8 @@ pub struct Index {
     pub sql: Option<String>,
     /// Statistics for the index (sqlite_stat1)
     pub stats: Option<IndexStats>,
+    /// ON CONFLICT action for UNIQUE constraint
+    pub conflict_action: Option<ConflictAction>,
 }
 
 impl Index {
@@ -823,6 +828,7 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
                             collation: DEFAULT_COLLATION.to_string(),
                             is_primary_key: false,
                             is_unique: false,
+                            unique_conflict: None,
                             is_hidden: false,
                             generated: None,
                         });
@@ -903,6 +909,7 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
                     collation: DEFAULT_COLLATION.to_string(),
                     is_primary_key: false,
                     is_unique: false,
+                    unique_conflict: None,
                     is_hidden: false,
                     generated: None,
                 })
@@ -967,7 +974,8 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
     // Parse columns and table constraints
     // We need to be careful about commas inside parentheses (e.g., UNIQUE(c, d))
     let mut columns = Vec::new();
-    let mut indexes = Vec::new();
+    // indexes: (name, col_names, is_unique, conflict_action)
+    let mut indexes: Vec<(String, Vec<String>, bool, Option<ConflictAction>)> = Vec::new();
     let mut depth = 0;
     let mut current = String::new();
     let mut parts_list = Vec::new();
@@ -1004,7 +1012,7 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
 
         // Check for table-level constraints
         if col_def_upper.starts_with("UNIQUE") && col_def_upper.contains('(') {
-            // Parse UNIQUE(col1, col2, ...)
+            // Parse UNIQUE(col1, col2, ...) [ON CONFLICT action]
             if let Some(paren_start) = col_def.find('(') {
                 if let Some(paren_end) = col_def.rfind(')') {
                     let col_list = &col_def[paren_start + 1..paren_end];
@@ -1014,11 +1022,27 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
                         .filter(|s| !s.is_empty())
                         .collect();
 
+                    // Check for ON CONFLICT clause
+                    let conflict_action = if let Some(pos) = col_def_upper.find("ON CONFLICT") {
+                        let after = &col_def_upper[pos + "ON CONFLICT".len()..].trim_start();
+                        let action_str = after.split_whitespace().next().unwrap_or("");
+                        match action_str {
+                            "IGNORE" => Some(ConflictAction::Ignore),
+                            "REPLACE" => Some(ConflictAction::Replace),
+                            "ABORT" => Some(ConflictAction::Abort),
+                            "FAIL" => Some(ConflictAction::Fail),
+                            "ROLLBACK" => Some(ConflictAction::Rollback),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+
                     auto_idx_num += 1;
                     let index_name = format!("sqlite_autoindex_{}_{}", table_name, auto_idx_num);
 
                     // We'll fill in column indices after all columns are parsed
-                    indexes.push((index_name, col_names, true)); // true = unique
+                    indexes.push((index_name, col_names, true, conflict_action));
                 }
             }
             continue;
@@ -1050,6 +1074,27 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
         let is_primary_key =
             col_def_upper.contains(" PRIMARY KEY") || col_def_upper.contains(" PRIMARY");
         let is_not_null = col_def_upper.contains(" NOT NULL");
+
+        // Extract UNIQUE ON CONFLICT action if present
+        let unique_conflict = if is_unique {
+            // Look for "UNIQUE ON CONFLICT <action>" pattern
+            if let Some(pos) = col_def_upper.find("UNIQUE ON CONFLICT") {
+                let after = &col_def_upper[pos + "UNIQUE ON CONFLICT".len()..].trim_start();
+                let action_str = after.split_whitespace().next().unwrap_or("");
+                match action_str {
+                    "IGNORE" => Some(ConflictAction::Ignore),
+                    "REPLACE" => Some(ConflictAction::Replace),
+                    "ABORT" => Some(ConflictAction::Abort),
+                    "FAIL" => Some(ConflictAction::Fail),
+                    "ROLLBACK" => Some(ConflictAction::Rollback),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // Extract DEFAULT value if present
         let default_value = extract_default_value(&col_def_upper, &col_def);
@@ -1094,6 +1139,7 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
             collation,
             is_primary_key,
             is_unique,
+            unique_conflict,
             is_hidden: generated
                 .as_ref()
                 .map(|g| g.storage == GeneratedStorage::Virtual)
@@ -1136,13 +1182,19 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
         if needs_index {
             auto_idx_count += 1;
             let index_name = format!("sqlite_autoindex_{}_{}", table_name, auto_idx_count);
-            indexes.push((index_name, vec![col.name.clone()], true));
+            // For column-level UNIQUE, use the column's unique_conflict
+            let conflict = if col.is_unique {
+                col.unique_conflict
+            } else {
+                None
+            };
+            indexes.push((index_name, vec![col.name.clone()], true, conflict));
         }
     }
 
     // Now build the index structures with proper column indices
     let mut index_list = Vec::new();
-    for (index_name, col_names, is_unique) in indexes {
+    for (index_name, col_names, is_unique, conflict_action) in indexes {
         let mut index_columns = Vec::new();
         for col_name in &col_names {
             // Find column index
@@ -1170,6 +1222,7 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
                 is_primary_key: false,
                 sql: None,
                 stats: None,
+                conflict_action,
             }));
         }
     }
@@ -1300,6 +1353,7 @@ pub fn parse_create_index_sql(sql: &str, _is_unique: bool) -> Option<Index> {
         root_page: 0, // Will be set when actual btree is created
         sql: Some(sql.to_string()),
         stats: None,
+        conflict_action: None, // ON CONFLICT not stored in SQL, comes from table definition
     })
 }
 
@@ -1956,6 +2010,43 @@ impl Schema {
             self.apply_table_constraint(&mut table, constraint)?;
         }
 
+        // Create implicit indexes for column-level UNIQUE constraints
+        // This must happen after all columns are added so column indices are correct
+        let mut auto_idx_num = table.indexes.len();
+        for (col_idx, column) in table.columns.iter().enumerate() {
+            // Create index for UNIQUE column that doesn't already have an index
+            // (Skip if it's a PRIMARY KEY column - those are handled by table constraints)
+            if column.is_unique && !column.is_primary_key {
+                // Check if index already exists for this column
+                let has_index = table.indexes.iter().any(|idx| {
+                    idx.columns.len() == 1 && idx.columns[0].column_idx == col_idx as i32
+                });
+
+                if !has_index {
+                    auto_idx_num += 1;
+                    let index_name = format!("sqlite_autoindex_{}_{}", table.name, auto_idx_num);
+                    table.indexes.push(std::sync::Arc::new(Index {
+                        name: index_name,
+                        table: table.name.clone(),
+                        db_idx: table.db_idx,
+                        columns: vec![IndexColumn {
+                            column_idx: col_idx as i32,
+                            expr: None,
+                            sort_order: SortOrder::Asc,
+                            collation: column.collation.clone(),
+                        }],
+                        root_page: 0, // Will be set when btree is created
+                        unique: true,
+                        partial: None,
+                        is_primary_key: false,
+                        sql: None,
+                        stats: None,
+                        conflict_action: column.unique_conflict,
+                    }));
+                }
+            }
+        }
+
         // Validate the table
         self.validate_table(&table)?;
 
@@ -1979,6 +2070,7 @@ impl Schema {
             collation: DEFAULT_COLLATION.to_string(),
             is_primary_key: false,
             is_unique: false,
+            unique_conflict: None,
             is_hidden: false,
             generated: None,
         };
@@ -2033,9 +2125,10 @@ impl Schema {
                 column.not_null = true;
                 column.not_null_conflict = *conflict;
             }
-            ColumnConstraint::Unique { conflict: _ } => {
+            ColumnConstraint::Unique { conflict } => {
                 // Mark column as unique
                 column.is_unique = true;
+                column.unique_conflict = *conflict;
                 // Note: Implicit index creation should happen at table creation time
             }
             ColumnConstraint::Check(expr) => {
@@ -2143,13 +2236,11 @@ impl Schema {
                         is_primary_key: true,
                         sql: None,
                         stats: None,
+                        conflict_action: *conflict,
                     }));
                 }
             }
-            TableConstraint::Unique {
-                columns,
-                conflict: _,
-            } => {
+            TableConstraint::Unique { columns, conflict } => {
                 // Create an implicit unique index for this constraint
                 // Generate an automatic index name like "sqlite_autoindex_tablename_N"
                 let auto_idx_num = table.indexes.len() + 1;
@@ -2194,6 +2285,7 @@ impl Schema {
                         is_primary_key: false,
                         sql: None,
                         stats: None,
+                        conflict_action: *conflict,
                     }));
                 }
             }
@@ -2298,6 +2390,7 @@ impl Schema {
             is_primary_key: false,
             sql: None,
             stats: None,
+            conflict_action: None, // CREATE INDEX doesn't have ON CONFLICT
         };
 
         // Process indexed columns

@@ -1757,8 +1757,31 @@ impl<'s> SelectCompiler<'s> {
                             key_record_reg,
                             P4::Int64(1),
                         );
+                    } else if end_bound.is_some() {
+                        // No start bound but we have an end bound (e.g., y < 33)
+                        // Use SeekGT(NULL) to skip past NULL values at the start of the index
+                        // This is necessary because NULL comparisons are always UNKNOWN, not TRUE,
+                        // so NULL values should never be included in range results
+                        let null_key_reg = self.alloc_reg();
+                        self.emit(Opcode::Null, 0, null_key_reg, 0, P4::Unused);
+                        let null_record_reg = self.alloc_reg();
+                        self.emit(
+                            Opcode::MakeRecord,
+                            null_key_reg,
+                            1,
+                            null_record_reg,
+                            P4::Unused,
+                        );
+                        // SeekGT(NULL) positions past all NULL values
+                        self.emit(
+                            Opcode::SeekGT,
+                            index_cursor,
+                            skip_label,
+                            null_record_reg,
+                            P4::Int64(1),
+                        );
                     } else {
-                        // No start bound - start from beginning
+                        // No constraints - start from beginning
                         self.emit(Opcode::Rewind, index_cursor, skip_label, 0, P4::Unused);
                     }
 
@@ -5433,6 +5456,7 @@ impl<'s> SelectCompiler<'s> {
                                 collation: "BINARY".to_string(),
                                 is_primary_key: false,
                                 is_unique: false,
+                                unique_conflict: None,
                                 is_hidden: false,
                                 generated: None,
                             },
@@ -5446,6 +5470,7 @@ impl<'s> SelectCompiler<'s> {
                                 collation: "BINARY".to_string(),
                                 is_primary_key: false,
                                 is_unique: false,
+                                unique_conflict: None,
                                 is_hidden: false,
                                 generated: None,
                             },
@@ -5459,6 +5484,7 @@ impl<'s> SelectCompiler<'s> {
                                 collation: "BINARY".to_string(),
                                 is_primary_key: false,
                                 is_unique: false,
+                                unique_conflict: None,
                                 is_hidden: false,
                                 generated: None,
                             },
@@ -5472,6 +5498,7 @@ impl<'s> SelectCompiler<'s> {
                                 collation: "BINARY".to_string(),
                                 is_primary_key: false,
                                 is_unique: false,
+                                unique_conflict: None,
                                 is_hidden: false,
                                 generated: None,
                             },
@@ -5485,6 +5512,7 @@ impl<'s> SelectCompiler<'s> {
                                 collation: "BINARY".to_string(),
                                 is_primary_key: false,
                                 is_unique: false,
+                                unique_conflict: None,
                                 is_hidden: false,
                                 generated: None,
                             },
@@ -5520,6 +5548,7 @@ impl<'s> SelectCompiler<'s> {
                                 collation: "BINARY".to_string(),
                                 is_primary_key: false,
                                 is_unique: false,
+                                unique_conflict: None,
                                 is_hidden: false,
                                 generated: None,
                             },
@@ -5533,6 +5562,7 @@ impl<'s> SelectCompiler<'s> {
                                 collation: "BINARY".to_string(),
                                 is_primary_key: false,
                                 is_unique: false,
+                                unique_conflict: None,
                                 is_hidden: false,
                                 generated: None,
                             },
@@ -5546,6 +5576,7 @@ impl<'s> SelectCompiler<'s> {
                                 collation: "BINARY".to_string(),
                                 is_primary_key: false,
                                 is_unique: false,
+                                unique_conflict: None,
                                 is_hidden: false,
                                 generated: None,
                             },
@@ -8894,9 +8925,31 @@ impl<'s> SelectCompiler<'s> {
                 let pos = *n as usize;
                 pos >= 1 && pos <= self.result_column_names.len()
             }
-            // Column reference (simple identifier or table.column) - always allowed
-            // SQLite allows referencing column names from any part of the UNION
-            Expr::Column(_) => true,
+            // Column reference - must match a result column name OR a column from another SELECT in the UNION
+            // In UNION queries, ORDER BY can reference columns that appear in any component SELECT
+            // SQLite extension: the right SELECT's columns can be referenced too
+            Expr::Column(col_ref) => {
+                // Get the column name to match (ignore table qualifier for matching)
+                let col_name = &col_ref.column;
+
+                // Check if any result column name matches this column name
+                // We need to compare just the column part, not table.column
+                let in_result_cols = self.result_column_names.iter().any(|name| {
+                    // Handle both simple names and qualified names (table.column)
+                    let result_col = if let Some(pos) = name.rfind('.') {
+                        &name[pos + 1..]
+                    } else {
+                        name.as_str()
+                    };
+                    result_col.eq_ignore_ascii_case(col_name)
+                });
+
+                // Also check compound_aliases (column names from right SELECTs in UNION)
+                let in_compound_aliases =
+                    self.compound_aliases.contains_key(&col_name.to_lowercase());
+
+                in_result_cols || in_compound_aliases
+            }
             // For complex expressions (like f2+101), check if they match a result column name
             // These must match exactly or be invalid
             _ => {

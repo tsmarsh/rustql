@@ -4156,9 +4156,10 @@ impl<'s> SelectCompiler<'s> {
     }
 
     /// Get the affinity for a comparison operation.
-    /// If either operand is a column with numeric affinity (INTEGER, REAL, NUMERIC),
-    /// returns NUMERIC affinity to enable type coercion.
-    /// Otherwise returns BLOB (0) for strict type ordering.
+    /// SQLite affinity rules for comparisons:
+    /// - If either operand has NUMERIC affinity, use NUMERIC for coercion
+    /// - If either operand has TEXT affinity (and neither has NUMERIC), use TEXT
+    /// - Otherwise use BLOB (strict type ordering)
     fn get_comparison_affinity(&self, left: &Expr, right: &Expr) -> u16 {
         let left_affinity = self.get_expr_affinity(left);
         let right_affinity = self.get_expr_affinity(right);
@@ -4166,9 +4167,18 @@ impl<'s> SelectCompiler<'s> {
         // If either side has numeric affinity, use NUMERIC for coercion
         if Self::is_numeric_affinity(left_affinity) || Self::is_numeric_affinity(right_affinity) {
             vdbe_affinity::NUMERIC
+        } else if Self::is_text_affinity(left_affinity) || Self::is_text_affinity(right_affinity) {
+            // If either side has TEXT affinity, use TEXT for coercion
+            // This makes integer literals compare as text when compared with TEXT columns
+            vdbe_affinity::TEXT
         } else {
             vdbe_affinity::BLOB
         }
+    }
+
+    /// Check if affinity is TEXT
+    fn is_text_affinity(affinity: Option<Affinity>) -> bool {
+        matches!(affinity, Some(Affinity::Text))
     }
 
     /// Get the affinity of an expression (for comparison purposes).
@@ -4214,6 +4224,45 @@ impl<'s> SelectCompiler<'s> {
             affinity,
             Some(Affinity::Integer) | Some(Affinity::Real) | Some(Affinity::Numeric)
         )
+    }
+
+    /// Get the collation of an expression (from explicit COLLATE or column definition)
+    fn get_expr_collation(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Collate { collation, .. } => Some(collation.clone()),
+            Expr::Column(col_ref) => self.get_column_collation(col_ref),
+            Expr::Parens(inner) => self.get_expr_collation(inner),
+            _ => None,
+        }
+    }
+
+    /// Get the collation of a column reference from its schema definition
+    fn get_column_collation(&self, col_ref: &ColumnRef) -> Option<String> {
+        // Find the table for this column
+        let tables_to_search: Vec<_> = if let Some(table_name) = &col_ref.table {
+            self.tables
+                .iter()
+                .filter(|t| Self::table_name_matches(t, table_name))
+                .collect()
+        } else {
+            // Search all tables for unqualified column
+            self.tables.iter().collect()
+        };
+
+        for table in tables_to_search {
+            if let Some(schema_table) = &table.schema_table {
+                for col in &schema_table.columns {
+                    if col.name.eq_ignore_ascii_case(&col_ref.column) {
+                        // Only return non-default collation
+                        if !col.collation.eq_ignore_ascii_case("BINARY") {
+                            return Some(col.collation.clone());
+                        }
+                        return None;
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Convert a type name to an affinity
@@ -8096,11 +8145,26 @@ impl<'s> SelectCompiler<'s> {
                 // 3. If val is NULL, result is NULL
                 // 4. If low is NULL or high is NULL (and we haven't jumped), result is NULL
                 // 5. Otherwise, val is in range, result is TRUE
+
+                // Extract collation from COLLATE wrapper or column definition
+                let (inner_val_expr, collation) = match val_expr.as_ref() {
+                    Expr::Collate {
+                        expr: inner,
+                        collation,
+                    } => (inner.as_ref(), Some(collation.clone())),
+                    _ => {
+                        // If no explicit COLLATE, check if the expression is a column
+                        // with a non-default collation in its schema definition
+                        let col_collation = self.get_expr_collation(val_expr.as_ref());
+                        (val_expr.as_ref(), col_collation)
+                    }
+                };
+
                 let val_reg = self.alloc_reg();
                 let low_reg = self.alloc_reg();
                 let high_reg = self.alloc_reg();
 
-                self.compile_expr(val_expr, val_reg)?;
+                self.compile_expr(inner_val_expr, val_reg)?;
                 self.compile_expr(low, low_reg)?;
                 self.compile_expr(high, high_reg)?;
 
@@ -8111,8 +8175,8 @@ impl<'s> SelectCompiler<'s> {
                 let end_label = self.alloc_label();
 
                 // Determine affinity for comparisons
-                let low_affinity = self.get_comparison_affinity(val_expr, low);
-                let high_affinity = self.get_comparison_affinity(val_expr, high);
+                let low_affinity = self.get_comparison_affinity(inner_val_expr, low);
+                let high_affinity = self.get_comparison_affinity(inner_val_expr, high);
 
                 // First check if val is NULL - if so, result is NULL
                 self.emit_with_p5(Opcode::IsNull, val_reg, null_label, 0, P4::Unused, 0);
@@ -8120,27 +8184,49 @@ impl<'s> SelectCompiler<'s> {
                 // Check val > high first (skip if high is NULL - can't determine yet)
                 self.emit(Opcode::IsNull, high_reg, check_low_label, 0, P4::Unused);
                 // Gt P1 P2 P3: jumps if r[P3] > r[P1], so P1=high, P3=val
-                self.emit_with_p5(
-                    Opcode::Gt,
-                    high_reg,
-                    false_label,
-                    val_reg,
-                    P4::Unused,
-                    high_affinity,
-                );
+                if let Some(ref coll) = collation {
+                    self.emit_with_p5(
+                        Opcode::Gt,
+                        high_reg,
+                        false_label,
+                        val_reg,
+                        P4::Collation(coll.clone()),
+                        0, // Use collation instead of affinity
+                    );
+                } else {
+                    self.emit_with_p5(
+                        Opcode::Gt,
+                        high_reg,
+                        false_label,
+                        val_reg,
+                        P4::Unused,
+                        high_affinity,
+                    );
+                }
 
                 // Check val < low (skip if low is NULL - can't determine yet)
                 self.resolve_label(check_low_label, self.current_addr());
                 self.emit(Opcode::IsNull, low_reg, check_nulls_label, 0, P4::Unused);
                 // Lt P1 P2 P3: jumps if r[P3] < r[P1], so P1=low, P3=val
-                self.emit_with_p5(
-                    Opcode::Lt,
-                    low_reg,
-                    false_label,
-                    val_reg,
-                    P4::Unused,
-                    low_affinity,
-                );
+                if let Some(ref coll) = collation {
+                    self.emit_with_p5(
+                        Opcode::Lt,
+                        low_reg,
+                        false_label,
+                        val_reg,
+                        P4::Collation(coll.clone()),
+                        0, // Use collation instead of affinity
+                    );
+                } else {
+                    self.emit_with_p5(
+                        Opcode::Lt,
+                        low_reg,
+                        false_label,
+                        val_reg,
+                        P4::Unused,
+                        low_affinity,
+                    );
+                }
 
                 // If we reach here, val is not definitively out of range
                 // Check if either bound is NULL - if so, result is NULL

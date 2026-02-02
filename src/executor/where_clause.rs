@@ -200,6 +200,11 @@ pub struct WhereTerm {
     /// "BINARY" for case-sensitive LIKE, "NOCASE" for case-insensitive
     /// None means any collation is acceptable
     pub required_collation: Option<String>,
+
+    /// Bitmask of tables used in the right-hand side of a comparison
+    /// For range/equality terms, this tracks which tables the bound value depends on
+    /// If this overlaps with the target table, the term can't be used for index seeking
+    pub rhs_table_mask: u64,
 }
 
 /// Operator type for a WHERE term
@@ -237,6 +242,7 @@ impl WhereTerm {
             or_terms: Vec::new(),
             eval_cost,
             required_collation: None,
+            rhs_table_mask: 0,
         }
     }
 
@@ -810,7 +816,7 @@ impl QueryPlanner {
             term.mask = where_expr::expr_usage_with_columns(term.expr.as_ref(), &table_usage_info);
             term.prereq = term.mask;
             // Determine operator type and selectivity
-            Self::analyze_term_expr_static(&table_info, term)?;
+            Self::analyze_term_expr_static(&table_info, &table_usage_info, term)?;
         }
 
         // LIKE index optimization: generate virtual range terms for LIKE patterns
@@ -968,7 +974,7 @@ impl QueryPlanner {
                 lower_term.mask =
                     where_expr::expr_usage_with_columns(lower_term.expr.as_ref(), table_usage_info);
                 lower_term.prereq = lower_term.mask;
-                Self::analyze_term_expr_static(table_info, &mut lower_term)?;
+                Self::analyze_term_expr_static(table_info, table_usage_info, &mut lower_term)?;
                 lower_term.flags |= WhereTermFlags::INDEX_CONSTRAINT;
                 self.where_clause.add_term(lower_term);
 
@@ -992,7 +998,7 @@ impl QueryPlanner {
                 upper_term.mask =
                     where_expr::expr_usage_with_columns(upper_term.expr.as_ref(), table_usage_info);
                 upper_term.prereq = upper_term.mask;
-                Self::analyze_term_expr_static(table_info, &mut upper_term)?;
+                Self::analyze_term_expr_static(table_info, table_usage_info, &mut upper_term)?;
                 upper_term.flags |= WhereTermFlags::INDEX_CONSTRAINT;
                 self.where_clause.add_term(upper_term);
             }
@@ -1004,6 +1010,7 @@ impl QueryPlanner {
     /// Analyze a single term's expression (static version for borrow checker)
     fn analyze_term_expr_static(
         table_info: &[(String, Option<String>, u64, Vec<String>, i32, Vec<String>)],
+        table_usage_info: &[(String, Option<String>, u64, Vec<String>)],
         term: &mut WhereTerm,
     ) -> Result<()> {
         let needs_commute = match term.expr.as_ref() {
@@ -1068,6 +1075,10 @@ impl QueryPlanner {
                 if term.op == Some(TermOp::Eq) || term.op == Some(TermOp::Is) {
                     Self::analyze_right_column_ref(table_info, term, right)?;
                 }
+                // Compute the RHS table mask - which tables does the bound value depend on?
+                // This is used to determine if the bound can be computed before reading the row.
+                term.rhs_table_mask =
+                    where_expr::expr_usage_with_columns(right.as_ref(), table_usage_info);
             }
 
             Expr::IsNull { negated, expr } => {
@@ -1645,9 +1656,19 @@ impl QueryPlanner {
 
                 if prereqs_satisfied && term.is_index_usable() {
                     if term.is_equality() {
-                        usable_eq_terms.push(term);
+                        // For equality terms, also check RHS doesn't depend on current table
+                        if term.rhs_table_mask & table.mask == 0 {
+                            usable_eq_terms.push(term);
+                        }
                     } else if term.is_range() {
-                        usable_range_terms.push(term);
+                        // For range terms, we can only use them for index seeking if the
+                        // bound value (RHS) doesn't depend on the current table.
+                        // E.g., "w BETWEEN 5 AND 65-y" where y is from the same table:
+                        // - "w >= 5" has RHS=5 (literal, no table dependency) -> usable
+                        // - "w <= 65-y" has RHS depending on current table -> NOT usable for index
+                        if term.rhs_table_mask & table.mask == 0 {
+                            usable_range_terms.push(term);
+                        }
                     }
                     total_selectivity *= term.selectivity;
                     // Note: used_terms is populated AFTER choosing the best plan,

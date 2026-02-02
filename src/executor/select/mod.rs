@@ -3097,12 +3097,64 @@ impl<'s> SelectCompiler<'s> {
         // Offset in sorter is num_group_cols + num_agg_args
         let non_agg_sorter_offset = num_group_cols + num_agg_args;
 
-        // Make record and insert into sorter (group cols + agg args + having agg args + non-agg cols)
+        // Copy all values into contiguous registers for MakeRecord.
+        // compile_expr allocates temporary registers, so the result registers may not be contiguous.
         let total_cols = group_regs.1 + agg_arg_regs.1 + having_agg_args_count + non_agg_count;
+        let contiguous_base = self.alloc_regs(total_cols);
+        let mut dest_offset = 0;
+
+        // Copy group columns
+        for i in 0..group_regs.1 {
+            self.emit(
+                Opcode::Copy,
+                group_regs.0 + i as i32,
+                contiguous_base + dest_offset,
+                0,
+                P4::Unused,
+            );
+            dest_offset += 1;
+        }
+
+        // Copy aggregate arguments
+        for i in 0..agg_arg_regs.1 {
+            self.emit(
+                Opcode::Copy,
+                agg_arg_regs.0 + i as i32,
+                contiguous_base + dest_offset,
+                0,
+                P4::Unused,
+            );
+            dest_offset += 1;
+        }
+
+        // Copy HAVING aggregate arguments (they follow immediately after regular agg args)
+        for i in 0..having_agg_args_count {
+            self.emit(
+                Opcode::Copy,
+                agg_arg_regs.0 + agg_arg_regs.1 as i32 + i as i32,
+                contiguous_base + dest_offset,
+                0,
+                P4::Unused,
+            );
+            dest_offset += 1;
+        }
+
+        // Copy non-aggregate result columns
+        for i in 0..non_agg_count {
+            self.emit(
+                Opcode::Copy,
+                non_agg_base_reg + i as i32,
+                contiguous_base + dest_offset,
+                0,
+                P4::Unused,
+            );
+            dest_offset += 1;
+        }
+        // MakeRecord from the contiguous block
         let record_reg = self.alloc_reg();
         self.emit(
             Opcode::MakeRecord,
-            group_regs.0,
+            contiguous_base,
             total_cols as i32,
             record_reg,
             P4::Unused,
@@ -3172,6 +3224,11 @@ impl<'s> SelectCompiler<'s> {
             P4::Unused,
         );
 
+        // Flag to track if this is the first group (0 = first, 1 = not first)
+        // We can't use IsNull on prev_group_regs because the first group's key might be NULL
+        let first_group_flag = self.alloc_reg();
+        self.emit(Opcode::Integer, 0, first_group_flag, 0, P4::Unused);
+
         // Allocate registers to store non-aggregate values for the current group
         // These are updated during accumulation and used during finalization
         let prev_non_agg_regs = if non_agg_count > 0 {
@@ -3216,7 +3273,18 @@ impl<'s> SelectCompiler<'s> {
             );
         }
 
-        // Compare with previous group
+        // Check if this is the first row - must be done BEFORE Compare because
+        // if the first group key is NULL, it would compare equal to the initialized NULL prev_group_regs
+        let first_group_label = self.alloc_label();
+        self.emit(
+            Opcode::IfNot,
+            first_group_flag,
+            first_group_label,
+            0,
+            P4::Unused,
+        );
+
+        // Compare with previous group (only after first row has been processed)
         let same_group_label = self.alloc_label();
         self.emit(
             Opcode::Compare,
@@ -3228,17 +3296,7 @@ impl<'s> SelectCompiler<'s> {
         // Jump to same_group_label when compare result = 0 (same group)
         self.emit(Opcode::Jump, 0, same_group_label, 0, P4::Unused);
 
-        // New group - output previous group if not first
-        // Skip output if prev_group is NULL (first group)
-        // Use IsNull instead of IfNot because 0 is a valid group key but IfNot treats 0 as falsy
-        let first_group_label = self.alloc_label();
-        self.emit(
-            Opcode::IsNull,
-            prev_group_regs,
-            first_group_label,
-            0,
-            P4::Unused,
-        );
+        // New group - output previous group (we know it's not the first because we checked above)
 
         // Finalize and output previous group
         // Save column names length - finalize_aggregates_with_group adds to result_column_names
@@ -3290,6 +3348,9 @@ impl<'s> SelectCompiler<'s> {
 
         self.resolve_label(first_group_label, self.current_addr());
 
+        // Mark that we've processed at least one group
+        self.emit(Opcode::Integer, 1, first_group_flag, 0, P4::Unused);
+
         // Reset aggregates for new group
         self.reset_aggregates(&agg_regs)?;
 
@@ -3302,6 +3363,25 @@ impl<'s> SelectCompiler<'s> {
                 0,
                 P4::Unused,
             );
+        }
+
+        // Copy non-aggregate values from sorter to saved registers
+        // This is done BEFORE same_group_label so it only happens on the FIRST row
+        // of each group (not on subsequent rows where we jump directly to same_group_label)
+        if let Some(prev_regs) = prev_non_agg_regs {
+            for (idx, maybe_offset) in non_agg_indices.iter().enumerate() {
+                if let Some(offset) = maybe_offset {
+                    let sorter_col = (non_agg_sorter_offset + offset) as i32;
+                    let dest_reg = prev_regs + *offset as i32;
+                    self.emit(
+                        Opcode::Column,
+                        sorter_cursor,
+                        sorter_col,
+                        dest_reg,
+                        P4::Unused,
+                    );
+                }
+            }
         }
 
         self.resolve_label(same_group_label, self.current_addr());
@@ -3324,25 +3404,6 @@ impl<'s> SelectCompiler<'s> {
                     &mut having_agg_idx,
                     &mut having_col_idx,
                 )?;
-            }
-        }
-
-        // Copy non-aggregate values from sorter to saved registers
-        // This captures the values for the current group (overwriting on each row,
-        // so we get one representative value per group)
-        if let Some(prev_regs) = prev_non_agg_regs {
-            for (idx, maybe_offset) in non_agg_indices.iter().enumerate() {
-                if let Some(offset) = maybe_offset {
-                    let sorter_col = (non_agg_sorter_offset + offset) as i32;
-                    let dest_reg = prev_regs + *offset as i32;
-                    self.emit(
-                        Opcode::Column,
-                        sorter_cursor,
-                        sorter_col,
-                        dest_reg,
-                        P4::Unused,
-                    );
-                }
             }
         }
 
@@ -10258,10 +10319,12 @@ impl<'s> SelectCompiler<'s> {
     }
 
     fn compile_expressions(&mut self, exprs: &[Expr]) -> Result<(i32, usize)> {
-        let base_reg = self.next_reg;
-        for expr in exprs {
-            let reg = self.alloc_reg();
-            self.compile_expr(expr, reg)?;
+        // Pre-allocate all destination registers first to ensure they're contiguous.
+        // compile_expr may allocate temporary registers internally, so allocating
+        // one-at-a-time would result in non-contiguous dest registers.
+        let base_reg = self.alloc_regs(exprs.len());
+        for (i, expr) in exprs.iter().enumerate() {
+            self.compile_expr(expr, base_reg + i as i32)?;
         }
         Ok((base_reg, exprs.len()))
     }

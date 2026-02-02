@@ -10147,9 +10147,9 @@ impl<'s> SelectCompiler<'s> {
         columns: &[ResultColumn],
         group_by: Option<&[Expr]>,
     ) -> Result<(i32, usize, Vec<Option<usize>>)> {
-        let base_reg = self.next_reg;
-        let mut count = 0;
-        let mut indices = Vec::with_capacity(columns.len());
+        // First pass: count how many non-agg columns we have
+        let mut non_agg_count = 0;
+        let mut is_non_agg: Vec<bool> = Vec::with_capacity(columns.len());
 
         for col in columns {
             if let ResultColumn::Expr { expr, .. } = col {
@@ -10159,13 +10159,34 @@ impl<'s> SelectCompiler<'s> {
                         .map(|gb| self.find_matching_group_expr(expr, gb).is_some())
                         .unwrap_or(false);
                     if !is_group_col {
-                        let reg = self.alloc_reg();
-                        self.compile_expr(expr, reg)?;
-                        indices.push(Some(count));
-                        count += 1;
+                        is_non_agg.push(true);
+                        non_agg_count += 1;
                     } else {
-                        indices.push(None);
+                        is_non_agg.push(false);
                     }
+                } else {
+                    is_non_agg.push(false);
+                }
+            } else {
+                is_non_agg.push(false);
+            }
+        }
+
+        // Pre-allocate all destination registers to ensure they're contiguous
+        // compile_expr may allocate temp registers, so we must reserve space first
+        let base_reg = self.alloc_regs(non_agg_count);
+
+        // Second pass: compile non-agg expressions into pre-allocated registers
+        let mut count = 0;
+        let mut indices = Vec::with_capacity(columns.len());
+
+        for (i, col) in columns.iter().enumerate() {
+            if is_non_agg[i] {
+                if let ResultColumn::Expr { expr, .. } = col {
+                    let dest_reg = base_reg + count as i32;
+                    self.compile_expr(expr, dest_reg)?;
+                    indices.push(Some(count));
+                    count += 1;
                 } else {
                     indices.push(None);
                 }

@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::{Error, ErrorCode, Result};
-use crate::parser::ast::LikeOp;
+use crate::parser::ast::{self, LikeOp};
+use crate::parser::grammar::Parser;
 use crate::types::Pgno;
 
 // ============================================================================
@@ -761,11 +762,12 @@ fn extract_generated_column(col_def: &str, col_def_upper: &str) -> Option<Genera
             } else {
                 GeneratedStorage::Virtual
             };
-            // Parse the expression string into a schema Expr
-            // For simple literals like 'Y', we can handle them directly
+            // Parse the expression string into a schema Expr using the SQL parser
             let expr_str = expr_str.trim();
-            let expr = if expr_str.starts_with('\'') && expr_str.ends_with('\'') {
-                // String literal
+            let expr = if let Some(parsed) = parse_expr_string(expr_str) {
+                parsed
+            } else if expr_str.starts_with('\'') && expr_str.ends_with('\'') {
+                // String literal fallback
                 let s = &expr_str[1..expr_str.len() - 1];
                 Expr::String(s.replace("''", "'"))
             } else if let Ok(n) = expr_str.parse::<i64>() {
@@ -775,11 +777,196 @@ fn extract_generated_column(col_def: &str, col_def_upper: &str) -> Option<Genera
             } else if expr_str.eq_ignore_ascii_case("NULL") {
                 Expr::Null
             } else {
-                // For complex expressions, we would need to parse them properly
-                // For now, store as a simple column reference or string
-                Expr::String(expr_str.to_string())
+                // Fallback: treat as a simple column reference
+                Expr::Column {
+                    table: None,
+                    column: expr_str.to_string(),
+                }
             };
             return Some(GeneratedColumn { expr, storage });
+        }
+    }
+    None
+}
+
+/// Convert a parser AST expression to a schema expression
+fn ast_expr_to_schema_expr(ast_expr: &ast::Expr) -> Expr {
+    match ast_expr {
+        ast::Expr::Literal(lit) => match lit {
+            ast::Literal::Null => Expr::Null,
+            ast::Literal::Integer(i) => Expr::Integer(*i),
+            ast::Literal::Float(f) => Expr::Real(*f),
+            ast::Literal::String(s) => Expr::String(s.clone()),
+            ast::Literal::Blob(b) => Expr::Blob(b.clone()),
+            ast::Literal::CurrentTime => Expr::CurrentTime,
+            ast::Literal::CurrentDate => Expr::CurrentDate,
+            ast::Literal::CurrentTimestamp => Expr::CurrentTimestamp,
+            ast::Literal::Bool(b) => Expr::Integer(if *b { 1 } else { 0 }),
+        },
+        ast::Expr::Column(col_ref) => Expr::Column {
+            table: col_ref.table.clone(),
+            column: col_ref.column.clone(),
+        },
+        ast::Expr::Binary { op, left, right } => {
+            let schema_op = match op {
+                ast::BinaryOp::Add => BinaryOp::Add,
+                ast::BinaryOp::Sub => BinaryOp::Sub,
+                ast::BinaryOp::Mul => BinaryOp::Mul,
+                ast::BinaryOp::Div => BinaryOp::Div,
+                ast::BinaryOp::Mod => BinaryOp::Mod,
+                ast::BinaryOp::Concat => BinaryOp::Concat,
+                ast::BinaryOp::Eq => BinaryOp::Eq,
+                ast::BinaryOp::Ne => BinaryOp::Ne,
+                ast::BinaryOp::Lt => BinaryOp::Lt,
+                ast::BinaryOp::Le => BinaryOp::Le,
+                ast::BinaryOp::Gt => BinaryOp::Gt,
+                ast::BinaryOp::Ge => BinaryOp::Ge,
+                ast::BinaryOp::And => BinaryOp::And,
+                ast::BinaryOp::Or => BinaryOp::Or,
+                ast::BinaryOp::BitAnd => BinaryOp::BitAnd,
+                ast::BinaryOp::BitOr => BinaryOp::BitOr,
+                ast::BinaryOp::ShiftLeft => BinaryOp::LeftShift,
+                ast::BinaryOp::ShiftRight => BinaryOp::RightShift,
+                ast::BinaryOp::Is => BinaryOp::Is,
+                ast::BinaryOp::IsNot => BinaryOp::IsNot,
+                // JSON operators are not typically used in generated columns
+                ast::BinaryOp::JsonExtract | ast::BinaryOp::JsonExtractText => BinaryOp::Concat,
+            };
+            Expr::BinaryOp {
+                left: Box::new(ast_expr_to_schema_expr(left)),
+                op: schema_op,
+                right: Box::new(ast_expr_to_schema_expr(right)),
+            }
+        }
+        ast::Expr::Unary { op, expr } => {
+            let schema_op = match op {
+                ast::UnaryOp::Neg => UnaryOp::Neg,
+                ast::UnaryOp::Not => UnaryOp::Not,
+                ast::UnaryOp::BitNot => UnaryOp::BitNot,
+                ast::UnaryOp::Pos => UnaryOp::Plus,
+            };
+            Expr::UnaryOp {
+                op: schema_op,
+                operand: Box::new(ast_expr_to_schema_expr(expr)),
+            }
+        }
+        ast::Expr::Function(func) => {
+            let args = match &func.args {
+                ast::FunctionArgs::Star => vec![],
+                ast::FunctionArgs::Exprs(exprs) => {
+                    exprs.iter().map(ast_expr_to_schema_expr).collect()
+                }
+            };
+            Expr::Function {
+                name: func.name.clone(),
+                args,
+                distinct: func.distinct,
+            }
+        }
+        ast::Expr::Cast { expr, type_name } => Expr::Cast {
+            expr: Box::new(ast_expr_to_schema_expr(expr)),
+            type_name: type_name.name.clone(),
+        },
+        ast::Expr::Collate { expr, collation } => Expr::Collate {
+            expr: Box::new(ast_expr_to_schema_expr(expr)),
+            collation: collation.clone(),
+        },
+        ast::Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr: Box::new(ast_expr_to_schema_expr(expr)),
+            negated: *negated,
+        },
+        ast::Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => Expr::Between {
+            expr: Box::new(ast_expr_to_schema_expr(expr)),
+            low: Box::new(ast_expr_to_schema_expr(low)),
+            high: Box::new(ast_expr_to_schema_expr(high)),
+            negated: *negated,
+        },
+        ast::Expr::In {
+            expr,
+            list,
+            negated,
+        } => {
+            let values = match list {
+                ast::InList::Values(exprs) => exprs.iter().map(ast_expr_to_schema_expr).collect(),
+                ast::InList::Subquery(_) | ast::InList::Table(_) => vec![], // Subqueries/tables not supported in generated columns
+            };
+            Expr::In {
+                expr: Box::new(ast_expr_to_schema_expr(expr)),
+                list: values,
+                negated: *negated,
+            }
+        }
+        ast::Expr::Like {
+            expr,
+            pattern,
+            escape,
+            op,
+            negated,
+        } => Expr::Like {
+            expr: Box::new(ast_expr_to_schema_expr(expr)),
+            pattern: Box::new(ast_expr_to_schema_expr(pattern)),
+            escape: escape
+                .as_ref()
+                .map(|e| Box::new(ast_expr_to_schema_expr(e))),
+            op: *op,
+            negated: *negated,
+        },
+        ast::Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => Expr::Case {
+            operand: operand
+                .as_ref()
+                .map(|e| Box::new(ast_expr_to_schema_expr(e))),
+            when_clauses: when_clauses
+                .iter()
+                .map(|wc| {
+                    (
+                        ast_expr_to_schema_expr(&wc.when),
+                        ast_expr_to_schema_expr(&wc.then),
+                    )
+                })
+                .collect(),
+            else_clause: else_clause
+                .as_ref()
+                .map(|e| Box::new(ast_expr_to_schema_expr(e))),
+        },
+        ast::Expr::Variable(var) => match var {
+            ast::Variable::Numbered(n) => Expr::Parameter {
+                index: *n,
+                name: None,
+            },
+            ast::Variable::Named { name, .. } => Expr::Parameter {
+                index: None,
+                name: Some(name.clone()),
+            },
+        },
+        // For unsupported expressions, return NULL
+        _ => Expr::Null,
+    }
+}
+
+/// Try to parse an expression string using the SQL parser
+fn parse_expr_string(expr_str: &str) -> Option<Expr> {
+    // Wrap the expression in a SELECT to make it a valid SQL statement
+    let sql = format!("SELECT {}", expr_str);
+    let mut parser = Parser::new(&sql).ok()?;
+    let stmt = parser.parse_stmt().ok()?;
+
+    // Extract the expression from the SELECT statement
+    if let crate::parser::ast::Stmt::Select(select) = stmt {
+        if let crate::parser::ast::SelectBody::Select(body) = &select.body {
+            if let Some(first_col) = body.columns.first() {
+                if let crate::parser::ast::ResultColumn::Expr { expr, .. } = first_col {
+                    return Some(ast_expr_to_schema_expr(expr));
+                }
+            }
         }
     }
     None

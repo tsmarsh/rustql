@@ -2459,6 +2459,8 @@ impl<'s> SelectCompiler<'s> {
         core: &SelectCore,
         dest: &SelectDest,
     ) -> Result<()> {
+        use crate::executor::window::{WindowFunc, WindowFuncType};
+
         // Create a WindowCompiler to analyze and compile window functions
         let mut window_compiler = WindowCompiler::new(self.next_reg, self.next_cursor);
 
@@ -2471,11 +2473,41 @@ impl<'s> SelectCompiler<'s> {
         }
 
         // Group by window specification
-        let windows = window_compiler.group_by_window(window_funcs)?;
+        let windows = window_compiler.group_by_window(window_funcs.clone())?;
 
         // Update our register/cursor counters
         self.next_reg = window_compiler.next_reg();
         self.next_cursor = window_compiler.next_cursor();
+
+        // For aggregate window functions with empty OVER(), we need to:
+        // 1. Allocate accumulator registers
+        // 2. Emit AggStep during row collection
+        // 3. Emit AggFinal after collection
+        // 4. Use finalized value during output
+        //
+        // Identify simple aggregate window functions (AGG() OVER() with no partition/order)
+        let mut simple_agg_window_funcs: Vec<(usize, String, Vec<Expr>, i32, i32)> = Vec::new(); // (col_index, agg_name, args, accum_reg, final_reg)
+        for func in &window_funcs {
+            let is_empty_spec = func.spec.partition_by.is_none()
+                && func.spec.order_by.is_none()
+                && func.spec.frame.is_none();
+
+            if is_empty_spec {
+                if let WindowFuncType::Aggregate(agg_name) = &func.func_type {
+                    let accum_reg = self.alloc_reg();
+                    let final_reg = self.alloc_reg();
+                    // Initialize accumulator to NULL
+                    self.emit(Opcode::Null, 0, accum_reg, 0, P4::Unused);
+                    simple_agg_window_funcs.push((
+                        func.col_index,
+                        agg_name.clone(),
+                        func.args.clone(),
+                        accum_reg,
+                        final_reg,
+                    ));
+                }
+            }
+        }
 
         // Step 1: Open ephemeral table to store intermediate results
         let eph_cursor = self.alloc_cursor();
@@ -2504,7 +2536,7 @@ impl<'s> SelectCompiler<'s> {
         }
 
         // The innermost loop label is used for WHERE skip target
-        let loop_start_label = *loop_labels.last().unwrap_or(&self.alloc_label());
+        let _loop_start_label = *loop_labels.last().unwrap_or(&self.alloc_label());
 
         // Evaluate WHERE clause
         let where_skip_label = if let Some(where_expr) = &core.where_clause {
@@ -2517,6 +2549,31 @@ impl<'s> SelectCompiler<'s> {
 
         // Evaluate all result columns (except window functions get placeholders)
         let (result_base, result_count) = self.compile_result_columns_for_window(core)?;
+
+        // For simple aggregate window functions, emit AggStep to accumulate values
+        for (_, agg_name, args, accum_reg, _) in &simple_agg_window_funcs {
+            // Compile arguments
+            let argc = args.len();
+            let arg_base = self.alloc_regs(argc.max(1));
+
+            if argc == 0 {
+                // For COUNT(*) etc., use NULL argument
+                self.emit(Opcode::Null, 0, arg_base, 0, P4::Unused);
+            } else {
+                for (i, arg) in args.iter().enumerate() {
+                    self.compile_expr(arg, arg_base + i as i32)?;
+                }
+            }
+
+            // Emit AggStep: P1=argc, P2=arg_base, P3=accum, P4=func_name
+            self.emit(
+                Opcode::AggStep,
+                argc.max(1) as i32,
+                arg_base,
+                *accum_reg,
+                P4::Text(agg_name.clone()),
+            );
+        }
 
         // Store into ephemeral table
         let record_reg = self.alloc_reg();
@@ -2553,16 +2610,28 @@ impl<'s> SelectCompiler<'s> {
             self.resolve_label(done_labels[i], self.current_addr());
         }
 
-        // Step 3: Now process window functions
-        // For each window group, sort by PARTITION BY + ORDER BY, then compute
-        let _window_ops = window_compiler.take_ops();
-        window_compiler.compile_window_functions(&windows, result_base, result_count)?;
-        let window_ops = window_compiler.take_ops();
-
-        // Add window operations to our ops
-        for op in window_ops {
-            self.ops.push(op);
+        // Finalize simple aggregate window functions
+        for (_, agg_name, _, accum_reg, final_reg) in &simple_agg_window_funcs {
+            // Emit AggFinal: P1=accum, P2=dest, P4=func_name
+            self.emit(
+                Opcode::AggFinal,
+                *accum_reg,
+                *final_reg,
+                0,
+                P4::Text(agg_name.clone()),
+            );
         }
+
+        // Step 3: Now process window functions
+        // (Skip the old window compiler ops as we handle simple aggregates directly)
+        let _window_ops = window_compiler.take_ops();
+        // Only call compile_window_functions for non-simple window functions
+        // For now we skip this as we handle simple aggregates directly
+        // window_compiler.compile_window_functions(&windows, result_base, result_count)?;
+        // let window_ops = window_compiler.take_ops();
+        // for op in window_ops {
+        //     self.ops.push(op);
+        // }
 
         // Step 4: Read from ephemeral table and output with window results
         let done_label = self.alloc_label();
@@ -2570,15 +2639,34 @@ impl<'s> SelectCompiler<'s> {
 
         let read_loop = self.current_addr();
 
-        // Read column values
+        // Build a map of col_index -> final_reg for simple aggregate window functions
+        let simple_agg_map: HashMap<usize, i32> = simple_agg_window_funcs
+            .iter()
+            .map(|(col_idx, _, _, _, final_reg)| (*col_idx, *final_reg))
+            .collect();
+
+        // Read column values, but for simple aggregate window functions,
+        // use the finalized value instead of reading from ephemeral table
         for i in 0..result_count {
-            self.emit(
-                Opcode::Column,
-                eph_cursor,
-                i as i32,
-                result_base + i as i32,
-                P4::Unused,
-            );
+            if let Some(final_reg) = simple_agg_map.get(&i) {
+                // Use the finalized aggregate value
+                self.emit(
+                    Opcode::Copy,
+                    *final_reg,
+                    result_base + i as i32,
+                    0,
+                    P4::Unused,
+                );
+            } else {
+                // Read from ephemeral table
+                self.emit(
+                    Opcode::Column,
+                    eph_cursor,
+                    i as i32,
+                    result_base + i as i32,
+                    P4::Unused,
+                );
+            }
         }
 
         // Output the row
@@ -11270,6 +11358,88 @@ impl<'s> SelectCompiler<'s> {
         Ok(())
     }
 
+    /// Expand Star and TableStar in result columns to explicit column expressions.
+    /// This is needed for GROUP BY queries where we need to handle each column individually.
+    fn expand_result_columns(&self, columns: &[ResultColumn]) -> Vec<ResultColumn> {
+        let mut expanded = Vec::new();
+
+        for col in columns {
+            match col {
+                ResultColumn::Star => {
+                    // Expand * to all columns from all tables
+                    for table in &self.tables {
+                        if let Some(schema_table) = &table.schema_table {
+                            for col_def in &schema_table.columns {
+                                expanded.push(ResultColumn::Expr {
+                                    expr: Expr::Column(ColumnRef {
+                                        database: None,
+                                        table: Some(table.name.clone()),
+                                        column: col_def.name.clone(),
+                                        column_index: None,
+                                        source_text: None,
+                                    }),
+                                    alias: None,
+                                });
+                            }
+                        } else if let Some(subquery_cols) = &table.subquery_columns {
+                            for col_name in subquery_cols {
+                                expanded.push(ResultColumn::Expr {
+                                    expr: Expr::Column(ColumnRef {
+                                        database: None,
+                                        table: Some(table.name.clone()),
+                                        column: col_name.clone(),
+                                        column_index: None,
+                                        source_text: None,
+                                    }),
+                                    alias: None,
+                                });
+                            }
+                        }
+                    }
+                }
+                ResultColumn::TableStar(table_name) => {
+                    // Expand table.* to columns from that table
+                    for table in &self.tables {
+                        if table.name.eq_ignore_ascii_case(table_name) {
+                            if let Some(schema_table) = &table.schema_table {
+                                for col_def in &schema_table.columns {
+                                    expanded.push(ResultColumn::Expr {
+                                        expr: Expr::Column(ColumnRef {
+                                            database: None,
+                                            table: Some(table.name.clone()),
+                                            column: col_def.name.clone(),
+                                            column_index: None,
+                                            source_text: None,
+                                        }),
+                                        alias: None,
+                                    });
+                                }
+                            } else if let Some(subquery_cols) = &table.subquery_columns {
+                                for col_name in subquery_cols {
+                                    expanded.push(ResultColumn::Expr {
+                                        expr: Expr::Column(ColumnRef {
+                                            database: None,
+                                            table: Some(table.name.clone()),
+                                            column: col_name.clone(),
+                                            column_index: None,
+                                            source_text: None,
+                                        }),
+                                        alias: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                ResultColumn::Expr { .. } => {
+                    expanded.push(col.clone());
+                }
+            }
+        }
+
+        expanded
+    }
+
     fn finalize_aggregates(
         &mut self,
         columns: &[ResultColumn],
@@ -11285,6 +11455,10 @@ impl<'s> SelectCompiler<'s> {
         group_by: Option<&[Expr]>,
         group_regs: i32,
     ) -> Result<(i32, usize)> {
+        // Expand Star and TableStar to explicit column expressions
+        let expanded_columns = self.expand_result_columns(columns);
+        let columns = &expanded_columns;
+
         // Pre-allocate all destination registers to ensure they are contiguous
         // This is important because expression compilation may allocate additional
         // temporary registers, which would make the result registers non-contiguous
@@ -11893,6 +12067,10 @@ impl<'s> SelectCompiler<'s> {
         columns: &[ResultColumn],
         group_by: Option<&[Expr]>,
     ) -> usize {
+        // Expand Star and TableStar to explicit column expressions
+        let expanded_columns = self.expand_result_columns(columns);
+        let columns = &expanded_columns;
+
         let mut count = 0;
         for col in columns {
             if let ResultColumn::Expr { expr, .. } = col {
@@ -11917,6 +12095,10 @@ impl<'s> SelectCompiler<'s> {
         columns: &[ResultColumn],
         group_by: Option<&[Expr]>,
     ) -> Result<(i32, usize, Vec<Option<usize>>)> {
+        // Expand Star and TableStar to explicit column expressions
+        let expanded_columns = self.expand_result_columns(columns);
+        let columns = &expanded_columns;
+
         // First pass: count how many non-agg columns we have
         let mut non_agg_count = 0;
         let mut is_non_agg: Vec<bool> = Vec::with_capacity(columns.len());

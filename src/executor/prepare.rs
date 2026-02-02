@@ -36,6 +36,9 @@ pub struct CompiledStmt {
     pub read_only: bool,
     /// Statement type
     pub stmt_type: StmtType,
+    /// LIKE patterns with variable parameters that may need reprepare
+    /// Contains (param_index, is_case_sensitive) for each LIKE with a variable pattern
+    pub like_reprepare_info: Vec<(i32, bool)>,
 }
 
 /// Statement type
@@ -306,6 +309,187 @@ impl<'s> StatementCompiler<'s> {
         compiler
     }
 
+    /// Detect LIKE patterns with variable parameters that may benefit from reprepare
+    /// Returns list of (param_index, is_case_sensitive) for LIKE expressions where
+    /// the pattern is a variable parameter
+    fn detect_like_variable_patterns(&self, stmt: &Stmt) -> Vec<(i32, bool)> {
+        let mut results = Vec::new();
+        self.collect_like_variables(stmt, &mut results);
+        results
+    }
+
+    /// Recursively collect LIKE expressions with variable patterns
+    fn collect_like_variables(&self, stmt: &Stmt, results: &mut Vec<(i32, bool)>) {
+        match stmt {
+            Stmt::Select(select) => {
+                self.collect_like_variables_in_select(select, results);
+            }
+            Stmt::Update(update) => {
+                if let Some(ref where_clause) = update.where_clause {
+                    self.collect_like_variables_in_expr(where_clause, results);
+                }
+            }
+            Stmt::Delete(delete) => {
+                if let Some(ref where_clause) = delete.where_clause {
+                    self.collect_like_variables_in_expr(where_clause, results);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_like_variables_in_select(
+        &self,
+        select: &SelectStmt,
+        results: &mut Vec<(i32, bool)>,
+    ) {
+        // Process all SelectCores in the body (handles compound queries)
+        self.collect_like_variables_in_body(&select.body, results);
+    }
+
+    fn collect_like_variables_in_body(&self, body: &SelectBody, results: &mut Vec<(i32, bool)>) {
+        match body {
+            SelectBody::Select(core) => {
+                // Check WHERE clause
+                if let Some(ref where_clause) = core.where_clause {
+                    self.collect_like_variables_in_expr(where_clause, results);
+                }
+
+                // Check HAVING clause
+                if let Some(ref having) = core.having {
+                    self.collect_like_variables_in_expr(having, results);
+                }
+            }
+            SelectBody::Compound { left, right, .. } => {
+                self.collect_like_variables_in_body(left, results);
+                self.collect_like_variables_in_body(right, results);
+            }
+        }
+    }
+
+    fn collect_like_variables_in_expr(&self, expr: &Expr, results: &mut Vec<(i32, bool)>) {
+        match expr {
+            Expr::Like {
+                pattern,
+                op,
+                negated: false,
+                ..
+            } => {
+                // Check if the pattern is a variable
+                if let Some(param_idx) = self.extract_variable_index(pattern) {
+                    // Determine if this is case-sensitive
+                    // GLOB is always case-sensitive; LIKE depends on pragma
+                    let is_case_sensitive = matches!(op, LikeOp::Glob) || self.case_sensitive_like;
+                    results.push((param_idx, is_case_sensitive));
+                }
+            }
+            // Recurse into subexpressions
+            Expr::Binary { left, right, .. } => {
+                self.collect_like_variables_in_expr(left, results);
+                self.collect_like_variables_in_expr(right, results);
+            }
+            Expr::Unary { expr: inner, .. } => {
+                self.collect_like_variables_in_expr(inner, results);
+            }
+            Expr::Between {
+                expr: operand,
+                low,
+                high,
+                ..
+            } => {
+                self.collect_like_variables_in_expr(operand, results);
+                self.collect_like_variables_in_expr(low, results);
+                self.collect_like_variables_in_expr(high, results);
+            }
+            Expr::In {
+                expr: operand,
+                list,
+                ..
+            } => {
+                self.collect_like_variables_in_expr(operand, results);
+                if let InList::Values(exprs) = list {
+                    for e in exprs {
+                        self.collect_like_variables_in_expr(e, results);
+                    }
+                }
+            }
+            Expr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+                ..
+            } => {
+                if let Some(op) = operand {
+                    self.collect_like_variables_in_expr(op, results);
+                }
+                for when_clause in when_clauses {
+                    self.collect_like_variables_in_expr(&when_clause.when, results);
+                    self.collect_like_variables_in_expr(&when_clause.then, results);
+                }
+                if let Some(else_e) = else_clause {
+                    self.collect_like_variables_in_expr(else_e, results);
+                }
+            }
+            Expr::Collate { expr, .. } => {
+                self.collect_like_variables_in_expr(expr, results);
+            }
+            Expr::Cast { expr, .. } => {
+                self.collect_like_variables_in_expr(expr, results);
+            }
+            Expr::Function(func) => {
+                if let FunctionArgs::Exprs(args) = &func.args {
+                    for arg in args {
+                        self.collect_like_variables_in_expr(arg, results);
+                    }
+                }
+            }
+            Expr::Subquery(select) => {
+                self.collect_like_variables_in_select(select, results);
+            }
+            Expr::Exists { subquery, .. } => {
+                self.collect_like_variables_in_select(subquery, results);
+            }
+            _ => {}
+        }
+    }
+
+    /// Extract the parameter index if the expression is a variable
+    fn extract_variable_index(&self, expr: &Expr) -> Option<i32> {
+        // Unwrap Collate wrapper if present
+        let inner = match expr {
+            Expr::Collate { expr, .. } => expr.as_ref(),
+            other => other,
+        };
+
+        match inner {
+            Expr::Variable(var) => {
+                // Get the parameter index from our stored names
+                match var {
+                    Variable::Numbered(Some(idx)) => Some(*idx),
+                    Variable::Numbered(None) => {
+                        // Positional parameter - find its position
+                        // This is typically ?1, ?2, etc.
+                        Some(1)
+                    }
+                    Variable::Named { prefix, name } => {
+                        // Find this parameter in our list
+                        // prefix is ':', '@', or '$'
+                        let full_name = format!("{}{}", prefix, name);
+                        for (i, param_name) in self.param_names.iter().enumerate() {
+                            if let Some(pname) = param_name {
+                                if pname == &full_name || pname == name {
+                                    return Some((i + 1) as i32);
+                                }
+                            }
+                        }
+                        None
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Compile a SQL string to VDBE bytecode
     ///
     /// Returns the compiled statement and any remaining SQL (tail).
@@ -324,6 +508,9 @@ impl<'s> StatementCompiler<'s> {
         // Compile based on statement type
         let (ops, stmt_type, column_names, column_types) = self.compile_stmt(&stmt)?;
 
+        // Detect LIKE patterns with variable parameters for potential reprepare
+        let like_reprepare_info = self.detect_like_variable_patterns(&stmt);
+
         let compiled = CompiledStmt {
             ops,
             column_names,
@@ -332,6 +519,7 @@ impl<'s> StatementCompiler<'s> {
             param_names: self.param_names.clone(),
             read_only: stmt_type.is_read_only(),
             stmt_type,
+            like_reprepare_info,
         };
 
         Ok((compiled, tail))
@@ -3404,7 +3592,102 @@ impl<'s> StatementCompiler<'s> {
                     format!("RAISE({})", action_str)
                 }
             }
-            _ => "?".to_string(), // Fallback for complex expressions
+            Expr::Subquery(select) => {
+                // Scalar subquery - wrap SELECT in parentheses
+                format!("({})", self.select_to_sql(select))
+            }
+            Expr::Exists { subquery, negated } => {
+                let prefix = if *negated { "NOT EXISTS" } else { "EXISTS" };
+                format!("{} ({})", prefix, self.select_to_sql(subquery))
+            }
+            Expr::In {
+                expr,
+                list,
+                negated,
+            } => {
+                let neg = if *negated { " NOT" } else { "" };
+                let list_str = match list {
+                    InList::Values(vals) => vals
+                        .iter()
+                        .map(|v| self.expr_to_sql(v))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    InList::Subquery(sel) => self.select_to_sql(sel),
+                    InList::Table(name) => name.to_string(),
+                };
+                format!("({}{}IN ({}))", self.expr_to_sql(expr), neg, list_str)
+            }
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => {
+                let neg = if *negated { " NOT" } else { "" };
+                format!(
+                    "({}{}BETWEEN {} AND {})",
+                    self.expr_to_sql(expr),
+                    neg,
+                    self.expr_to_sql(low),
+                    self.expr_to_sql(high)
+                )
+            }
+            Expr::IsNull { expr, negated } => {
+                if *negated {
+                    format!("({} IS NOT NULL)", self.expr_to_sql(expr))
+                } else {
+                    format!("({} IS NULL)", self.expr_to_sql(expr))
+                }
+            }
+            Expr::IsDistinct {
+                left,
+                right,
+                negated,
+            } => {
+                if *negated {
+                    format!(
+                        "({} IS NOT DISTINCT FROM {})",
+                        self.expr_to_sql(left),
+                        self.expr_to_sql(right)
+                    )
+                } else {
+                    format!(
+                        "({} IS DISTINCT FROM {})",
+                        self.expr_to_sql(left),
+                        self.expr_to_sql(right)
+                    )
+                }
+            }
+            Expr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => {
+                let mut sql = String::from("CASE");
+                if let Some(op) = operand {
+                    sql.push(' ');
+                    sql.push_str(&self.expr_to_sql(op));
+                }
+                for when in when_clauses {
+                    sql.push_str(" WHEN ");
+                    sql.push_str(&self.expr_to_sql(&when.when));
+                    sql.push_str(" THEN ");
+                    sql.push_str(&self.expr_to_sql(&when.then));
+                }
+                if let Some(else_expr) = else_clause {
+                    sql.push_str(" ELSE ");
+                    sql.push_str(&self.expr_to_sql(else_expr));
+                }
+                sql.push_str(" END");
+                sql
+            }
+            Expr::Cast { expr, type_name } => {
+                format!("CAST({} AS {})", self.expr_to_sql(expr), type_name.name)
+            }
+            Expr::Collate { expr, collation } => {
+                format!("{} COLLATE {}", self.expr_to_sql(expr), collation)
+            }
+            _ => "?".to_string(), // Fallback for any remaining expressions
         }
     }
 

@@ -1847,10 +1847,11 @@ impl<'a> InsertCompiler<'a> {
             SelectCompiler::new()
         };
 
-        // Set starting register to avoid conflict with dest_reg
+        // Set starting register to avoid conflict with already-allocated registers
         // The subcompiler needs registers for intermediate values (WHERE clause, etc.)
-        // Start after dest_reg to avoid overwriting it
-        sub_compiler.set_register_base(dest_reg + 1, self.next_cursor);
+        // Use self.next_reg to avoid overwriting any registers in the current context
+        // (including column value registers allocated with alloc_regs)
+        sub_compiler.set_register_base(self.next_reg, self.next_cursor);
 
         // Compile with Set destination - copies first column to dest_reg
         let sub_dest = SelectDest::Set { reg: dest_reg };
@@ -1860,22 +1861,62 @@ impl<'a> InsertCompiler<'a> {
         let cursor_offset = self.next_cursor;
         let base_addr = self.ops.len() as i32;
 
-        // Inline the compiled ops, excluding Init/Halt/Transaction/Goto control flow wrapper
-        // We need to offset both cursors AND registers (except dest_reg which is already correct)
-        for mut op in sub_ops {
-            if op.opcode == Opcode::Init
+        // Build address mapping: old address -> new address
+        // We skip Init, Halt, Transaction, and the FINAL Goto (which is the jump from Transaction back to code)
+        // but keep internal Goto instructions used for control flow within the query
+        let mut addr_map: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
+        let mut new_addr = base_addr;
+        let sub_ops_len = sub_ops.len() as i32;
+
+        // First pass: determine which ops are kept and build address mapping
+        for (old_addr, op) in sub_ops.iter().enumerate() {
+            let old_addr = old_addr as i32;
+
+            // Skip control flow wrapper ops:
+            // - Init (always at start)
+            // - Halt (end of query body)
+            // - Transaction (setup)
+            // - Goto at the very end that jumps back to start (typically last op that jumps to addr 1)
+            let is_control_op = op.opcode == Opcode::Init
                 || op.opcode == Opcode::Halt
                 || op.opcode == Opcode::Transaction
-                || op.opcode == Opcode::Goto
-            {
+                || (op.opcode == Opcode::Goto && old_addr >= sub_ops_len - 2 && op.p2 <= 1);
+
+            if is_control_op {
+                // This op will be skipped, don't add to mapping
                 continue;
             }
 
-            // Adjust jump addresses
-            // Since we remove Init (at address 0), all internal addresses are shifted by 1
-            // So we need to adjust by (base_addr - 1) to account for this
+            addr_map.insert(old_addr, new_addr);
+            new_addr += 1;
+        }
+
+        // Calculate the end address (for jumps to Halt, which should go past the inlined code)
+        let end_addr = new_addr;
+
+        // Second pass: inline ops with adjusted addresses
+        for (old_addr, mut op) in sub_ops.into_iter().enumerate() {
+            let old_addr = old_addr as i32;
+
+            // Skip the same control ops we identified in the first pass
+            let is_control_op = op.opcode == Opcode::Init
+                || op.opcode == Opcode::Halt
+                || op.opcode == Opcode::Transaction
+                || (op.opcode == Opcode::Goto && old_addr >= sub_ops_len - 2 && op.p2 <= 1);
+
+            if is_control_op {
+                continue;
+            }
+
+            // Adjust jump addresses using the mapping
             if op.opcode.is_jump() && op.p2 > 0 {
-                op.p2 += base_addr - 1;
+                if let Some(&new_target) = addr_map.get(&op.p2) {
+                    op.p2 = new_target;
+                } else {
+                    // Jump target was a skipped instruction (like Halt)
+                    // Redirect to end of inlined code
+                    op.p2 = end_addr;
+                }
             }
 
             // Adjust cursor numbers for table operations

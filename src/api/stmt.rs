@@ -68,6 +68,12 @@ pub struct PreparedStmt {
     expired: bool,
     /// Schema generation when statement was prepared
     schema_generation: u64,
+    /// Needs reprepare for LIKE optimization with bound variables
+    /// Contains list of (param_index, is_case_sensitive) for LIKE patterns
+    /// that use variable parameters
+    like_reprepare_info: Vec<(i32, bool)>,
+    /// Has been reprepared for LIKE optimization
+    like_reprepared: bool,
 }
 
 impl PreparedStmt {
@@ -98,6 +104,8 @@ impl PreparedStmt {
             conn_ptr: None,
             expired: false,
             schema_generation: 0,
+            like_reprepare_info: Vec::new(),
+            like_reprepared: false,
         }
     }
 
@@ -132,6 +140,8 @@ impl PreparedStmt {
             conn_ptr: None,
             expired: false,
             schema_generation: 0,
+            like_reprepare_info: compiled.like_reprepare_info,
+            like_reprepared: false,
         }
     }
 
@@ -497,6 +507,26 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
             return Ok(StepResult::Done);
         }
 
+        // Check for LIKE optimization reprepare
+        // If we have LIKE patterns with variable parameters and haven't reprepared yet,
+        // check if the bound values have usable prefixes for optimization
+        // Skip if QPSG (Query Planner Stability Guarantee) is enabled
+        if !stmt.like_reprepare_info.is_empty() && !stmt.like_reprepared {
+            if let Some(conn_ptr) = stmt.conn_ptr {
+                let conn = unsafe { &mut *conn_ptr };
+                // Only reprepare if QPSG is disabled
+                if !conn.db_config.enable_qpsg
+                    && should_reprepare_for_like(&stmt.params, &stmt.like_reprepare_info)
+                {
+                    // Reprepare with bound values substituted
+                    if let Ok(new_ops) = reprepare_with_like_literals(conn, stmt) {
+                        stmt.ops = new_ops;
+                    }
+                }
+            }
+            stmt.like_reprepared = true;
+        }
+
         // Reset the sort and like counts before executing a new query
         reset_sort_count();
         reset_like_count();
@@ -759,6 +789,136 @@ fn eval_attach_expr(stmt: &PreparedStmt, expr: &Expr) -> Result<Value> {
             "unsupported ATTACH expression",
         )),
     }
+}
+
+/// Check if we should reprepare the statement for LIKE optimization
+/// Returns true if any bound value has a usable prefix for LIKE optimization
+fn should_reprepare_for_like(params: &[Value], like_info: &[(i32, bool)]) -> bool {
+    for (param_idx, _is_case_sensitive) in like_info {
+        if let Some(value) = params.get((*param_idx - 1) as usize) {
+            if let Value::Text(pattern) = value {
+                // Check if pattern has a usable prefix (doesn't start with wildcard)
+                if let Some(first_char) = pattern.chars().next() {
+                    // For LIKE: % and _ are wildcards
+                    // For GLOB: * and ? are wildcards (handled by is_case_sensitive check)
+                    if first_char != '%'
+                        && first_char != '_'
+                        && first_char != '*'
+                        && first_char != '?'
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Reprepare the statement with LIKE variable patterns replaced by their literal values
+/// This allows the query optimizer to generate efficient index-based LIKE plans
+fn reprepare_with_like_literals(
+    conn: &mut SqliteConnection,
+    stmt: &PreparedStmt,
+) -> Result<Vec<VdbeOp>> {
+    use crate::executor::prepare::compile_sql_with_full_config;
+
+    // Build a mapping of parameter indices to their literal values
+    let mut param_values: std::collections::HashMap<i32, String> = std::collections::HashMap::new();
+    for (param_idx, _is_case_sensitive) in &stmt.like_reprepare_info {
+        if let Some(Value::Text(pattern)) = stmt.params.get((*param_idx - 1) as usize) {
+            param_values.insert(*param_idx, pattern.clone());
+        }
+    }
+
+    if param_values.is_empty() {
+        return Err(Error::with_message(
+            ErrorCode::Error,
+            "no LIKE patterns to substitute",
+        ));
+    }
+
+    // Create modified SQL with literals substituted for the LIKE pattern variables
+    // This is a simple approach - we reparse and recompile with the schema
+    let modified_sql = substitute_like_params(&stmt.sql, &stmt.param_names, &param_values);
+
+    // Recompile with the schema
+    // We need to get the schema and lock it for reading
+    let main_db = conn
+        .find_db("main")
+        .ok_or_else(|| Error::with_message(ErrorCode::Error, "no main database"))?;
+
+    let main_schema = main_db
+        .schema
+        .as_ref()
+        .ok_or_else(|| Error::with_message(ErrorCode::Error, "no main schema"))?;
+
+    let main_schema_guard = main_schema
+        .read()
+        .map_err(|_| Error::with_message(ErrorCode::Error, "failed to lock main schema"))?;
+
+    // Get temp schema if available
+    let temp_schema_guard;
+    let temp_schema_ref = if conn.dbs.len() > 1 {
+        if let Some(ref ts) = conn.dbs[1].schema {
+            temp_schema_guard = ts
+                .read()
+                .map_err(|_| Error::with_message(ErrorCode::Error, "failed to lock temp schema"))?;
+            Some(&*temp_schema_guard)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Get attached schemas (we'll use an empty vec for simplicity)
+    let attached_schemas: Vec<(String, &crate::schema::Schema)> = Vec::new();
+
+    let compiled = compile_sql_with_full_config(
+        &modified_sql,
+        &*main_schema_guard,
+        temp_schema_ref,
+        attached_schemas,
+        conn.db_config.short_column_names,
+        conn.db_config.full_column_names,
+        conn.db_config.case_sensitive_like,
+        conn.db_config.enable_view,
+        Some(conn.vtab_registry.clone()),
+        conn.db_config.dqs_dml,
+    )?;
+
+    Ok(compiled.0.ops)
+}
+
+/// Substitute LIKE pattern variables with their literal values in SQL
+fn substitute_like_params(
+    sql: &str,
+    param_names: &[Option<String>],
+    param_values: &std::collections::HashMap<i32, String>,
+) -> String {
+    let mut result = sql.to_string();
+
+    // For each parameter with a value, replace it in the SQL
+    for (param_idx, value) in param_values {
+        if let Some(Some(name)) = param_names.get((*param_idx - 1) as usize) {
+            // Escape single quotes in the value
+            let escaped_value = value.replace('\'', "''");
+            let literal = format!("'{}'", escaped_value);
+
+            // Replace the parameter name with the literal
+            // Handle different parameter formats: $name, :name, @name, ?N
+            result = result.replace(name, &literal);
+
+            // Also try without prefix for TCL-style $::name patterns
+            if name.starts_with('$') {
+                // TCL variables like $::likepat
+                result = result.replace(name, &literal);
+            }
+        }
+    }
+
+    result
 }
 
 fn literal_to_value(literal: &Literal) -> Result<Value> {

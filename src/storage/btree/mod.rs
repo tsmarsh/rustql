@@ -2109,6 +2109,8 @@ fn merge_leaf_with_sibling(
             }
             receiver_cells.push(receiver.data[start..end].to_vec());
         }
+        // Save borrowed cell for separator key update before moving it
+        let borrowed_for_sep = borrowed.clone();
         if borrow_from_left {
             receiver_cells.insert(0, borrowed);
         } else {
@@ -2128,6 +2130,74 @@ fn merge_leaf_with_sibling(
         shared.pager.write(&mut receiver_page)?;
         receiver_page.data = receiver_data.clone();
         shared.pager.write_page_to_cache(&receiver_page);
+
+        // Update the parent's separator key after borrowing
+        // The separator key between left and right should be updated to the
+        // first key of the right sibling (which is now the borrowed cell if borrowing from left,
+        // or the second cell if borrowing from right)
+        let sep_index = if use_left {
+            // Separator is at child_index - 1 (between left sibling and current)
+            child_index - 1
+        } else {
+            // Separator is at child_index (between current and right sibling)
+            child_index
+        };
+
+        // Get the new separator key from the first cell of the right page
+        let right_first_cell = if borrow_from_left {
+            // We borrowed from left, so receiver is right, and borrowed cell is now first
+            borrowed_for_sep
+        } else {
+            // We borrowed from right, so donor is right, and the new first cell is what remains
+            if !donor_cells.is_empty() {
+                donor_cells[0].clone()
+            } else {
+                // No cells left in donor, shouldn't happen in borrow case
+                return Ok(MergeResult::Borrowed);
+            }
+        };
+
+        // Parse the cell to get the key
+        let right_page_for_parse = if borrow_from_left {
+            // receiver is the right page, use its flags/format
+            &receiver
+        } else {
+            // donor is the right page
+            &donor
+        };
+        let right_limits_for_parse = if borrow_from_left {
+            receiver_limits
+        } else {
+            donor_limits
+        };
+
+        // Parse the separator key from the cell data
+        if let Ok(cell_info) = parse_cell_from_bytes(
+            right_page_for_parse,
+            right_limits_for_parse,
+            &right_first_cell,
+        ) {
+            // Update parent's separator key
+            let (mut keys, children) = rebuild_internal_children(parent, parent_limits)?;
+            let sep_pos = sep_index as usize;
+            if sep_pos < keys.len() {
+                if parent.is_intkey {
+                    keys[sep_pos] = InternalKey::Int(cell_info.n_key);
+                } else if let Some(payload) = cell_info.payload {
+                    keys[sep_pos] = InternalKey::Blob(payload);
+                }
+                let parent_flags = parent.data[parent_limits.header_start()];
+                if let Ok(parent_data) =
+                    build_internal_page_data(parent_limits, parent_flags, &keys, &children)
+                {
+                    let mut parent_page = shared.pager.get(parent.pgno, PagerGetFlags::empty())?;
+                    shared.pager.write(&mut parent_page)?;
+                    parent_page.data = parent_data;
+                    shared.pager.write_page_to_cache(&parent_page);
+                }
+            }
+        }
+
         return Ok(MergeResult::Borrowed);
     }
 
@@ -4446,12 +4516,18 @@ impl Btree {
         page.data.copy_from_slice(&mem_page.data);
         if std::env::var("RUSTQL_BTREE_TRACE").is_ok() {
             trace_btree(&format!(
-                "btree: delete pgno={} ix={} cell_offset={} size={}",
-                actual_pgno, _cursor.ix, cell_offset, cell_size
+                "btree: delete pgno={} ix={} cell_offset={} size={} n_cell_after={}",
+                actual_pgno, _cursor.ix, cell_offset, cell_size, mem_page.n_cell
             ));
         }
 
         // Write modified page back to cache so subsequent reads see the changes
+        if std::env::var("VDBE_TRACE").is_ok() {
+            eprintln!(
+                "btree: writing page {} to cache after delete, n_cell={}",
+                actual_pgno, mem_page.n_cell
+            );
+        }
         shared_guard.pager.write_page_to_cache(&page);
 
         // Update cursor's stored page
@@ -5184,6 +5260,19 @@ impl BtCursor {
         };
         let page = shared.pager.get(pgno, PagerGetFlags::empty())?;
         let mem_page = MemPage::parse_with_shared(pgno, page.data.clone(), limits, Some(shared))?;
+        if std::env::var("VDBE_TRACE").is_ok() && pgno == 4 {
+            // Dump cell pointers for page 4
+            let mut cell_ptrs = Vec::new();
+            for i in 0..mem_page.n_cell {
+                if let Ok(cell_offset) = mem_page.cell_ptr(i, limits) {
+                    cell_ptrs.push(format!("{}:{}", i, cell_offset));
+                }
+            }
+            eprintln!(
+                "btree: load_page pgno={} n_cell={} cell_ptrs={:?}",
+                pgno, mem_page.n_cell, cell_ptrs
+            );
+        }
         mem_page.validate_layout(limits)?;
         Ok((mem_page, limits))
     }
@@ -5903,7 +5992,6 @@ impl BtCursor {
 
         // Get KeyInfo for comparison - prefer from UnpackedRecord, fall back to cursor's key_info
         let key_info = search_key.key_info.as_ref().or(self.key_info.as_ref());
-
         loop {
             let (mem_page, limits) = self.load_page(shared_guard, pgno)?;
             if mem_page.is_leaf {
@@ -5969,13 +6057,17 @@ impl BtCursor {
                 let payload = info.payload.as_deref().unwrap_or(&[]);
 
                 // Use KeyInfo comparison if available, otherwise use default record comparison
-                let is_greater = if let Some(ki) = key_info {
-                    ki.compare_records(payload, &search_key.key) == std::cmp::Ordering::Greater
+                // The separator is the LAST key of the left subtree, so we should go LEFT
+                // if separator >= search_key (i.e., if separator is Greater OR Equal to search_key)
+                let cmp = if let Some(ki) = key_info {
+                    ki.compare_records(payload, &search_key.key)
                 } else {
-                    compare_records_default(payload, &search_key.key) == std::cmp::Ordering::Greater
+                    compare_records_default(payload, &search_key.key)
                 };
+                let is_greater_or_equal =
+                    cmp == std::cmp::Ordering::Greater || cmp == std::cmp::Ordering::Equal;
 
-                if is_greater {
+                if is_greater_or_equal {
                     child = mem_page.child_pgno(cell_offset)?;
                     child_index = i;
                     break;

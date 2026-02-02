@@ -1565,6 +1565,53 @@ pub fn parse_create_view_sql(sql: &str) -> Option<View> {
     }
 }
 
+/// Parse a CREATE TRIGGER SQL string into a Trigger struct.
+/// This function is used during schema loading to reconstruct Trigger objects
+/// from their stored SQL in sqlite_master.
+pub fn parse_create_trigger_sql(sql: &str, table_name: &str, db_idx: i32) -> Option<Trigger> {
+    // Use the full parser to parse the CREATE TRIGGER statement
+    let stmt = crate::parser::grammar::parse(sql).ok()?;
+
+    if let crate::parser::ast::Stmt::CreateTrigger(create) = stmt {
+        // Convert TriggerTime to TriggerTiming
+        let timing = match create.time {
+            crate::parser::ast::TriggerTime::Before => TriggerTiming::Before,
+            crate::parser::ast::TriggerTime::After => TriggerTiming::After,
+            crate::parser::ast::TriggerTime::InsteadOf => TriggerTiming::InsteadOf,
+        };
+
+        // Convert TriggerEvent
+        let (event, update_columns) = match &create.event {
+            crate::parser::ast::TriggerEvent::Insert => (TriggerEvent::Insert, None),
+            crate::parser::ast::TriggerEvent::Delete => (TriggerEvent::Delete, None),
+            crate::parser::ast::TriggerEvent::Update(cols) => (TriggerEvent::Update, cols.clone()),
+        };
+
+        // Convert body statements - store as raw SQL for now
+        // The trigger body is compiled at execution time from the SQL
+        let body: Vec<TriggerStep> = Vec::new();
+
+        // Note: when_clause uses a different Expr type (schema::Expr vs ast::Expr)
+        // For now, skip it - the SQL is stored and can be reparsed when needed
+        // TODO: Convert ast::Expr to schema::Expr for WHEN clause
+
+        Some(Trigger {
+            name: create.name.name.clone(),
+            table: table_name.to_string(),
+            db_idx,
+            timing,
+            event,
+            for_each_row: create.for_each_row,
+            update_columns,
+            when_clause: None, // WHEN clause not supported in schema reload yet
+            body,
+            sql: Some(sql.to_string()),
+        })
+    } else {
+        None
+    }
+}
+
 /// Parse the WHERE clause of a partial index
 fn parse_partial_index_where(s: &str) -> Option<Expr> {
     let s_upper = s.trim().to_uppercase();

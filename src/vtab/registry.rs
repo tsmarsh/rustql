@@ -120,6 +120,10 @@ impl VtabRegistry {
     }
 
     /// Unregister a virtual table instance
+    ///
+    /// This removes the instance from the registry but does NOT call disconnect().
+    /// disconnect() is only called when the database connection is closed (via disconnect_all).
+    /// For DROP TABLE, use drop_virtual_table which calls destroy() instead.
     pub fn unregister_instance(
         &self,
         db_name: &str,
@@ -347,6 +351,23 @@ impl VtabRegistry {
             table.rollback_to(point)?;
         }
 
+        Ok(())
+    }
+
+    /// Disconnect all virtual tables
+    ///
+    /// This should be called when a database connection is closed. Each virtual
+    /// table's `disconnect()` method is called, then instances are cleared.
+    pub fn disconnect_all(&self) -> Result<()> {
+        let mut instances = self.instances.write().map_err(|_| {
+            Error::with_message(ErrorCode::Internal, "failed to acquire registry lock")
+        })?;
+
+        for table in instances.values() {
+            let _ = table.disconnect();
+        }
+
+        instances.clear();
         Ok(())
     }
 }

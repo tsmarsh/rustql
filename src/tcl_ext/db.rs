@@ -1132,11 +1132,22 @@ pub unsafe fn db_onecolumn(
 
 /// Close database connection
 pub unsafe fn db_close(db_name: &str, interp: *mut Tcl_Interp) -> c_int {
+    // Set the interpreter for vtab callback logging
+    set_current_interp(interp);
+
     CONNECTIONS.with(|connections| {
+        // First, disconnect all virtual tables before closing
+        if let Some(conn) = connections.borrow().get(db_name) {
+            let _ = conn.vtab_registry.disconnect_all();
+        }
+        // Then remove and close the connection
         if let Some(conn) = connections.borrow_mut().remove(db_name) {
             let _ = sqlite3_close(conn);
         }
     });
+
+    // Clear the interpreter
+    clear_current_interp();
     // Clean up null value setting
     NULL_VALUES.with(|nv| {
         nv.borrow_mut().remove(db_name);
@@ -1158,6 +1169,11 @@ pub unsafe extern "C" fn db_delete_cmd(client_data: *mut std::ffi::c_void) {
     if !client_data.is_null() {
         let db_name = Box::from_raw(client_data as *mut String);
         CONNECTIONS.with(|connections| {
+            // First, disconnect all virtual tables before closing
+            if let Some(conn) = connections.borrow().get(&*db_name) {
+                let _ = conn.vtab_registry.disconnect_all();
+            }
+            // Then remove and close the connection
             if let Some(conn) = connections.borrow_mut().remove(&*db_name) {
                 let _ = sqlite3_close(conn);
             }

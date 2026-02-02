@@ -246,41 +246,22 @@ fn pragma_table_info(
                                 .collect();
                             Some(cols)
                         } else {
-                            // Try lazy connect
-                            let args = table.virtual_args.clone();
-                            drop(schema_guard); // Release read lock
-
-                            if let Ok(Some(module)) = conn.vtab_registry.get_module(module_name) {
-                                // Try connect without ctx (simpler approach)
-                                if let Ok((_schema_str, instance)) =
-                                    module.connect(db_name, &table_name, &args)
-                                {
-                                    let _ = conn.vtab_registry.register_instance(
-                                        db_name,
-                                        &table_name,
-                                        instance.clone(),
-                                    );
-                                    let count = instance.column_count();
-                                    let cols: Vec<(String, String)> = (0..count)
-                                        .map(|i| {
-                                            let name = instance.column_name(i).to_string();
-                                            let affinity = instance.column_affinity(i);
-                                            let type_name = match affinity {
-                                                crate::schema::Affinity::Integer => {
-                                                    "INTEGER".to_string()
-                                                }
-                                                crate::schema::Affinity::Real => "REAL".to_string(),
-                                                crate::schema::Affinity::Text => "TEXT".to_string(),
-                                                crate::schema::Affinity::Blob => "BLOB".to_string(),
-                                                _ => String::new(),
-                                            };
-                                            (name, type_name)
-                                        })
-                                        .collect();
-                                    return pragma_table_info_from_cols(&cols);
-                                }
+                            // No instance yet - use schema columns instead of lazy connect
+                            // The vtab instance will be created by VFilter when the table is actually queried
+                            let cols: Vec<(String, String)> = table
+                                .columns
+                                .iter()
+                                .map(|col| {
+                                    let type_name =
+                                        col.type_name.clone().unwrap_or_default().to_uppercase();
+                                    (col.name.clone(), type_name)
+                                })
+                                .collect();
+                            if cols.is_empty() {
+                                None
+                            } else {
+                                return pragma_table_info_from_cols(&cols);
                             }
-                            None
                         }
                     } else {
                         None

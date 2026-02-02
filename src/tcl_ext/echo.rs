@@ -9,16 +9,16 @@
 //!
 //! This creates a virtual table echo_t1 that mirrors real table t1.
 
+use std::ffi::CString;
 use std::sync::Arc;
 
 use crate::api::{
     sqlite3_bind_double, sqlite3_bind_int64, sqlite3_bind_null, sqlite3_bind_text,
-    sqlite3_column_count, sqlite3_column_int64, sqlite3_column_text, sqlite3_column_type,
     sqlite3_prepare_v2, sqlite3_step, PreparedStmt,
 };
 use crate::error::{Error, ErrorCode, Result};
 use crate::schema::Affinity;
-use crate::types::{ColumnType, StepResult, Value};
+use crate::types::Value;
 use crate::vdbe::mem::Mem;
 use crate::vtab::{
     ConstraintValue, DbContext, IndexInfo, VtabCursor, VtabModule, VtabTable,
@@ -27,7 +27,28 @@ use crate::vtab::{
     SQLITE_INDEX_CONSTRAINT_LT, SQLITE_INDEX_CONSTRAINT_MATCH,
 };
 
-use super::CONNECTIONS;
+use super::ffi::{Tcl_SetVar, TCL_APPEND_VALUE, TCL_GLOBAL_ONLY, TCL_LIST_ELEMENT};
+use super::{CONNECTIONS, CURRENT_INTERP};
+
+/// Append a string to the ::echo_module TCL variable
+///
+/// This mirrors SQLite's appendToEchoModule function in test8.c.
+/// It appends to the global echo_module variable as a list element.
+fn append_to_echo_module(arg: &str) {
+    CURRENT_INTERP.with(|interp_cell| {
+        let interp_opt = interp_cell.borrow();
+        if let Some(interp) = *interp_opt {
+            let flags = TCL_APPEND_VALUE | TCL_LIST_ELEMENT | TCL_GLOBAL_ONLY;
+            if let Ok(var_name) = CString::new("echo_module") {
+                if let Ok(value) = CString::new(arg) {
+                    unsafe {
+                        Tcl_SetVar(interp, var_name.as_ptr(), value.as_ptr(), flags);
+                    }
+                }
+            }
+        }
+    });
+}
 
 /// Echo virtual table module
 pub struct EchoModule;
@@ -58,6 +79,15 @@ impl VtabModule for EchoModule {
         args: &[String],
         ctx: &dyn DbContext,
     ) -> Result<(String, Arc<dyn VtabTable>)> {
+        // Log the xCreate callback
+        append_to_echo_module("xCreate");
+        append_to_echo_module("echo");
+        append_to_echo_module(db_name);
+        append_to_echo_module(table_name);
+        for arg in args {
+            append_to_echo_module(arg);
+        }
+
         // First argument should be the name of the real table to mirror
         // If no args, return empty schema to trigger "did not declare schema" error
         let real_table = match args.first() {
@@ -73,6 +103,23 @@ impl VtabModule for EchoModule {
                 return Ok((String::new(), Arc::new(table)));
             }
         };
+
+        // If a second argument is provided, it's a log table name
+        // If that table already exists, return an error (matches SQLite's echo behavior)
+        if let Some(log_table) = args.get(1) {
+            let check_sql = format!(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='{}'",
+                log_table
+            );
+            if let Ok(rows) = ctx.query(&check_sql) {
+                if !rows.is_empty() {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        format!("table '{}' already exists", log_table),
+                    ));
+                }
+            }
+        }
 
         // Query the schema for the real table using DbContext
         let sql = format!(
@@ -126,8 +173,63 @@ impl VtabModule for EchoModule {
         args: &[String],
         ctx: &dyn DbContext,
     ) -> Result<(String, Arc<dyn VtabTable>)> {
-        // For echo, connect is the same as create
-        self.create_with_ctx(db_name, table_name, args, ctx)
+        // Log the xConnect callback
+        append_to_echo_module("xConnect");
+        append_to_echo_module("echo");
+        append_to_echo_module(db_name);
+        append_to_echo_module(table_name);
+        for arg in args {
+            append_to_echo_module(arg);
+        }
+
+        // For echo, connect creates the same table structure but doesn't initialize storage
+        // Parse the real table schema just like create
+        let real_table = match args.first() {
+            Some(name) => name,
+            None => {
+                let table = EchoTable {
+                    name: table_name.to_string(),
+                    db_name: db_name.to_string(),
+                    real_table: String::new(),
+                    columns: Vec::new(),
+                };
+                return Ok((String::new(), Arc::new(table)));
+            }
+        };
+
+        let sql = format!(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='{}'",
+            real_table
+        );
+
+        let rows = ctx.query(&sql)?;
+
+        if let Some(row) = rows.first() {
+            if let Some(Value::Text(create_sql)) = row.first() {
+                let columns = parse_columns_from_sql(create_sql);
+                let schema = extract_column_defs(create_sql);
+
+                let table = EchoTable {
+                    name: table_name.to_string(),
+                    db_name: db_name.to_string(),
+                    real_table: real_table.to_string(),
+                    columns,
+                };
+
+                return Ok((schema, Arc::new(table)));
+            }
+        }
+
+        Err(Error::with_message(
+            ErrorCode::Error,
+            format!("table {} does not exist", real_table),
+        ))
+    }
+
+    fn destroy(&self, _table: Arc<dyn VtabTable>) -> Result<()> {
+        // Log the xDestroy callback
+        append_to_echo_module("xDestroy");
+        Ok(())
     }
 }
 
@@ -277,6 +379,12 @@ impl VtabTable for EchoTable {
             rows: Vec::new(),
             position: 0,
         }))
+    }
+
+    fn disconnect(&self) -> Result<()> {
+        // Log the xDisconnect callback
+        append_to_echo_module("xDisconnect");
+        Ok(())
     }
 
     fn update(

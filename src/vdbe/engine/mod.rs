@@ -7550,13 +7550,17 @@ impl Vdbe {
                 if let P4::Text(name) = &op.p4 {
                     let name_lower = name.to_lowercase();
 
-                    // Check if this is a virtual table (R-tree) and collect shadow table names
+                    // Check if this is a virtual table and collect info for xDestroy
                     let mut is_rtree = false;
+                    let mut is_virtual = false;
+                    let mut virtual_module_name: Option<String> = None;
                     let mut shadow_tables: Vec<String> = Vec::new();
                     if let Some(ref schema) = self.schema {
                         if let Ok(schema_guard) = schema.read() {
                             if let Some(table) = schema_guard.tables.get(&name_lower) {
                                 if table.is_virtual {
+                                    is_virtual = true;
+                                    virtual_module_name = table.virtual_module.clone();
                                     if let Some(ref module) = table.virtual_module {
                                         if module.eq_ignore_ascii_case("rtree") {
                                             is_rtree = true;
@@ -7566,6 +7570,57 @@ impl Vdbe {
                                         }
                                     }
                                 }
+                            }
+                        }
+                    }
+
+                    // Call xDestroy on virtual tables BEFORE removing from schema
+                    if is_virtual {
+                        if let Some(ref module_name) = virtual_module_name {
+                            if let Some(ref registry) = self.vtab_registry {
+                                let db_name = self.db_name_for_idx(db_idx);
+
+                                // Lazy connect: if no instance exists, connect first
+                                // This ensures xConnect is called before xDestroy
+                                if registry
+                                    .get_instance(&db_name, name)
+                                    .ok()
+                                    .flatten()
+                                    .is_none()
+                                {
+                                    // Get args from schema and try to connect
+                                    if let Some(ref schema_lock) = self.schema {
+                                        if let Ok(schema_guard) = schema_lock.read() {
+                                            if let Some(table) =
+                                                schema_guard.tables.get(&name_lower)
+                                            {
+                                                let args = table.virtual_args.clone();
+                                                drop(schema_guard); // Release lock
+
+                                                if let Ok(Some(module)) =
+                                                    registry.get_module(module_name)
+                                                {
+                                                    // Create db context
+                                                    if let Some(conn_ptr) = self.conn_ptr {
+                                                        let db_ctx =
+                                                            ConnectionDbContext { conn_ptr };
+                                                        if let Ok((_schema, instance)) = module
+                                                            .connect_with_ctx(
+                                                                &db_name, name, &args, &db_ctx,
+                                                            )
+                                                        {
+                                                            let _ = registry.register_instance(
+                                                                &db_name, name, instance,
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                let _ = registry.drop_virtual_table(module_name, &db_name, name);
                             }
                         }
                     }

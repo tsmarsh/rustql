@@ -8,7 +8,11 @@ use std::os::raw::{c_char, c_int};
 // TCL result codes
 pub const TCL_OK: c_int = 0;
 pub const TCL_ERROR: c_int = 1;
+
+// TCL variable flags
 pub const TCL_GLOBAL_ONLY: c_int = 1;
+pub const TCL_APPEND_VALUE: c_int = 4;
+pub const TCL_LIST_ELEMENT: c_int = 8;
 
 /// Opaque TCL interpreter handle
 #[repr(C)]

@@ -744,12 +744,22 @@ impl Mem {
 
         // Mixed type comparison - behavior depends on affinity
         // affinity 0 (BLOB) = use type ordering
+        // affinity 1 (TEXT) = convert numbers to text before comparison
         // affinity 2+ (NUMERIC/INTEGER/REAL) = try numeric conversion
+        let use_text_conversion = affinity == 1;
         let use_numeric_conversion = affinity >= 2;
 
         match (self.column_type(), other.column_type()) {
             (ColumnType::Text, ColumnType::Integer | ColumnType::Float) => {
-                if use_numeric_conversion {
+                if use_text_conversion {
+                    // Convert number to text and compare as text
+                    let other_text = if other.column_type() == ColumnType::Integer {
+                        other.i.to_string()
+                    } else {
+                        other.r.to_string()
+                    };
+                    return self.to_str().cmp(&other_text);
+                } else if use_numeric_conversion {
                     // Try to parse text as number
                     let text_trimmed = self.to_str().trim().to_string();
                     if let Ok(self_int) = text_trimmed.parse::<i64>() {
@@ -776,7 +786,15 @@ impl Mem {
                 Ordering::Greater
             }
             (ColumnType::Integer | ColumnType::Float, ColumnType::Text) => {
-                if use_numeric_conversion {
+                if use_text_conversion {
+                    // Convert number to text and compare as text
+                    let self_text = if self.column_type() == ColumnType::Integer {
+                        self.i.to_string()
+                    } else {
+                        self.r.to_string()
+                    };
+                    return self_text.cmp(&other.to_str());
+                } else if use_numeric_conversion {
                     // Try to parse text as number
                     let text_trimmed = other.to_str().trim().to_string();
                     if let Ok(other_int) = text_trimmed.parse::<i64>() {

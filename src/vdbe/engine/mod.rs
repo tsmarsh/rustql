@@ -1567,7 +1567,8 @@ impl Vdbe {
             }
 
             Opcode::Lt => {
-                // Lt P1 P2 P3 * P5: jump to P2 if r[P3] < r[P1]
+                // Lt P1 P2 P3 P4 P5: jump to P2 if r[P3] < r[P1]
+                // P4 can be a collation sequence for string comparisons
                 // Note: SQLite semantics compare P3 vs P1 (not P1 vs P3)
                 use crate::vdbe::ops::cmp_flags;
 
@@ -1582,7 +1583,11 @@ impl Vdbe {
                     }
                     // Otherwise: standard SQL - result is unknown, no jump
                 } else {
-                    let cmp = left.compare_with_affinity(right, affinity);
+                    // Use collation from P4 if available, otherwise use affinity
+                    let cmp = match &op.p4 {
+                        P4::Collation(coll) => left.compare_with_collation(right, coll),
+                        _ => left.compare_with_affinity(right, affinity),
+                    };
                     if cmp == Ordering::Less {
                         self.pc = op.p2;
                     }
@@ -1590,7 +1595,8 @@ impl Vdbe {
             }
 
             Opcode::Le => {
-                // Le P1 P2 P3 * P5: jump to P2 if r[P3] <= r[P1]
+                // Le P1 P2 P3 P4 P5: jump to P2 if r[P3] <= r[P1]
+                // P4 can be a collation sequence for string comparisons
                 use crate::vdbe::ops::cmp_flags;
 
                 let left = self.mem(op.p3);
@@ -1603,7 +1609,11 @@ impl Vdbe {
                         self.pc = op.p2;
                     }
                 } else {
-                    let cmp = left.compare_with_affinity(right, affinity);
+                    // Use collation from P4 if available, otherwise use affinity
+                    let cmp = match &op.p4 {
+                        P4::Collation(coll) => left.compare_with_collation(right, coll),
+                        _ => left.compare_with_affinity(right, affinity),
+                    };
                     if cmp != Ordering::Greater {
                         self.pc = op.p2;
                     }
@@ -1611,7 +1621,8 @@ impl Vdbe {
             }
 
             Opcode::Gt => {
-                // Gt P1 P2 P3 * P5: jump to P2 if r[P3] > r[P1]
+                // Gt P1 P2 P3 P4 P5: jump to P2 if r[P3] > r[P1]
+                // P4 can be a collation sequence for string comparisons
                 use crate::vdbe::ops::cmp_flags;
 
                 let left = self.mem(op.p3);
@@ -1624,7 +1635,11 @@ impl Vdbe {
                         self.pc = op.p2;
                     }
                 } else {
-                    let cmp = left.compare_with_affinity(right, affinity);
+                    // Use collation from P4 if available, otherwise use affinity
+                    let cmp = match &op.p4 {
+                        P4::Collation(coll) => left.compare_with_collation(right, coll),
+                        _ => left.compare_with_affinity(right, affinity),
+                    };
                     if cmp == Ordering::Greater {
                         self.pc = op.p2;
                     }
@@ -1632,7 +1647,8 @@ impl Vdbe {
             }
 
             Opcode::Ge => {
-                // Ge P1 P2 P3 * P5: jump to P2 if r[P3] >= r[P1]
+                // Ge P1 P2 P3 P4 P5: jump to P2 if r[P3] >= r[P1]
+                // P4 can be a collation sequence for string comparisons
                 use crate::vdbe::ops::cmp_flags;
 
                 let left = self.mem(op.p3);
@@ -1645,7 +1661,11 @@ impl Vdbe {
                         self.pc = op.p2;
                     }
                 } else {
-                    let cmp = left.compare_with_affinity(right, affinity);
+                    // Use collation from P4 if available, otherwise use affinity
+                    let cmp = match &op.p4 {
+                        P4::Collation(coll) => left.compare_with_collation(right, coll),
+                        _ => left.compare_with_affinity(right, affinity),
+                    };
                     if cmp != Ordering::Less {
                         self.pc = op.p2;
                     }

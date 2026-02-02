@@ -93,6 +93,21 @@ impl ExprCompiler {
         idx
     }
 
+    /// Add an instruction with a label reference and P4 (to be resolved later)
+    pub fn add_op_label_p4(
+        &mut self,
+        opcode: Opcode,
+        p1: i32,
+        label: i32,
+        p3: i32,
+        p4: P4,
+    ) -> usize {
+        let idx = self.ops.len();
+        self.ops.push(VdbeOp::with_p4(opcode, p1, 0, p3, p4)); // P2 will be patched
+        self.unresolved_labels.push((label, idx));
+        idx
+    }
+
     /// Resolve a label to the current instruction position
     pub fn resolve_label(&mut self, label: i32) {
         let addr = self.ops.len() as i32;
@@ -655,16 +670,45 @@ impl ExprCompiler {
         let lbl_false = self.make_label();
         let lbl_end = self.make_label();
 
+        // Extract collation from COLLATE wrapper if present
+        let (inner_expr, collation) = match expr {
+            Expr::Collate {
+                expr: inner,
+                collation,
+            } => (inner.as_ref(), Some(collation.clone())),
+            _ => (expr, None),
+        };
+
         // Evaluate expression
-        let expr_reg = self.compile_expr(expr)?;
+        let expr_reg = self.compile_expr(inner_expr)?;
         let low_reg = self.compile_expr(low)?;
         let high_reg = self.compile_expr(high)?;
 
-        // Check expr >= low
-        self.add_op_label(Opcode::Lt, expr_reg, lbl_false, low_reg);
+        // Check expr >= low (fail if expr < low)
+        if let Some(ref coll) = collation {
+            self.add_op_label_p4(
+                Opcode::Lt,
+                expr_reg,
+                lbl_false,
+                low_reg,
+                P4::Collation(coll.clone()),
+            );
+        } else {
+            self.add_op_label(Opcode::Lt, expr_reg, lbl_false, low_reg);
+        }
 
-        // Check expr <= high
-        self.add_op_label(Opcode::Gt, expr_reg, lbl_false, high_reg);
+        // Check expr <= high (fail if expr > high)
+        if let Some(ref coll) = collation {
+            self.add_op_label_p4(
+                Opcode::Gt,
+                expr_reg,
+                lbl_false,
+                high_reg,
+                P4::Collation(coll.clone()),
+            );
+        } else {
+            self.add_op_label(Opcode::Gt, expr_reg, lbl_false, high_reg);
+        }
 
         // In range
         self.add_op(Opcode::Integer, if negated { 0 } else { 1 }, target, 0);

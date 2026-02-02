@@ -638,6 +638,10 @@ pub struct Vdbe {
     /// (parent ops, return pc, parent param_base, parent num_columns)
     subprogram_stack: Vec<(Vec<VdbeOp>, i32, i32, Option<i32>, i32)>,
 
+    /// Flag set when RAISE(IGNORE) was executed in a trigger
+    /// This signals the parent DML to skip the current row
+    raise_ignore: bool,
+
     /// Aggregate function contexts, keyed by accumulator register
     agg_contexts: HashMap<i32, AggregateState>,
 
@@ -701,6 +705,7 @@ impl Vdbe {
             trigger_depth: 0,
             max_trigger_depth: 1000,
             subprogram_stack: Vec::new(),
+            raise_ignore: false,
             agg_contexts: HashMap::new(),
             last_compare: std::cmp::Ordering::Equal,
             once_flags: std::collections::HashSet::new(),
@@ -1268,6 +1273,11 @@ impl Vdbe {
                 self.rc = ErrorCode::from_i32(op.p1).unwrap_or(ErrorCode::Error);
                 if let P4::Text(ref msg) = op.p4 {
                     self.error_msg = Some(msg.clone());
+                }
+
+                // Check for RAISE(IGNORE) - P2=4 (OE_IGNORE)
+                if op.p2 == 4 && !self.subprogram_stack.is_empty() {
+                    self.raise_ignore = true;
                 }
 
                 // Check if we're in a subprogram (trigger)
@@ -4895,6 +4905,14 @@ impl Vdbe {
                 // P4 = table name (for debug)
                 // P5 = flags (conflict resolution)
 
+                // Check if RAISE(IGNORE) was called - skip this insert
+                if self.raise_ignore {
+                    self.raise_ignore = false;
+                    // Don't increment n_change - row was ignored
+                    self.pc += 1;
+                    return Ok(ExecResult::Continue);
+                }
+
                 // Mark as DML statement for count_changes support
                 if (op.p5 & OPFLAG_NCHANGE) != 0 {
                     self.is_dml_statement = true;
@@ -5450,15 +5468,18 @@ impl Vdbe {
                     }
                 }
 
-                // Fire AFTER INSERT triggers if a row was successfully inserted
-                if inserted {
-                    // Get table name from P4
-                    if let P4::Text(ref table_name) = op.p4 {
-                        self.fire_after_insert_triggers(table_name)?;
-                    } else if let P4::Table(ref table_name) = op.p4 {
-                        self.fire_after_insert_triggers(table_name)?;
-                    }
-                }
+                // Note: AFTER INSERT triggers are now handled at compile time
+                // via Program opcodes emitted by insert.rs. The fire_after_insert_triggers
+                // approach was causing double trigger execution because the compiler
+                // already generates Program opcodes for triggers.
+                // Disabled to allow the compile-time approach to work correctly.
+                // if inserted {
+                //     if let P4::Text(ref table_name) = op.p4 {
+                //         self.fire_after_insert_triggers(table_name)?;
+                //     } else if let P4::Table(ref table_name) = op.p4 {
+                //         self.fire_after_insert_triggers(table_name)?;
+                //     }
+                // }
 
                 // Persist R-tree to shadow tables after cursor borrows end
                 if let Some((table_name, table_arc, cursor_db_idx)) = rtree_persist_info {
@@ -5620,6 +5641,14 @@ impl Vdbe {
                 // P3 = register holding rowid for triggers
                 // P4 = table name
                 // P5 = flags (OPFLAG_* constants)
+
+                // Check if RAISE(IGNORE) was called - skip this delete
+                if self.raise_ignore {
+                    self.raise_ignore = false;
+                    // Don't change n_change - row was ignored
+                    self.pc += 1;
+                    return Ok(ExecResult::Continue);
+                }
 
                 // Mark as DML statement for count_changes support
                 if (op.p5 & OPFLAG_NCHANGE) != 0 {

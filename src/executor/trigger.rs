@@ -774,7 +774,8 @@ impl<'s> TriggerBodyCompiler<'s> {
                         self.emit(Opcode::Divide, right_reg, left_reg, dest_reg, P4::Unused);
                     }
                     BinaryOp::Concat => {
-                        self.emit(Opcode::Concat, left_reg, right_reg, dest_reg, P4::Unused);
+                        // Concat P1 P2 P3: P3 = P2 || P1, so swap args to get left || right
+                        self.emit(Opcode::Concat, right_reg, left_reg, dest_reg, P4::Unused);
                     }
                     _ => {
                         // For other ops, just use the left value
@@ -1127,7 +1128,8 @@ impl<'s> TriggerBodyCompiler<'s> {
                         self.emit(Opcode::Divide, right_reg, left_reg, dest_reg, P4::Unused)
                     }
                     BinaryOp::Concat => {
-                        self.emit(Opcode::Concat, left_reg, right_reg, dest_reg, P4::Unused)
+                        // Concat P1 P2 P3: P3 = P2 || P1, so swap args to get left || right
+                        self.emit(Opcode::Concat, right_reg, left_reg, dest_reg, P4::Unused)
                     }
                     _ => {
                         // For other operators, just use left value for now
@@ -1269,11 +1271,11 @@ pub fn generate_trigger_code(
     }
 
     for trigger in triggers {
-        // Parse the trigger SQL to get the body statements
-        let body_stmts = if let Some(sql) = &trigger.sql {
+        // Parse the trigger SQL to get the body statements and WHEN clause
+        let (body_stmts, when_clause) = if let Some(sql) = &trigger.sql {
             // Parse the SQL to get the trigger AST
             match crate::parser::grammar::parse(sql) {
-                Ok(crate::parser::ast::Stmt::CreateTrigger(create)) => create.body,
+                Ok(crate::parser::ast::Stmt::CreateTrigger(create)) => (create.body, create.when),
                 _ => continue, // Skip if can't parse
             }
         } else {
@@ -1342,6 +1344,25 @@ pub fn generate_trigger_code(
             }
         }
 
+        // Handle WHEN clause - if present, evaluate and skip trigger if false/NULL
+        if let Some(ref when_expr) = when_clause {
+            let when_reg = *next_reg;
+            *next_reg += 1;
+
+            compile_when_clause(
+                &mut ops,
+                when_expr,
+                when_reg,
+                base_reg,
+                num_columns,
+                next_reg,
+                &compiler.column_map,
+            );
+
+            let skip_addr = ops.len() as i32 + 2;
+            ops.push(make_op(Opcode::IfNot, when_reg, skip_addr, 1, P4::Unused));
+        }
+
         // Emit Program opcode to execute the trigger (SQLite-aligned)
         // P1 = base register for OLD/NEW values
         // P2 = return address
@@ -1356,6 +1377,291 @@ pub fn generate_trigger_code(
     }
 
     Ok(ops)
+}
+
+/// Compile a WHEN clause expression for a trigger
+fn compile_when_clause(
+    ops: &mut Vec<VdbeOp>,
+    expr: &crate::parser::ast::Expr,
+    dest_reg: i32,
+    base_reg: i32,
+    num_columns: i32,
+    next_reg: &mut i32,
+    column_map: &std::collections::HashMap<String, usize>,
+) {
+    use crate::parser::ast::{BinaryOp, Expr, Literal};
+
+    match expr {
+        Expr::Binary { op, left, right } => {
+            let left_reg = *next_reg;
+            *next_reg += 1;
+            let right_reg = *next_reg;
+            *next_reg += 1;
+
+            compile_when_clause(
+                ops,
+                left,
+                left_reg,
+                base_reg,
+                num_columns,
+                next_reg,
+                column_map,
+            );
+            compile_when_clause(
+                ops,
+                right,
+                right_reg,
+                base_reg,
+                num_columns,
+                next_reg,
+                column_map,
+            );
+
+            match op {
+                BinaryOp::Gt => {
+                    let set_true_addr = ops.len() as i32 + 3;
+                    ops.push(make_op(Opcode::Integer, 0, dest_reg, 0, P4::Unused));
+                    ops.push(make_op(
+                        Opcode::Gt,
+                        right_reg,
+                        set_true_addr,
+                        left_reg,
+                        P4::Unused,
+                    ));
+                    let end_addr = ops.len() as i32 + 2;
+                    ops.push(make_op(Opcode::Goto, 0, end_addr, 0, P4::Unused));
+                    ops.push(make_op(Opcode::Integer, 1, dest_reg, 0, P4::Unused));
+                }
+                BinaryOp::Lt => {
+                    let set_true_addr = ops.len() as i32 + 3;
+                    ops.push(make_op(Opcode::Integer, 0, dest_reg, 0, P4::Unused));
+                    ops.push(make_op(
+                        Opcode::Lt,
+                        right_reg,
+                        set_true_addr,
+                        left_reg,
+                        P4::Unused,
+                    ));
+                    let end_addr = ops.len() as i32 + 2;
+                    ops.push(make_op(Opcode::Goto, 0, end_addr, 0, P4::Unused));
+                    ops.push(make_op(Opcode::Integer, 1, dest_reg, 0, P4::Unused));
+                }
+                BinaryOp::Ge => {
+                    let set_true_addr = ops.len() as i32 + 3;
+                    ops.push(make_op(Opcode::Integer, 0, dest_reg, 0, P4::Unused));
+                    ops.push(make_op(
+                        Opcode::Ge,
+                        right_reg,
+                        set_true_addr,
+                        left_reg,
+                        P4::Unused,
+                    ));
+                    let end_addr = ops.len() as i32 + 2;
+                    ops.push(make_op(Opcode::Goto, 0, end_addr, 0, P4::Unused));
+                    ops.push(make_op(Opcode::Integer, 1, dest_reg, 0, P4::Unused));
+                }
+                BinaryOp::Le => {
+                    let set_true_addr = ops.len() as i32 + 3;
+                    ops.push(make_op(Opcode::Integer, 0, dest_reg, 0, P4::Unused));
+                    ops.push(make_op(
+                        Opcode::Le,
+                        right_reg,
+                        set_true_addr,
+                        left_reg,
+                        P4::Unused,
+                    ));
+                    let end_addr = ops.len() as i32 + 2;
+                    ops.push(make_op(Opcode::Goto, 0, end_addr, 0, P4::Unused));
+                    ops.push(make_op(Opcode::Integer, 1, dest_reg, 0, P4::Unused));
+                }
+                BinaryOp::Eq => {
+                    let set_true_addr = ops.len() as i32 + 3;
+                    ops.push(make_op(Opcode::Integer, 0, dest_reg, 0, P4::Unused));
+                    ops.push(make_op(
+                        Opcode::Eq,
+                        right_reg,
+                        set_true_addr,
+                        left_reg,
+                        P4::Unused,
+                    ));
+                    let end_addr = ops.len() as i32 + 2;
+                    ops.push(make_op(Opcode::Goto, 0, end_addr, 0, P4::Unused));
+                    ops.push(make_op(Opcode::Integer, 1, dest_reg, 0, P4::Unused));
+                }
+                BinaryOp::Ne => {
+                    let set_true_addr = ops.len() as i32 + 3;
+                    ops.push(make_op(Opcode::Integer, 0, dest_reg, 0, P4::Unused));
+                    ops.push(make_op(
+                        Opcode::Ne,
+                        right_reg,
+                        set_true_addr,
+                        left_reg,
+                        P4::Unused,
+                    ));
+                    let end_addr = ops.len() as i32 + 2;
+                    ops.push(make_op(Opcode::Goto, 0, end_addr, 0, P4::Unused));
+                    ops.push(make_op(Opcode::Integer, 1, dest_reg, 0, P4::Unused));
+                }
+                BinaryOp::And => {
+                    ops.push(make_op(
+                        Opcode::And,
+                        left_reg,
+                        right_reg,
+                        dest_reg,
+                        P4::Unused,
+                    ));
+                }
+                BinaryOp::Or => {
+                    ops.push(make_op(
+                        Opcode::Or,
+                        left_reg,
+                        right_reg,
+                        dest_reg,
+                        P4::Unused,
+                    ));
+                }
+                BinaryOp::Add => {
+                    ops.push(make_op(
+                        Opcode::Add,
+                        right_reg,
+                        left_reg,
+                        dest_reg,
+                        P4::Unused,
+                    ));
+                }
+                BinaryOp::Sub => {
+                    ops.push(make_op(
+                        Opcode::Subtract,
+                        right_reg,
+                        left_reg,
+                        dest_reg,
+                        P4::Unused,
+                    ));
+                }
+                BinaryOp::Mul => {
+                    ops.push(make_op(
+                        Opcode::Multiply,
+                        right_reg,
+                        left_reg,
+                        dest_reg,
+                        P4::Unused,
+                    ));
+                }
+                BinaryOp::Div => {
+                    ops.push(make_op(
+                        Opcode::Divide,
+                        right_reg,
+                        left_reg,
+                        dest_reg,
+                        P4::Unused,
+                    ));
+                }
+                _ => {
+                    ops.push(make_op(Opcode::Integer, 1, dest_reg, 0, P4::Unused));
+                }
+            }
+        }
+
+        Expr::Column(col_ref) => {
+            if let Some(ref table) = col_ref.table {
+                let table_upper = table.to_uppercase();
+                if table_upper == "OLD" || table_upper == "NEW" {
+                    let table_type = if table_upper == "OLD" { 0 } else { 1 };
+                    let col_lower = col_ref.column.to_lowercase();
+                    let col_idx = column_map
+                        .get(&col_lower)
+                        .map(|&idx| idx as i32)
+                        .unwrap_or(0);
+
+                    let row_size = num_columns + 1;
+                    let src_reg = base_reg + (table_type * row_size) + col_idx + 1;
+
+                    ops.push(make_op(Opcode::SCopy, src_reg, dest_reg, 0, P4::Unused));
+                    return;
+                }
+            }
+            ops.push(make_op(Opcode::Null, 0, dest_reg, 0, P4::Unused));
+        }
+
+        Expr::Literal(lit) => match lit {
+            Literal::Null => {
+                ops.push(make_op(Opcode::Null, 0, dest_reg, 0, P4::Unused));
+            }
+            Literal::Integer(n) => {
+                ops.push(make_op(Opcode::Integer, *n as i32, dest_reg, 0, P4::Unused));
+            }
+            Literal::Float(f) => {
+                ops.push(make_op(Opcode::Real, 0, dest_reg, 0, P4::Real(*f)));
+            }
+            Literal::String(s) => {
+                ops.push(make_op(
+                    Opcode::String8,
+                    0,
+                    dest_reg,
+                    0,
+                    P4::Text(s.clone()),
+                ));
+            }
+            Literal::Bool(b) => {
+                ops.push(make_op(
+                    Opcode::Integer,
+                    if *b { 1 } else { 0 },
+                    dest_reg,
+                    0,
+                    P4::Unused,
+                ));
+            }
+            _ => {
+                ops.push(make_op(Opcode::Null, 0, dest_reg, 0, P4::Unused));
+            }
+        },
+
+        Expr::Parens(inner) => {
+            compile_when_clause(
+                ops,
+                inner,
+                dest_reg,
+                base_reg,
+                num_columns,
+                next_reg,
+                column_map,
+            );
+        }
+
+        Expr::Unary { op, expr: inner } => {
+            compile_when_clause(
+                ops,
+                inner,
+                dest_reg,
+                base_reg,
+                num_columns,
+                next_reg,
+                column_map,
+            );
+            match op {
+                crate::parser::ast::UnaryOp::Not => {
+                    ops.push(make_op(Opcode::Not, dest_reg, dest_reg, 0, P4::Unused));
+                }
+                crate::parser::ast::UnaryOp::Neg => {
+                    let zero_reg = *next_reg;
+                    *next_reg += 1;
+                    ops.push(make_op(Opcode::Integer, 0, zero_reg, 0, P4::Unused));
+                    ops.push(make_op(
+                        Opcode::Subtract,
+                        dest_reg,
+                        zero_reg,
+                        dest_reg,
+                        P4::Unused,
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        _ => {
+            ops.push(make_op(Opcode::Integer, 1, dest_reg, 0, P4::Unused));
+        }
+    }
 }
 
 /// Context for trigger execution

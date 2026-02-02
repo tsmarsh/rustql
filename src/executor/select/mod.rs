@@ -863,6 +863,8 @@ impl<'s> SelectCompiler<'s> {
         if let Some(temp_schema) = self.temp_schema {
             subcompiler.set_temp_schema(temp_schema);
         }
+        // Propagate attached schemas for attached database table lookups
+        subcompiler.set_attached_schemas(self.attached_schemas.clone());
         subcompiler.next_reg = self.next_reg;
         subcompiler.next_cursor = self.next_cursor;
         subcompiler.ctes = self.ctes.clone();
@@ -1100,6 +1102,8 @@ impl<'s> SelectCompiler<'s> {
         } else {
             SelectCompiler::new()
         };
+        // Propagate attached schemas for attached database table lookups
+        subcompiler.set_attached_schemas(self.attached_schemas.clone());
         subcompiler.next_reg = self.next_reg;
         subcompiler.next_cursor = self.next_cursor;
         subcompiler.ctes = self.ctes.clone();
@@ -6960,6 +6964,8 @@ impl<'s> SelectCompiler<'s> {
                         if let Some(temp_schema) = self.temp_schema {
                             subcompiler.set_temp_schema(temp_schema);
                         }
+                        // Propagate attached schemas for attached database table lookups
+                        subcompiler.set_attached_schemas(self.attached_schemas.clone());
                         subcompiler.next_reg = self.next_reg;
                         subcompiler.next_cursor = self.next_cursor;
                         // Propagate expanding_views for circular view detection
@@ -7097,6 +7103,8 @@ impl<'s> SelectCompiler<'s> {
                 } else {
                     SelectCompiler::new()
                 };
+                // Propagate attached schemas for attached database table lookups
+                subcompiler.set_attached_schemas(self.attached_schemas.clone());
                 subcompiler.next_reg = self.next_reg;
                 subcompiler.next_cursor = self.next_cursor;
                 // Pass column naming settings to subquery compiler
@@ -9736,6 +9744,8 @@ impl<'s> SelectCompiler<'s> {
                         if let Some(temp_schema) = self.temp_schema {
                             subcompiler.set_temp_schema(temp_schema);
                         }
+                        // Propagate attached schemas for attached database table lookups
+                        subcompiler.set_attached_schemas(self.attached_schemas.clone());
                         subcompiler.next_reg = self.next_reg;
                         subcompiler.next_cursor = self.next_cursor;
                         subcompiler.ctes = self.ctes.clone();

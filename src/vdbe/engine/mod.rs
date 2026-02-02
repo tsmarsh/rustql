@@ -2583,8 +2583,9 @@ impl Vdbe {
                         }
                     }
 
-                    // If not found in main schema and we have a specific db_idx, check attached schemas
-                    // Also check when root_page is known but table_found is false (for correct db_idx)
+                    // If not found in main schema, check attached schemas
+                    // For qualified names: check only the specified database
+                    // For unqualified names: search all attached databases in order
                     if !table_found {
                         // Use requested_db_idx from schema name OR from P5 (for trigger body compilation)
                         let requested_db_idx = schema_name
@@ -2601,10 +2602,23 @@ impl Vdbe {
                             .unwrap_or_default();
                         let need_root_lookup = root_page == 0;
 
-                        if requested_db_idx.is_some() {
-                            if let Some(conn_ptr) = self.conn_ptr {
-                                let conn = unsafe { &*conn_ptr };
-                                if let Some(db) = conn.dbs.get(requested_db_idx.unwrap() as usize) {
+                        if let Some(conn_ptr) = self.conn_ptr {
+                            let conn = unsafe { &*conn_ptr };
+
+                            // Determine which databases to search
+                            let dbs_to_search: Vec<usize> = if let Some(db_idx) = requested_db_idx {
+                                // Qualified name or trigger context - search only the specified database
+                                vec![db_idx as usize]
+                            } else {
+                                // Unqualified name - search all attached databases (skip main at 0, temp at 1)
+                                (2..conn.dbs.len()).collect()
+                            };
+
+                            'db_search: for db_idx in dbs_to_search {
+                                if table_found {
+                                    break;
+                                }
+                                if let Some(db) = conn.dbs.get(db_idx) {
                                     if let Some(ref schema_arc) = db.schema {
                                         if let Ok(schema_guard) = schema_arc.read() {
                                             // Try as a table
@@ -2619,6 +2633,7 @@ impl Vdbe {
                                                 if need_root_lookup {
                                                     root_page = table.root_page;
                                                 }
+                                                break 'db_search;
                                             }
                                             // Try as an index
                                             if need_root_lookup && root_page == 0 && !table_found {
@@ -2636,6 +2651,7 @@ impl Vdbe {
                                                         .iter()
                                                         .map(|c| c.collation.clone())
                                                         .collect();
+                                                    break 'db_search;
                                                 }
                                             }
                                             // Also check auto-indexes
@@ -2654,11 +2670,8 @@ impl Vdbe {
                                                                 .iter()
                                                                 .map(|c| c.collation.clone())
                                                                 .collect();
-                                                            break;
+                                                            break 'db_search;
                                                         }
-                                                    }
-                                                    if table_found {
-                                                        break;
                                                     }
                                                 }
                                             }

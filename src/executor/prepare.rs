@@ -215,6 +215,48 @@ impl<'s> StatementCompiler<'s> {
         }
     }
 
+    /// Get the schema for a given database index
+    /// 0 = main, 1 = temp, 2+ = attached databases
+    fn schema_for_db_idx(&self, db_idx: i32) -> Option<&'s crate::schema::Schema> {
+        match db_idx {
+            0 => self.schema,
+            1 => self.temp_schema,
+            idx if idx > 1 => self
+                .attached_schemas
+                .get((idx - 2) as usize)
+                .map(|(_, schema)| *schema),
+            _ => None,
+        }
+    }
+
+    /// Look up a table in the schema for the given database index,
+    /// or search all schemas if db_idx is -1 (unqualified name)
+    fn lookup_table_in_db(
+        &self,
+        table_name: &str,
+        db_idx: i32,
+    ) -> Option<std::sync::Arc<crate::schema::Table>> {
+        let table_name_lower = table_name.to_lowercase();
+        if db_idx >= 0 {
+            // Look up in specific database schema
+            self.schema_for_db_idx(db_idx)
+                .and_then(|schema| schema.tables.get(&table_name_lower).cloned())
+        } else {
+            // Unqualified name - search all schemas (main first, then temp, then attached)
+            self.schema
+                .and_then(|s| s.tables.get(&table_name_lower).cloned())
+                .or_else(|| {
+                    self.temp_schema
+                        .and_then(|s| s.tables.get(&table_name_lower).cloned())
+                })
+                .or_else(|| {
+                    self.attached_schemas
+                        .iter()
+                        .find_map(|(_, schema)| schema.tables.get(&table_name_lower).cloned())
+                })
+        }
+    }
+
     /// Set temp schema for TEMP tables/views
     pub fn set_temp_schema(&mut self, temp_schema: &'s crate::schema::Schema) {
         self.temp_schema = Some(temp_schema);
@@ -559,17 +601,28 @@ impl<'s> StatementCompiler<'s> {
 
             Stmt::Insert(insert) => {
                 // Resolve schema: check for schema prefix (attached database)
-                let target_schema: Option<&crate::schema::Schema> =
-                    if let Some(ref schema_name) = insert.table.schema {
-                        // Look up in attached_schemas
-                        self.attached_schemas
-                            .iter()
-                            .find(|(name, _)| name.eq_ignore_ascii_case(schema_name))
-                            .map(|(_, schema)| *schema)
-                            .or(self.schema) // Fallback to main if not found
-                    } else {
-                        self.schema
-                    };
+                let target_schema: Option<&crate::schema::Schema> = if let Some(ref schema_name) =
+                    insert.table.schema
+                {
+                    // Look up in attached_schemas
+                    self.attached_schemas
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(schema_name))
+                        .map(|(_, schema)| *schema)
+                        .or(self.schema) // Fallback to main if not found
+                } else {
+                    // Unqualified table name: search main first, then attached schemas
+                    let table_name_lower = insert.table.name.to_lowercase();
+                    self.schema
+                        .filter(|s| s.tables.contains_key(&table_name_lower))
+                        .or_else(|| {
+                            self.attached_schemas
+                                .iter()
+                                .find(|(_, schema)| schema.tables.contains_key(&table_name_lower))
+                                .map(|(_, schema)| *schema)
+                        })
+                        .or(self.schema) // Fallback to main if not found anywhere
+                };
 
                 // Check if target is a virtual table with unregistered module
                 self.check_vtab_module(&insert.table.name, target_schema)?;
@@ -589,16 +642,27 @@ impl<'s> StatementCompiler<'s> {
 
             Stmt::Update(update) => {
                 // Resolve schema: check for schema prefix (attached database)
-                let target_schema: Option<&crate::schema::Schema> =
-                    if let Some(ref schema_name) = update.table.schema {
-                        self.attached_schemas
-                            .iter()
-                            .find(|(name, _)| name.eq_ignore_ascii_case(schema_name))
-                            .map(|(_, schema)| *schema)
-                            .or(self.schema)
-                    } else {
-                        self.schema
-                    };
+                let target_schema: Option<&crate::schema::Schema> = if let Some(ref schema_name) =
+                    update.table.schema
+                {
+                    self.attached_schemas
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(schema_name))
+                        .map(|(_, schema)| *schema)
+                        .or(self.schema)
+                } else {
+                    // Unqualified table name: search main first, then attached schemas
+                    let table_name_lower = update.table.name.to_lowercase();
+                    self.schema
+                        .filter(|s| s.tables.contains_key(&table_name_lower))
+                        .or_else(|| {
+                            self.attached_schemas
+                                .iter()
+                                .find(|(_, schema)| schema.tables.contains_key(&table_name_lower))
+                                .map(|(_, schema)| *schema)
+                        })
+                        .or(self.schema) // Fallback to main if not found anywhere
+                };
 
                 // Check if target is a virtual table with unregistered module
                 self.check_vtab_module(&update.table.name, target_schema)?;
@@ -616,16 +680,27 @@ impl<'s> StatementCompiler<'s> {
 
             Stmt::Delete(delete) => {
                 // Resolve schema: check for schema prefix (attached database)
-                let target_schema: Option<&crate::schema::Schema> =
-                    if let Some(ref schema_name) = delete.table.schema {
-                        self.attached_schemas
-                            .iter()
-                            .find(|(name, _)| name.eq_ignore_ascii_case(schema_name))
-                            .map(|(_, schema)| *schema)
-                            .or(self.schema)
-                    } else {
-                        self.schema
-                    };
+                let target_schema: Option<&crate::schema::Schema> = if let Some(ref schema_name) =
+                    delete.table.schema
+                {
+                    self.attached_schemas
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(schema_name))
+                        .map(|(_, schema)| *schema)
+                        .or(self.schema)
+                } else {
+                    // Unqualified table name: search main first, then attached schemas
+                    let table_name_lower = delete.table.name.to_lowercase();
+                    self.schema
+                        .filter(|s| s.tables.contains_key(&table_name_lower))
+                        .or_else(|| {
+                            self.attached_schemas
+                                .iter()
+                                .find(|(_, schema)| schema.tables.contains_key(&table_name_lower))
+                                .map(|(_, schema)| *schema)
+                        })
+                        .or(self.schema) // Fallback to main if not found anywhere
+                };
 
                 // Check if target is a virtual table with unregistered module
                 self.check_vtab_module(&delete.table.name, target_schema)?;
@@ -2468,8 +2543,11 @@ impl<'s> StatementCompiler<'s> {
         let table_name_lower = table_name.to_lowercase();
         let db_idx = self.resolve_db_idx(&create.name, false)?;
 
-        // Check if index already exists
-        if let Some(schema) = self.schema {
+        // Get the schema for the target database
+        let target_schema = self.schema_for_db_idx(db_idx);
+
+        // Check if index already exists (in the target schema)
+        if let Some(schema) = target_schema {
             if schema.indexes.contains_key(&index_name_lower) {
                 if create.if_not_exists {
                     // Return no-op
@@ -2492,7 +2570,7 @@ impl<'s> StatementCompiler<'s> {
                 ));
             }
 
-            // Check if target table exists
+            // Check if target table exists in the target schema
             if !schema.tables.contains_key(&table_name_lower) {
                 return Err(crate::error::Error::with_message(
                     crate::error::ErrorCode::Error,

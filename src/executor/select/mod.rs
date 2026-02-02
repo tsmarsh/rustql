@@ -7553,7 +7553,7 @@ impl<'s> SelectCompiler<'s> {
                     if !is_known_function {
                         return Err(Error::with_message(
                             ErrorCode::Error,
-                            format!("no such function: {}", func_call.name.to_uppercase()),
+                            format!("no such function: {}", func_call.name),
                         ));
                     }
 

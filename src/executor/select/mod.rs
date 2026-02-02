@@ -5996,6 +5996,14 @@ impl<'s> SelectCompiler<'s> {
         use crate::parser::ast::{BinaryOp, ColumnRef, Expr};
         use std::collections::HashSet;
 
+        // Check if there's a RIGHT JOIN anywhere in the src_list.
+        // If so, ON clauses must not reference tables to their right.
+        // This matches SQLite's hasRightJoin() check in selectCheckOnClauses().
+        let has_right_join = src_list
+            .items
+            .iter()
+            .any(|item| item.join_type.contains(JoinFlags::RIGHT));
+
         for (i, item) in src_list.items.iter().enumerate() {
             if i == 0 {
                 // First table has no join with previous
@@ -6090,12 +6098,312 @@ impl<'s> SelectCompiler<'s> {
             }
             // Handle ON clause
             else if let Some(on_expr) = &item.on_clause {
+                // Check if this ON clause needs validation for forward references.
+                // SQLite validates ON clauses that are either:
+                // - On an OUTER join (LEFT, RIGHT, or FULL), or
+                // - On an INNER join when there's a RIGHT join somewhere in the FROM
+                let is_outer = item.join_type.is_outer();
+                let needs_validation = is_outer || has_right_join;
+
+                if needs_validation {
+                    // Validate that ON clause doesn't reference tables to its right
+                    self.validate_on_clause_references(on_expr, i, src_list)?;
+                }
+
                 // on_expr is &Box<Expr>, so we need to deref twice to get &Expr
                 self.join_conditions.push((**on_expr).clone());
             }
         }
 
         Ok(())
+    }
+
+    /// Validate that an ON clause doesn't reference tables to its right.
+    ///
+    /// This matches SQLite's selectCheckOnClauses() function from select.c.
+    /// When there's a RIGHT or FULL JOIN in the FROM clause, ON clauses must
+    /// not reference tables that appear later in the join sequence.
+    fn validate_on_clause_references(
+        &self,
+        on_expr: &Expr,
+        join_index: usize,
+        src_list: &crate::parser::ast::SrcList,
+    ) -> Result<()> {
+        // Collect all column references in the ON expression (including subqueries)
+        let columns = self.collect_on_clause_columns(on_expr);
+
+        // Build a set of table names that appear AFTER this join position
+        let tables_to_right: HashSet<String> = src_list
+            .items
+            .iter()
+            .skip(join_index + 1)
+            .map(|item| {
+                let name = item.alias.clone().unwrap_or_else(|| match &item.source {
+                    crate::parser::ast::TableSource::Table(qn) => qn.name.clone(),
+                    crate::parser::ast::TableSource::Subquery(_) => "subquery".to_string(),
+                    crate::parser::ast::TableSource::TableFunction { name, .. } => name.clone(),
+                });
+                name.to_lowercase()
+            })
+            .collect();
+
+        // Also include the actual table names (not just aliases) for tables to the right
+        let table_names_to_right: HashSet<String> = src_list
+            .items
+            .iter()
+            .skip(join_index + 1)
+            .filter_map(|item| match &item.source {
+                crate::parser::ast::TableSource::Table(qn) => Some(qn.name.to_lowercase()),
+                _ => None,
+            })
+            .collect();
+
+        // Check each column reference
+        for col_ref in &columns {
+            if let Some(table_name) = &col_ref.table {
+                let table_lower = table_name.to_lowercase();
+                if tables_to_right.contains(&table_lower)
+                    || table_names_to_right.contains(&table_lower)
+                {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        "ON clause references tables to its right",
+                    ));
+                }
+            } else {
+                // Column without explicit table qualifier - check if it could only
+                // resolve to a table on the right
+                let col_name = col_ref.column.to_lowercase();
+
+                // Check if column exists in any table to the left (index <= join_index)
+                let mut found_left = false;
+                for idx in 0..=join_index {
+                    if idx < self.tables.len() {
+                        let table = &self.tables[idx];
+                        if self.table_has_column(table, &col_name) {
+                            found_left = true;
+                            break;
+                        }
+                    }
+                }
+
+                // Check if column exists ONLY in tables to the right
+                if !found_left {
+                    for idx in (join_index + 1)..self.tables.len() {
+                        let table = &self.tables[idx];
+                        if self.table_has_column(table, &col_name) {
+                            return Err(Error::with_message(
+                                ErrorCode::Error,
+                                "ON clause references tables to its right",
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Collect all column references from an expression, including nested subqueries.
+    /// This recursively walks the expression tree.
+    fn collect_on_clause_columns(&self, expr: &Expr) -> Vec<ColumnRef> {
+        let mut columns = Vec::new();
+        self.collect_columns_recursive(expr, &mut columns);
+        columns
+    }
+
+    fn collect_columns_recursive(&self, expr: &Expr, columns: &mut Vec<ColumnRef>) {
+        use crate::parser::ast::{FunctionArgs, InList};
+
+        match expr {
+            Expr::Column(col_ref) => {
+                columns.push(col_ref.clone());
+            }
+            Expr::Binary { left, right, .. } | Expr::IsDistinct { left, right, .. } => {
+                self.collect_columns_recursive(left, columns);
+                self.collect_columns_recursive(right, columns);
+            }
+            Expr::Unary { expr, .. }
+            | Expr::Cast { expr, .. }
+            | Expr::Collate { expr, .. }
+            | Expr::IsNull { expr, .. }
+            | Expr::Parens(expr) => {
+                self.collect_columns_recursive(expr, columns);
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.collect_columns_recursive(expr, columns);
+                self.collect_columns_recursive(low, columns);
+                self.collect_columns_recursive(high, columns);
+            }
+            Expr::In { expr, list, .. } => {
+                self.collect_columns_recursive(expr, columns);
+                match list {
+                    InList::Values(values) => {
+                        for v in values {
+                            self.collect_columns_recursive(v, columns);
+                        }
+                    }
+                    InList::Subquery(select) => {
+                        // For subqueries in IN, we need to check columns in the subquery's WHERE
+                        // that reference outer tables
+                        self.collect_columns_from_select(select, columns);
+                    }
+                    InList::Table(_) => {}
+                }
+            }
+            Expr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => {
+                self.collect_columns_recursive(expr, columns);
+                self.collect_columns_recursive(pattern, columns);
+                if let Some(esc) = escape {
+                    self.collect_columns_recursive(esc, columns);
+                }
+            }
+            Expr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => {
+                if let Some(op) = operand {
+                    self.collect_columns_recursive(op, columns);
+                }
+                for clause in when_clauses {
+                    self.collect_columns_recursive(&clause.when, columns);
+                    self.collect_columns_recursive(&clause.then, columns);
+                }
+                if let Some(el) = else_clause {
+                    self.collect_columns_recursive(el, columns);
+                }
+            }
+            Expr::Function(func) => {
+                if let FunctionArgs::Exprs(args) = &func.args {
+                    for arg in args {
+                        self.collect_columns_recursive(arg, columns);
+                    }
+                }
+                if let Some(filter) = &func.filter {
+                    self.collect_columns_recursive(filter, columns);
+                }
+            }
+            Expr::Subquery(select)
+            | Expr::Exists {
+                subquery: select, ..
+            } => {
+                // For subqueries, collect columns that could be correlated references
+                self.collect_columns_from_select(select, columns);
+            }
+            Expr::Literal(_) | Expr::Variable(_) | Expr::Raise { .. } => {}
+        }
+    }
+
+    /// Collect columns from a SELECT that might be correlated references to outer query
+    fn collect_columns_from_select(&self, select: &SelectStmt, columns: &mut Vec<ColumnRef>) {
+        // Walk the SELECT body looking for column references
+        self.collect_columns_from_select_body(&select.body, columns);
+
+        // Also check ORDER BY and LIMIT
+        if let Some(order_by) = &select.order_by {
+            for term in order_by {
+                self.collect_columns_recursive(&term.expr, columns);
+            }
+        }
+        if let Some(limit) = &select.limit {
+            self.collect_columns_recursive(&limit.limit, columns);
+            if let Some(offset) = &limit.offset {
+                self.collect_columns_recursive(offset, columns);
+            }
+        }
+    }
+
+    fn collect_columns_from_select_body(&self, body: &SelectBody, columns: &mut Vec<ColumnRef>) {
+        match body {
+            SelectBody::Select(core) => {
+                // Check result columns
+                for col in &core.columns {
+                    if let ResultColumn::Expr { expr, .. } = col {
+                        self.collect_columns_recursive(expr, columns);
+                    }
+                }
+                // Check WHERE clause
+                if let Some(where_clause) = &core.where_clause {
+                    self.collect_columns_recursive(where_clause, columns);
+                }
+                // Check GROUP BY
+                if let Some(group_by) = &core.group_by {
+                    for expr in group_by {
+                        self.collect_columns_recursive(expr, columns);
+                    }
+                }
+                // Check HAVING
+                if let Some(having) = &core.having {
+                    self.collect_columns_recursive(having, columns);
+                }
+                // Check FROM clause for nested subqueries and ON clauses
+                if let Some(from) = &core.from {
+                    self.collect_columns_from_from_clause(from, columns);
+                }
+            }
+            SelectBody::Compound { left, right, .. } => {
+                self.collect_columns_from_select_body(left, columns);
+                self.collect_columns_from_select_body(right, columns);
+            }
+        }
+    }
+
+    fn collect_columns_from_from_clause(&self, from: &FromClause, columns: &mut Vec<ColumnRef>) {
+        for table_ref in &from.tables {
+            self.collect_columns_from_table_ref(table_ref, columns);
+        }
+    }
+
+    fn collect_columns_from_table_ref(&self, table_ref: &TableRef, columns: &mut Vec<ColumnRef>) {
+        match table_ref {
+            TableRef::Table { .. } => {}
+            TableRef::Subquery { query, .. } => {
+                self.collect_columns_from_select(query, columns);
+            }
+            TableRef::Join {
+                left,
+                right,
+                constraint,
+                ..
+            } => {
+                self.collect_columns_from_table_ref(left, columns);
+                self.collect_columns_from_table_ref(right, columns);
+                if let Some(crate::parser::ast::JoinConstraint::On(expr)) = constraint {
+                    self.collect_columns_recursive(expr, columns);
+                }
+            }
+            TableRef::TableFunction { args, .. } => {
+                for arg in args {
+                    self.collect_columns_recursive(arg, columns);
+                }
+            }
+            TableRef::Parens(inner) => {
+                self.collect_columns_from_table_ref(inner, columns);
+            }
+        }
+    }
+
+    /// Check if a table has a column with the given name
+    fn table_has_column(&self, table: &TableInfo, col_name: &str) -> bool {
+        if let Some(schema) = &table.schema_table {
+            schema
+                .columns
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(col_name))
+        } else if let Some(subq_cols) = &table.subquery_columns {
+            subq_cols.iter().any(|c| c.eq_ignore_ascii_case(col_name))
+        } else {
+            false
+        }
     }
 
     /// Find column names that exist in both the current table and any previous table

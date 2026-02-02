@@ -610,7 +610,7 @@ impl<'s> SelectCompiler<'s> {
                     // If expr has explicit `COLLATE name`, use `name`; otherwise look up column schema collation
                     let collations: Vec<String> = order_by
                         .iter()
-                        .map(|t| self.extract_collation_from_expr(&t.expr))
+                        .map(|t| self.extract_collation_from_expr(&t.expr, Some(&select.body)))
                         .collect();
 
                     // Check if any custom collations are used
@@ -7642,22 +7642,198 @@ impl<'s> SelectCompiler<'s> {
     /// Extract the collation name from an expression.
     /// If the expression is `expr COLLATE name`, returns `name` (uppercased).
     /// If the expression is a column reference, looks up the column's collation from schema.
+    /// For positional ORDER BY (e.g., `ORDER BY 1`), resolves to the result column.
     /// Otherwise returns "BINARY" as the default collation.
-    fn extract_collation_from_expr(&self, expr: &Expr) -> String {
+    fn extract_collation_from_expr(&self, expr: &Expr, body: Option<&SelectBody>) -> String {
         match expr {
             Expr::Collate { collation, .. } => collation.to_uppercase(),
             Expr::Column(col_ref) => {
+                // First check if this column name is an alias in the SELECT list
+                if col_ref.table.is_none() {
+                    if let Some(SelectBody::Select(core)) = body {
+                        let col_lower = col_ref.column.to_lowercase();
+                        for result_col in &core.columns {
+                            if let ResultColumn::Expr {
+                                alias,
+                                expr: col_expr,
+                            } = result_col
+                            {
+                                if let Some(al) = alias {
+                                    if al.to_lowercase() == col_lower {
+                                        // Found alias - recursively get collation from underlying expr
+                                        return self.extract_collation_from_expr(col_expr, body);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 // Look up the column's collation from schema
                 self.lookup_column_collation(col_ref.table.as_deref(), &col_ref.column)
             }
-            Expr::Literal(Literal::Integer(_)) => {
+            Expr::Literal(Literal::Integer(n)) => {
                 // Position-based ORDER BY (e.g., ORDER BY 1)
-                // The collation should be determined by the result column
-                // For now, return BINARY as we'd need more context
+                // Resolve to the result column and get its collation
+                if let Some(SelectBody::Select(core)) = body {
+                    let idx = (*n as usize).saturating_sub(1);
+                    // Count actual column positions accounting for * expansion
+                    let mut col_pos = 0;
+                    for result_col in &core.columns {
+                        match result_col {
+                            ResultColumn::Expr { expr: col_expr, .. } => {
+                                if col_pos == idx {
+                                    return self.extract_collation_from_expr(col_expr, body);
+                                }
+                                col_pos += 1;
+                            }
+                            ResultColumn::Star => {
+                                // SELECT * - need to expand from FROM clause
+                                if let Some(from) = &core.from {
+                                    let count = self.count_columns_from_from(from);
+                                    if idx < col_pos + count {
+                                        // The position is within this * expansion
+                                        let offset = idx - col_pos;
+                                        if let Some(collation) =
+                                            self.get_column_collation_from_from(from, offset)
+                                        {
+                                            return collation;
+                                        }
+                                    }
+                                    col_pos += count;
+                                }
+                            }
+                            ResultColumn::TableStar(table_name) => {
+                                // SELECT table.* - need to expand for specific table
+                                if let Some(from) = &core.from {
+                                    let count = self.count_columns_from_table(from, table_name);
+                                    if idx < col_pos + count {
+                                        let offset = idx - col_pos;
+                                        if let Some(collation) = self
+                                            .get_column_collation_from_table(
+                                                from, table_name, offset,
+                                            )
+                                        {
+                                            return collation;
+                                        }
+                                    }
+                                    col_pos += count;
+                                }
+                            }
+                        }
+                    }
+                }
                 "BINARY".to_string()
             }
             _ => "BINARY".to_string(),
         }
+    }
+
+    /// Count how many columns the FROM clause would expand to
+    fn count_columns_from_from(&self, from: &FromClause) -> usize {
+        let mut count = 0;
+        for table_ref in &from.tables {
+            count += self.count_columns_from_table_ref(table_ref);
+        }
+        count
+    }
+
+    fn count_columns_from_table_ref(&self, table_ref: &TableRef) -> usize {
+        match table_ref {
+            TableRef::Table { name, .. } => {
+                let table_name = &name.name;
+                if let Some(schema) = self.schema {
+                    if let Some(table) = schema.tables.get(&table_name.to_lowercase()) {
+                        return table.columns.len();
+                    }
+                }
+                0
+            }
+            TableRef::Subquery { .. } => 0, // Would need more complex handling
+            TableRef::TableFunction { .. } => 0,
+            TableRef::Join { left, right, .. } => {
+                self.count_columns_from_table_ref(left) + self.count_columns_from_table_ref(right)
+            }
+            _ => 0,
+        }
+    }
+
+    fn count_columns_from_table(&self, from: &FromClause, table_name: &str) -> usize {
+        let tbl_lower = table_name.to_lowercase();
+        for table_ref in &from.tables {
+            if let TableRef::Table { name, alias, .. } = table_ref {
+                let matches = name.name.to_lowercase() == tbl_lower
+                    || alias.as_ref().map(|a| a.to_lowercase()) == Some(tbl_lower.clone());
+                if matches {
+                    return self.count_columns_from_table_ref(table_ref);
+                }
+            }
+        }
+        0
+    }
+
+    /// Get the collation for a specific column at offset within the FROM clause expansion
+    fn get_column_collation_from_from(&self, from: &FromClause, offset: usize) -> Option<String> {
+        let mut current_offset = 0;
+        for table_ref in &from.tables {
+            let count = self.count_columns_from_table_ref(table_ref);
+            if offset < current_offset + count {
+                let local_offset = offset - current_offset;
+                return self.get_column_collation_from_table_ref(table_ref, local_offset);
+            }
+            current_offset += count;
+        }
+        None
+    }
+
+    fn get_column_collation_from_table_ref(
+        &self,
+        table_ref: &TableRef,
+        offset: usize,
+    ) -> Option<String> {
+        match table_ref {
+            TableRef::Table { name, .. } => {
+                let table_name = &name.name;
+                if let Some(schema) = self.schema {
+                    if let Some(table) = schema.tables.get(&table_name.to_lowercase()) {
+                        if let Some(col) = table.columns.get(offset) {
+                            if col.collation.is_empty() || col.collation == "BINARY" {
+                                return Some("BINARY".to_string());
+                            }
+                            return Some(col.collation.to_uppercase());
+                        }
+                    }
+                }
+                None
+            }
+            TableRef::Join { left, right, .. } => {
+                let left_count = self.count_columns_from_table_ref(left);
+                if offset < left_count {
+                    self.get_column_collation_from_table_ref(left, offset)
+                } else {
+                    self.get_column_collation_from_table_ref(right, offset - left_count)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn get_column_collation_from_table(
+        &self,
+        from: &FromClause,
+        table_name: &str,
+        offset: usize,
+    ) -> Option<String> {
+        let tbl_lower = table_name.to_lowercase();
+        for table_ref in &from.tables {
+            if let TableRef::Table { name, alias, .. } = table_ref {
+                let matches = name.name.to_lowercase() == tbl_lower
+                    || alias.as_ref().map(|a| a.to_lowercase()) == Some(tbl_lower.clone());
+                if matches {
+                    return self.get_column_collation_from_table_ref(table_ref, offset);
+                }
+            }
+        }
+        None
     }
 
     /// Look up the collation for a column from the schema.

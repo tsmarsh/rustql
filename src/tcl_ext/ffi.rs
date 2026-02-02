@@ -2,6 +2,8 @@
 //!
 //! This module contains the raw FFI bindings to the TCL C library.
 
+#![allow(non_camel_case_types)]
+
 use std::ffi::c_void;
 use std::os::raw::{c_char, c_int};
 

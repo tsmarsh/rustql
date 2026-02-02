@@ -754,7 +754,7 @@ impl RtreeTable {
     ///
     /// Returns (is_leaf, entries)
     /// Note: is_leaf is determined by whether depth==0 and node has no children
-    pub fn deserialize_node(&self, data: &[u8], is_leaf: bool) -> Result<Vec<RtreeEntry>> {
+    pub fn deserialize_node(&self, data: &[u8], _is_leaf: bool) -> Result<Vec<RtreeEntry>> {
         if data.len() < 4 {
             return Err(Error::with_message(
                 ErrorCode::Corrupt,

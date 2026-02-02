@@ -13,7 +13,7 @@ use crate::vtab::{
 };
 
 use super::fts3::{Fts3Cursor, Fts3Table};
-use super::registry::{get_table, register_table};
+use super::registry::register_table;
 use super::tokenizer::create_tokenizer;
 
 /// FTS3 virtual table module

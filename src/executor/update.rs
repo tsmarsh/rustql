@@ -981,7 +981,7 @@ impl<'s> UpdateCompiler<'s> {
         // that involves updated columns
         let (root_page, _) = self.lookup_table_info(&self.table_name)?;
 
-        for (idx_name, col_indices) in unique_checks {
+        for (_idx_name, col_indices) in unique_checks {
             // Determine column name(s) for error message
             // Format: "table.col" for single column, "table.col1, table.col2" for multiple
             let col_name = if col_indices.len() == 1 {
@@ -1044,7 +1044,7 @@ impl<'s> UpdateCompiler<'s> {
             // For single-column UNIQUE: just compare
             // For multi-column UNIQUE: all must match
             let ipk_col = self.get_ipk_column_index();
-            let mut all_match_label = conflict_label;
+            let all_match_label = conflict_label;
             for (i, &col_idx) in col_indices.iter().enumerate() {
                 let check_val_reg = self.alloc_reg();
                 // For IPK columns, use Rowid instead of Column
@@ -1370,7 +1370,7 @@ impl<'s> UpdateCompiler<'s> {
         new_data_base: i32,
         new_rowid_reg: i32,
     ) -> Result<()> {
-        let ipk_col = self.get_ipk_column_index();
+        let _ipk_col = self.get_ipk_column_index();
 
         for (idx_cursor, col_indices) in index_cursors {
             // Build the new index key: indexed columns + rowid

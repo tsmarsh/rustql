@@ -1724,7 +1724,7 @@ impl<'s> SelectCompiler<'s> {
                         (None, None)
                     };
 
-                    let key_base_reg = self.next_reg;
+                    let _key_base_reg = self.next_reg;
                     let start_key_reg = self.alloc_reg();
                     let end_key_reg = if end_bound.is_some() {
                         Some(self.alloc_reg())
@@ -2080,7 +2080,7 @@ impl<'s> SelectCompiler<'s> {
         }
 
         // Inner loop start is the innermost loop label
-        let loop_start_label = *loop_labels.last().unwrap_or(&self.alloc_label());
+        let _loop_start_label = *loop_labels.last().unwrap_or(&self.alloc_label());
 
         // Evaluate WHERE clause, filtering out terms consumed by index seeks
         let where_skip_label = if let Some(info) = &where_info {
@@ -2176,7 +2176,7 @@ impl<'s> SelectCompiler<'s> {
             let loop_label = loop_labels[loop_pos];
 
             // Get scan info for this table (indexed by loop position)
-            let (is_index_scan, index_cursor, key_base_reg, key_count, is_rowid_eq) = scan_info
+            let (is_index_scan, index_cursor, _key_base_reg, _key_count, is_rowid_eq) = scan_info
                 .get(loop_pos)
                 .copied()
                 .unwrap_or((false, None, 0, 0, false));
@@ -2339,7 +2339,7 @@ impl<'s> SelectCompiler<'s> {
         }
 
         // The innermost loop label is used for WHERE skip target
-        let loop_start_label = *loop_labels.last().unwrap_or(&self.alloc_label());
+        let _loop_start_label = *loop_labels.last().unwrap_or(&self.alloc_label());
 
         // Evaluate WHERE clause
         let where_skip_label = if let Some(where_expr) = &core.where_clause {
@@ -2674,7 +2674,7 @@ impl<'s> SelectCompiler<'s> {
         }
 
         // The innermost loop label is used for WHERE skip target
-        let loop_start_label = *loop_labels.last().unwrap_or(&self.alloc_label());
+        let _loop_start_label = *loop_labels.last().unwrap_or(&self.alloc_label());
 
         // Evaluate WHERE clause
         let where_skip_label = if let Some(where_expr) = &core.where_clause {
@@ -3079,7 +3079,7 @@ impl<'s> SelectCompiler<'s> {
         }
 
         // The innermost loop label is used for WHERE skip target
-        let loop_start_label = *loop_labels.last().unwrap_or(&self.alloc_label());
+        let _loop_start_label = *loop_labels.last().unwrap_or(&self.alloc_label());
 
         // Evaluate WHERE clause
         let where_skip_label = if let Some(where_expr) = &core.where_clause {
@@ -3383,7 +3383,7 @@ impl<'s> SelectCompiler<'s> {
         // This is done BEFORE same_group_label so it only happens on the FIRST row
         // of each group (not on subsequent rows where we jump directly to same_group_label)
         if let Some(prev_regs) = prev_non_agg_regs {
-            for (idx, maybe_offset) in non_agg_indices.iter().enumerate() {
+            for (_idx, maybe_offset) in non_agg_indices.iter().enumerate() {
                 if let Some(offset) = maybe_offset {
                     let sorter_col = (non_agg_sorter_offset + offset) as i32;
                     let dest_reg = prev_regs + *offset as i32;
@@ -4728,7 +4728,7 @@ impl<'s> SelectCompiler<'s> {
         match expr {
             Expr::Column(col_ref) if col_ref.table.is_none() => {
                 // Check if this matches a result column name (alias)
-                if let Some(col_idx) = self
+                if let Some(_col_idx) = self
                     .result_column_names
                     .iter()
                     .position(|name| name.eq_ignore_ascii_case(&col_ref.column))
@@ -4922,7 +4922,7 @@ impl<'s> SelectCompiler<'s> {
     fn emit_index_scan_start(
         &mut self,
         table_cursor: i32,
-        level: &WhereLevel,
+        _level: &WhereLevel,
         index_name: &str,
         eq_cols: i32,
         skip_label: i32,
@@ -6940,7 +6940,7 @@ impl<'s> SelectCompiler<'s> {
                 }
 
                 // Check if this is a comparison involving a column from this table
-                let (col_idx, value_expr, constraint_op) = if let Some((col, idx)) =
+                let (col_idx, value_expr, constraint_op) = if let Some((_col, idx)) =
                     self.get_vtab_column(left, table, schema_table)
                 {
                     let op = self.binary_op_to_constraint_op(op);
@@ -6949,7 +6949,7 @@ impl<'s> SelectCompiler<'s> {
                     } else {
                         return;
                     }
-                } else if let Some((col, idx)) = self.get_vtab_column(right, table, schema_table) {
+                } else if let Some((_col, idx)) = self.get_vtab_column(right, table, schema_table) {
                     // Reverse the operator for col on right side
                     let op = self.binary_op_to_constraint_op_reversed(op);
                     if let Some(op) = op {

@@ -1499,7 +1499,7 @@ impl<'s> DeleteCompiler<'s> {
 
                         self.resolve_label(end_label, self.current_addr() as i32);
                     }
-                    crate::parser::ast::InList::Table(table_name) => {
+                    crate::parser::ast::InList::Table(_table_name) => {
                         // IN with table name - not commonly used, default to false
                         self.emit(
                             Opcode::Integer,

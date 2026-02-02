@@ -2772,7 +2772,7 @@ impl<'a> InsertCompiler<'a> {
         &mut self,
         data_base: i32,
         rowid_reg: i32,
-        conflict_action: ConflictAction,
+        _conflict_action: ConflictAction,
     ) {
         // Clone index_cursors to avoid borrow issues
         let index_cursors: Vec<_> = self

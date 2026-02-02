@@ -120,7 +120,7 @@ pub struct BtShared {
     pub schema_cookie: u32,
     pub file_format: u8,
     pub free_pages: Vec<Pgno>,
-    pub table_locks: Vec<BtTableLockEntry>,
+    pub(crate) table_locks: Vec<BtTableLockEntry>,
     /// Incremented on every write operation (insert/delete/update).
     /// Used by cursors to detect when btree was modified.
     pub shared_data_version: u32,
@@ -3985,7 +3985,7 @@ impl Btree {
         // Collapse empty internal roots before inserting
         // This can happen after bulk DELETE operations leave the tree in an invalid state
         loop {
-            let (root_mem_page, root_limits) = _cursor.load_page(&mut shared_guard, root_pgno)?;
+            let (root_mem_page, _root_limits) = _cursor.load_page(&mut shared_guard, root_pgno)?;
             if root_mem_page.is_leaf {
                 break;
             }

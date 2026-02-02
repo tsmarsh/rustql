@@ -314,7 +314,6 @@ impl Shell {
                         }
                         break;
                     }
-                    _ => break,
                 }
             }
 

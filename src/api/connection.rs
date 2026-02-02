@@ -1755,7 +1755,7 @@ fn parse_create_index_sql(
         }
 
         // Parse "colname [COLLATE collation] [ASC|DESC]"
-        let col_str_upper = col_str.to_uppercase();
+        let _col_str_upper = col_str.to_uppercase();
         let parts: Vec<&str> = col_str.split_whitespace().collect();
         let col_name = parts.first()?.to_lowercase();
 

@@ -610,6 +610,10 @@ pub struct Vdbe {
     /// Virtual table module registry
     vtab_registry: Option<Arc<crate::vtab::VtabRegistry>>,
 
+    /// Flag set when a virtual table write operation occurred (VCreate, VUpdate)
+    /// Used to trigger xSync/xCommit at Halt in auto-commit mode
+    vtab_needs_sync: bool,
+
     // ========================================================================
     // Trigger Context
     // ========================================================================
@@ -687,6 +691,7 @@ impl Vdbe {
             vtab_context_name: None,
             vtab_context_rowid: None,
             vtab_registry: None,
+            vtab_needs_sync: false,
             trigger_param_base: None,
             trigger_num_columns: 0,
             trigger_depth: 0,
@@ -1053,6 +1058,7 @@ impl Vdbe {
         self.n_change = 0;
         self.count_changes_returned = false;
         self.is_dml_statement = false;
+        self.vtab_needs_sync = false;
         self.start_time = None;
         self.interrupted = false;
         self.magic = VDBE_MAGIC_INIT;
@@ -1317,6 +1323,23 @@ impl Vdbe {
                             }
                         }
                     }
+
+                    // Virtual table sync/commit for auto-commit mode
+                    // This mirrors SQLite's sqlite3VtabSync/sqlite3VtabCommit calls
+                    if self.vtab_needs_sync {
+                        if let Some(conn_ptr) = self.conn_ptr {
+                            let conn = unsafe { &*conn_ptr };
+                            if conn.autocommit.load(std::sync::atomic::Ordering::SeqCst) {
+                                // In auto-commit mode, sync and commit virtual tables
+                                if let Some(ref registry) = self.vtab_registry {
+                                    let _ = registry.sync_all();
+                                    let _ = registry.commit_all();
+                                }
+                            }
+                        }
+                        self.vtab_needs_sync = false;
+                    }
+
                     // execution is done
                     return Ok(ExecResult::Done);
                 }
@@ -8848,6 +8871,9 @@ impl Vdbe {
                                             }
                                         }
                                     }
+
+                                    // Mark that vtab needs sync/commit at Halt
+                                    self.vtab_needs_sync = true;
                                 }
                                 Err(_e) => {
                                     // Module's create() returned an error

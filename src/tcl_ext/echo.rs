@@ -280,7 +280,18 @@ impl VtabTable for EchoTable {
         // Build a SQL query based on constraints
         // The echo module can use indices on the underlying table
 
-        let mut sql = format!("SELECT rowid, * FROM {}", self.real_table);
+        // Build column list - use explicit column names like SQLite's echo module
+        let col_list = if self.columns.is_empty() {
+            "*".to_string()
+        } else {
+            self.columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        let mut sql = format!("SELECT rowid, {} FROM '{}'", col_list, self.real_table);
         let mut where_parts = Vec::new();
         let mut arg_idx = 1;
 
@@ -369,6 +380,10 @@ impl VtabTable for EchoTable {
             info.estimated_rows = 10;
         }
 
+        // Log the xBestIndex callback with the generated SQL
+        append_to_echo_module("xBestIndex");
+        append_to_echo_module(&sql);
+
         Ok(())
     }
 
@@ -384,6 +399,34 @@ impl VtabTable for EchoTable {
     fn disconnect(&self) -> Result<()> {
         // Log the xDisconnect callback
         append_to_echo_module("xDisconnect");
+        Ok(())
+    }
+
+    fn begin(&self) -> Result<()> {
+        // Log the xBegin callback
+        append_to_echo_module("xBegin");
+        append_to_echo_module(&format!("echo({})", self.real_table));
+        Ok(())
+    }
+
+    fn sync(&self) -> Result<()> {
+        // Log the xSync callback
+        append_to_echo_module("xSync");
+        append_to_echo_module(&format!("echo({})", self.real_table));
+        Ok(())
+    }
+
+    fn commit(&self) -> Result<()> {
+        // Log the xCommit callback
+        append_to_echo_module("xCommit");
+        append_to_echo_module(&format!("echo({})", self.real_table));
+        Ok(())
+    }
+
+    fn rollback(&self) -> Result<()> {
+        // Log the xRollback callback
+        append_to_echo_module("xRollback");
+        append_to_echo_module(&format!("echo({})", self.real_table));
         Ok(())
     }
 
@@ -543,16 +586,61 @@ impl VtabCursor for EchoCursor {
         &mut self,
         _index_num: i32,
         index_str: Option<&str>,
-        _constraints: &[ConstraintValue],
+        constraints: &[ConstraintValue],
         ctx: &dyn DbContext,
     ) -> Result<()> {
         self.rows.clear();
         self.position = 0;
 
         // Get the SQL from idx_str, or use default
-        let sql = index_str
+        let col_list = if self.columns.is_empty() {
+            "*".to_string()
+        } else {
+            self.columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let base_sql = index_str
             .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("SELECT rowid, * FROM {}", self.real_table));
+            .unwrap_or_else(|| format!("SELECT rowid, {} FROM '{}'", col_list, self.real_table));
+
+        // Log the xFilter callback with the SQL
+        append_to_echo_module("xFilter");
+        append_to_echo_module(&base_sql);
+
+        // Log constraint values (for test verification)
+        for cv in constraints {
+            let val = &cv.value;
+            if val.is_null() {
+                append_to_echo_module("NULL");
+            } else if val.is_int() {
+                append_to_echo_module(&val.to_int().to_string());
+            } else if val.is_real() {
+                append_to_echo_module(&val.to_real().to_string());
+            } else {
+                append_to_echo_module(&val.to_str());
+            }
+        }
+
+        // Replace ? placeholders with actual values for execution
+        let mut sql = base_sql;
+        for cv in constraints {
+            let val = &cv.value;
+            let replacement = if val.is_null() {
+                "NULL".to_string()
+            } else if val.is_int() {
+                val.to_int().to_string()
+            } else if val.is_real() {
+                val.to_real().to_string()
+            } else {
+                // Quote strings and escape single quotes
+                let s = val.to_str().replace('\'', "''");
+                format!("'{}'", s)
+            };
+            sql = sql.replacen('?', &replacement, 1);
+        }
 
         // Execute query using DbContext
         let query_rows = ctx.query(&sql)?;

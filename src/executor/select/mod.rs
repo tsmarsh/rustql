@@ -2792,7 +2792,13 @@ impl<'s> SelectCompiler<'s> {
             if let Some(found_match_reg) = found_match_regs[i] {
                 // If found_match > 0, skip null row handling
                 if let Some(after_null_label) = after_null_labels[i] {
-                    self.emit(Opcode::IfPos, found_match_reg, after_null_label, 0, P4::Unused);
+                    self.emit(
+                        Opcode::IfPos,
+                        found_match_reg,
+                        after_null_label,
+                        0,
+                        P4::Unused,
+                    );
                 }
 
                 // Resolve null_row_label here - both Rewind-when-empty AND loop-no-match land here
@@ -2859,19 +2865,27 @@ impl<'s> SelectCompiler<'s> {
 
         // HAVING clause - evaluated after aggregates are finalized
         // For simple aggregate (no GROUP BY), HAVING filters the single result row
+        // Create skip label for LIMIT/OFFSET
+        let after_output_label = self.alloc_label();
         if let Some(having) = &core.having {
             let skip_output_label = self.alloc_label();
             self.compile_where_condition(having, skip_output_label)?;
             // Clear the saved column context
             self.saved_column_regs = None;
             // Output single row only if HAVING condition is true
-            self.output_row(dest, result_regs.0, result_regs.1)?;
+            self.output_row_with_limit(dest, result_regs.0, result_regs.1, after_output_label)?;
             self.resolve_label(skip_output_label, self.current_addr());
         } else {
             // Clear the saved column context
             self.saved_column_regs = None;
             // Output single row
-            self.output_row(dest, result_regs.0, result_regs.1)?;
+            self.output_row_with_limit(dest, result_regs.0, result_regs.1, after_output_label)?;
+        }
+        self.resolve_label(after_output_label, self.current_addr());
+
+        // Resolve limit_done_label if set
+        if let Some(done_label) = self.limit_done_label {
+            self.resolve_label(done_label, self.current_addr());
         }
 
         // Close cursors
@@ -3074,8 +3088,15 @@ impl<'s> SelectCompiler<'s> {
             }
         }
 
-        // Output the result
-        self.output_row(dest, result_reg, 1)?;
+        // Output the result with LIMIT/OFFSET support
+        let after_output_label = self.alloc_label();
+        self.output_row_with_limit(dest, result_reg, 1, after_output_label)?;
+        self.resolve_label(after_output_label, self.current_addr());
+
+        // Resolve limit_done_label if set
+        if let Some(done_label) = self.limit_done_label {
+            self.resolve_label(done_label, self.current_addr());
+        }
 
         Ok(true)
     }
@@ -3366,7 +3387,13 @@ impl<'s> SelectCompiler<'s> {
             if let Some(found_match_reg) = found_match_regs[i] {
                 // If found_match > 0, skip null row handling
                 if let Some(after_null_label) = after_null_labels[i] {
-                    self.emit(Opcode::IfPos, found_match_reg, after_null_label, 0, P4::Unused);
+                    self.emit(
+                        Opcode::IfPos,
+                        found_match_reg,
+                        after_null_label,
+                        0,
+                        P4::Unused,
+                    );
                 }
 
                 // Resolve null_row_label here - both Rewind-when-empty AND loop-no-match land here
@@ -3624,16 +3651,29 @@ impl<'s> SelectCompiler<'s> {
         }
 
         // HAVING clause
+        // Create skip label for LIMIT/OFFSET - when offset skips, continue to next group
+        let after_group_output_label = self.alloc_label();
         if let Some(having) = &core.having {
             // Reset agg_final_idx so HAVING expression can find finalized aggregates
             self.agg_final_idx = 0;
             let skip_output_label = self.alloc_label();
             self.compile_where_condition(having, skip_output_label)?;
-            self.output_row(dest, result_regs.0, result_regs.1)?;
+            self.output_row_with_limit(
+                dest,
+                result_regs.0,
+                result_regs.1,
+                after_group_output_label,
+            )?;
             self.resolve_label(skip_output_label, self.current_addr());
         } else {
-            self.output_row(dest, result_regs.0, result_regs.1)?;
+            self.output_row_with_limit(
+                dest,
+                result_regs.0,
+                result_regs.1,
+                after_group_output_label,
+            )?;
         }
+        self.resolve_label(after_group_output_label, self.current_addr());
 
         // Clear group column substitution context after HAVING is compiled
         // Note: Don't clear non_agg_saved_regs here - it's needed for subsequent group outputs
@@ -3736,16 +3776,29 @@ impl<'s> SelectCompiler<'s> {
             }
         }
 
+        // Create skip label for LIMIT/OFFSET - when offset skips final group, just continue to end
+        let after_final_output_label = self.alloc_label();
         if let Some(having) = &core.having {
             // Reset agg_final_idx so HAVING expression can find finalized aggregates
             self.agg_final_idx = 0;
             let skip_output_label = self.alloc_label();
             self.compile_where_condition(having, skip_output_label)?;
-            self.output_row(dest, result_regs.0, result_regs.1)?;
+            self.output_row_with_limit(
+                dest,
+                result_regs.0,
+                result_regs.1,
+                after_final_output_label,
+            )?;
             self.resolve_label(skip_output_label, self.current_addr());
         } else {
-            self.output_row(dest, result_regs.0, result_regs.1)?;
+            self.output_row_with_limit(
+                dest,
+                result_regs.0,
+                result_regs.1,
+                after_final_output_label,
+            )?;
         }
+        self.resolve_label(after_final_output_label, self.current_addr());
 
         // Clear group column substitution context after HAVING is compiled
         self.group_column_regs.clear();
@@ -3753,6 +3806,11 @@ impl<'s> SelectCompiler<'s> {
         self.agg_final_regs.clear();
 
         self.resolve_label(sort_done_label, self.current_addr());
+
+        // Resolve limit_done_label to exit point (same as sort_done)
+        if let Some(done_label) = self.limit_done_label {
+            self.resolve_label(done_label, self.current_addr());
+        }
 
         // Close sorter
         self.emit(Opcode::Close, sorter_cursor, 0, 0, P4::Unused);

@@ -374,7 +374,7 @@ pub unsafe extern "C" fn sqlite3_cmd(
         ":memory:".to_string()
     };
 
-    // Open the database
+    // Open the database first (before any cleanup, in case it fails)
     let conn = match sqlite3_open(&filename) {
         Ok(c) => c,
         Err(e) => {
@@ -383,14 +383,30 @@ pub unsafe extern "C" fn sqlite3_cmd(
         }
     };
 
-    // Store the connection
+    // Check if a connection with this name already exists - if so, close it first
+    // This must happen BEFORE Tcl_CreateObjCommand, because that will trigger
+    // db_delete_cmd for the old command which would otherwise try to close the
+    // connection. We close it here manually instead.
     CONNECTIONS.with(|connections| {
-        connections.borrow_mut().insert(db_name.clone(), conn);
+        if let Some(old_conn) = connections.borrow_mut().remove(&db_name) {
+            // Disconnect virtual tables and close the old connection
+            let _ = old_conn.vtab_registry.disconnect_all();
+            let _ = sqlite3_close(old_conn);
+        }
+    });
+    // Also clean up associated state for the old connection
+    NULL_VALUES.with(|nv| {
+        nv.borrow_mut().remove(&db_name);
+    });
+    USER_FUNCTIONS.with(|uf| {
+        uf.borrow_mut().retain(|(n, _, _), _| n != &db_name);
     });
 
     // Create the database command
+    // If replacing an existing command, Tcl_CreateObjCommand will call db_delete_cmd
+    // for the old command, but we've already removed it from CONNECTIONS above
     let cmd_name = CString::new(db_name.clone()).unwrap();
-    let db_name_ptr = Box::into_raw(Box::new(db_name)) as *mut std::ffi::c_void;
+    let db_name_ptr = Box::into_raw(Box::new(db_name.clone())) as *mut std::ffi::c_void;
 
     Tcl_CreateObjCommand(
         interp,
@@ -399,6 +415,13 @@ pub unsafe extern "C" fn sqlite3_cmd(
         db_name_ptr,
         Some(db_delete_cmd),
     );
+
+    // Now store the new connection - AFTER Tcl_CreateObjCommand has been called
+    // This ensures db_delete_cmd (which runs during Tcl_CreateObjCommand for
+    // existing commands) doesn't remove our new connection
+    CONNECTIONS.with(|connections| {
+        connections.borrow_mut().insert(db_name, conn);
+    });
 
     TCL_OK
 }

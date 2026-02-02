@@ -1244,8 +1244,9 @@ impl<'s> SelectCompiler<'s> {
         // Check for constant-false WHERE clause (e.g., WHERE 0)
         // In this case, skip all loop generation and return immediately - no rows match
         if self.is_constant_false_where(remaining_where.as_ref()) {
-            // Generate no rows - jump to end immediately
-            // The result is empty, no output needed
+            // Still need to populate result_column_names for subquery column resolution
+            // even though we won't output any rows
+            self.populate_result_column_names(&core.columns);
             return Ok(());
         }
 
@@ -2624,12 +2625,18 @@ impl<'s> SelectCompiler<'s> {
             saved_col_map.insert((*cursor, *col_idx), reg);
         }
 
-        // Collect table cursors to avoid borrow checker issues
+        // Collect table cursors and join types to avoid borrow checker issues
         let table_cursors: Vec<i32> = self
             .tables
             .iter()
             .skip(self.outer_tables_boundary)
             .map(|t| t.cursor)
+            .collect();
+        let table_join_types: Vec<JoinType> = self
+            .tables
+            .iter()
+            .skip(self.outer_tables_boundary)
+            .map(|t| t.join_type)
             .collect();
 
         // For queries without MIN/MAX, use first-row saving semantics
@@ -2649,22 +2656,62 @@ impl<'s> SelectCompiler<'s> {
             None
         };
 
-        // Generate proper nested loop structure for cross joins
-        // For N tables, we need:
+        // Allocate found_match registers for LEFT JOINs
+        let mut found_match_regs: Vec<Option<i32>> = Vec::with_capacity(table_cursors.len());
+        for (i, join_type) in table_join_types.iter().enumerate() {
+            let is_outer_join = join_type.is_outer();
+            let found_match_reg = if is_outer_join && i > 0 {
+                let reg = self.alloc_reg();
+                Some(reg)
+            } else {
+                None
+            };
+            found_match_regs.push(found_match_reg);
+        }
+
+        // Generate proper nested loop structure for cross joins and LEFT JOINs
+        // For N tables with LEFT JOIN on inner tables:
         //   Rewind t0, done0
         // loop0:
-        //   Rewind t1, done1
+        //   init found_match = 0
+        //   Rewind t1, null_row1  ; if empty, jump to null row handling
         // loop1:
-        //   ... body ...
+        //   ... body (marks found_match=1) ...
         //   Next t1, loop1
-        // done1:
+        //   IfPos found_match, after_null1  ; skip null row if found match
+        // null_row1:
+        //   NullRow t1
+        //   ... body again with NULL values (skips found_match marking) ...
+        // after_null1:
         //   Next t0, loop0
         // done0:
         let mut loop_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
         let mut done_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
-        for cursor in &table_cursors {
+        let mut null_row_labels: Vec<Option<i32>> = Vec::with_capacity(table_cursors.len());
+        let mut after_null_labels: Vec<Option<i32>> = Vec::with_capacity(table_cursors.len());
+
+        for (i, cursor) in table_cursors.iter().enumerate() {
+            let is_left_join_inner = i > 0 && table_join_types[i].is_outer();
+
+            // Initialize found_match for THIS table if it's an outer join
+            if let Some(reg) = found_match_regs[i] {
+                self.emit(Opcode::Integer, 0, reg, 0, P4::Unused);
+            }
+
             let done_label = self.alloc_label();
-            self.emit(Opcode::Rewind, *cursor, done_label, 0, P4::Unused);
+
+            if is_left_join_inner {
+                // For LEFT JOIN inner table: Rewind jumps to null_row handling if empty
+                let null_row_label = self.alloc_label();
+                self.emit(Opcode::Rewind, *cursor, null_row_label, 0, P4::Unused);
+                null_row_labels.push(Some(null_row_label));
+                after_null_labels.push(Some(self.alloc_label()));
+            } else {
+                self.emit(Opcode::Rewind, *cursor, done_label, 0, P4::Unused);
+                null_row_labels.push(None);
+                after_null_labels.push(None);
+            }
+
             done_labels.push(done_label);
 
             // Mark loop start for this level
@@ -2705,6 +2752,13 @@ impl<'s> SelectCompiler<'s> {
             self.resolve_label(skip_save_label, self.current_addr());
         }
 
+        // For LEFT JOIN tables, mark that we found a match
+        for (i, _) in table_cursors.iter().enumerate() {
+            if let Some(reg) = found_match_regs[i] {
+                self.emit(Opcode::Integer, 1, reg, 0, P4::Unused);
+            }
+        }
+
         // Accumulate aggregates
         // For MIN/MAX queries, pass the column refs so they get saved when min/max changes
         if let Some(changed_reg) = min_max_changed_reg {
@@ -2734,7 +2788,66 @@ impl<'s> SelectCompiler<'s> {
             // Next on this cursor, jump back to its loop start
             self.emit(Opcode::Next, cursor, loop_label, 0, P4::Unused);
 
-            // Resolve done label for this level (where Rewind jumps when empty)
+            // For LEFT JOIN: handle empty/exhausted inner table
+            if let Some(found_match_reg) = found_match_regs[i] {
+                // If found_match > 0, skip null row handling
+                if let Some(after_null_label) = after_null_labels[i] {
+                    self.emit(Opcode::IfPos, found_match_reg, after_null_label, 0, P4::Unused);
+                }
+
+                // Resolve null_row_label here - both Rewind-when-empty AND loop-no-match land here
+                if let Some(null_row_label) = null_row_labels[i] {
+                    self.resolve_label(null_row_label, self.current_addr());
+                }
+
+                // Set cursor to null row mode
+                self.emit(Opcode::NullRow, cursor, 0, 0, P4::Unused);
+
+                // For non-MIN/MAX queries: Save outer table column refs if this is the first row
+                // This handles the case where inner table is empty from the start
+                if let Some(flag_reg) = first_row_flag_reg {
+                    let skip_save_label = self.alloc_label();
+                    self.emit(Opcode::If, flag_reg, skip_save_label, 0, P4::Unused);
+
+                    // Save column values from outer tables (not the LEFT JOIN inner table)
+                    for (cur, col_idx, _col_name) in &col_refs_to_save {
+                        // Only save from outer tables (cursor != current LEFT JOIN cursor)
+                        if *cur != cursor {
+                            if let Some(&dest_reg) = saved_col_map.get(&(*cur, *col_idx)) {
+                                if *col_idx == -1 {
+                                    self.emit(Opcode::Rowid, *cur, dest_reg, 0, P4::Unused);
+                                } else {
+                                    self.emit(Opcode::Column, *cur, *col_idx, dest_reg, P4::Unused);
+                                }
+                            }
+                        }
+                    }
+
+                    // Set flag to indicate first row values have been saved
+                    self.emit(Opcode::Integer, 1, flag_reg, 0, P4::Unused);
+                    self.resolve_label(skip_save_label, self.current_addr());
+                }
+
+                // Accumulate with NULL values from the LEFT JOIN table
+                if let Some(changed_reg) = min_max_changed_reg {
+                    self.accumulate_aggregates_with_bare_cols(
+                        &core.columns,
+                        &agg_regs,
+                        changed_reg,
+                        &col_refs_to_save,
+                        &saved_col_map,
+                    )?;
+                } else {
+                    self.accumulate_aggregates(&core.columns, &agg_regs)?;
+                }
+
+                // Resolve after_null_label
+                if let Some(after_null_label) = after_null_labels[i] {
+                    self.resolve_label(after_null_label, self.current_addr());
+                }
+            }
+
+            // Resolve done label for this level (for non-LEFT-JOIN Rewind-empty)
             self.resolve_label(done_labels[i], self.current_addr());
         }
 
@@ -2950,6 +3063,16 @@ impl<'s> SelectCompiler<'s> {
 
         // Copy to result register (matches SQLite's pattern)
         self.emit(Opcode::Copy, count_reg, result_reg, 0, P4::Unused);
+
+        // Populate result_column_names for subquery column resolution
+        for col in &core.columns {
+            if let ResultColumn::Expr { expr, alias } = col {
+                let name = alias
+                    .clone()
+                    .unwrap_or_else(|| self.expr_to_name(expr, self.result_column_names.len() + 1));
+                self.result_column_names.push(name);
+            }
+        }
 
         // Output the result
         self.output_row(dest, result_reg, 1)?;
@@ -6407,6 +6530,76 @@ impl<'s> SelectCompiler<'s> {
         }
     }
 
+    /// Populate result_column_names from the SELECT column list without generating code.
+    /// Used when we need column names for subquery resolution but won't output any rows
+    /// (e.g., constant false WHERE clause).
+    fn populate_result_column_names(&mut self, columns: &[ResultColumn]) {
+        let mut col_idx = 0;
+        for col in columns {
+            match col {
+                ResultColumn::Expr { expr, alias } => {
+                    col_idx += 1;
+                    let name = alias
+                        .clone()
+                        .unwrap_or_else(|| self.expr_to_name(expr, col_idx));
+                    self.result_column_names.push(name);
+                }
+                ResultColumn::Star => {
+                    // Expand all columns from all tables
+                    for table in &self.tables.clone() {
+                        if let Some(schema_table) = &table.schema_table {
+                            for col_def in &schema_table.columns {
+                                let col_name = if self.short_column_names {
+                                    col_def.name.clone()
+                                } else {
+                                    format!("{}.{}", table.name, col_def.name)
+                                };
+                                self.result_column_names.push(col_name);
+                            }
+                        } else if let Some(subquery_cols) = &table.subquery_columns {
+                            for subquery_col_name in subquery_cols {
+                                let col_name = if self.short_column_names {
+                                    subquery_col_name.clone()
+                                } else {
+                                    format!("{}.{}", table.name, subquery_col_name)
+                                };
+                                self.result_column_names.push(col_name);
+                            }
+                        }
+                    }
+                }
+                ResultColumn::TableStar(table_name) => {
+                    // Expand columns from specific table
+                    if let Some(table) = self
+                        .tables
+                        .iter()
+                        .find(|t| t.name.eq_ignore_ascii_case(table_name))
+                    {
+                        if let Some(schema_table) = &table.schema_table {
+                            for col_def in &schema_table.columns {
+                                let col_name = if self.short_column_names {
+                                    col_def.name.clone()
+                                } else {
+                                    format!("{}.{}", table.name, col_def.name)
+                                };
+                                self.result_column_names.push(col_name);
+                            }
+                        } else if let Some(subquery_cols) = &table.subquery_columns {
+                            for subquery_col_name in subquery_cols {
+                                let col_name = if self.short_column_names {
+                                    subquery_col_name.clone()
+                                } else {
+                                    format!("{}.{}", table.name, subquery_col_name)
+                                };
+                                self.result_column_names.push(col_name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Check if a WHERE clause is constant false (e.g., WHERE 0)
     /// If so, no rows can match and we can skip all loop generation.
     fn is_constant_false_where(&self, where_clause: Option<&Expr>) -> bool {
@@ -7123,6 +7316,24 @@ impl<'s> SelectCompiler<'s> {
                 }
             }
             Expr::Column(col_ref) => {
+                // Validate database qualifier if present
+                // SQLite only allows: main, temp, or attached database aliases
+                // RustQL currently only supports 'main' database
+                if let Some(ref db_name) = col_ref.database {
+                    if !db_name.eq_ignore_ascii_case("main") {
+                        // Format the full qualified name for the error message
+                        let full_name = if let Some(ref tbl) = col_ref.table {
+                            format!("{}.{}.{}", db_name, tbl, col_ref.column)
+                        } else {
+                            format!("{}.{}", db_name, col_ref.column)
+                        };
+                        return Err(Error::with_message(
+                            ErrorCode::Error,
+                            format!("no such column: {}", full_name),
+                        ));
+                    }
+                }
+
                 // Check if this is a result column alias (for ORDER BY expressions)
                 if col_ref.table.is_none() {
                     let alias_lower = col_ref.column.to_lowercase();

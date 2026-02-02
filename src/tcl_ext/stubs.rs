@@ -74,7 +74,7 @@ pub unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         "sqlite3_crash_on_write",
         "sqlite3_crashparams",
         "sqlite3_connection_pointer",
-        "sqlite3_db_config",
+        // "sqlite3_db_config" - removed from stubs, implemented properly below
         "sqlite3_db_filename",
         "sqlite3_db_status",
         "sqlite3_exec_nr",
@@ -700,6 +700,18 @@ pub unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         None,
     );
 
+    // Register sqlite3_db_config - configure database connection options
+    // Usage: sqlite3_db_config DBHANDLE OPTION VALUE
+    // Options: SQLITE_DBCONFIG_DQS_DML, SQLITE_DBCONFIG_DQS_DDL, etc.
+    let cmd_name = CString::new("sqlite3_db_config").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(sqlite3_db_config_cmd),
+        std::ptr::null_mut(),
+        None,
+    );
+
     // Register sqlite3_db_config_lookaside - configures per-connection lookaside memory
     // Used by printf.test, altermalloc.test, analyze9.test, dbstatus.test, and others
     let cmd_name = CString::new("sqlite3_db_config_lookaside").unwrap();
@@ -837,6 +849,118 @@ unsafe extern "C" fn test_stub_status(
     _objv: *const *mut Tcl_Obj,
 ) -> c_int {
     set_result_string(interp, "0 0 0");
+    TCL_OK
+}
+
+/// Implementation of sqlite3_db_config command
+///
+/// Usage: sqlite3_db_config DBHANDLE OPTION VALUE
+/// Options:
+///   SQLITE_DBCONFIG_DQS_DML (1013) - Enable double-quoted string literals in DML
+///   SQLITE_DBCONFIG_DQS_DDL (1014) - Enable double-quoted string literals in DDL
+///   SQLITE_DBCONFIG_ENABLE_VIEW (1015) - Enable views
+///   etc.
+///
+/// Returns: The old value of the option
+unsafe extern "C" fn sqlite3_db_config_cmd(
+    _client_data: *mut c_void,
+    interp: *mut Tcl_Interp,
+    objc: c_int,
+    objv: *const *mut Tcl_Obj,
+) -> c_int {
+    use super::helpers::obj_to_string;
+
+    if objc < 4 {
+        set_result_string(
+            interp,
+            "wrong # args: should be \"sqlite3_db_config DB OPTION VALUE\"",
+        );
+        return TCL_OK;
+    }
+
+    let db_name = obj_to_string(*objv.offset(1));
+    let option_str = obj_to_string(*objv.offset(2));
+    let value_str = obj_to_string(*objv.offset(3));
+
+    // Parse option
+    let option = match option_str.as_str() {
+        "SQLITE_DBCONFIG_DQS_DML" | "1013" => 1013,
+        "SQLITE_DBCONFIG_DQS_DDL" | "1014" => 1014,
+        "SQLITE_DBCONFIG_ENABLE_VIEW" | "1015" => 1015,
+        "SQLITE_DBCONFIG_ENABLE_FKEY" | "1002" => 1002,
+        "SQLITE_DBCONFIG_ENABLE_TRIGGER" | "1003" => 1003,
+        "SQLITE_DBCONFIG_DEFENSIVE" | "1010" => 1010,
+        _ => {
+            // Unknown option - return 0 for compatibility
+            set_result_int(interp, 0);
+            return TCL_OK;
+        }
+    };
+
+    // Parse value (-1 means query, 0/1 means set)
+    let value: i32 = value_str.parse().unwrap_or(-1);
+
+    // Apply to the connection
+    let old_value = CONNECTIONS.with(|connections| {
+        let mut conns = connections.borrow_mut();
+        if let Some(conn) = conns.get_mut(&db_name) {
+            match option {
+                1013 => {
+                    // DQS_DML
+                    let old = conn.db_config.dqs_dml as i32;
+                    if value >= 0 {
+                        conn.db_config.dqs_dml = value != 0;
+                    }
+                    old
+                }
+                1014 => {
+                    // DQS_DDL
+                    let old = conn.db_config.dqs_ddl as i32;
+                    if value >= 0 {
+                        conn.db_config.dqs_ddl = value != 0;
+                    }
+                    old
+                }
+                1015 => {
+                    // ENABLE_VIEW
+                    let old = conn.db_config.enable_view as i32;
+                    if value >= 0 {
+                        conn.db_config.enable_view = value != 0;
+                    }
+                    old
+                }
+                1002 => {
+                    // ENABLE_FKEY
+                    let old = conn.db_config.enable_fkey as i32;
+                    if value >= 0 {
+                        conn.db_config.enable_fkey = value != 0;
+                    }
+                    old
+                }
+                1003 => {
+                    // ENABLE_TRIGGER
+                    let old = conn.db_config.enable_trigger as i32;
+                    if value >= 0 {
+                        conn.db_config.enable_trigger = value != 0;
+                    }
+                    old
+                }
+                1010 => {
+                    // DEFENSIVE
+                    let old = conn.db_config.defensive as i32;
+                    if value >= 0 {
+                        conn.db_config.defensive = value != 0;
+                    }
+                    old
+                }
+                _ => 0,
+            }
+        } else {
+            0
+        }
+    });
+
+    set_result_int(interp, old_value);
     TCL_OK
 }
 

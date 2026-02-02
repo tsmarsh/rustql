@@ -126,6 +126,8 @@ pub struct StatementCompiler<'s> {
     vtab_registry: Option<std::sync::Arc<crate::vtab::VtabRegistry>>,
     /// Attached database schemas (name, schema) in attach order
     attached_schemas: Vec<(String, &'s crate::schema::Schema)>,
+    /// Enable double-quoted string literals in DML (SQLITE_DBCONFIG_DQS_DML)
+    dqs_dml: bool,
 }
 
 impl<'s> StatementCompiler<'s> {
@@ -143,6 +145,7 @@ impl<'s> StatementCompiler<'s> {
             enable_view: true,
             vtab_registry: None,
             attached_schemas: Vec::new(),
+            dqs_dml: true, // Default: enabled for backward compatibility
         }
     }
 
@@ -160,11 +163,17 @@ impl<'s> StatementCompiler<'s> {
             enable_view: true,
             vtab_registry: None,
             attached_schemas: Vec::new(),
+            dqs_dml: true, // Default: enabled for backward compatibility
         }
     }
 
     pub fn set_attached_schemas(&mut self, schemas: Vec<(String, &'s crate::schema::Schema)>) {
         self.attached_schemas = schemas;
+    }
+
+    /// Set the DQS_DML flag (double-quoted string literals in DML)
+    pub fn set_dqs_dml(&mut self, enabled: bool) {
+        self.dqs_dml = enabled;
     }
 
     fn resolve_db_idx(&self, name: &QualifiedName, temporary: bool) -> Result<i32> {
@@ -384,6 +393,8 @@ impl<'s> StatementCompiler<'s> {
                 };
                 // Pass parameter names for Variable compilation
                 compiler.set_param_names(self.param_names.clone());
+                // Pass DQS_DML flag for double-quoted string handling
+                compiler.set_dqs_dml(self.dqs_dml);
                 let ops = compiler.compile(insert)?;
                 Ok((ops, StmtType::Insert, Vec::new(), Vec::new()))
             }
@@ -5150,6 +5161,7 @@ pub fn compile_sql_with_full_config<'a>(
     case_sensitive_like: bool,
     enable_view: bool,
     vtab_registry: Option<std::sync::Arc<crate::vtab::VtabRegistry>>,
+    dqs_dml: bool,
 ) -> Result<(CompiledStmt, &'a str)> {
     let mut compiler = StatementCompiler::with_schema(schema);
     if let Some(ts) = temp_schema {
@@ -5159,6 +5171,7 @@ pub fn compile_sql_with_full_config<'a>(
     compiler.set_column_name_flags(short_column_names, full_column_names);
     compiler.set_case_sensitive_like(case_sensitive_like);
     compiler.set_enable_view(enable_view);
+    compiler.set_dqs_dml(dqs_dml);
     if let Some(registry) = vtab_registry {
         compiler.set_vtab_registry(registry);
     }

@@ -163,6 +163,8 @@ pub fn execute_pragma(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Resul
         "checkpoint_fullfsync" => pragma_checkpoint_fullfsync(conn, pragma),
         "read_uncommitted" => pragma_read_uncommitted(conn, pragma),
         "reverse_unordered_selects" => pragma_reverse_unordered_selects(conn, pragma),
+        // Debug/trace pragmas - no-ops in RustQL but recognized for compatibility
+        "vdbe_trace" => Ok(empty_result()),
         _ => Err(Error::with_message(
             ErrorCode::Error,
             format!("unknown pragma: {}", pragma.name),

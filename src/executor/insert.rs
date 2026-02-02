@@ -109,6 +109,9 @@ pub struct InsertCompiler<'a> {
 
     /// Column affinity string (one char per column)
     column_affinities: String,
+
+    /// Enable double-quoted string literals in DML (SQLITE_DBCONFIG_DQS_DML)
+    dqs_dml: bool,
 }
 
 impl<'a> InsertCompiler<'a> {
@@ -133,6 +136,7 @@ impl<'a> InsertCompiler<'a> {
             after_delete_triggers: Vec::new(),
             table_name: String::new(),
             column_affinities: String::new(),
+            dqs_dml: true, // Default: enabled for backward compatibility
         }
     }
 
@@ -157,7 +161,13 @@ impl<'a> InsertCompiler<'a> {
             after_delete_triggers: Vec::new(),
             table_name: String::new(),
             column_affinities: String::new(),
+            dqs_dml: true, // Default: enabled for backward compatibility
         }
+    }
+
+    /// Set the DQS_DML flag (double-quoted string literals in DML)
+    pub fn set_dqs_dml(&mut self, enabled: bool) {
+        self.dqs_dml = enabled;
     }
 
     /// Set parameter names for Variable compilation
@@ -2511,14 +2521,38 @@ impl<'a> InsertCompiler<'a> {
             Expr::Column(col_ref) => {
                 // Column references are not valid in INSERT VALUES context
                 // The only valid table references would be in subqueries, which are handled separately
+
+                // When DQS_DML is enabled, treat double-quoted identifiers as string literals
+                // This is a SQLite quirk for backward compatibility
+                if self.dqs_dml && col_ref.table.is_none() {
+                    // Treat the column name as a string literal
+                    self.emit(
+                        Opcode::String8,
+                        0,
+                        dest_reg,
+                        0,
+                        P4::Text(col_ref.column.clone()),
+                    );
+                    return Ok(());
+                }
+
                 let col_name = if let Some(ref table) = col_ref.table {
                     format!("{}.{}", table, col_ref.column)
                 } else {
                     col_ref.column.clone()
                 };
+                // When DQS_DML is disabled and user writes "", it becomes a column reference
+                // with empty name. Provide a helpful hint about using single quotes.
+                let hint = if col_name.is_empty() {
+                    format!(
+                        "no such column: \"\" - should this be a string literal in single-quotes?"
+                    )
+                } else {
+                    format!("no such column: {}", col_name)
+                };
                 return Err(crate::error::Error::with_message(
                     crate::error::ErrorCode::Error,
-                    format!("no such column: {}", col_name),
+                    hint,
                 ));
             }
             Expr::Binary { op, left, right } => {
@@ -3033,6 +3067,17 @@ pub fn compile_insert(insert: &InsertStmt) -> Result<Vec<VdbeOp>> {
 /// Compile an INSERT statement with schema for proper column count validation
 pub fn compile_insert_with_schema(insert: &InsertStmt, schema: &Schema) -> Result<Vec<VdbeOp>> {
     let mut compiler = InsertCompiler::with_schema(schema);
+    compiler.compile(insert)
+}
+
+/// Compile an INSERT statement with schema and DQS_DML flag
+pub fn compile_insert_with_config(
+    insert: &InsertStmt,
+    schema: &Schema,
+    dqs_dml: bool,
+) -> Result<Vec<VdbeOp>> {
+    let mut compiler = InsertCompiler::with_schema(schema);
+    compiler.set_dqs_dml(dqs_dml);
     compiler.compile(insert)
 }
 

@@ -10896,6 +10896,88 @@ impl<'s> SelectCompiler<'s> {
         Ok(())
     }
 
+    /// Expand Star and TableStar in result columns to explicit column expressions.
+    /// This is needed for GROUP BY queries where we need to handle each column individually.
+    fn expand_result_columns(&self, columns: &[ResultColumn]) -> Vec<ResultColumn> {
+        let mut expanded = Vec::new();
+
+        for col in columns {
+            match col {
+                ResultColumn::Star => {
+                    // Expand * to all columns from all tables
+                    for table in &self.tables {
+                        if let Some(schema_table) = &table.schema_table {
+                            for col_def in &schema_table.columns {
+                                expanded.push(ResultColumn::Expr {
+                                    expr: Expr::Column(ColumnRef {
+                                        database: None,
+                                        table: Some(table.name.clone()),
+                                        column: col_def.name.clone(),
+                                        column_index: None,
+                                        source_text: None,
+                                    }),
+                                    alias: None,
+                                });
+                            }
+                        } else if let Some(subquery_cols) = &table.subquery_columns {
+                            for col_name in subquery_cols {
+                                expanded.push(ResultColumn::Expr {
+                                    expr: Expr::Column(ColumnRef {
+                                        database: None,
+                                        table: Some(table.name.clone()),
+                                        column: col_name.clone(),
+                                        column_index: None,
+                                        source_text: None,
+                                    }),
+                                    alias: None,
+                                });
+                            }
+                        }
+                    }
+                }
+                ResultColumn::TableStar(table_name) => {
+                    // Expand table.* to columns from that table
+                    for table in &self.tables {
+                        if table.name.eq_ignore_ascii_case(table_name) {
+                            if let Some(schema_table) = &table.schema_table {
+                                for col_def in &schema_table.columns {
+                                    expanded.push(ResultColumn::Expr {
+                                        expr: Expr::Column(ColumnRef {
+                                            database: None,
+                                            table: Some(table.name.clone()),
+                                            column: col_def.name.clone(),
+                                            column_index: None,
+                                            source_text: None,
+                                        }),
+                                        alias: None,
+                                    });
+                                }
+                            } else if let Some(subquery_cols) = &table.subquery_columns {
+                                for col_name in subquery_cols {
+                                    expanded.push(ResultColumn::Expr {
+                                        expr: Expr::Column(ColumnRef {
+                                            database: None,
+                                            table: Some(table.name.clone()),
+                                            column: col_name.clone(),
+                                            column_index: None,
+                                            source_text: None,
+                                        }),
+                                        alias: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                ResultColumn::Expr { .. } => {
+                    expanded.push(col.clone());
+                }
+            }
+        }
+
+        expanded
+    }
+
     fn finalize_aggregates(
         &mut self,
         columns: &[ResultColumn],
@@ -10911,6 +10993,10 @@ impl<'s> SelectCompiler<'s> {
         group_by: Option<&[Expr]>,
         group_regs: i32,
     ) -> Result<(i32, usize)> {
+        // Expand Star and TableStar to explicit column expressions
+        let expanded_columns = self.expand_result_columns(columns);
+        let columns = &expanded_columns;
+
         // Pre-allocate all destination registers to ensure they are contiguous
         // This is important because expression compilation may allocate additional
         // temporary registers, which would make the result registers non-contiguous
@@ -11519,6 +11605,10 @@ impl<'s> SelectCompiler<'s> {
         columns: &[ResultColumn],
         group_by: Option<&[Expr]>,
     ) -> usize {
+        // Expand Star and TableStar to explicit column expressions
+        let expanded_columns = self.expand_result_columns(columns);
+        let columns = &expanded_columns;
+
         let mut count = 0;
         for col in columns {
             if let ResultColumn::Expr { expr, .. } = col {
@@ -11543,6 +11633,10 @@ impl<'s> SelectCompiler<'s> {
         columns: &[ResultColumn],
         group_by: Option<&[Expr]>,
     ) -> Result<(i32, usize, Vec<Option<usize>>)> {
+        // Expand Star and TableStar to explicit column expressions
+        let expanded_columns = self.expand_result_columns(columns);
+        let columns = &expanded_columns;
+
         // First pass: count how many non-agg columns we have
         let mut non_agg_count = 0;
         let mut is_non_agg: Vec<bool> = Vec::with_capacity(columns.len());

@@ -175,6 +175,23 @@ pub fn execute_pragma(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Resul
 fn pragma_database_list(conn: &SqliteConnection) -> Result<PragmaResult> {
     let mut rows = Vec::new();
     for (idx, db) in conn.dbs.iter().enumerate() {
+        // Skip temp database (index 1) if it has no btree opened and no tables in schema
+        // SQLite only shows temp in PRAGMA database_list when it's been used
+        if db.name.eq_ignore_ascii_case("temp") {
+            let temp_is_empty = db.btree.is_none()
+                && db
+                    .schema
+                    .as_ref()
+                    .map(|s| {
+                        s.read()
+                            .map(|schema| schema.tables.is_empty())
+                            .unwrap_or(true)
+                    })
+                    .unwrap_or(true);
+            if temp_is_empty {
+                continue;
+            }
+        }
         let file = db
             .path
             .as_ref()
@@ -1534,7 +1551,10 @@ mod tests {
     fn test_database_list() {
         let conn = SqliteConnection::new();
         let result = pragma_database_list(&conn).unwrap();
-        assert!(result.rows.len() >= 2);
+        // Should at least have main; temp is skipped if empty
+        assert!(result.rows.len() >= 1);
+        // First should be main
+        assert_eq!(result.rows[0][1], Value::Text("main".to_string()));
     }
 
     #[test]

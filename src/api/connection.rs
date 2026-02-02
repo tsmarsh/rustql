@@ -1295,8 +1295,28 @@ impl SqliteConnection {
         }
         self.dbs.push(db);
         let idx = self.dbs.len() - 1;
-        self.open_attached_btree(idx)?;
-        Ok(())
+        match self.open_attached_btree(idx) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Remove the database entry on failure
+                self.dbs.pop();
+                // Transform error messages to match SQLite's format
+                match e.code {
+                    ErrorCode::CantOpen | ErrorCode::Perm => {
+                        // SQLite uses "unable to open database: <filename>" for file access errors
+                        Err(Error::with_message(
+                            ErrorCode::CantOpen,
+                            format!("unable to open database: {}", filename),
+                        ))
+                    }
+                    ErrorCode::Busy => {
+                        // SQLite uses "database is locked" for busy errors
+                        Err(Error::with_message(ErrorCode::Busy, "database is locked"))
+                    }
+                    _ => Err(e),
+                }
+            }
+        }
     }
 
     /// Detach a database by schema name

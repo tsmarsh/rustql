@@ -468,7 +468,14 @@ pub unsafe extern "C" fn db_method_cmd(
         "eval" => db_eval(db_name, interp, objc, objv),
         "close" => db_close(db_name, interp),
         "errorcode" => {
-            set_result_int(interp, 0);
+            CONNECTIONS.with(|connections| {
+                let conns = connections.borrow();
+                if let Some(conn) = conns.get(db_name) {
+                    set_result_int(interp, crate::sqlite3_errcode(conn) as c_int);
+                } else {
+                    set_result_int(interp, 0);
+                }
+            });
             TCL_OK
         }
         "changes" => {

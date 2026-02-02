@@ -761,9 +761,17 @@ fn attach_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
     let filename_val = eval_attach_expr(stmt, &attach.expr)?;
     let filename = filename_val.to_text();
     let conn = unsafe { &mut *conn_ptr };
-    conn.attach_database(&filename, &attach.schema)?;
-    stmt.set_done();
-    Ok(StepResult::Done)
+    match conn.attach_database(&filename, &attach.schema) {
+        Ok(()) => {
+            stmt.set_done();
+            Ok(StepResult::Done)
+        }
+        Err(e) => {
+            // Set error on connection so sqlite3_errcode can return it
+            conn.set_error(e.code, e.message.as_deref().unwrap_or("attach error"));
+            Err(e)
+        }
+    }
 }
 
 fn detach_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
@@ -775,9 +783,17 @@ fn detach_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
         .clone()
         .ok_or_else(|| Error::with_message(ErrorCode::Error, "missing detach".to_string()))?;
     let conn = unsafe { &mut *conn_ptr };
-    conn.detach_database(&detach_name)?;
-    stmt.set_done();
-    Ok(StepResult::Done)
+    match conn.detach_database(&detach_name) {
+        Ok(()) => {
+            stmt.set_done();
+            Ok(StepResult::Done)
+        }
+        Err(e) => {
+            // Set error on connection so sqlite3_errcode can return it
+            conn.set_error(e.code, e.message.as_deref().unwrap_or("detach error"));
+            Err(e)
+        }
+    }
 }
 
 fn eval_attach_expr(stmt: &PreparedStmt, expr: &Expr) -> Result<Value> {

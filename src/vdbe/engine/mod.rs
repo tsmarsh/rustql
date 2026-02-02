@@ -1275,6 +1275,11 @@ impl Vdbe {
                     self.error_msg = Some(msg.clone());
                 }
 
+                // Check for RAISE(IGNORE) - P2=4 (OE_IGNORE)
+                if op.p2 == 4 && !self.subprogram_stack.is_empty() {
+                    self.raise_ignore = true;
+                }
+
                 // Check if we're in a subprogram (trigger)
                 if let Some((
                     parent_ops,
@@ -4884,6 +4889,14 @@ impl Vdbe {
                 // P4 = table name (for debug)
                 // P5 = flags (conflict resolution)
 
+                // Check if RAISE(IGNORE) was called - skip this insert
+                if self.raise_ignore {
+                    self.raise_ignore = false;
+                    // Don't increment n_change - row was ignored
+                    self.pc += 1;
+                    return Ok(ExecResult::Continue);
+                }
+
                 // Mark as DML statement for count_changes support
                 if (op.p5 & OPFLAG_NCHANGE) != 0 {
                     self.is_dml_statement = true;
@@ -5612,6 +5625,14 @@ impl Vdbe {
                 // P3 = register holding rowid for triggers
                 // P4 = table name
                 // P5 = flags (OPFLAG_* constants)
+
+                // Check if RAISE(IGNORE) was called - skip this delete
+                if self.raise_ignore {
+                    self.raise_ignore = false;
+                    // Don't change n_change - row was ignored
+                    self.pc += 1;
+                    return Ok(ExecResult::Continue);
+                }
 
                 // Mark as DML statement for count_changes support
                 if (op.p5 & OPFLAG_NCHANGE) != 0 {

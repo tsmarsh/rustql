@@ -576,6 +576,22 @@ impl<'s> UpdateCompiler<'s> {
             self.emit_before_triggers(&table_name, old_save_base, new_base)?;
         }
 
+        // After BEFORE triggers: re-read row to pick up any changes made by triggers
+        // for columns NOT being explicitly SET. Triggers may have modified other columns.
+        if has_before_triggers {
+            // Re-read all column values from the positioned cursor
+            // This picks up any modifications made by the BEFORE trigger
+            for i in 0..self.num_columns {
+                let reg = data_base + i as i32;
+                if Some(i) == ipk_col_idx {
+                    // IPK column - get value from rowid
+                    self.emit(Opcode::Rowid, cursor, reg, 0, P4::Unused);
+                } else {
+                    self.emit(Opcode::Column, cursor, i as i32, reg, P4::Unused);
+                }
+            }
+        }
+
         // Phase 2: Copy temp values to data registers
         // Also track which columns are being updated for UNIQUE checks
         let mut updated_columns: Vec<usize> = Vec::new();

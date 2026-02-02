@@ -10604,6 +10604,42 @@ impl<'s> SelectCompiler<'s> {
         self.finalize_aggregates_with_group(columns, agg_regs, None, 0)
     }
 
+    /// Count actual number of columns after expanding Star/TableStar
+    fn count_expanded_columns(&self, columns: &[ResultColumn]) -> usize {
+        let mut count = 0;
+        for col in columns {
+            match col {
+                ResultColumn::Star => {
+                    // Count columns from all tables
+                    for table in &self.tables {
+                        if let Some(schema_table) = &table.schema_table {
+                            count += schema_table.columns.len();
+                        } else if let Some(subquery_cols) = &table.subquery_columns {
+                            count += subquery_cols.len();
+                        }
+                    }
+                }
+                ResultColumn::TableStar(table_name) => {
+                    // Count columns from the specified table
+                    for table in &self.tables {
+                        if table.name.eq_ignore_ascii_case(table_name) {
+                            if let Some(schema_table) = &table.schema_table {
+                                count += schema_table.columns.len();
+                            } else if let Some(subquery_cols) = &table.subquery_columns {
+                                count += subquery_cols.len();
+                            }
+                            break;
+                        }
+                    }
+                }
+                ResultColumn::Expr { .. } => {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
     fn finalize_aggregates_with_group(
         &mut self,
         columns: &[ResultColumn],
@@ -10614,7 +10650,8 @@ impl<'s> SelectCompiler<'s> {
         // Pre-allocate all destination registers to ensure they are contiguous
         // This is important because expression compilation may allocate additional
         // temporary registers, which would make the result registers non-contiguous
-        let num_columns = columns.len();
+        // Count actual columns including Star expansion
+        let num_columns = self.count_expanded_columns(columns);
         let base_reg = self.next_reg;
         let dest_regs: Vec<i32> = (0..num_columns).map(|_| self.alloc_reg()).collect();
 
@@ -10634,59 +10671,259 @@ impl<'s> SelectCompiler<'s> {
             }
         }
 
-        for (col_idx, col) in columns.iter().enumerate() {
-            let dest_reg = dest_regs[col_idx];
-            if let ResultColumn::Expr { expr, alias } = col {
-                // Populate result_column_names for this column
-                let col_name = alias
-                    .clone()
-                    .unwrap_or_else(|| self.expr_to_name(expr, count + 1));
-                self.result_column_names.push(col_name);
-                // Check if this column matches a GROUP BY expression
-                if let Some(group_exprs) = group_by {
-                    if let Some(idx) = self.find_matching_group_expr(expr, group_exprs) {
-                        // Copy from the group register
-                        self.emit(
-                            Opcode::Copy,
-                            group_regs + idx as i32,
-                            dest_reg,
-                            0,
-                            P4::Unused,
-                        );
-                        count += 1;
-                        continue;
+        // reg_idx tracks position in dest_regs (which is expanded)
+        let mut reg_idx = 0;
+        for col in columns {
+            match col {
+                ResultColumn::Star => {
+                    // Expand * to all columns from all tables
+                    let tables_snapshot: Vec<_> = self.tables.clone();
+                    for table in &tables_snapshot {
+                        if let Some(schema_table) = &table.schema_table {
+                            for (col_idx, col_def) in schema_table.columns.iter().enumerate() {
+                                let dest_reg = dest_regs[reg_idx];
+                                // Check if this column is a GROUP BY column
+                                let col_expr = Expr::Column(ColumnRef {
+                                    database: None,
+                                    table: Some(table.name.clone()),
+                                    column: col_def.name.clone(),
+                                    column_index: None,
+                                    source_text: None,
+                                });
+                                if let Some(group_exprs) = group_by {
+                                    if let Some(idx) =
+                                        self.find_matching_group_expr(&col_expr, group_exprs)
+                                    {
+                                        self.emit(
+                                            Opcode::Copy,
+                                            group_regs + idx as i32,
+                                            dest_reg,
+                                            0,
+                                            P4::Unused,
+                                        );
+                                        self.result_column_names.push(col_def.name.clone());
+                                        count += 1;
+                                        reg_idx += 1;
+                                        continue;
+                                    }
+                                }
+                                // Check for GROUP BY match without table prefix
+                                let col_expr_no_table = Expr::Column(ColumnRef {
+                                    database: None,
+                                    table: None,
+                                    column: col_def.name.clone(),
+                                    column_index: None,
+                                    source_text: None,
+                                });
+                                if let Some(group_exprs) = group_by {
+                                    if let Some(idx) = self
+                                        .find_matching_group_expr(&col_expr_no_table, group_exprs)
+                                    {
+                                        self.emit(
+                                            Opcode::Copy,
+                                            group_regs + idx as i32,
+                                            dest_reg,
+                                            0,
+                                            P4::Unused,
+                                        );
+                                        self.result_column_names.push(col_def.name.clone());
+                                        count += 1;
+                                        reg_idx += 1;
+                                        continue;
+                                    }
+                                }
+                                // Check if this is a VIRTUAL generated column
+                                if let Some(ref gen) = col_def.generated {
+                                    if gen.storage == GeneratedStorage::Virtual {
+                                        // Compile the generated expression
+                                        let gen_expr = Self::convert_schema_expr_to_ast(&gen.expr);
+                                        self.compile_expr(&gen_expr, dest_reg)?;
+                                    } else {
+                                        // STORED generated column - needs to be read from saved registers
+                                        // For now, compile a column reference that will use group_column_regs
+                                        self.compile_expr(&col_expr_no_table, dest_reg)?;
+                                    }
+                                } else {
+                                    // Regular column - compile as column reference
+                                    self.compile_expr(&col_expr_no_table, dest_reg)?;
+                                }
+                                self.result_column_names.push(col_def.name.clone());
+                                count += 1;
+                                reg_idx += 1;
+                            }
+                        }
                     }
                 }
+                ResultColumn::TableStar(table_name) => {
+                    // Expand table.* to columns from the specific table
+                    let tables_snapshot: Vec<_> = self.tables.clone();
+                    for table in &tables_snapshot {
+                        if table.name.eq_ignore_ascii_case(table_name) {
+                            if let Some(schema_table) = &table.schema_table {
+                                for (col_idx, col_def) in schema_table.columns.iter().enumerate() {
+                                    let dest_reg = dest_regs[reg_idx];
+                                    // Check if this column is a GROUP BY column
+                                    let col_expr = Expr::Column(ColumnRef {
+                                        database: None,
+                                        table: Some(table.name.clone()),
+                                        column: col_def.name.clone(),
+                                        column_index: None,
+                                        source_text: None,
+                                    });
+                                    if let Some(group_exprs) = group_by {
+                                        if let Some(idx) =
+                                            self.find_matching_group_expr(&col_expr, group_exprs)
+                                        {
+                                            self.emit(
+                                                Opcode::Copy,
+                                                group_regs + idx as i32,
+                                                dest_reg,
+                                                0,
+                                                P4::Unused,
+                                            );
+                                            self.result_column_names.push(col_def.name.clone());
+                                            count += 1;
+                                            reg_idx += 1;
+                                            continue;
+                                        }
+                                    }
+                                    // Check for GROUP BY match without table prefix
+                                    let col_expr_no_table = Expr::Column(ColumnRef {
+                                        database: None,
+                                        table: None,
+                                        column: col_def.name.clone(),
+                                        column_index: None,
+                                        source_text: None,
+                                    });
+                                    if let Some(group_exprs) = group_by {
+                                        if let Some(idx) = self.find_matching_group_expr(
+                                            &col_expr_no_table,
+                                            group_exprs,
+                                        ) {
+                                            self.emit(
+                                                Opcode::Copy,
+                                                group_regs + idx as i32,
+                                                dest_reg,
+                                                0,
+                                                P4::Unused,
+                                            );
+                                            self.result_column_names.push(col_def.name.clone());
+                                            count += 1;
+                                            reg_idx += 1;
+                                            continue;
+                                        }
+                                    }
+                                    // Check if this is a VIRTUAL generated column
+                                    if let Some(ref gen) = col_def.generated {
+                                        if gen.storage == GeneratedStorage::Virtual {
+                                            let gen_expr =
+                                                Self::convert_schema_expr_to_ast(&gen.expr);
+                                            self.compile_expr(&gen_expr, dest_reg)?;
+                                        } else {
+                                            self.compile_expr(&col_expr_no_table, dest_reg)?;
+                                        }
+                                    } else {
+                                        self.compile_expr(&col_expr_no_table, dest_reg)?;
+                                    }
+                                    self.result_column_names.push(col_def.name.clone());
+                                    count += 1;
+                                    reg_idx += 1;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                ResultColumn::Expr { expr, alias } => {
+                    let dest_reg = dest_regs[reg_idx];
+                    // Populate result_column_names for this column
+                    let col_name = alias
+                        .clone()
+                        .unwrap_or_else(|| self.expr_to_name(expr, count + 1));
+                    self.result_column_names.push(col_name);
+                    // Check if this column matches a GROUP BY expression
+                    if let Some(group_exprs) = group_by {
+                        if let Some(idx) = self.find_matching_group_expr(expr, group_exprs) {
+                            // Copy from the group register
+                            self.emit(
+                                Opcode::Copy,
+                                group_regs + idx as i32,
+                                dest_reg,
+                                0,
+                                P4::Unused,
+                            );
+                            count += 1;
+                            reg_idx += 1;
+                            continue;
+                        }
+                    }
 
-                if let Expr::Function(func_call) = expr {
-                    let name_upper = func_call.name.to_uppercase();
-                    let arg_count = match &func_call.args {
-                        crate::parser::ast::FunctionArgs::Exprs(exprs) => exprs.len(),
-                        crate::parser::ast::FunctionArgs::Star => 0,
-                    };
-                    // MIN/MAX with multiple args are scalar functions
-                    let is_multi_arg_min_max =
-                        matches!(name_upper.as_str(), "MIN" | "MAX") && arg_count > 1;
-                    if !is_multi_arg_min_max
-                        && matches!(
-                            name_upper.as_str(),
-                            "COUNT"
-                                | "SUM"
-                                | "AVG"
-                                | "MIN"
-                                | "MAX"
-                                | "GROUP_CONCAT"
-                                | "STRING_AGG"
-                                | "TOTAL"
-                        )
-                    {
-                        let agg_reg = agg_regs[agg_idx];
-                        self.emit(Opcode::AggFinal, agg_reg, dest_reg, 0, P4::Text(name_upper));
-                        // Track this finalized aggregate for HAVING clause compilation
-                        self.agg_final_regs.push(dest_reg);
-                        agg_idx += 1;
+                    if let Expr::Function(func_call) = expr {
+                        let name_upper = func_call.name.to_uppercase();
+                        let arg_count = match &func_call.args {
+                            crate::parser::ast::FunctionArgs::Exprs(exprs) => exprs.len(),
+                            crate::parser::ast::FunctionArgs::Star => 0,
+                        };
+                        // MIN/MAX with multiple args are scalar functions
+                        let is_multi_arg_min_max =
+                            matches!(name_upper.as_str(), "MIN" | "MAX") && arg_count > 1;
+                        if !is_multi_arg_min_max
+                            && matches!(
+                                name_upper.as_str(),
+                                "COUNT"
+                                    | "SUM"
+                                    | "AVG"
+                                    | "MIN"
+                                    | "MAX"
+                                    | "GROUP_CONCAT"
+                                    | "STRING_AGG"
+                                    | "TOTAL"
+                            )
+                        {
+                            let agg_reg = agg_regs[agg_idx];
+                            self.emit(Opcode::AggFinal, agg_reg, dest_reg, 0, P4::Text(name_upper));
+                            // Track this finalized aggregate for HAVING clause compilation
+                            self.agg_final_regs.push(dest_reg);
+                            agg_idx += 1;
+                        } else if self.expr_has_aggregate(expr) {
+                            // Non-aggregate function with nested aggregates (e.g., coalesce(max(a), 'x'))
+                            let num_aggs = self.count_aggregates_in_expr(expr);
+                            self.agg_final_regs.clear();
+                            self.agg_final_idx = 0;
+
+                            // Emit AggFinal for each aggregate in this expression
+                            for _ in 0..num_aggs {
+                                if agg_idx < agg_regs.len() {
+                                    let agg_reg = agg_regs[agg_idx];
+                                    let result_reg = self.alloc_reg();
+                                    let agg_name = self.get_aggregate_name_at_index(
+                                        expr,
+                                        self.agg_final_regs.len(),
+                                    );
+                                    self.emit(
+                                        Opcode::AggFinal,
+                                        agg_reg,
+                                        result_reg,
+                                        0,
+                                        P4::Text(agg_name),
+                                    );
+                                    self.agg_final_regs.push(result_reg);
+                                    agg_idx += 1;
+                                }
+                            }
+
+                            // Now compile the expression - it will use agg_final_regs
+                            self.compile_expr(expr, dest_reg)?;
+
+                            // Clear the aggregate context
+                            self.agg_final_regs.clear();
+                            self.agg_final_idx = 0;
+                        } else {
+                            // Non-aggregate function - compile the expression
+                            self.compile_expr(expr, dest_reg)?;
+                        }
                     } else if self.expr_has_aggregate(expr) {
-                        // Non-aggregate function with nested aggregates (e.g., coalesce(max(a), 'x'))
+                        // Expression contains nested aggregates - finalize them first
                         let num_aggs = self.count_aggregates_in_expr(expr);
                         self.agg_final_regs.clear();
                         self.agg_final_idx = 0;
@@ -10696,6 +10933,7 @@ impl<'s> SelectCompiler<'s> {
                             if agg_idx < agg_regs.len() {
                                 let agg_reg = agg_regs[agg_idx];
                                 let result_reg = self.alloc_reg();
+                                // Get the aggregate name for this index
                                 let agg_name = self
                                     .get_aggregate_name_at_index(expr, self.agg_final_regs.len());
                                 self.emit(
@@ -10717,69 +10955,13 @@ impl<'s> SelectCompiler<'s> {
                         self.agg_final_regs.clear();
                         self.agg_final_idx = 0;
                     } else {
-                        // Non-aggregate function - check if it was saved in registers
-                        if let Some((base_reg, ref indices)) = self.non_agg_saved_regs {
-                            if col_idx < indices.len() {
-                                if let Some(offset) = indices[col_idx] {
-                                    // Copy from saved register
-                                    let src_reg = base_reg + offset as i32;
-                                    self.emit(Opcode::SCopy, src_reg, dest_reg, 0, P4::Unused);
-                                } else {
-                                    self.compile_expr(expr, dest_reg)?;
-                                }
-                            } else {
-                                self.compile_expr(expr, dest_reg)?;
-                            }
-                        } else {
-                            self.compile_expr(expr, dest_reg)?;
-                        }
-                    }
-                } else if self.expr_has_aggregate(expr) {
-                    // Expression contains nested aggregates - finalize them first
-                    let num_aggs = self.count_aggregates_in_expr(expr);
-                    self.agg_final_regs.clear();
-                    self.agg_final_idx = 0;
-
-                    // Emit AggFinal for each aggregate in this expression
-                    for _ in 0..num_aggs {
-                        if agg_idx < agg_regs.len() {
-                            let agg_reg = agg_regs[agg_idx];
-                            let result_reg = self.alloc_reg();
-                            // Get the aggregate name for this index
-                            let agg_name =
-                                self.get_aggregate_name_at_index(expr, self.agg_final_regs.len());
-                            self.emit(Opcode::AggFinal, agg_reg, result_reg, 0, P4::Text(agg_name));
-                            self.agg_final_regs.push(result_reg);
-                            agg_idx += 1;
-                        }
-                    }
-
-                    // Now compile the expression - it will use agg_final_regs
-                    self.compile_expr(expr, dest_reg)?;
-
-                    // Clear the aggregate context
-                    self.agg_final_regs.clear();
-                    self.agg_final_idx = 0;
-                } else {
-                    // Non-aggregate expression - check if it was saved in registers
-                    if let Some((base_reg, ref indices)) = self.non_agg_saved_regs {
-                        if col_idx < indices.len() {
-                            if let Some(offset) = indices[col_idx] {
-                                // Copy from saved register
-                                let src_reg = base_reg + offset as i32;
-                                self.emit(Opcode::SCopy, src_reg, dest_reg, 0, P4::Unused);
-                            } else {
-                                self.compile_expr(expr, dest_reg)?;
-                            }
-                        } else {
-                            self.compile_expr(expr, dest_reg)?;
-                        }
-                    } else {
+                        // Non-aggregate expression - compile it
                         self.compile_expr(expr, dest_reg)?;
                     }
+                    count += 1;
+                    reg_idx += 1;
                 }
             }
-            count += 1;
         }
 
         // NOTE: Do NOT clear group_column_regs here - HAVING clause needs it

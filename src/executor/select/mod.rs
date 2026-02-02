@@ -1329,6 +1329,10 @@ impl<'s> SelectCompiler<'s> {
             &core.columns,
         )?;
 
+        // Pre-scan result columns to extract alias expressions (needed for ON clause validation)
+        // This allows checking if ON clause references aliases that derive from tables to the right
+        self.prescan_result_aliases(&core.columns);
+
         // Process FROM clause - open cursors
         if let Some(from) = &core.from {
             self.compile_from_clause(from)?;
@@ -6196,6 +6200,52 @@ impl<'s> SelectCompiler<'s> {
                                 ErrorCode::Error,
                                 "ON clause references tables to its right",
                             ));
+                        }
+                    }
+
+                    // Check if this is a result column alias that references tables to the right
+                    // This handles cases like: SELECT c+d AS cd FROM t1 LEFT JOIN t2 ON (cd=5) CROSS JOIN t3
+                    // where cd is an alias for c+d, and c,d come from t3
+                    if let Some(alias_expr) = self.alias_expressions.get(&col_name) {
+                        // Collect all columns from the alias expression
+                        let alias_columns = self.collect_on_clause_columns(alias_expr);
+                        for alias_col in alias_columns {
+                            // Check if any column in the alias expression comes from a table to the right
+                            if let Some(alias_table) = &alias_col.table {
+                                let alias_table_lower = alias_table.to_lowercase();
+                                if tables_to_right.contains(&alias_table_lower)
+                                    || table_names_to_right.contains(&alias_table_lower)
+                                {
+                                    return Err(Error::with_message(
+                                        ErrorCode::Error,
+                                        "ON clause references tables to its right",
+                                    ));
+                                }
+                            } else {
+                                // Unqualified column in alias - check if it resolves to right tables
+                                let alias_col_name = alias_col.column.to_lowercase();
+                                let mut alias_found_left = false;
+                                for idx in 0..=join_index {
+                                    if idx < self.tables.len() {
+                                        let table = &self.tables[idx];
+                                        if self.table_has_column(table, &alias_col_name) {
+                                            alias_found_left = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if !alias_found_left {
+                                    for idx in (join_index + 1)..self.tables.len() {
+                                        let table = &self.tables[idx];
+                                        if self.table_has_column(table, &alias_col_name) {
+                                            return Err(Error::with_message(
+                                                ErrorCode::Error,
+                                                "ON clause references tables to its right",
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }

@@ -2109,6 +2109,11 @@ impl Vdbe {
                                 }
                             }
                         }
+                        if std::env::var("VDBE_TRACE").is_ok() {
+                            let btree_ptr = btree.as_ref().map(|b| Arc::as_ptr(b) as usize);
+                            eprintln!("  OpenRead: cursor={}, resolved_root_page={}, is_index={}, table_name={:?}, btree_ptr={:x?}",
+                                op.p1, root_page, is_index, table_name, btree_ptr);
+                        }
                         self.open_cursor(op.p1, root_page, false)?;
                         if let Some(cursor) = self.cursor_mut(op.p1) {
                             cursor.n_field = op.p3;
@@ -7155,9 +7160,19 @@ impl Vdbe {
                 // For ephemeral indexes: remove from set
                 // For btree indexes: find and delete the entry
                 let record = self.mem(op.p2).to_blob();
-                let btree_arc = self.btree.clone();
+                // Get btree from cursor first (supports temp tables), fall back to main btree
+                let btree_arc = self
+                    .cursor(op.p1)
+                    .and_then(|c| c.btree.clone())
+                    .or_else(|| self.btree.clone());
 
                 if let Some(cursor) = self.cursor_mut(op.p1) {
+                    if std::env::var("VDBE_TRACE").is_ok() {
+                        let cursor_btree_ptr =
+                            cursor.btree.as_ref().map(|b| Arc::as_ptr(b) as usize);
+                        eprintln!("  IdxDelete: cursor={}, root_page={}, is_index={}, cursor_btree_ptr={:x?}",
+                            op.p1, cursor.root_page, cursor.is_index, cursor_btree_ptr);
+                    }
                     if cursor.is_ephemeral {
                         cursor.ephemeral_set.remove(&record);
                     } else if let Some(ref mut bt_cursor) = cursor.btree_cursor {
@@ -7168,9 +7183,15 @@ impl Vdbe {
                             let search_key =
                                 crate::storage::btree::UnpackedRecord::new(record.clone());
                             let move_result = bt_cursor.index_moveto(&search_key)?;
+                            if std::env::var("VDBE_TRACE").is_ok() {
+                                eprintln!("  IdxDelete: moveto result={}", move_result);
+                            }
                             if move_result == 0 {
                                 // Found exact match - delete it
                                 btree.delete(bt_cursor, BtreeInsertFlags::empty())?;
+                                if std::env::var("VDBE_TRACE").is_ok() {
+                                    eprintln!("  IdxDelete: deleted entry");
+                                }
                             }
                             // If not found (move_result != 0), nothing to delete
                         }

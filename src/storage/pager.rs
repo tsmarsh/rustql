@@ -802,6 +802,16 @@ impl Pager {
                 let is_new_page =
                     cache_page_ref.n_ref == 1 && cache_page_ref.data.iter().all(|&b| b == 0);
 
+                if std::env::var("VDBE_TRACE").is_ok() && pgno == 4 {
+                    eprintln!(
+                        "pager.get({}): n_ref={}, is_new_page={}, first_byte={}",
+                        pgno,
+                        cache_page_ref.n_ref,
+                        is_new_page,
+                        cache_page_ref.data.get(0).copied().unwrap_or(0)
+                    );
+                }
+
                 if is_new_page {
                     // New page - read from disk if file is open
                     if let Some(ref mut fd) = self.fd {

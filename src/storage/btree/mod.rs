@@ -4446,12 +4446,18 @@ impl Btree {
         page.data.copy_from_slice(&mem_page.data);
         if std::env::var("RUSTQL_BTREE_TRACE").is_ok() {
             trace_btree(&format!(
-                "btree: delete pgno={} ix={} cell_offset={} size={}",
-                actual_pgno, _cursor.ix, cell_offset, cell_size
+                "btree: delete pgno={} ix={} cell_offset={} size={} n_cell_after={}",
+                actual_pgno, _cursor.ix, cell_offset, cell_size, mem_page.n_cell
             ));
         }
 
         // Write modified page back to cache so subsequent reads see the changes
+        if std::env::var("VDBE_TRACE").is_ok() {
+            eprintln!(
+                "btree: writing page {} to cache after delete, n_cell={}",
+                actual_pgno, mem_page.n_cell
+            );
+        }
         shared_guard.pager.write_page_to_cache(&page);
 
         // Update cursor's stored page
@@ -5184,6 +5190,19 @@ impl BtCursor {
         };
         let page = shared.pager.get(pgno, PagerGetFlags::empty())?;
         let mem_page = MemPage::parse_with_shared(pgno, page.data.clone(), limits, Some(shared))?;
+        if std::env::var("VDBE_TRACE").is_ok() && pgno == 4 {
+            // Dump cell pointers for page 4
+            let mut cell_ptrs = Vec::new();
+            for i in 0..mem_page.n_cell {
+                if let Ok(cell_offset) = mem_page.cell_ptr(i, limits) {
+                    cell_ptrs.push(format!("{}:{}", i, cell_offset));
+                }
+            }
+            eprintln!(
+                "btree: load_page pgno={} n_cell={} cell_ptrs={:?}",
+                pgno, mem_page.n_cell, cell_ptrs
+            );
+        }
         mem_page.validate_layout(limits)?;
         Ok((mem_page, limits))
     }

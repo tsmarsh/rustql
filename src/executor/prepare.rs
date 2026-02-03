@@ -2472,21 +2472,36 @@ impl<'s> StatementCompiler<'s> {
     }
 
     /// Delete entries from sqlite_master where name matches
-    fn append_sqlite_master_delete(&self, ops: &mut Vec<VdbeOp>, cursor_id: i32, name: &str) {
+    fn append_sqlite_master_delete(
+        &self,
+        ops: &mut Vec<VdbeOp>,
+        cursor_id: i32,
+        name: &str,
+        kind: &str,
+    ) {
         // sqlite_master columns: type, name, tbl_name, rootpage, sql
-        // We need to scan and find rows where name (column 1) matches
+        // We need to scan and find rows where name (column 1) matches AND type (column 0) matches
 
         // Use high register numbers to avoid conflicts
-        let reg_name_col = 30;
-        let reg_target = 31;
+        let reg_type_col = 30;
+        let reg_name_col = 31;
+        let reg_target_name = 32;
+        let reg_target_type = 33;
 
-        // Store the target name to match
+        // Store the target name and type to match
         ops.push(Self::make_op(
             Opcode::String8,
             0,
-            reg_target,
+            reg_target_name,
             0,
             P4::Text(name.to_string()),
+        ));
+        ops.push(Self::make_op(
+            Opcode::String8,
+            0,
+            reg_target_type,
+            0,
+            P4::Text(kind.to_string()),
         ));
 
         // Rewind to start of sqlite_master
@@ -2500,8 +2515,15 @@ impl<'s> StatementCompiler<'s> {
             P4::Unused,
         ));
 
-        // Loop: read name column (column 1)
+        // Loop: read type column (column 0) and name column (column 1)
         let loop_start = ops.len();
+        ops.push(Self::make_op(
+            Opcode::Column,
+            cursor_id,
+            0,
+            reg_type_col,
+            P4::Unused,
+        ));
         ops.push(Self::make_op(
             Opcode::Column,
             cursor_id,
@@ -2510,13 +2532,25 @@ impl<'s> StatementCompiler<'s> {
             P4::Unused,
         ));
 
-        // Compare with target name (case insensitive would be better, but for now exact match)
-        let skip_label = ops.len() + 2; // Jump over Delete if no match
+        // Compare type first - skip if type doesn't match
+        // next_label points to the Next instruction: current + 3 ops (Ne, Ne, Delete)
+        let next_label = ops.len() + 3;
+        ops.push(Self::make_op(
+            Opcode::Ne,
+            reg_type_col,
+            next_label as i32,
+            reg_target_type,
+            P4::Unused,
+        ));
+
+        // Compare with target name - skip if name doesn't match
+        // Still jump to the same Next instruction
+        let next_label2 = ops.len() + 2; // current + 2 ops (Ne, Delete)
         ops.push(Self::make_op(
             Opcode::Ne,
             reg_name_col,
-            skip_label as i32,
-            reg_target,
+            next_label2 as i32,
+            reg_target_name,
             P4::Unused,
         ));
 
@@ -2524,7 +2558,130 @@ impl<'s> StatementCompiler<'s> {
         ops.push(Self::make_op(Opcode::Delete, cursor_id, 0, 0, P4::Unused));
 
         // Next row
-        let _next_addr = ops.len();
+        ops.push(Self::make_op(
+            Opcode::Next,
+            cursor_id,
+            loop_start as i32,
+            0,
+            P4::Unused,
+        ));
+
+        // End of loop - fix the Rewind jump address
+        let end_addr = ops.len();
+        ops[rewind_addr].p2 = end_addr as i32;
+    }
+
+    /// Delete entries from sqlite_master where tbl_name matches (for cascading drops)
+    /// This is used when dropping a table to also drop its indexes and triggers
+    fn append_sqlite_master_delete_by_tbl_name(
+        &self,
+        ops: &mut Vec<VdbeOp>,
+        cursor_id: i32,
+        tbl_name: &str,
+    ) {
+        // sqlite_master columns: type, name, tbl_name, rootpage, sql
+        // We need to scan and find rows where tbl_name (column 2) matches
+        // and type is 'trigger' or 'index'
+
+        // Use high register numbers to avoid conflicts
+        let reg_type_col = 32;
+        let reg_tbl_name_col = 33;
+        let reg_target = 34;
+        let reg_trigger_type = 35;
+        let reg_index_type = 36;
+
+        // Store the target tbl_name to match
+        ops.push(Self::make_op(
+            Opcode::String8,
+            0,
+            reg_target,
+            0,
+            P4::Text(tbl_name.to_string()),
+        ));
+
+        // Store "trigger" and "index" for type comparison
+        ops.push(Self::make_op(
+            Opcode::String8,
+            0,
+            reg_trigger_type,
+            0,
+            P4::Text("trigger".to_string()),
+        ));
+        ops.push(Self::make_op(
+            Opcode::String8,
+            0,
+            reg_index_type,
+            0,
+            P4::Text("index".to_string()),
+        ));
+
+        // Rewind to start of sqlite_master
+        let rewind_addr = ops.len();
+        let end_label = 0; // Will be fixed later
+        ops.push(Self::make_op(
+            Opcode::Rewind,
+            cursor_id,
+            end_label,
+            0,
+            P4::Unused,
+        ));
+
+        // Loop: read type column (column 0) and tbl_name column (column 2)
+        let loop_start = ops.len();
+        ops.push(Self::make_op(
+            Opcode::Column,
+            cursor_id,
+            0,
+            reg_type_col,
+            P4::Unused,
+        ));
+        ops.push(Self::make_op(
+            Opcode::Column,
+            cursor_id,
+            2,
+            reg_tbl_name_col,
+            P4::Unused,
+        ));
+
+        // Skip if tbl_name doesn't match - jump to Next instruction
+        // After this Ne, we have: Ne(trigger), Delete, Ne(index), Delete, Next
+        // That's 5 more ops, so Next is at current + 5
+        let next_label = ops.len() + 5;
+        ops.push(Self::make_op(
+            Opcode::Ne,
+            reg_tbl_name_col,
+            next_label as i32,
+            reg_target,
+            P4::Unused,
+        ));
+
+        // Check if type is 'trigger' - if so, delete
+        let check_index_label = ops.len() + 2;
+        ops.push(Self::make_op(
+            Opcode::Ne,
+            reg_type_col,
+            check_index_label as i32,
+            reg_trigger_type,
+            P4::Unused,
+        ));
+
+        // Delete the trigger row
+        ops.push(Self::make_op(Opcode::Delete, cursor_id, 0, 0, P4::Unused));
+
+        // Check if type is 'index' - if so, delete
+        let next_label2 = ops.len() + 2;
+        ops.push(Self::make_op(
+            Opcode::Ne,
+            reg_type_col,
+            next_label2 as i32,
+            reg_index_type,
+            P4::Unused,
+        ));
+
+        // Delete the index row
+        ops.push(Self::make_op(Opcode::Delete, cursor_id, 0, 0, P4::Unused));
+
+        // Next row
         ops.push(Self::make_op(
             Opcode::Next,
             cursor_id,
@@ -4709,7 +4866,13 @@ impl<'s> StatementCompiler<'s> {
             // Delete from sqlite_master
             let cursor_id = 0;
             self.append_sqlite_master_open(&mut ops, cursor_id, actual_db_idx);
-            self.append_sqlite_master_delete(&mut ops, cursor_id, name);
+            self.append_sqlite_master_delete(&mut ops, cursor_id, name, kind);
+
+            // When dropping a table, also delete associated triggers and indexes
+            if kind == "table" {
+                self.append_sqlite_master_delete_by_tbl_name(&mut ops, cursor_id, name);
+            }
+
             self.append_sqlite_master_close(&mut ops, cursor_id);
         }
 

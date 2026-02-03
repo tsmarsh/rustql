@@ -1956,7 +1956,10 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::Begin)?;
         let mut body = Vec::new();
         while !self.check(TokenKind::End) {
-            body.push(self.parse_stmt()?);
+            let stmt = self.parse_stmt()?;
+            // Validate trigger body statements
+            self.validate_trigger_body_stmt(&stmt)?;
+            body.push(stmt);
             self.match_token(TokenKind::Semicolon);
         }
         self.expect(TokenKind::End)?;
@@ -1973,6 +1976,59 @@ impl<'a> Parser<'a> {
             when,
             body,
         })
+    }
+
+    /// Validate that a trigger body statement doesn't use features forbidden within triggers
+    fn validate_trigger_body_stmt(&self, stmt: &Stmt) -> Result<()> {
+        use crate::parser::ast::{DeleteStmt, IndexedBy, InsertStmt, Stmt, UpdateStmt};
+
+        match stmt {
+            Stmt::Insert(insert) => {
+                // Qualified table names not allowed
+                if insert.table.schema.is_some() {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        "qualified table names are not allowed on INSERT, UPDATE, and DELETE statements within triggers".to_string(),
+                    ));
+                }
+            }
+            Stmt::Update(update) => {
+                // Qualified table names not allowed
+                if update.table.schema.is_some() {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        "qualified table names are not allowed on INSERT, UPDATE, and DELETE statements within triggers".to_string(),
+                    ));
+                }
+                // INDEXED BY / NOT INDEXED not allowed
+                if let Some(indexed_by) = &update.indexed_by {
+                    let msg = match indexed_by {
+                        IndexedBy::NotIndexed => "the NOT INDEXED clause is not allowed on UPDATE or DELETE statements within triggers",
+                        IndexedBy::Index(_) => "the INDEXED BY clause is not allowed on UPDATE or DELETE statements within triggers",
+                    };
+                    return Err(Error::with_message(ErrorCode::Error, msg.to_string()));
+                }
+            }
+            Stmt::Delete(delete) => {
+                // Qualified table names not allowed
+                if delete.table.schema.is_some() {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        "qualified table names are not allowed on INSERT, UPDATE, and DELETE statements within triggers".to_string(),
+                    ));
+                }
+                // INDEXED BY / NOT INDEXED not allowed
+                if let Some(indexed_by) = &delete.indexed_by {
+                    let msg = match indexed_by {
+                        IndexedBy::NotIndexed => "the NOT INDEXED clause is not allowed on UPDATE or DELETE statements within triggers",
+                        IndexedBy::Index(_) => "the INDEXED BY clause is not allowed on UPDATE or DELETE statements within triggers",
+                    };
+                    return Err(Error::with_message(ErrorCode::Error, msg.to_string()));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     // ========================================================================

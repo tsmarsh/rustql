@@ -1215,6 +1215,9 @@ pub enum Expr {
     // Parenthesized expression
     Parens(Box<Expr>),
 
+    // Row value (vector) - e.g., (a, b, c)
+    Vector(Vec<Expr>),
+
     // RAISE function
     Raise {
         action: RaiseAction,

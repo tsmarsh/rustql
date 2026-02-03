@@ -504,6 +504,12 @@ impl<'a> Resolver<'a> {
             Expr::Subquery(select) => self.resolve_select(select),
             Expr::Exists { subquery, .. } => self.resolve_select(subquery),
             Expr::Parens(inner) => self.resolve_expr(inner, sources),
+            Expr::Vector(exprs) => {
+                for e in exprs {
+                    self.resolve_expr(e, sources)?;
+                }
+                Ok(())
+            }
             Expr::Raise { .. } => Ok(()),
             Expr::Literal(_) | Expr::Variable(_) => Ok(()),
         }

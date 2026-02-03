@@ -52,6 +52,13 @@ fn walk_expr_impl<W: ExprWalker>(walker: &mut W, expr: &mut Expr) -> WalkResult 
                 return WalkResult::Abort;
             }
         }
+        Expr::Vector(exprs) => {
+            for e in exprs {
+                if walk_expr_impl(walker, e) == WalkResult::Abort {
+                    return WalkResult::Abort;
+                }
+            }
+        }
         Expr::Binary { left, right, .. } | Expr::IsDistinct { left, right, .. } => {
             if walk_expr_impl(walker, left) == WalkResult::Abort {
                 return WalkResult::Abort;
@@ -503,6 +510,7 @@ pub fn expr_depth(expr: &Expr) -> i32 {
                 1 + args_depth.max(filter_depth).max(over_depth)
             }
             Expr::Subquery(_) | Expr::Exists { .. } => 1,
+            Expr::Vector(exprs) => 1 + exprs.iter().map(depth).max().unwrap_or(0),
         }
     }
 

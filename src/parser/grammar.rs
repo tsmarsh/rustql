@@ -2797,6 +2797,16 @@ impl<'a> Parser<'a> {
                 return Ok(Expr::Subquery(Box::new(subquery)));
             }
             let expr = self.parse_expr()?;
+            // Check if this is a row value (vector) - (expr, expr, ...)
+            if self.match_token(TokenKind::Comma) {
+                let mut values = vec![expr];
+                values.push(self.parse_expr()?);
+                while self.match_token(TokenKind::Comma) {
+                    values.push(self.parse_expr()?);
+                }
+                self.expect(TokenKind::RParen)?;
+                return Ok(Expr::Vector(values));
+            }
             self.expect(TokenKind::RParen)?;
             return Ok(Expr::Parens(Box::new(expr)));
         }

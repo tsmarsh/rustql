@@ -410,6 +410,18 @@ pub fn vfs_find(name: Option<&str>) -> Option<Arc<dyn Vfs>> {
     VFS_REGISTRY.lock().unwrap().find(name)
 }
 
+/// Find the first VFS whose name does NOT match the given name.
+/// This is used by wrapper VFSes (like testvfs) to find their parent.
+pub fn vfs_find_parent(exclude_name: &str) -> Option<Arc<dyn Vfs>> {
+    let registry = VFS_REGISTRY.lock().unwrap();
+    for vfs_entry in &registry.vfs_list {
+        if vfs_entry.name() != exclude_name {
+            return Some(Arc::clone(vfs_entry));
+        }
+    }
+    None
+}
+
 /// Register a VFS
 pub fn vfs_register(vfs: Arc<dyn Vfs>, make_default: bool) -> Result<()> {
     VFS_REGISTRY.lock().unwrap().register(vfs, make_default)

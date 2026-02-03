@@ -28,6 +28,8 @@ pub mod helpers;
 pub mod md5;
 pub mod printf;
 pub mod stubs;
+pub mod tcl_module;
+pub mod testvfs;
 pub mod user_func;
 
 // Re-exports for public API

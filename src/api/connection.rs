@@ -903,6 +903,7 @@ impl SqliteConnection {
             let _ = self
                 .vtab_registry
                 .register_module(Arc::new(crate::fts3::Fts3VtabModule));
+            let _ = self.vtab_registry.register_module(Arc::new(crate::fts3::Fts4VtabModule));
         }
 
         // FTS5 module (if feature enabled)

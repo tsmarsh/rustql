@@ -11,7 +11,7 @@ use super::datetime::{
     func_julianday, func_strftime, func_time, func_unixepoch,
 };
 #[cfg(feature = "fts3")]
-use super::fts3::{func_matchinfo, func_offsets, func_snippet};
+use super::fts3::{func_fts3_exprtest, func_fts3_exprtest_rebalance, func_matchinfo, func_offsets, func_snippet};
 #[cfg(feature = "fts5")]
 use super::fts5::{func_bm25, func_highlight, func_snippet as func_snippet_fts5};
 use super::printf::printf_format;
@@ -96,6 +96,10 @@ pub fn get_scalar_function(name: &str) -> Option<ScalarFunc> {
         "OFFSETS" => Some(func_offsets),
         #[cfg(feature = "fts3")]
         "MATCHINFO" => Some(func_matchinfo),
+        #[cfg(feature = "fts3")]
+        "FTS3_EXPRTEST" => Some(func_fts3_exprtest),
+        #[cfg(feature = "fts3")]
+        "FTS3_EXPRTEST_REBALANCE" => Some(func_fts3_exprtest_rebalance),
         #[cfg(feature = "fts5")]
         "BM25" => Some(func_bm25),
         #[cfg(feature = "fts5")]

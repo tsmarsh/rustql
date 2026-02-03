@@ -579,6 +579,7 @@ pub unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         ("trace", "1"),
         ("secure_delete", "1"),
         ("fts3", "1"),
+        ("fts4", "1"),
         ("fts5", "1"),
         ("rtree", "1"),
         ("json", "1"),

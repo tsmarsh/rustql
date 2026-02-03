@@ -842,6 +842,254 @@ pub fn func_matchinfo(args: &[Value]) -> Result<Value> {
     Ok(Value::Blob(buf))
 }
 
+// ============================================================================
+// FTS3 Expression Test Functions
+// ============================================================================
+
+#[derive(Debug, Clone)]
+enum ExprTestNode {
+    Phrase(i32, Vec<(String, bool)>),
+    And(Box<ExprTestNode>, Box<ExprTestNode>),
+    Or(Box<ExprTestNode>, Box<ExprTestNode>),
+    Not(Box<ExprTestNode>, Box<ExprTestNode>),
+    Near(i32, Box<ExprTestNode>, Box<ExprTestNode>),
+}
+
+impl ExprTestNode {
+    fn to_string_repr(&self) -> String {
+        match self {
+            ExprTestNode::Phrase(col, terms) => {
+                let mut p = vec!["PHRASE".to_string(), col.to_string(), "0".to_string()];
+                for (t, pfx) in terms {
+                    p.push(if *pfx { format!("{}+", t) } else { t.clone() });
+                }
+                p.join(" ")
+            }
+            ExprTestNode::And(l, r) => format!("AND {{{}}} {{{}}}", l.to_string_repr(), r.to_string_repr()),
+            ExprTestNode::Or(l, r) => format!("OR {{{}}} {{{}}}", l.to_string_repr(), r.to_string_repr()),
+            ExprTestNode::Not(l, r) => format!("NOT {{{}}} {{{}}}", l.to_string_repr(), r.to_string_repr()),
+            ExprTestNode::Near(d, l, r) => format!("NEAR/{} {{{}}} {{{}}}", d, l.to_string_repr(), r.to_string_repr()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ExprTestToken {
+    Word(Option<String>, String, bool),
+    QuotedPhrase(Vec<(String, bool)>),
+    LParen, RParen, And, Or, Not, Near(i32),
+}
+
+fn tokenize_exprtest(expr: &str) -> Vec<ExprTestToken> {
+    let mut tokens = Vec::new();
+    let chars: Vec<char> = expr.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    while i < len {
+        let ch = chars[i];
+        if ch.is_ascii_whitespace() { i += 1; continue; }
+        if ch == '(' { tokens.push(ExprTestToken::LParen); i += 1; continue; }
+        if ch == ')' { tokens.push(ExprTestToken::RParen); i += 1; continue; }
+        if ch == '"' {
+            i += 1;
+            let mut phrase_terms: Vec<(String, bool)> = Vec::new();
+            let mut cw = String::new();
+            while i < len && chars[i] != '"' {
+                let c = chars[i];
+                if c.is_ascii_alphanumeric() || c == '_' || (!c.is_ascii() && c != '"') {
+                    cw.push(c.to_ascii_lowercase()); i += 1;
+                } else if c == '*' && !cw.is_empty() {
+                    phrase_terms.push((cw.clone(), true)); cw.clear(); i += 1;
+                } else {
+                    if !cw.is_empty() { phrase_terms.push((cw.clone(), false)); cw.clear(); }
+                    i += 1;
+                }
+            }
+            if !cw.is_empty() { phrase_terms.push((cw, false)); }
+            if i < len && chars[i] == '"' { i += 1; }
+            if !phrase_terms.is_empty() { tokens.push(ExprTestToken::QuotedPhrase(phrase_terms)); }
+            continue;
+        }
+        if ch.is_ascii_alphanumeric() || ch == '_' || !ch.is_ascii() {
+            let mut word = String::new();
+            while i < len && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || !chars[i].is_ascii()) {
+                word.push(chars[i]); i += 1;
+            }
+            let upper = word.to_ascii_uppercase();
+            if upper == "AND" { tokens.push(ExprTestToken::And); continue; }
+            if upper == "OR" { tokens.push(ExprTestToken::Or); continue; }
+            if upper == "NOT" { tokens.push(ExprTestToken::Not); continue; }
+            if upper == "NEAR" {
+                let mut dist = 10;
+                if i < len && chars[i] == '/' {
+                    i += 1;
+                    let mut ns = String::new();
+                    while i < len && chars[i].is_ascii_digit() { ns.push(chars[i]); i += 1; }
+                    if !ns.is_empty() { dist = ns.parse::<i32>().unwrap_or(10); }
+                }
+                tokens.push(ExprTestToken::Near(dist)); continue;
+            }
+            let mut col_prefix = None;
+            if i < len && chars[i] == ':' {
+                col_prefix = Some(word.to_ascii_lowercase());
+                i += 1;
+                word = String::new();
+                while i < len && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || !chars[i].is_ascii()) {
+                    word.push(chars[i]); i += 1;
+                }
+                if word.is_empty() { word = col_prefix.take().unwrap(); }
+            }
+            let is_prefix = i < len && chars[i] == '*';
+            if is_prefix { i += 1; }
+            tokens.push(ExprTestToken::Word(col_prefix, word.to_ascii_lowercase(), is_prefix));
+            continue;
+        }
+        i += 1;
+    }
+    tokens
+}
+
+struct ExprTestParser { tokens: Vec<ExprTestToken>, pos: usize, columns: Vec<String>, n_col: i32 }
+
+impl ExprTestParser {
+    fn new(tokens: Vec<ExprTestToken>, columns: Vec<String>) -> Self {
+        let n_col = columns.len() as i32;
+        ExprTestParser { tokens, pos: 0, columns, n_col }
+    }
+    fn peek(&self) -> Option<&ExprTestToken> { self.tokens.get(self.pos) }
+    fn advance(&mut self) { self.pos += 1; }
+    fn resolve_column(&self, name: &str) -> i32 {
+        let lower = name.to_ascii_lowercase();
+        for (idx, col) in self.columns.iter().enumerate() {
+            if col.to_ascii_lowercase() == lower { return idx as i32; }
+        }
+        self.n_col
+    }
+    fn parse(&mut self) -> Result<Option<ExprTestNode>> { self.parse_or() }
+    fn parse_or(&mut self) -> Result<Option<ExprTestNode>> {
+        let mut left = match self.parse_and()? { Some(n) => n, None => return Ok(None) };
+        while let Some(ExprTestToken::Or) = self.peek() {
+            self.advance();
+            let right = self.parse_and()?.ok_or_else(|| Error::with_message(ErrorCode::Error, "expected expression after OR"))?;
+            left = ExprTestNode::Or(Box::new(left), Box::new(right));
+        }
+        Ok(Some(left))
+    }
+    fn parse_and(&mut self) -> Result<Option<ExprTestNode>> {
+        let mut left = match self.parse_not()? { Some(n) => n, None => return Ok(None) };
+        loop {
+            if let Some(ExprTestToken::And) = self.peek() {
+                self.advance();
+                let right = self.parse_not()?.ok_or_else(|| Error::with_message(ErrorCode::Error, "expected expression after AND"))?;
+                left = ExprTestNode::And(Box::new(left), Box::new(right));
+                continue;
+            }
+            match self.peek() {
+                Some(ExprTestToken::Word(..)) | Some(ExprTestToken::QuotedPhrase(_)) | Some(ExprTestToken::LParen) => {
+                    let right = self.parse_not()?.ok_or_else(|| Error::with_message(ErrorCode::Error, "expected expression"))?;
+                    left = ExprTestNode::And(Box::new(left), Box::new(right));
+                    continue;
+                }
+                _ => break,
+            }
+        }
+        Ok(Some(left))
+    }
+    fn parse_not(&mut self) -> Result<Option<ExprTestNode>> {
+        let mut left = match self.parse_near()? { Some(n) => n, None => return Ok(None) };
+        while let Some(ExprTestToken::Not) = self.peek() {
+            self.advance();
+            let right = self.parse_near()?.ok_or_else(|| Error::with_message(ErrorCode::Error, "expected expression after NOT"))?;
+            left = ExprTestNode::Not(Box::new(left), Box::new(right));
+        }
+        Ok(Some(left))
+    }
+    fn parse_near(&mut self) -> Result<Option<ExprTestNode>> {
+        let mut left = match self.parse_primary()? { Some(n) => n, None => return Ok(None) };
+        while let Some(ExprTestToken::Near(dist)) = self.peek() {
+            let dist = *dist; self.advance();
+            let right = self.parse_primary()?.ok_or_else(|| Error::with_message(ErrorCode::Error, "expected expression after NEAR"))?;
+            left = ExprTestNode::Near(dist, Box::new(left), Box::new(right));
+        }
+        Ok(Some(left))
+    }
+    fn parse_primary(&mut self) -> Result<Option<ExprTestNode>> {
+        match self.peek().cloned() {
+            Some(ExprTestToken::Word(col_prefix, term, is_prefix)) => {
+                self.advance();
+                let col = if let Some(ref p) = col_prefix { self.resolve_column(p) } else { self.n_col };
+                Ok(Some(ExprTestNode::Phrase(col, vec![(term, is_prefix)])))
+            }
+            Some(ExprTestToken::QuotedPhrase(terms)) => { self.advance(); Ok(Some(ExprTestNode::Phrase(self.n_col, terms))) }
+            Some(ExprTestToken::LParen) => {
+                self.advance();
+                let node = self.parse_or()?;
+                if let Some(ExprTestToken::RParen) = self.peek() { self.advance(); }
+                Ok(node)
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+fn flatten_and(node: &ExprTestNode) -> Vec<ExprTestNode> {
+    match node {
+        ExprTestNode::And(l, r) => { let mut res = flatten_and(l); res.extend(flatten_and(r)); res }
+        _ => vec![node.clone()],
+    }
+}
+
+fn build_balanced_and(nodes: &[ExprTestNode]) -> ExprTestNode {
+    assert!(!nodes.is_empty());
+    if nodes.len() == 1 { return nodes[0].clone(); }
+    if nodes.len() == 2 { return ExprTestNode::And(Box::new(nodes[0].clone()), Box::new(nodes[1].clone())); }
+    let mid = (nodes.len() + 1) / 2;
+    ExprTestNode::And(Box::new(build_balanced_and(&nodes[..mid])), Box::new(build_balanced_and(&nodes[mid..])))
+}
+
+fn rebalance_tree(node: &ExprTestNode) -> ExprTestNode {
+    match node {
+        ExprTestNode::And(_, _) => {
+            let flat: Vec<ExprTestNode> = flatten_and(node).into_iter().map(|n| rebalance_tree(&n)).collect();
+            build_balanced_and(&flat)
+        }
+        ExprTestNode::Or(l, r) => ExprTestNode::Or(Box::new(rebalance_tree(l)), Box::new(rebalance_tree(r))),
+        ExprTestNode::Not(l, r) => ExprTestNode::Not(Box::new(rebalance_tree(l)), Box::new(rebalance_tree(r))),
+        ExprTestNode::Near(d, l, r) => ExprTestNode::Near(*d, Box::new(rebalance_tree(l)), Box::new(rebalance_tree(r))),
+        ExprTestNode::Phrase(c, t) => ExprTestNode::Phrase(*c, t.clone()),
+    }
+}
+
+pub fn func_fts3_exprtest(args: &[Value]) -> Result<Value> {
+    if args.len() < 3 {
+        return Err(Error::with_message(ErrorCode::Error, "fts3_exprtest requires at least 3 arguments"));
+    }
+    let _tokenizer_name = value_to_string(&args[0]);
+    let expression = value_to_string(&args[1]);
+    let columns: Vec<String> = args[2..].iter().map(|v| value_to_string(v).to_ascii_lowercase()).collect();
+    let tokens = tokenize_exprtest(&expression);
+    let mut parser = ExprTestParser::new(tokens, columns);
+    match parser.parse()? {
+        Some(node) => Ok(Value::Text(node.to_string_repr())),
+        None => Err(Error::with_message(ErrorCode::Error, "fts3_exprtest: parse error")),
+    }
+}
+
+pub fn func_fts3_exprtest_rebalance(args: &[Value]) -> Result<Value> {
+    if args.len() < 3 {
+        return Err(Error::with_message(ErrorCode::Error, "fts3_exprtest_rebalance requires at least 3 arguments"));
+    }
+    let _tokenizer_name = value_to_string(&args[0]);
+    let expression = value_to_string(&args[1]);
+    let columns: Vec<String> = args[2..].iter().map(|v| value_to_string(v).to_ascii_lowercase()).collect();
+    let tokens = tokenize_exprtest(&expression);
+    let mut parser = ExprTestParser::new(tokens, columns);
+    match parser.parse()? {
+        Some(node) => { let r = rebalance_tree(&node); Ok(Value::Text(r.to_string_repr())) }
+        None => Err(Error::with_message(ErrorCode::Error, "fts3_exprtest_rebalance: parse error")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

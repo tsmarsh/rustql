@@ -18,4 +18,4 @@ pub use tokenize::Fts3TokenizeTable;
 pub use tokenizer::{
     create_tokenizer, parse_tokenize_arg, register_tokenizer, PorterTokenizer, Unicode61Tokenizer,
 };
-pub use vtab_adapter::Fts3VtabModule;
+pub use vtab_adapter::{Fts3VtabModule, Fts4VtabModule};

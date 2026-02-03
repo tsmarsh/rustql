@@ -21,6 +21,9 @@ use super::tokenizer::create_tokenizer;
 /// This module creates FTS3 full-text search tables.
 pub struct Fts3VtabModule;
 
+/// FTS4 virtual table module - delegates to FTS3
+pub struct Fts4VtabModule;
+
 impl VtabModule for Fts3VtabModule {
     fn name(&self) -> &str {
         "fts3"
@@ -99,6 +102,19 @@ impl VtabModule for Fts3VtabModule {
     fn shadow_table_suffixes(&self) -> Vec<&'static str> {
         vec!["_content", "_segments", "_segdir", "_stat"]
     }
+}
+
+impl VtabModule for Fts4VtabModule {
+    fn name(&self) -> &str { "fts4" }
+    fn create(&self, db_name: &str, table_name: &str, args: &[String]) -> Result<(String, Arc<dyn VtabTable>)> {
+        Fts3VtabModule.create(db_name, table_name, args)
+    }
+    fn connect(&self, db_name: &str, table_name: &str, args: &[String]) -> Result<(String, Arc<dyn VtabTable>)> {
+        Fts3VtabModule.connect(db_name, table_name, args)
+    }
+    fn destroy(&self, table: Arc<dyn VtabTable>) -> Result<()> { Fts3VtabModule.destroy(table) }
+    fn uses_shadow_tables(&self) -> bool { true }
+    fn shadow_table_suffixes(&self) -> Vec<&'static str> { vec!["_content", "_segments", "_segdir", "_stat"] }
 }
 
 /// FTS3 virtual table instance adapter

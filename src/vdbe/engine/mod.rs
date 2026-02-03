@@ -2328,9 +2328,15 @@ impl Vdbe {
                             && table_meta.is_none()
                             && !is_index
                         {
+                            // Use qualified name in error message (SQLite always includes schema prefix)
+                            let error_name = if schema_name.is_some() {
+                                tname.clone()
+                            } else {
+                                format!("main.{}", simple_name)
+                            };
                             return Err(Error::with_message(
                                 ErrorCode::Error,
-                                format!("no such table: {}", tname),
+                                format!("no such table: {}", error_name),
                             ));
                         }
                     }
@@ -2687,9 +2693,17 @@ impl Vdbe {
                 if root_page == 0 && !is_virtual {
                     if let Some(ref tname) = table_name {
                         if !table_found {
+                            // Use qualified name in error message (SQLite always includes schema prefix)
+                            let error_name = if schema_name.is_some() {
+                                tname.clone()
+                            } else if let Some(ref sname) = simple_name {
+                                format!("main.{}", sname)
+                            } else {
+                                format!("main.{}", tname)
+                            };
                             return Err(Error::with_message(
                                 ErrorCode::Error,
-                                format!("no such table: {}", tname),
+                                format!("no such table: {}", error_name),
                             ));
                         }
                     }
@@ -7735,10 +7749,20 @@ impl Vdbe {
                                                 ));
                                             }
                                             if !is_view {
-                                                return Err(Error::with_message(
-                                                    ErrorCode::Error,
-                                                    format!("no such view: {}", create.table),
-                                                ));
+                                                if db_idx == 1 {
+                                                    return Err(Error::with_message(
+                                                        ErrorCode::Error,
+                                                        format!("no such view: {}", create.table),
+                                                    ));
+                                                } else {
+                                                    return Err(Error::with_message(
+                                                        ErrorCode::Error,
+                                                        format!(
+                                                            "no such view: main.{}",
+                                                            create.table
+                                                        ),
+                                                    ));
+                                                }
                                             }
                                         } else {
                                             // BEFORE/AFTER triggers - check if view
@@ -7762,10 +7786,22 @@ impl Vdbe {
                                             }
                                             // Must be a table
                                             if !is_table {
-                                                return Err(Error::with_message(
-                                                    ErrorCode::Error,
-                                                    format!("no such table: {}", create.table),
-                                                ));
+                                                // For temp triggers (db_idx == 1), no prefix
+                                                // For main triggers, include "main." prefix
+                                                if db_idx == 1 {
+                                                    return Err(Error::with_message(
+                                                        ErrorCode::Error,
+                                                        format!("no such table: {}", create.table),
+                                                    ));
+                                                } else {
+                                                    return Err(Error::with_message(
+                                                        ErrorCode::Error,
+                                                        format!(
+                                                            "no such table: main.{}",
+                                                            create.table
+                                                        ),
+                                                    ));
+                                                }
                                             }
                                         }
 

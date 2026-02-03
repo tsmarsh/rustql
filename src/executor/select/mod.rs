@@ -4847,14 +4847,11 @@ impl<'s> SelectCompiler<'s> {
                 if self.schema.is_some() && schema_table.is_none() {
                     // Use qualified name with database prefix for error message
                     // Only add "main." prefix when inside a view expansion (for consistency with SQLite)
+                    // SQLite always includes "main." prefix for unqualified table names
                     let qualified_name = if let Some(ref schema) = name.schema {
                         format!("{}.{}", schema, table_name)
-                    } else if self.main_view_depth > 0 {
-                        // Inside a view expansion - use qualified name
-                        format!("main.{}", table_name)
                     } else {
-                        // Top-level query - use plain name
-                        table_name.clone()
+                        format!("main.{}", table_name)
                     };
                     return Err(Error::with_message(
                         ErrorCode::Error,
@@ -7115,9 +7112,15 @@ impl<'s> SelectCompiler<'s> {
                                 })
                             };
                             if !in_temp && !in_attached {
+                                // SQLite always includes "main." prefix for unqualified table names
+                                let error_name = if name.schema.is_some() {
+                                    qualified_name.clone()
+                                } else {
+                                    format!("main.{}", table_name)
+                                };
                                 return Err(Error::with_message(
                                     ErrorCode::Error,
-                                    format!("no such table: {}", qualified_name),
+                                    format!("no such table: {}", error_name),
                                 ));
                             }
                         }

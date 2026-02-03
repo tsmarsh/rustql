@@ -26,7 +26,16 @@ pub fn compile_create_trigger(
     // Validate table exists
     let table_name = &create.table;
     let _table = schema.table(table_name).ok_or_else(|| {
-        Error::with_message(ErrorCode::Error, format!("no such table: {}", table_name))
+        // For non-temp triggers, include "main." prefix in error
+        // For temp triggers, no prefix (they can reference any database)
+        if create.temporary {
+            Error::with_message(ErrorCode::Error, format!("no such table: {}", table_name))
+        } else {
+            Error::with_message(
+                ErrorCode::Error,
+                format!("no such table: main.{}", table_name),
+            )
+        }
     })?;
 
     // Check for INSTEAD OF on regular table (table.is_virtual is false for views)

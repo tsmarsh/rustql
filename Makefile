@@ -242,7 +242,7 @@ test-report:
 	done | sort -t'(' -k2 -rn
 	@echo ""
 	@echo "=== Overall ==="
-	@total_pass=0; total_tests=0; \
+	@total_pass=0; total_tests=0; pct_sum=0; file_count=0; \
 	for log in $(RESULT_DIR)/*.log; do \
 		if [ -f "$$log" ]; then \
 			name=$$(basename "$$log" .log); \
@@ -250,12 +250,19 @@ test-report:
 			total=$$(grep -cE "^$${name}-[0-9]" "$$log" 2>/dev/null | tr -d '[:space:]'); \
 			pass=$${pass:-0}; \
 			total=$${total:-0}; \
-			total_pass=$$((total_pass + pass)); \
-			total_tests=$$((total_tests + total)); \
+			if [ "$$total" -gt 0 ] 2>/dev/null; then \
+				total_pass=$$((total_pass + pass)); \
+				total_tests=$$((total_tests + total)); \
+				pct_sum=$$((pct_sum + (pass * 100 / total))); \
+				file_count=$$((file_count + 1)); \
+			fi; \
 		fi; \
 	done; \
 	if [ "$$total_tests" -gt 0 ]; then \
-		echo "Total: $$total_pass/$$total_tests passed ($$((total_pass * 100 / total_tests))%)"; \
+		echo "Weighted: $$total_pass/$$total_tests passed ($$((total_pass * 100 / total_tests))%)"; \
+	fi; \
+	if [ "$$file_count" -gt 0 ]; then \
+		echo "Average:  $$((pct_sum / file_count))% across $$file_count test files"; \
 	else \
 		echo "No test data found."; \
 	fi
@@ -265,7 +272,7 @@ pass-rates:
 		echo "No test results found. Run 'make test' first."; \
 		exit 1; \
 	fi
-	@total_pass=0; total_tests=0; \
+	@total_pass=0; total_tests=0; pct_sum=0; file_count=0; \
 	for t in $(SQLITE_TESTS); do \
 		if [ -f "$(RESULT_DIR)/$$t.log" ]; then \
 			pass=$$(grep -cE "^$$t-.*\.\.\. Ok$$" "$(RESULT_DIR)/$$t.log" 2>/dev/null | tr -d '[:space:]'); \
@@ -277,11 +284,16 @@ pass-rates:
 				printf "%-15s %4d / %4d  (%3d%%)\n" "$$t" "$$pass" "$$total" "$$pct"; \
 				total_pass=$$((total_pass + pass)); \
 				total_tests=$$((total_tests + total)); \
+				pct_sum=$$((pct_sum + pct)); \
+				file_count=$$((file_count + 1)); \
 			fi; \
 		fi; \
 	done; \
 	echo ""; \
 	echo "----------------------------------------"; \
 	if [ "$$total_tests" -gt 0 ]; then \
-		printf "%-15s %4d / %4d  (%3d%%)\n" "TOTAL" "$$total_pass" "$$total_tests" "$$((total_pass * 100 / total_tests))"; \
+		printf "%-15s %4d / %4d  (%3d%% weighted)\n" "TOTAL" "$$total_pass" "$$total_tests" "$$((total_pass * 100 / total_tests))"; \
+	fi; \
+	if [ "$$file_count" -gt 0 ]; then \
+		printf "%-15s              (%3d%% average across $$file_count files)\n" "AVERAGE" "$$((pct_sum / file_count))"; \
 	fi

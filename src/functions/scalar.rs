@@ -14,6 +14,12 @@ use super::datetime::{
 use super::fts3::{func_fts3_exprtest, func_fts3_exprtest_rebalance, func_matchinfo, func_offsets, func_snippet};
 #[cfg(feature = "fts5")]
 use super::fts5::{func_bm25, func_highlight, func_snippet as func_snippet_fts5};
+use super::json::{
+    func_json, func_json_array, func_json_array_length, func_json_extract,
+    func_json_group_array, func_json_group_object, func_json_insert, func_json_object,
+    func_json_patch, func_json_quote, func_json_remove, func_json_replace, func_json_set,
+    func_json_type, func_json_valid, func_jsonb,
+};
 use super::printf::printf_format;
 
 // ============================================================================
@@ -104,6 +110,24 @@ pub fn get_scalar_function(name: &str) -> Option<ScalarFunc> {
         "BM25" => Some(func_bm25),
         #[cfg(feature = "fts5")]
         "HIGHLIGHT" => Some(func_highlight),
+
+        // JSON functions
+        "JSON" => Some(func_json),
+        "JSONB" => Some(func_jsonb),
+        "JSON_VALID" => Some(func_json_valid),
+        "JSON_EXTRACT" => Some(func_json_extract),
+        "JSON_TYPE" => Some(func_json_type),
+        "JSON_ARRAY" => Some(func_json_array),
+        "JSON_OBJECT" => Some(func_json_object),
+        "JSON_ARRAY_LENGTH" => Some(func_json_array_length),
+        "JSON_INSERT" => Some(func_json_insert),
+        "JSON_SET" => Some(func_json_set),
+        "JSON_REPLACE" => Some(func_json_replace),
+        "JSON_REMOVE" => Some(func_json_remove),
+        "JSON_PATCH" => Some(func_json_patch),
+        "JSON_QUOTE" => Some(func_json_quote),
+        "JSON_GROUP_ARRAY" => Some(func_json_group_array),
+        "JSON_GROUP_OBJECT" => Some(func_json_group_object),
 
         // Test infrastructure functions
         "SQLITE_SEARCH_COUNT" => Some(func_sqlite_search_count),

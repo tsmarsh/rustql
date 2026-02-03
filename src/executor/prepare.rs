@@ -1326,7 +1326,7 @@ impl<'s> StatementCompiler<'s> {
         // 2: CreateBtree - create the table's root page
         // P1 = database index (0 for main, 1 for temp, 2+ attached)
         // P2 = register for root page, P3 = BTREE_INTKEY for table
-        let db_idx = self.resolve_db_idx(&create.name, false)?;
+        let db_idx = self.resolve_db_idx(&create.name, create.temporary)?;
         ops.push(Self::make_op(
             Opcode::CreateBtree,
             db_idx,
@@ -3142,6 +3142,18 @@ impl<'s> StatementCompiler<'s> {
             }
         }
 
+        // Check if the target table is in the temp schema
+        // Triggers on temp tables are implicitly temp triggers
+        let table_lower = create.table.to_lowercase();
+        let table_in_temp = self
+            .temp_schema
+            .map(|s| s.tables.contains_key(&table_lower) || s.views.contains_key(&table_lower))
+            .unwrap_or(false);
+        let is_temp_trigger = create.temporary || table_in_temp;
+
+        // Adjust db_idx if target table is in temp schema
+        let actual_db_idx = if table_in_temp { 1 } else { trigger_db_idx };
+
         // Reconstruct the CREATE TRIGGER SQL for storage
         // This preserves the original SQL text for later parsing
         let sql = self.reconstruct_create_trigger_sql(create);
@@ -3152,9 +3164,9 @@ impl<'s> StatementCompiler<'s> {
 
         // Only insert into sqlite_master for non-temp triggers
         // Temp triggers are transient and only exist in the in-memory schema
-        if !create.temporary {
+        if !is_temp_trigger {
             let cursor_id = 0;
-            self.append_sqlite_master_open(&mut ops, cursor_id, trigger_db_idx);
+            self.append_sqlite_master_open(&mut ops, cursor_id, actual_db_idx);
             self.append_sqlite_master_insert_trigger(
                 &mut ops,
                 cursor_id,
@@ -3169,7 +3181,7 @@ impl<'s> StatementCompiler<'s> {
         // P2=0 (triggers don't need a root page), P4=SQL text
         ops.push(Self::make_op(
             Opcode::ParseSchema,
-            trigger_db_idx,
+            actual_db_idx,
             0,
             0,
             P4::Text(sql.clone()),

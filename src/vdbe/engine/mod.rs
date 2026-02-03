@@ -7816,7 +7816,7 @@ impl Vdbe {
                                                     ErrorCode::Error,
                                                     format!(
                                                         "trigger {} already exists",
-                                                        trigger.name
+                                                        create.name.display_name()
                                                     ),
                                                 ));
                                             }

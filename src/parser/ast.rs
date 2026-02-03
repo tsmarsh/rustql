@@ -15,6 +15,8 @@ use std::fmt;
 pub struct QualifiedName {
     pub schema: Option<String>,
     pub name: String,
+    /// Original name with quotes preserved (for error messages)
+    pub original_name: Option<String>,
 }
 
 impl QualifiedName {
@@ -22,6 +24,7 @@ impl QualifiedName {
         QualifiedName {
             schema: None,
             name: name.into(),
+            original_name: None,
         }
     }
 
@@ -29,7 +32,22 @@ impl QualifiedName {
         QualifiedName {
             schema: Some(schema.into()),
             name: name.into(),
+            original_name: None,
         }
+    }
+
+    /// Create with original name preserved for error messages
+    pub fn with_original(name: impl Into<String>, original: impl Into<String>) -> Self {
+        QualifiedName {
+            schema: None,
+            name: name.into(),
+            original_name: Some(original.into()),
+        }
+    }
+
+    /// Get the display name (original if available, otherwise name)
+    pub fn display_name(&self) -> &str {
+        self.original_name.as_deref().unwrap_or(&self.name)
     }
 
     /// Get database index (0=main, 1=temp, 2+=attached)

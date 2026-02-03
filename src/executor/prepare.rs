@@ -3674,7 +3674,7 @@ impl<'s> StatementCompiler<'s> {
         if create.if_not_exists {
             sql.push_str("IF NOT EXISTS ");
         }
-        sql.push_str(&create.name.to_string());
+        sql.push_str(create.name.display_name());
         sql.push(' ');
 
         // Timing

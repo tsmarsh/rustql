@@ -74,7 +74,7 @@ pub fn compile_create_trigger(
         }
         return Err(Error::with_message(
             ErrorCode::Error,
-            format!("trigger {} already exists", trigger.name),
+            format!("trigger {} already exists", create.name.display_name()),
         ));
     }
 

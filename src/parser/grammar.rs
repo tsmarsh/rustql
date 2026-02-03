@@ -3153,6 +3153,8 @@ impl<'a> Parser<'a> {
 
     fn parse_qualified_name(&mut self) -> Result<QualifiedName> {
         // SQLite allows string literals as identifiers in some contexts (e.g., trigger names)
+        // Capture original text for quote preservation in error messages
+        let first_original = self.current_text().to_string();
         let first = if self.check(TokenKind::String) {
             self.expect_string()?
         } else {
@@ -3167,7 +3169,7 @@ impl<'a> Parser<'a> {
             };
             Ok(QualifiedName::with_schema(first, second))
         } else {
-            Ok(QualifiedName::new(first))
+            Ok(QualifiedName::with_original(first, first_original))
         }
     }
 

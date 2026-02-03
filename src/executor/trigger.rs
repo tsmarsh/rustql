@@ -460,14 +460,16 @@ impl<'s> TriggerBodyCompiler<'s> {
 
         // Open target table for writing
         // Encode db_idx in upper byte of P5 for attached database resolution
+        // Bit 0 (0x01) indicates we're in a trigger context (affects temp table lookup)
         let cursor = self.alloc_cursor();
+        let trigger_flag = 0x01u16; // Indicates trigger context
         self.ops.push(VdbeOp {
             opcode: Opcode::OpenWrite,
             p1: cursor,
             p2: 0,
             p3: 0,
             p4: P4::Text(table_name.clone()),
-            p5: ((target_db_idx as u16) << 8),
+            p5: ((target_db_idx as u16) << 8) | trigger_flag,
             comment: None,
         });
 
@@ -482,7 +484,7 @@ impl<'s> TriggerBodyCompiler<'s> {
                     p2: index.root_page as i32,
                     p3: (index.columns.len() + 1) as i32,
                     p4: P4::Text(index.name.clone()),
-                    p5: ((target_db_idx as u16) << 8),
+                    p5: ((target_db_idx as u16) << 8) | trigger_flag,
                     comment: None,
                 });
                 let col_indices: Vec<i32> = index.columns.iter().map(|c| c.column_idx).collect();

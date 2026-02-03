@@ -2182,16 +2182,38 @@ impl Vdbe {
                         // Only do full lookup if root_page not yet known
                         let need_root_lookup = root_page == 0;
 
-                        // First check main schema
-                        if let Some(ref schema) = self.schema {
-                            if let Ok(schema_guard) = schema.read() {
-                                // First try as a table (case-insensitive lookup)
-                                if let Some(table) = schema_guard.tables.get(&tname_lower) {
-                                    if requested_db_idx.map_or(true, |idx| table.db_idx == idx) {
+                        // For unqualified names, check temp schema first (SQLite behavior)
+                        // Temp tables take precedence over main tables with the same name
+                        if requested_db_idx.is_none() || requested_db_idx == Some(1) {
+                            if let Some(ref temp_schema) = self.temp_schema {
+                                if let Ok(temp_guard) = temp_schema.read() {
+                                    if let Some(table) = temp_guard.tables.get(&tname_lower) {
                                         root_page = table.root_page;
                                         table_meta = Some(std::sync::Arc::clone(table));
                                     }
                                 }
+                            }
+                        }
+
+                        // Then check main schema if not found in temp
+                        if root_page == 0 {
+                            if let Some(ref schema) = self.schema {
+                                if let Ok(schema_guard) = schema.read() {
+                                    // First try as a table (case-insensitive lookup)
+                                    if let Some(table) = schema_guard.tables.get(&tname_lower) {
+                                        if requested_db_idx.map_or(true, |idx| table.db_idx == idx)
+                                        {
+                                            root_page = table.root_page;
+                                            table_meta = Some(std::sync::Arc::clone(table));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Continue with index lookup in main schema
+                        if let Some(ref schema) = self.schema {
+                            if let Ok(schema_guard) = schema.read() {
                                 // If not found as table, try as index
                                 if root_page == 0 {
                                     if let Some(index) = schema_guard.indexes.get(&tname_lower) {
@@ -2511,31 +2533,67 @@ impl Vdbe {
                             }
                         }
                     }
-                    if let Some(ref schema) = self.schema {
-                        if let Ok(schema_guard) = schema.read() {
-                            // Use requested_db_idx from schema name OR from P5
-                            let requested_db_idx = schema_name
-                                .as_deref()
-                                .and_then(|db_name| self.db_idx_for_schema(db_name))
-                                .or(if p5_db_idx != 0 {
-                                    Some(p5_db_idx)
-                                } else {
-                                    None
-                                });
-                            let name_lower = simple_name
-                                .as_ref()
-                                .map(|n| n.to_lowercase())
-                                .unwrap_or_else(|| name.to_lowercase());
-                            // First try tables
-                            if let Some(table) = schema_guard.tables.get(&name_lower) {
-                                if requested_db_idx.map_or(true, |idx| table.db_idx == idx) {
+                    // Check temp_schema first for temp tables (db_idx=1)
+                    let name_lower = simple_name
+                        .as_ref()
+                        .map(|n| n.to_lowercase())
+                        .unwrap_or_else(|| {
+                            if let P4::Text(ref name) = op.p4 {
+                                name.to_lowercase()
+                            } else {
+                                String::new()
+                            }
+                        });
+
+                    // For unqualified names, check temp schema first ONLY if not in a main trigger body
+                    // Temp tables take precedence over main tables with the same name (SQLite behavior)
+                    // P5 encoding: upper byte = db_idx, bit 0 = trigger context flag
+                    // - Bit 0 set (p5 & 1 == 1): we're in a trigger body
+                    // - p5_db_idx: the trigger's database (0=main, 1=temp)
+                    let is_temp_qualified = schema_name
+                        .as_deref()
+                        .map(|s| s.eq_ignore_ascii_case("temp"))
+                        .unwrap_or(false);
+                    let in_trigger = (op.p5 & 1) == 1;
+                    let check_temp_first = is_temp_qualified
+                        || p5_db_idx == 1  // temp trigger body (always check temp first)
+                        || (schema_name.is_none() && !in_trigger); // regular query (not in trigger), unqualified
+                    if !name_lower.is_empty() && check_temp_first {
+                        if let Some(ref temp_schema) = self.temp_schema {
+                            if let Ok(temp_guard) = temp_schema.read() {
+                                if let Some(table) = temp_guard.tables.get(&name_lower) {
                                     table_found = true;
                                     is_virtual = table.is_virtual;
-                                    is_temp_table = table.db_idx == 1;
-                                    table_db_idx = table.db_idx;
+                                    is_temp_table = true;
+                                    table_db_idx = 1;
                                     table_columns = Some(table.columns.len() as i32);
                                     if root_page == 0 {
                                         root_page = table.root_page;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(ref schema) = self.schema {
+                        if let Ok(schema_guard) = schema.read() {
+                            // Use requested_db_idx from schema name only - don't use p5_db_idx as a filter
+                            // because temp triggers (p5_db_idx=1) can reference tables in main schema
+                            let requested_db_idx = schema_name
+                                .as_deref()
+                                .and_then(|db_name| self.db_idx_for_schema(db_name));
+                            // First try tables (if not already found in temp_schema)
+                            if !table_found {
+                                if let Some(table) = schema_guard.tables.get(&name_lower) {
+                                    if requested_db_idx.map_or(true, |idx| table.db_idx == idx) {
+                                        table_found = true;
+                                        is_virtual = table.is_virtual;
+                                        is_temp_table = table.db_idx == 1;
+                                        table_db_idx = table.db_idx;
+                                        table_columns = Some(table.columns.len() as i32);
+                                        if root_page == 0 {
+                                            root_page = table.root_page;
+                                        }
                                     }
                                 }
                             }
@@ -2589,23 +2647,17 @@ impl Vdbe {
                         }
                     }
 
-                    // If not found in main schema, check attached schemas
+                    // If not found in main/temp schema, check attached schemas
                     // For qualified names: check only the specified database
                     // For unqualified names: search all attached databases in order
+                    // Note: p5_db_idx=1 (temp trigger context) should not restrict search to temp only
+                    // since we've already checked temp_schema above
                     if !table_found {
-                        // Use requested_db_idx from schema name OR from P5 (for trigger body compilation)
+                        // Use requested_db_idx from schema name only (not p5_db_idx)
+                        // Temp triggers can reference tables in any database
                         let requested_db_idx = schema_name
                             .as_deref()
-                            .and_then(|db_name| self.db_idx_for_schema(db_name))
-                            .or(if p5_db_idx != 0 {
-                                Some(p5_db_idx)
-                            } else {
-                                None
-                            });
-                        let name_lower = simple_name
-                            .as_ref()
-                            .map(|n| n.to_lowercase())
-                            .unwrap_or_default();
+                            .and_then(|db_name| self.db_idx_for_schema(db_name));
                         let need_root_lookup = root_page == 0;
 
                         if let Some(conn_ptr) = self.conn_ptr {
@@ -2613,7 +2665,7 @@ impl Vdbe {
 
                             // Determine which databases to search
                             let dbs_to_search: Vec<usize> = if let Some(db_idx) = requested_db_idx {
-                                // Qualified name or trigger context - search only the specified database
+                                // Qualified name - search only the specified database
                                 vec![db_idx as usize]
                             } else {
                                 // Unqualified name - search all attached databases (skip main at 0, temp at 1)
@@ -7729,10 +7781,25 @@ impl Vdbe {
                                         }
 
                                         // Check if target is table or view
-                                        let is_table =
+                                        // For temp triggers (db_idx == 1), also check main schema
+                                        let mut is_table =
                                             schema_guard.tables.contains_key(&table_name_lower);
-                                        let is_view =
+                                        let mut is_view =
                                             schema_guard.views.contains_key(&table_name_lower);
+
+                                        // Temp triggers can reference tables in main schema
+                                        if db_idx == 1 && !is_table && !is_view {
+                                            if let Some(ref main_schema) = self.schema {
+                                                if let Ok(main_guard) = main_schema.read() {
+                                                    is_table = main_guard
+                                                        .tables
+                                                        .contains_key(&table_name_lower);
+                                                    is_view = main_guard
+                                                        .views
+                                                        .contains_key(&table_name_lower);
+                                                }
+                                            }
+                                        }
 
                                         // Validate INSTEAD OF triggers only on views
                                         if matches!(
@@ -8269,11 +8336,42 @@ impl Vdbe {
                 // DropTrigger P4
                 // Remove trigger from schema (SQLite: OP_DropTrigger)
                 // P4 = name of trigger to drop
+                // P1 = database index (0=main, 1=temp)
                 if let P4::Text(name) = &op.p4 {
-                    if let Some(ref schema) = self.schema {
-                        if let Ok(mut schema_guard) = schema.write() {
-                            let name_lower = name.to_lowercase();
-                            schema_guard.triggers.remove(&name_lower);
+                    let name_lower = name.to_lowercase();
+                    let db_idx = op.p1;
+
+                    // Check temp schema first if db_idx == 1 or if trigger not found in main
+                    let mut removed = false;
+                    if db_idx == 1 {
+                        // Explicitly dropping from temp schema
+                        if let Some(ref temp_schema) = self.temp_schema {
+                            if let Ok(mut temp_guard) = temp_schema.write() {
+                                if temp_guard.triggers.remove(&name_lower).is_some() {
+                                    removed = true;
+                                }
+                            }
+                        }
+                    }
+
+                    // If not removed from temp or db_idx != 1, try main schema
+                    if !removed {
+                        if let Some(ref schema) = self.schema {
+                            if let Ok(mut schema_guard) = schema.write() {
+                                if schema_guard.triggers.remove(&name_lower).is_some() {
+                                    removed = true;
+                                }
+                            }
+                        }
+                    }
+
+                    // Also try temp schema if db_idx == 0 and not found in main
+                    // (handles unqualified DROP TRIGGER when trigger is in temp)
+                    if !removed && db_idx == 0 {
+                        if let Some(ref temp_schema) = self.temp_schema {
+                            if let Ok(mut temp_guard) = temp_schema.write() {
+                                temp_guard.triggers.remove(&name_lower);
+                            }
                         }
                     }
                 }
@@ -9599,32 +9697,41 @@ impl Vdbe {
             ));
         }
 
-        // Get the schema to find triggers
-        let schema = match &self.schema {
-            Some(s) => s.clone(),
-            None => return Ok(()),
-        };
+        // Find matching triggers from both main and temp schemas
+        // Temp triggers (even on main tables) are stored in temp_schema
+        let mut triggers = Vec::new();
 
-        let schema_guard = match schema.read() {
-            Ok(g) => g,
-            Err(_) => return Ok(()),
-        };
+        // Check main schema for triggers
+        if let Some(ref schema) = self.schema {
+            if let Ok(schema_guard) = schema.read() {
+                let main_triggers = find_matching_triggers(
+                    &schema_guard,
+                    table_name,
+                    TriggerTiming::After,
+                    TriggerEvent::Insert,
+                    None,
+                );
+                triggers.extend(main_triggers);
+            }
+        }
 
-        // Find matching AFTER INSERT triggers
-        let triggers = find_matching_triggers(
-            &schema_guard,
-            table_name,
-            TriggerTiming::After,
-            TriggerEvent::Insert,
-            None,
-        );
+        // Also check temp schema for triggers (temp triggers can be on main tables)
+        if let Some(ref temp_schema) = self.temp_schema {
+            if let Ok(temp_guard) = temp_schema.read() {
+                let temp_triggers = find_matching_triggers(
+                    &temp_guard,
+                    table_name,
+                    TriggerTiming::After,
+                    TriggerEvent::Insert,
+                    None,
+                );
+                triggers.extend(temp_triggers);
+            }
+        }
 
         if triggers.is_empty() {
             return Ok(());
         }
-
-        // Drop the schema guard before we potentially need to compile/execute SQL
-        drop(schema_guard);
 
         // Execute each trigger's body
         for trigger in triggers {
@@ -9648,7 +9755,8 @@ impl Vdbe {
 
             // Get the schema for the trigger's database
             // If trigger belongs to an attached database, use that schema
-            // Otherwise fall back to main schema
+            // If trigger is temp (db_idx=1), use temp_schema
+            // Otherwise use main schema
             let trigger_schema = if trigger.db_idx >= 2 {
                 // Trigger is from an attached database
                 self.conn_ptr
@@ -9658,9 +9766,17 @@ impl Vdbe {
                             .get(trigger.db_idx as usize)
                             .and_then(|db| db.schema.clone())
                     })
-                    .unwrap_or_else(|| schema.clone())
+                    .or_else(|| self.schema.clone())
+            } else if trigger.db_idx == 1 {
+                // Temp trigger - use temp_schema
+                self.temp_schema.clone().or_else(|| self.schema.clone())
             } else {
-                schema.clone()
+                // Main trigger - use main schema
+                self.schema.clone()
+            };
+            let trigger_schema = match trigger_schema {
+                Some(s) => s,
+                None => continue, // No schema available, skip
             };
 
             // Compile and execute each body statement
@@ -9707,32 +9823,41 @@ impl Vdbe {
             ));
         }
 
-        // Get the schema to find triggers
-        let schema = match &self.schema {
-            Some(s) => s.clone(),
-            None => return Ok(()),
-        };
+        // Find matching triggers from both main and temp schemas
+        // Temp triggers (even on main tables) are stored in temp_schema
+        let mut triggers = Vec::new();
 
-        let schema_guard = match schema.read() {
-            Ok(g) => g,
-            Err(_) => return Ok(()),
-        };
+        // Check main schema for triggers
+        if let Some(ref schema) = self.schema {
+            if let Ok(schema_guard) = schema.read() {
+                let main_triggers = find_matching_triggers(
+                    &schema_guard,
+                    table_name,
+                    TriggerTiming::After,
+                    TriggerEvent::Delete,
+                    None,
+                );
+                triggers.extend(main_triggers);
+            }
+        }
 
-        // Find matching AFTER DELETE triggers
-        let triggers = find_matching_triggers(
-            &schema_guard,
-            table_name,
-            TriggerTiming::After,
-            TriggerEvent::Delete,
-            None,
-        );
+        // Also check temp schema for triggers (temp triggers can be on main tables)
+        if let Some(ref temp_schema) = self.temp_schema {
+            if let Ok(temp_guard) = temp_schema.read() {
+                let temp_triggers = find_matching_triggers(
+                    &temp_guard,
+                    table_name,
+                    TriggerTiming::After,
+                    TriggerEvent::Delete,
+                    None,
+                );
+                triggers.extend(temp_triggers);
+            }
+        }
 
         if triggers.is_empty() {
             return Ok(());
         }
-
-        // Drop the schema guard before we potentially need to compile/execute SQL
-        drop(schema_guard);
 
         // Execute each trigger's body
         for trigger in triggers {
@@ -9756,7 +9881,8 @@ impl Vdbe {
 
             // Get the schema for the trigger's database
             // If trigger belongs to an attached database, use that schema
-            // Otherwise fall back to main schema
+            // If trigger is temp (db_idx=1), use temp_schema
+            // Otherwise use main schema
             let trigger_schema = if trigger.db_idx >= 2 {
                 // Trigger is from an attached database
                 self.conn_ptr
@@ -9766,9 +9892,17 @@ impl Vdbe {
                             .get(trigger.db_idx as usize)
                             .and_then(|db| db.schema.clone())
                     })
-                    .unwrap_or_else(|| schema.clone())
+                    .or_else(|| self.schema.clone())
+            } else if trigger.db_idx == 1 {
+                // Temp trigger - use temp_schema
+                self.temp_schema.clone().or_else(|| self.schema.clone())
             } else {
-                schema.clone()
+                // Main trigger - use main schema
+                self.schema.clone()
+            };
+            let trigger_schema = match trigger_schema {
+                Some(s) => s,
+                None => continue, // No schema available, skip
             };
 
             // Compile and execute each body statement

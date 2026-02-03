@@ -636,6 +636,10 @@ impl<'s> StatementCompiler<'s> {
                 compiler.set_param_names(self.param_names.clone());
                 // Pass DQS_DML flag for double-quoted string handling
                 compiler.set_dqs_dml(self.dqs_dml);
+                // Pass temp schema for temp trigger lookup
+                if let Some(temp_schema) = self.temp_schema {
+                    compiler.set_temp_schema(temp_schema);
+                }
                 let ops = compiler.compile(insert)?;
                 Ok((ops, StmtType::Insert, Vec::new(), Vec::new()))
             }

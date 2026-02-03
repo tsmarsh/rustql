@@ -117,6 +117,9 @@ pub struct InsertCompiler<'a> {
 
     /// Label to skip the current row (for UNIQUE ON CONFLICT IGNORE)
     skip_row_label: Option<i32>,
+
+    /// Optional temp schema for trigger lookup
+    temp_schema: Option<&'a Schema>,
 }
 
 impl<'a> InsertCompiler<'a> {
@@ -143,6 +146,7 @@ impl<'a> InsertCompiler<'a> {
             column_affinities: String::new(),
             dqs_dml: true, // Default: enabled for backward compatibility
             skip_row_label: None,
+            temp_schema: None,
         }
     }
 
@@ -169,7 +173,13 @@ impl<'a> InsertCompiler<'a> {
             column_affinities: String::new(),
             dqs_dml: true, // Default: enabled for backward compatibility
             skip_row_label: None,
+            temp_schema: None,
         }
+    }
+
+    /// Set the temp schema for trigger lookup
+    pub fn set_temp_schema(&mut self, schema: &'a Schema) {
+        self.temp_schema = Some(schema);
     }
 
     /// Set the DQS_DML flag (double-quoted string literals in DML)
@@ -234,7 +244,8 @@ impl<'a> InsertCompiler<'a> {
         // Open indexes for writing
         self.open_indexes_for_write(&insert.table.name)?;
 
-        // Look up triggers
+        // Look up triggers from both main schema and temp schema
+        // Temp triggers (even on main tables) are stored in temp_schema
         if let Some(schema) = self.schema {
             self.before_triggers = find_matching_triggers(
                 schema,
@@ -265,6 +276,39 @@ impl<'a> InsertCompiler<'a> {
                 TriggerEvent::Delete,
                 None,
             );
+        }
+
+        // Also check temp schema for triggers (temp triggers can be on main tables)
+        if let Some(temp_schema) = self.temp_schema {
+            self.before_triggers.extend(find_matching_triggers(
+                temp_schema,
+                &insert.table.name,
+                TriggerTiming::Before,
+                TriggerEvent::Insert,
+                None,
+            ));
+            self.after_triggers.extend(find_matching_triggers(
+                temp_schema,
+                &insert.table.name,
+                TriggerTiming::After,
+                TriggerEvent::Insert,
+                None,
+            ));
+            // DELETE triggers for REPLACE conflict resolution
+            self.before_delete_triggers.extend(find_matching_triggers(
+                temp_schema,
+                &insert.table.name,
+                TriggerTiming::Before,
+                TriggerEvent::Delete,
+                None,
+            ));
+            self.after_delete_triggers.extend(find_matching_triggers(
+                temp_schema,
+                &insert.table.name,
+                TriggerTiming::After,
+                TriggerEvent::Delete,
+                None,
+            ));
         }
 
         // Handle conflict action

@@ -1189,6 +1189,49 @@ pub unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         None,
     );
 
+    // Register testvfs - the test VFS infrastructure command (blocks 20+ tests)
+    let cmd_name = CString::new("testvfs").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(super::testvfs::testvfs_cmd),
+        std::ptr::null_mut(),
+        None,
+    );
+
+    // Register atomic_batch_write - returns whether VFS supports batch atomic writes
+    // Used by 17+ tests; always returns 0 (not supported)
+    let cmd_name = CString::new("atomic_batch_write").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(super::testvfs::atomic_batch_write_cmd),
+        std::ptr::null_mut(),
+        None,
+    );
+
+    // Register file_control_reservebytes - sets reserve bytes per page
+    // Used by 2 tests (reservebytes.test, cksumvfs.test)
+    let cmd_name = CString::new("file_control_reservebytes").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(super::testvfs::file_control_reservebytes_cmd),
+        std::ptr::null_mut(),
+        None,
+    );
+
+    // Register sqlite3_simulate_device - simulates device characteristics for testing
+    // Used by 2 tests (io.test, wal.test)
+    let cmd_name = CString::new("sqlite3_simulate_device").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(super::testvfs::sqlite3_simulate_device_cmd),
+        std::ptr::null_mut(),
+        None,
+    );
+
     // Register additional faultsim helper procs via TCL eval
     // These are TCL procs that many fault injection tests expect
     let faultsim_helpers = CString::new(
@@ -2176,4 +2219,403 @@ unsafe extern "C" fn sqlite3_bind_parameter_name_cmd(
     // Without external statement handles, return empty string
     set_result_string(interp, "");
     TCL_OK
+}
+
+/// hexio_render_int32 - Render a 32-bit integer as an 8-character big-endian uppercase hex string
+///
+/// Usage: hexio_render_int32 INTEGER
+/// Example: hexio_render_int32 256 => "00000100"
+unsafe extern "C" fn hexio_render_int32_cmd(
+    _client_data: *mut c_void,
+    interp: *mut Tcl_Interp,
+    objc: c_int,
+    objv: *const *mut Tcl_Obj,
+) -> c_int {
+    if objc != 2 {
+        set_result_string(
+            interp,
+            "wrong # args: should be \"hexio_render_int32 INTEGER\"",
+        );
+        return TCL_ERROR;
+    }
+
+    let val_str = obj_to_string(*objv.offset(1));
+    let val: i32 = match val_str.parse() {
+        Ok(v) => v,
+        Err(_) => {
+            set_result_string(interp, "expected integer");
+            return TCL_ERROR;
+        }
+    };
+
+    // Render as big-endian 32-bit hex, uppercase, matching SQLite's sqlite3TestBinToHex
+    let result = format!(
+        "{:02X}{:02X}{:02X}{:02X}",
+        ((val >> 24) & 0xFF) as u8,
+        ((val >> 16) & 0xFF) as u8,
+        ((val >> 8) & 0xFF) as u8,
+        (val & 0xFF) as u8,
+    );
+    set_result_string(interp, &result);
+    TCL_OK
+}
+
+/// hexio_render_int16 - Render a 16-bit integer as a 4-character big-endian uppercase hex string
+///
+/// Usage: hexio_render_int16 INTEGER
+/// Example: hexio_render_int16 256 => "0100"
+unsafe extern "C" fn hexio_render_int16_cmd(
+    _client_data: *mut c_void,
+    interp: *mut Tcl_Interp,
+    objc: c_int,
+    objv: *const *mut Tcl_Obj,
+) -> c_int {
+    if objc != 2 {
+        set_result_string(
+            interp,
+            "wrong # args: should be \"hexio_render_int16 INTEGER\"",
+        );
+        return TCL_ERROR;
+    }
+
+    let val_str = obj_to_string(*objv.offset(1));
+    let val: i32 = match val_str.parse() {
+        Ok(v) => v,
+        Err(_) => {
+            set_result_string(interp, "expected integer");
+            return TCL_ERROR;
+        }
+    };
+
+    // Render as big-endian 16-bit hex, uppercase
+    let result = format!(
+        "{:02X}{:02X}",
+        ((val >> 8) & 0xFF) as u8,
+        (val & 0xFF) as u8,
+    );
+    set_result_string(interp, &result);
+    TCL_OK
+}
+
+/// decode_hexdb - Decode a hex-encoded database dump into a byte array
+///
+/// Usage: decode_hexdb TEXT
+/// Example: db deserialize [decode_hexdb $hexdb_text]
+///
+/// Input format (output of dbtotxt utility):
+///   | size 8192 pagesize 1024 filename x.db
+///   | page 1 offset 0
+///   |   000: 53 51 4c 69 74 65 20 66 6f 72 6d 61 74 20 33 00
+///   |   010: 04 00 01 01 00 40 20 20 00 00 00 02 00 00 00 02
+///
+/// Returns a byte array suitable for use with [db deserialize].
+unsafe extern "C" fn decode_hexdb_cmd(
+    _client_data: *mut c_void,
+    interp: *mut Tcl_Interp,
+    objc: c_int,
+    objv: *const *mut Tcl_Obj,
+) -> c_int {
+    if objc != 2 {
+        set_result_string(interp, "wrong # args: should be \"decode_hexdb HEXDB\"");
+        return TCL_ERROR;
+    }
+
+    let input = obj_to_string(*objv.offset(1));
+    let mut db_bytes: Option<Vec<u8>> = None;
+    let mut current_offset: usize = 0;
+
+    for line in input.lines() {
+        let trimmed = line.trim();
+
+        // Skip empty lines
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Try to parse "| size N pagesize P filename ..."
+        if db_bytes.is_none() {
+            if let Some(rest) = trimmed.strip_prefix("| size ") {
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                if parts.len() >= 3 && parts[1] == "pagesize" {
+                    let size: usize = match parts[0].parse() {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    let pagesize: usize = match parts[2].parse() {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+
+                    // Validate pagesize
+                    if pagesize < 512 || pagesize > 65536 || (pagesize & (pagesize - 1)) != 0 {
+                        set_result_string(interp, "bad 'pagesize' field");
+                        return TCL_ERROR;
+                    }
+
+                    // Round size up to next multiple of pagesize
+                    let n = (size + pagesize - 1) & !(pagesize - 1);
+                    if n < 512 {
+                        set_result_string(interp, "bad 'size' field");
+                        return TCL_ERROR;
+                    }
+                    db_bytes = Some(vec![0u8; n]);
+                }
+                continue;
+            }
+        }
+
+        // Try to parse "| page N offset M"
+        if let Some(rest) = trimmed.strip_prefix("| page ") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 3 && parts[1] == "offset" {
+                if let Ok(off) = parts[2].parse::<usize>() {
+                    current_offset = off;
+                }
+            }
+            continue;
+        }
+
+        // Try to parse "| OOO: XX XX XX ... XX   ASCII..."
+        // where OOO is a hex offset and XX are hex bytes
+        if let Some(rest) = trimmed.strip_prefix("| ") {
+            if let Some(colon_pos) = rest.find(':') {
+                let offset_str = rest[..colon_pos].trim();
+                if let Ok(line_offset) = usize::from_str_radix(offset_str, 16) {
+                    let hex_data = &rest[colon_pos + 1..];
+
+                    // Parse up to 16 hex byte values
+                    let mut hex_values: Vec<u8> = Vec::new();
+                    for token in hex_data.split_whitespace() {
+                        if token.len() != 2 {
+                            break; // Hit the ASCII section
+                        }
+                        match u8::from_str_radix(token, 16) {
+                            Ok(b) => hex_values.push(b),
+                            Err(_) => break,
+                        }
+                        if hex_values.len() >= 16 {
+                            break;
+                        }
+                    }
+
+                    // Write bytes to the buffer
+                    if let Some(ref mut bytes) = db_bytes {
+                        let write_offset = current_offset + line_offset;
+                        for (i, &b) in hex_values.iter().enumerate() {
+                            if write_offset + i < bytes.len() {
+                                bytes[write_offset + i] = b;
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+    }
+
+    // Return the byte array
+    match db_bytes {
+        Some(bytes) => {
+            set_result_bytearray(interp, &bytes);
+            TCL_OK
+        }
+        None => {
+            // No valid data found - return empty byte array
+            set_result_bytearray(interp, &[]);
+            TCL_OK
+        }
+    }
+}
+
+/// sqlite3_fts3_may_be_corrupt - Get/set the FTS3 may-be-corrupt flag
+///
+/// Usage: sqlite3_fts3_may_be_corrupt ?BOOLEAN?
+///
+/// With no argument, returns the current value.
+/// With an argument, sets the flag and returns the old value.
+/// Default is 1 (FTS3 tables may be corrupt).
+unsafe extern "C" fn sqlite3_fts3_may_be_corrupt_cmd(
+    _client_data: *mut c_void,
+    interp: *mut Tcl_Interp,
+    objc: c_int,
+    objv: *const *mut Tcl_Obj,
+) -> c_int {
+    if objc != 1 && objc != 2 {
+        set_result_string(
+            interp,
+            "wrong # args: should be \"sqlite3_fts3_may_be_corrupt ?BOOLEAN?\"",
+        );
+        return TCL_ERROR;
+    }
+
+    let old_val = FTS3_MAY_BE_CORRUPT.load(Ordering::SeqCst);
+
+    if objc == 2 {
+        let val_str = obj_to_string(*objv.offset(1));
+        // Parse as boolean: "0", "false", "no", "off" => 0; anything else => 1
+        let new_val = match val_str.to_lowercase().as_str() {
+            "0" | "false" | "no" | "off" => 0,
+            _ => 1,
+        };
+        FTS3_MAY_BE_CORRUPT.store(new_val, Ordering::SeqCst);
+    }
+
+    set_result_int(interp, old_val);
+    TCL_OK
+}
+
+/// sqlite3_config_uri - Enable/disable URI filename interpretation
+///
+/// Usage: sqlite3_config_uri BOOLEAN
+///
+/// Enables or disables interpretation of URI parameters by default.
+/// Returns SQLITE_OK (0) on success.
+unsafe extern "C" fn sqlite3_config_uri_cmd(
+    _client_data: *mut c_void,
+    interp: *mut Tcl_Interp,
+    objc: c_int,
+    objv: *const *mut Tcl_Obj,
+) -> c_int {
+    if objc != 2 {
+        set_result_string(
+            interp,
+            "wrong # args: should be \"sqlite3_config_uri BOOL\"",
+        );
+        return TCL_ERROR;
+    }
+
+    let val_str = obj_to_string(*objv.offset(1));
+    let new_val = match val_str.to_lowercase().as_str() {
+        "0" | "false" | "no" | "off" => 0,
+        _ => 1,
+    };
+    CONFIG_URI.store(new_val, Ordering::SeqCst);
+
+    // Return SQLITE_OK
+    set_result_int(interp, 0);
+    TCL_OK
+}
+
+/// fts3_test_varint - Test varint encoding/decoding roundtrip
+///
+/// Usage: fts3_test_varint INTEGER
+///
+/// Encodes the integer as a varint and decodes it back, verifying the roundtrip.
+/// Returns TCL_OK on success, TCL_ERROR if the roundtrip fails.
+unsafe extern "C" fn fts3_test_varint_cmd(
+    _client_data: *mut c_void,
+    interp: *mut Tcl_Interp,
+    objc: c_int,
+    objv: *const *mut Tcl_Obj,
+) -> c_int {
+    if objc != 2 {
+        set_result_string(
+            interp,
+            "wrong # args: should be \"fts3_test_varint INTEGER\"",
+        );
+        return TCL_ERROR;
+    }
+
+    let val_str = obj_to_string(*objv.offset(1));
+    // Try parsing as i64 first, then u64 for large unsigned values
+    let value: i64 = match val_str.parse::<i64>() {
+        Ok(v) => v,
+        Err(_) => match val_str.parse::<u64>() {
+            Ok(v) => v as i64,
+            Err(_) => {
+                set_result_string(
+                    interp,
+                    &format!("expected integer but got \"{}\"", val_str),
+                );
+                return TCL_ERROR;
+            }
+        },
+    };
+
+    // Encode as varint
+    let mut buf = [0u8; 10];
+    let n_encode = put_varint(&mut buf, value);
+
+    // Decode back
+    let (decoded, n_decode) = get_varint(&buf);
+
+    // Verify roundtrip
+    if value != decoded || n_encode != n_decode {
+        set_result_string(interp, &format!("error testing {}", value));
+        return TCL_ERROR;
+    }
+
+    // If value fits in 32 bits and is non-negative, also test 32-bit variant
+    if value >= 0 && value <= i32::MAX as i64 {
+        let (decoded32, n_decode32) = get_varint32(&buf);
+        if value as i32 != decoded32 || n_encode != n_decode32 {
+            set_result_string(interp, &format!("error testing {} (32-bit)", value));
+            return TCL_ERROR;
+        }
+    }
+
+    TCL_OK
+}
+
+/// Encode a 64-bit integer as an SQLite/FTS3 varint (up to 9 bytes)
+fn put_varint(buf: &mut [u8; 10], v: i64) -> usize {
+    let v = v as u64;
+    if v <= 0x7f {
+        buf[0] = v as u8;
+        return 1;
+    }
+    if v <= 0x3fff {
+        buf[0] = ((v >> 7) & 0x7f) as u8 | 0x80;
+        buf[1] = (v & 0x7f) as u8;
+        return 2;
+    }
+    // General case for larger values
+    let mut encoded = [0u8; 10];
+    let mut count = 0;
+    let mut remaining = v;
+    loop {
+        encoded[count] = (remaining & 0x7f) as u8;
+        count += 1;
+        remaining >>= 7;
+        if remaining == 0 {
+            break;
+        }
+    }
+    // Reverse and set high bits
+    for j in 0..count {
+        let idx = count - 1 - j;
+        if j < count - 1 {
+            buf[j] = encoded[idx] | 0x80;
+        } else {
+            buf[j] = encoded[idx];
+        }
+    }
+    count
+}
+
+/// Decode an SQLite/FTS3 varint from a byte buffer, returning (value, bytes_consumed)
+fn get_varint(buf: &[u8]) -> (i64, usize) {
+    let mut result: u64 = 0;
+    for i in 0..9 {
+        if i >= buf.len() {
+            return (result as i64, i);
+        }
+        let b = buf[i] as u64;
+        if i == 8 {
+            // 9th byte: use all 8 bits
+            result = (result << 8) | b;
+            return (result as i64, 9);
+        }
+        result = (result << 7) | (b & 0x7f);
+        if b & 0x80 == 0 {
+            return (result as i64, i + 1);
+        }
+    }
+    (result as i64, 9)
+}
+
+/// Decode a 32-bit varint from a byte buffer
+fn get_varint32(buf: &[u8]) -> (i32, usize) {
+    let (v, n) = get_varint(buf);
+    (v as i32, n)
 }

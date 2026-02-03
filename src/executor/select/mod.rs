@@ -5107,6 +5107,24 @@ impl<'s> SelectCompiler<'s> {
         }
     }
 
+    /// Get the collation for a comparison between two expressions.
+    /// SQLite rule: The collation to use for comparison is determined by:
+    /// 1. If either expression has an explicit COLLATE operator, use that (leftmost wins)
+    /// 2. If either expression is a column reference with a collation, use that (leftmost wins)
+    /// 3. Otherwise, use BINARY (default, represented as None)
+    fn get_comparison_collation(&self, left: &Expr, right: &Expr) -> Option<String> {
+        // Check left expression first
+        if let Some(coll) = self.get_expr_collation(left) {
+            return Some(coll.to_uppercase());
+        }
+        // Check right expression
+        if let Some(coll) = self.get_expr_collation(right) {
+            return Some(coll.to_uppercase());
+        }
+        // No collation - use default (BINARY, represented as None)
+        None
+    }
+
     /// Check if affinity is TEXT
     fn is_text_affinity(affinity: Option<Affinity>) -> bool {
         matches!(affinity, Some(Affinity::Text))

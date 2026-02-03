@@ -1777,6 +1777,11 @@ impl<'a> Parser<'a> {
                     column_index: None,
                     source_text: _,
                 }) => IndexedColumnKind::Name(column),
+                // SQLite legacy: single-quoted strings can be column names in CREATE INDEX
+                // This is for backward compatibility with old SQL scripts
+                Expr::Literal(crate::parser::ast::Literal::String(s)) => {
+                    IndexedColumnKind::Name(s)
+                }
                 _ => IndexedColumnKind::Expr(Box::new(expr)),
             }
         };

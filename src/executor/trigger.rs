@@ -1167,6 +1167,80 @@ impl<'s> TriggerBodyCompiler<'s> {
                         // Concat P1 P2 P3: P3 = P2 || P1, so swap args to get left || right
                         self.emit(Opcode::Concat, right_reg, left_reg, dest_reg, P4::Unused)
                     }
+                    BinaryOp::Eq => {
+                        // Equality comparison
+                        let set_true = self.alloc_label();
+                        let end_label = self.alloc_label();
+                        self.emit(Opcode::Integer, 0, dest_reg, 0, P4::Unused);
+                        self.emit(Opcode::Eq, right_reg, set_true, left_reg, P4::Unused);
+                        self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+                        self.resolve_label(set_true, self.current_addr() as i32);
+                        self.emit(Opcode::Integer, 1, dest_reg, 0, P4::Unused);
+                        self.resolve_label(end_label, self.current_addr() as i32);
+                    }
+                    BinaryOp::Ne => {
+                        // Not-equal comparison
+                        let set_true = self.alloc_label();
+                        let end_label = self.alloc_label();
+                        self.emit(Opcode::Integer, 0, dest_reg, 0, P4::Unused);
+                        self.emit(Opcode::Ne, right_reg, set_true, left_reg, P4::Unused);
+                        self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+                        self.resolve_label(set_true, self.current_addr() as i32);
+                        self.emit(Opcode::Integer, 1, dest_reg, 0, P4::Unused);
+                        self.resolve_label(end_label, self.current_addr() as i32);
+                    }
+                    BinaryOp::Lt => {
+                        // Less-than comparison
+                        let set_true = self.alloc_label();
+                        let end_label = self.alloc_label();
+                        self.emit(Opcode::Integer, 0, dest_reg, 0, P4::Unused);
+                        self.emit(Opcode::Lt, right_reg, set_true, left_reg, P4::Unused);
+                        self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+                        self.resolve_label(set_true, self.current_addr() as i32);
+                        self.emit(Opcode::Integer, 1, dest_reg, 0, P4::Unused);
+                        self.resolve_label(end_label, self.current_addr() as i32);
+                    }
+                    BinaryOp::Le => {
+                        // Less-or-equal comparison
+                        let set_true = self.alloc_label();
+                        let end_label = self.alloc_label();
+                        self.emit(Opcode::Integer, 0, dest_reg, 0, P4::Unused);
+                        self.emit(Opcode::Le, right_reg, set_true, left_reg, P4::Unused);
+                        self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+                        self.resolve_label(set_true, self.current_addr() as i32);
+                        self.emit(Opcode::Integer, 1, dest_reg, 0, P4::Unused);
+                        self.resolve_label(end_label, self.current_addr() as i32);
+                    }
+                    BinaryOp::Gt => {
+                        // Greater-than comparison
+                        let set_true = self.alloc_label();
+                        let end_label = self.alloc_label();
+                        self.emit(Opcode::Integer, 0, dest_reg, 0, P4::Unused);
+                        self.emit(Opcode::Gt, right_reg, set_true, left_reg, P4::Unused);
+                        self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+                        self.resolve_label(set_true, self.current_addr() as i32);
+                        self.emit(Opcode::Integer, 1, dest_reg, 0, P4::Unused);
+                        self.resolve_label(end_label, self.current_addr() as i32);
+                    }
+                    BinaryOp::Ge => {
+                        // Greater-or-equal comparison
+                        let set_true = self.alloc_label();
+                        let end_label = self.alloc_label();
+                        self.emit(Opcode::Integer, 0, dest_reg, 0, P4::Unused);
+                        self.emit(Opcode::Ge, right_reg, set_true, left_reg, P4::Unused);
+                        self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+                        self.resolve_label(set_true, self.current_addr() as i32);
+                        self.emit(Opcode::Integer, 1, dest_reg, 0, P4::Unused);
+                        self.resolve_label(end_label, self.current_addr() as i32);
+                    }
+                    BinaryOp::And => {
+                        // Logical AND
+                        self.emit(Opcode::And, left_reg, right_reg, dest_reg, P4::Unused)
+                    }
+                    BinaryOp::Or => {
+                        // Logical OR
+                        self.emit(Opcode::Or, left_reg, right_reg, dest_reg, P4::Unused)
+                    }
                     _ => {
                         // For other operators, just use left value for now
                         self.emit(Opcode::SCopy, left_reg, dest_reg, 0, P4::Unused);
@@ -1214,6 +1288,62 @@ impl<'s> TriggerBodyCompiler<'s> {
                 };
 
                 self.emit(Opcode::Halt, p1, p2, 0, p4);
+            }
+
+            Expr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => {
+                // CASE expression: CASE [operand] WHEN w1 THEN t1 WHEN w2 THEN t2 ... ELSE e END
+                // Used heavily in triggers for RAISE(ABORT/FAIL/ROLLBACK) patterns
+                let end_label = self.alloc_label();
+
+                if let Some(ref op) = operand {
+                    // Simple CASE: CASE operand WHEN value THEN result ...
+                    let operand_reg = self.alloc_reg();
+                    self.compile_expr(op, operand_reg)?;
+
+                    for clause in when_clauses {
+                        let when_reg = self.alloc_reg();
+                        self.compile_expr(&clause.when, when_reg)?;
+
+                        // Compare operand with when value
+                        let next_clause = self.alloc_label();
+                        self.emit(Opcode::Ne, when_reg, next_clause, operand_reg, P4::Unused);
+
+                        // Match - evaluate THEN clause
+                        self.compile_expr(&clause.then, dest_reg)?;
+                        self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+
+                        self.resolve_label(next_clause, self.current_addr() as i32);
+                    }
+                } else {
+                    // Searched CASE: CASE WHEN condition THEN result ...
+                    for clause in when_clauses {
+                        let cond_reg = self.alloc_reg();
+                        self.compile_expr(&clause.when, cond_reg)?;
+
+                        // If condition is false/NULL, skip to next clause
+                        let next_clause = self.alloc_label();
+                        self.emit(Opcode::IfNot, cond_reg, next_clause, 1, P4::Unused);
+
+                        // Condition is true - evaluate THEN clause
+                        self.compile_expr(&clause.then, dest_reg)?;
+                        self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+
+                        self.resolve_label(next_clause, self.current_addr() as i32);
+                    }
+                }
+
+                // ELSE clause (or NULL if none)
+                if let Some(ref else_expr) = else_clause {
+                    self.compile_expr(else_expr, dest_reg)?;
+                } else {
+                    self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                }
+
+                self.resolve_label(end_label, self.current_addr() as i32);
             }
 
             _ => {

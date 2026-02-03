@@ -666,6 +666,11 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
             sqlite3_step(stmt)
         }
         Err(e) => {
+            // Set the error on the connection (including extended error code)
+            if let Some(conn_ptr) = stmt.conn_ptr {
+                let conn = unsafe { &mut *conn_ptr };
+                conn.set_error_from(&e);
+            }
             // Rollback on error - both in autocommit mode and explicit transactions
             // This matches SQLite behavior where errors within a transaction cause
             // automatic rollback to maintain database consistency

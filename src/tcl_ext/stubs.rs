@@ -26,8 +26,9 @@ use super::{CONNECTIONS, FUNCTION_DESTRUCTORS};
 
 // Database commands from db module
 use super::db::{
-    clang_sanitize_address_cmd, sqlite3_exec_cmd, sqlite3_exec_hex_cmd, sqlite3_get_autocommit_cmd,
-    sqlite3_txn_state_cmd, tcl_variable_type_cmd, working_64bit_int_cmd,
+    clang_sanitize_address_cmd, sqlite3_exec_cmd, sqlite3_exec_hex_cmd,
+    sqlite3_extended_errcode_cmd, sqlite3_get_autocommit_cmd, sqlite3_txn_state_cmd,
+    tcl_variable_type_cmd, working_64bit_int_cmd,
 };
 
 // Printf formatting commands from printf module
@@ -121,7 +122,7 @@ pub unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         "sqlite3_errcode",
         "sqlite3_errmsg",
         "sqlite3_errmsg16",
-        "sqlite3_extended_errcode",
+        // "sqlite3_extended_errcode" - implemented properly below
         "sqlite3_result_int",
         "sqlite3_result_text",
         "sqlite3_result_blob",
@@ -489,6 +490,16 @@ pub unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         interp,
         cmd_name.as_ptr(),
         Some(sqlite3_exec_hex_cmd),
+        std::ptr::null_mut(),
+        None,
+    );
+
+    // Register sqlite3_extended_errcode
+    let cmd_name = CString::new("sqlite3_extended_errcode").unwrap();
+    Tcl_CreateObjCommand(
+        interp,
+        cmd_name.as_ptr(),
+        Some(sqlite3_extended_errcode_cmd),
         std::ptr::null_mut(),
         None,
     );

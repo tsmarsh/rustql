@@ -14,7 +14,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use crate::api::{SqliteConnection, StubVfs, TransactionState};
-use crate::error::{Error, ErrorCode, Result};
+use crate::error::{Error, ErrorCode, ExtendedErrorCode, Result};
 use crate::executor::trigger::find_matching_triggers;
 use crate::functions::aggregate::AggregateState;
 use crate::schema::{Schema, TriggerEvent, TriggerTiming};
@@ -1469,6 +1469,10 @@ impl Vdbe {
                     self.raise_ignore = true;
                 }
 
+                // Determine if this is a trigger RAISE error (P2 = 1, 2, or 3 with P1 = SQLITE_CONSTRAINT)
+                // P2: 1=ROLLBACK, 2=ABORT, 3=FAIL, 4=IGNORE
+                let is_trigger_constraint = self.rc == ErrorCode::Constraint && op.p2 >= 1 && op.p2 <= 3;
+
                 // Check if we're in a subprogram (trigger)
                 if let Some((
                     parent_ops,
@@ -1495,6 +1499,12 @@ impl Vdbe {
                             .error_msg
                             .clone()
                             .unwrap_or_else(|| "constraint failed".to_string());
+                        // Use extended error code for trigger constraints
+                        if is_trigger_constraint {
+                            let mut err = Error::with_message(self.rc, msg);
+                            err.extended = Some(ExtendedErrorCode::ConstraintTrigger);
+                            return Err(err);
+                        }
                         return Err(Error::with_message(self.rc, msg));
                     }
                     // Otherwise continue execution in parent
@@ -1505,6 +1515,12 @@ impl Vdbe {
                             .error_msg
                             .clone()
                             .unwrap_or_else(|| "constraint failed".to_string());
+                        // Use extended error code for trigger constraints
+                        if is_trigger_constraint {
+                            let mut err = Error::with_message(self.rc, msg);
+                            err.extended = Some(ExtendedErrorCode::ConstraintTrigger);
+                            return Err(err);
+                        }
                         return Err(Error::with_message(self.rc, msg));
                     }
 

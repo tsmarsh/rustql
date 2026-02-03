@@ -1212,6 +1212,19 @@ impl SqliteConnection {
         self.err_msg = Some(msg.to_string());
     }
 
+    /// Set an error on this connection from an Error object, including extended code
+    pub fn set_error_from(&mut self, err: &crate::error::Error) {
+        self.err_code = err.code;
+        if let Some(ref ext) = err.extended {
+            self.err_code_ext = ext.as_i32();
+        } else {
+            self.err_code_ext = err.code.as_i32();
+        }
+        if let Some(ref msg) = err.message {
+            self.err_msg = Some(msg.clone());
+        }
+    }
+
     /// Clear any pending error
     pub fn clear_error(&mut self) {
         self.err_code = ErrorCode::Ok;

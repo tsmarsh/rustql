@@ -103,6 +103,61 @@ pub unsafe extern "C" fn sqlite3_get_autocommit_cmd(
     TCL_OK
 }
 
+/// sqlite3_extended_errcode - get the extended error code
+/// Usage: sqlite3_extended_errcode DB
+/// Returns: The extended error code as an integer, or error code name for known codes
+pub unsafe extern "C" fn sqlite3_extended_errcode_cmd(
+    _client_data: *mut std::ffi::c_void,
+    interp: *mut Tcl_Interp,
+    objc: c_int,
+    objv: *const *mut Tcl_Obj,
+) -> c_int {
+    if objc < 2 {
+        set_result_string(
+            interp,
+            "wrong # args: should be \"sqlite3_extended_errcode DB\"",
+        );
+        return TCL_ERROR;
+    }
+
+    let db_name = obj_to_string(*objv.offset(1));
+    let ext_code = CONNECTIONS.with(|connections| {
+        let conns = connections.borrow();
+        conns
+            .get(&db_name)
+            .map(|conn| crate::api::sqlite3_extended_errcode(conn))
+            .unwrap_or(0)
+    });
+
+    // Convert known extended error codes to their names (for test output matching)
+    let result_name = match ext_code {
+        // SQLITE_CONSTRAINT_TRIGGER = 19 | (7 << 8) = 19 | 1792 = 1811
+        1811 => "SQLITE_CONSTRAINT_TRIGGER",
+        // SQLITE_CONSTRAINT_CHECK = 19 | (1 << 8) = 275
+        275 => "SQLITE_CONSTRAINT_CHECK",
+        // SQLITE_CONSTRAINT_UNIQUE = 19 | (8 << 8) = 19 | 2048 = 2067
+        2067 => "SQLITE_CONSTRAINT_UNIQUE",
+        // SQLITE_CONSTRAINT_PRIMARYKEY = 19 | (6 << 8) = 19 | 1536 = 1555
+        1555 => "SQLITE_CONSTRAINT_PRIMARYKEY",
+        // SQLITE_CONSTRAINT_NOTNULL = 19 | (5 << 8) = 19 | 1280 = 1299
+        1299 => "SQLITE_CONSTRAINT_NOTNULL",
+        // SQLITE_CONSTRAINT_FOREIGNKEY = 19 | (3 << 8) = 19 | 768 = 787
+        787 => "SQLITE_CONSTRAINT_FOREIGNKEY",
+        // Plain SQLITE_CONSTRAINT = 19
+        19 => "SQLITE_CONSTRAINT",
+        // SQLITE_OK = 0
+        0 => "SQLITE_OK",
+        // Default: return the numeric value as string
+        _ => {
+            set_result_int(interp, ext_code);
+            return TCL_OK;
+        }
+    };
+
+    set_result_string(interp, result_name);
+    TCL_OK
+}
+
 /// sqlite3_exec - execute SQL and return result code and results
 /// Usage: sqlite3_exec DB SQL
 /// Returns: {RESULT_CODE {results}}

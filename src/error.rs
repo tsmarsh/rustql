@@ -285,6 +285,122 @@ pub enum ExtendedErrorCode {
 }
 
 impl ExtendedErrorCode {
+    /// Returns the numeric SQLite extended error code value.
+    /// Extended codes are: (primary_code | (subcode << 8))
+    pub fn as_i32(&self) -> i32 {
+        let primary = self.primary_code().as_i32();
+        let subcode = match self {
+            // Error subcodes (1-6)
+            ExtendedErrorCode::ErrorMissingCollseq => 1,
+            ExtendedErrorCode::ErrorRetry => 2,
+            ExtendedErrorCode::ErrorSnapshot => 3,
+            ExtendedErrorCode::ErrorReserveSize => 4,
+            ExtendedErrorCode::ErrorKey => 5,
+            ExtendedErrorCode::ErrorUnable => 6,
+
+            // IoErr subcodes (1-35)
+            ExtendedErrorCode::IoErrRead => 1,
+            ExtendedErrorCode::IoErrShortRead => 2,
+            ExtendedErrorCode::IoErrWrite => 3,
+            ExtendedErrorCode::IoErrFsync => 4,
+            ExtendedErrorCode::IoErrDirFsync => 5,
+            ExtendedErrorCode::IoErrTruncate => 6,
+            ExtendedErrorCode::IoErrFstat => 7,
+            ExtendedErrorCode::IoErrUnlock => 8,
+            ExtendedErrorCode::IoErrRdLock => 9,
+            ExtendedErrorCode::IoErrDelete => 10,
+            ExtendedErrorCode::IoErrBlocked => 11,
+            ExtendedErrorCode::IoErrNoMem => 12,
+            ExtendedErrorCode::IoErrAccess => 13,
+            ExtendedErrorCode::IoErrCheckReservedLock => 14,
+            ExtendedErrorCode::IoErrLock => 15,
+            ExtendedErrorCode::IoErrClose => 16,
+            ExtendedErrorCode::IoErrDirClose => 17,
+            ExtendedErrorCode::IoErrShmOpen => 18,
+            ExtendedErrorCode::IoErrShmSize => 19,
+            ExtendedErrorCode::IoErrShmLock => 20,
+            ExtendedErrorCode::IoErrShmMap => 21,
+            ExtendedErrorCode::IoErrSeek => 22,
+            ExtendedErrorCode::IoErrDeleteNoEnt => 23,
+            ExtendedErrorCode::IoErrMmap => 24,
+            ExtendedErrorCode::IoErrGetTempPath => 25,
+            ExtendedErrorCode::IoErrConvPath => 26,
+            ExtendedErrorCode::IoErrVnode => 27,
+            ExtendedErrorCode::IoErrAuth => 28,
+            ExtendedErrorCode::IoErrBeginAtomic => 29,
+            ExtendedErrorCode::IoErrCommitAtomic => 30,
+            ExtendedErrorCode::IoErrRollbackAtomic => 31,
+            ExtendedErrorCode::IoErrData => 32,
+            ExtendedErrorCode::IoErrCorruptFs => 33,
+            ExtendedErrorCode::IoErrInPage => 34,
+            ExtendedErrorCode::IoErrBadKey => 35,
+            ExtendedErrorCode::IoErrCodec => 36,
+
+            // Locked subcodes
+            ExtendedErrorCode::LockedSharedCache => 1,
+            ExtendedErrorCode::LockedVTab => 2,
+
+            // Busy subcodes
+            ExtendedErrorCode::BusyRecovery => 1,
+            ExtendedErrorCode::BusySnapshot => 2,
+            ExtendedErrorCode::BusyTimeout => 3,
+
+            // CantOpen subcodes
+            ExtendedErrorCode::CantOpenNoTempDir => 1,
+            ExtendedErrorCode::CantOpenIsDir => 2,
+            ExtendedErrorCode::CantOpenFullPath => 3,
+            ExtendedErrorCode::CantOpenConvPath => 4,
+            ExtendedErrorCode::CantOpenDirtyWal => 5,
+            ExtendedErrorCode::CantOpenSymlink => 6,
+
+            // Corrupt subcodes
+            ExtendedErrorCode::CorruptVTab => 1,
+            ExtendedErrorCode::CorruptSequence => 2,
+            ExtendedErrorCode::CorruptIndex => 3,
+
+            // ReadOnly subcodes
+            ExtendedErrorCode::ReadOnlyRecovery => 1,
+            ExtendedErrorCode::ReadOnlyCantLock => 2,
+            ExtendedErrorCode::ReadOnlyRollback => 3,
+            ExtendedErrorCode::ReadOnlyDbMoved => 4,
+            ExtendedErrorCode::ReadOnlyCantInit => 5,
+            ExtendedErrorCode::ReadOnlyDirectory => 6,
+
+            // Abort subcodes
+            ExtendedErrorCode::AbortRollback => 2,
+
+            // Constraint subcodes - these are the important ones for trigger tests
+            ExtendedErrorCode::ConstraintCheck => 1,
+            ExtendedErrorCode::ConstraintCommitHook => 2,
+            ExtendedErrorCode::ConstraintForeignKey => 3,
+            ExtendedErrorCode::ConstraintFunction => 4,
+            ExtendedErrorCode::ConstraintNotNull => 5,
+            ExtendedErrorCode::ConstraintPrimaryKey => 6,
+            ExtendedErrorCode::ConstraintTrigger => 7, // SQLITE_CONSTRAINT_TRIGGER
+            ExtendedErrorCode::ConstraintUnique => 8,
+            ExtendedErrorCode::ConstraintVTab => 9,
+            ExtendedErrorCode::ConstraintRowId => 10,
+            ExtendedErrorCode::ConstraintPinned => 11,
+            ExtendedErrorCode::ConstraintDataType => 12,
+
+            // Notice subcodes
+            ExtendedErrorCode::NoticeRecoverWal => 1,
+            ExtendedErrorCode::NoticeRecoverRollback => 2,
+            ExtendedErrorCode::NoticeRbu => 3,
+
+            // Warning subcodes
+            ExtendedErrorCode::WarningAutoIndex => 1,
+
+            // Auth subcodes
+            ExtendedErrorCode::AuthUser => 1,
+
+            // Ok subcodes
+            ExtendedErrorCode::OkLoadPermanently => 1,
+            ExtendedErrorCode::OkSymlink => 2,
+        };
+        primary | (subcode << 8)
+    }
+
     /// Returns the primary error code for this extended code
     pub fn primary_code(&self) -> ErrorCode {
         match self {

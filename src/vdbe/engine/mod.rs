@@ -326,6 +326,8 @@ pub struct VdbeCursor {
     pub sort_desc: Vec<bool>,
     /// Collation names for each ORDER BY column
     pub sort_collations: Vec<String>,
+    /// NULLS FIRST/LAST flags for each ORDER BY column (BIGNULL)
+    pub sort_bignull: Vec<bool>,
     /// Ephemeral index data - used for DISTINCT and index operations
     pub ephemeral_set: std::collections::HashSet<Vec<u8>>,
     /// Ephemeral table rows for iteration - stores (rowid, record) pairs
@@ -407,6 +409,7 @@ impl VdbeCursor {
             sorter_sorted: false,
             sort_desc: Vec::new(),
             sort_collations: Vec::new(),
+            sort_bignull: Vec::new(),
             ephemeral_set: std::collections::HashSet::new(),
             ephemeral_rows: Vec::new(),
             ephemeral_index: 0,
@@ -3278,9 +3281,10 @@ impl Vdbe {
                             cursor.sort_desc = dirs.iter().map(|&b| b != 0).collect();
                         }
                         P4::KeyInfo(key_info) => {
-                            // Extract sort orders and collations from KeyInfo
+                            // Extract sort orders, collations, and bignull from KeyInfo
                             cursor.sort_desc = key_info.sort_orders.clone();
                             cursor.sort_collations = key_info.collations.clone();
+                            cursor.sort_bignull = key_info.bignull.clone();
                         }
                         _ => {}
                     }
@@ -6487,10 +6491,11 @@ impl Vdbe {
                         cursor.n_field.max(1) as usize,
                         cursor.sort_desc.clone(),
                         cursor.sort_collations.clone(),
+                        cursor.sort_bignull.clone(),
                     )
                 });
 
-                if let Some((is_empty, num_key_cols, sort_desc, sort_collations)) = cursor_info {
+                if let Some((is_empty, num_key_cols, sort_desc, sort_collations, sort_bignull)) = cursor_info {
                     if is_empty {
                         self.pc = op.p2;
                     } else {
@@ -6525,13 +6530,14 @@ impl Vdbe {
                         // Sort the data using custom comparison that decodes records
                         if let Some(cursor) = self.cursor_mut(op.p1) {
                             cursor.sorter_data.sort_by(|a, b| {
-                                compare_records_with_collations(
+                                compare_records_with_collations_bignull(
                                     a,
                                     b,
                                     num_key_cols,
                                     &sort_desc,
                                     &sort_collations,
                                     &collation_fns,
+                                    &sort_bignull,
                                 )
                             });
                             cursor.sorter_sorted = true;
@@ -9211,10 +9217,11 @@ impl Vdbe {
                         cursor.n_field.max(1) as usize,
                         cursor.sort_desc.clone(),
                         cursor.sort_collations.clone(),
+                        cursor.sort_bignull.clone(),
                     )
                 });
 
-                if let Some((is_empty, num_key_cols, sort_desc, sort_collations)) = cursor_info {
+                if let Some((is_empty, num_key_cols, sort_desc, sort_collations, sort_bignull)) = cursor_info {
                     if is_empty {
                         self.pc = op.p2;
                     } else {
@@ -9249,13 +9256,14 @@ impl Vdbe {
                         // Sort the data using custom comparison that decodes records
                         if let Some(cursor) = self.cursor_mut(op.p1) {
                             cursor.sorter_data.sort_by(|a, b| {
-                                compare_records_with_collations(
+                                compare_records_with_collations_bignull(
                                     a,
                                     b,
                                     num_key_cols,
                                     &sort_desc,
                                     &sort_collations,
                                     &collation_fns,
+                                    &sort_bignull,
                                 )
                             });
                             cursor.sorter_sorted = true;
@@ -10450,6 +10458,87 @@ fn compare_records_with_collations(
 
         if cmp != Ordering::Equal {
             // Reverse comparison for DESC columns
+            let is_desc = sort_desc.get(i).copied().unwrap_or(false);
+            return if is_desc { cmp.reverse() } else { cmp };
+        }
+    }
+
+    Ordering::Equal
+}
+
+/// Like compare_records_with_collations but with NULLS FIRST/LAST (BIGNULL) support.
+fn compare_records_with_collations_bignull(
+    a: &[u8],
+    b: &[u8],
+    num_key_cols: usize,
+    sort_desc: &[bool],
+    sort_collations: &[String],
+    collation_fns: &[Option<Arc<dyn Fn(&str, &str) -> Ordering + Send + Sync>>],
+    sort_bignull: &[bool],
+) -> Ordering {
+    use crate::vdbe::auxdata::{decode_record_header, deserialize_value};
+
+    let (a_types, a_header_size) = match decode_record_header(a) {
+        Ok(v) => v,
+        Err(_) => return Ordering::Equal,
+    };
+    let (b_types, b_header_size) = match decode_record_header(b) {
+        Ok(v) => v,
+        Err(_) => return Ordering::Equal,
+    };
+
+    let mut a_offset = a_header_size;
+    let mut b_offset = b_header_size;
+
+    for i in 0..num_key_cols {
+        let a_type = a_types.get(i);
+        let b_type = b_types.get(i);
+
+        let a_mem = if let Some(t) = a_type {
+            deserialize_value(&a[a_offset..], t).ok()
+        } else {
+            None
+        };
+
+        let b_mem = if let Some(t) = b_type {
+            deserialize_value(&b[b_offset..], t).ok()
+        } else {
+            None
+        };
+
+        if let Some(t) = a_type {
+            a_offset += t.size();
+        }
+        if let Some(t) = b_type {
+            b_offset += t.size();
+        }
+
+        let bignull = sort_bignull.get(i).copied().unwrap_or(false);
+
+        let cmp = match (a_mem, b_mem) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => {
+                if bignull { Ordering::Greater } else { Ordering::Less }
+            }
+            (Some(_), None) => {
+                if bignull { Ordering::Less } else { Ordering::Greater }
+            }
+            (Some(a_val), Some(b_val)) => {
+                let collation_name = sort_collations
+                    .get(i)
+                    .map(|s| s.as_str())
+                    .unwrap_or("BINARY");
+                let custom_fn = collation_fns.get(i).and_then(|opt| opt.as_ref());
+
+                if let Some(coll_fn) = custom_fn {
+                    a_val.compare_with_collation_fn(&b_val, collation_name, Some(coll_fn.as_ref()))
+                } else {
+                    a_val.compare_with_collation(&b_val, collation_name)
+                }
+            }
+        };
+
+        if cmp != Ordering::Equal {
             let is_desc = sort_desc.get(i).copied().unwrap_or(false);
             return if is_desc { cmp.reverse() } else { cmp };
         }

@@ -2912,6 +2912,7 @@ impl<'s> StatementCompiler<'s> {
             let key_info = KeyInfo {
                 collations: index_collations.clone(),
                 sort_orders: vec![false; index_collations.len()],
+                bignull: vec![false; index_collations.len()],
                 n_key_field: index_collations.len() as u16,
             };
 

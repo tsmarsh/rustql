@@ -1099,6 +1099,8 @@ pub struct KeyInfo {
     pub collations: Vec<String>,
     /// Sort orders for each key column (true = descending)
     pub sort_orders: Vec<bool>,
+    /// NULLS FIRST/LAST: true means NULLs sort as larger than any value (BIGNULL)
+    pub bignull: Vec<bool>,
     /// Number of key columns
     pub n_key_field: u16,
 }
@@ -1108,6 +1110,7 @@ impl KeyInfo {
         Self {
             collations: vec!["BINARY".to_string(); n_fields],
             sort_orders: vec![false; n_fields],
+            bignull: vec![false; n_fields],
             n_key_field: n_fields as u16,
         }
     }

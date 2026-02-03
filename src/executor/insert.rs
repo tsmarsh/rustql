@@ -352,8 +352,19 @@ impl<'a> InsertCompiler<'a> {
             ));
         }
 
-        // Handle conflict action
-        let conflict_action = insert.or_action.unwrap_or(ConflictAction::Abort);
+        // Handle conflict action - UPSERT ON CONFLICT DO NOTHING maps to Ignore
+        let conflict_action = if let Some(ref oc) = insert.on_conflict {
+            match oc.action {
+                crate::parser::ast::ConflictResolution::Nothing => ConflictAction::Ignore,
+                crate::parser::ast::ConflictResolution::Update { .. } => {
+                    // DO UPDATE: use Ignore to suppress the constraint error,
+                    // then the update is handled separately (TODO: full DO UPDATE support)
+                    ConflictAction::Ignore
+                }
+            }
+        } else {
+            insert.or_action.unwrap_or(ConflictAction::Abort)
+        };
 
         // Compile based on source type
         match &insert.source {

@@ -1291,27 +1291,9 @@ impl<'a> Parser<'a> {
         if self.match_token(TokenKind::LParen) {
             if !self.check(TokenKind::RParen) {
                 loop {
-                    if self.check(TokenKind::Identifier) {
-                        let key = self.expect_identifier()?;
-                        if self.match_token(TokenKind::Eq) {
-                            if self.check(TokenKind::Identifier) {
-                                let value = self.expect_identifier()?;
-                                args.push(format!("{}={}", key, value));
-                            } else if self.check(TokenKind::String) {
-                                let value = self.current_text().to_string();
-                                self.advance();
-                                args.push(format!("{}={}", key, value));
-                            } else {
-                                return Err(self.error("expected identifier or string after '='"));
-                            }
-                        } else {
-                            args.push(key);
-                        }
-                    } else if self.check(TokenKind::String) {
-                        args.push(self.current_text().to_string());
-                        self.advance();
-                    } else {
-                        return Err(self.error("expected column name or string in module args"));
+                    let arg = self.collect_virtual_table_arg()?;
+                    if !arg.is_empty() {
+                        args.push(arg);
                     }
                     if !self.match_token(TokenKind::Comma) {
                         break;
@@ -1327,6 +1309,42 @@ impl<'a> Parser<'a> {
             module,
             args,
         })
+    }
+
+    /// Collect a single virtual table argument as opaque text.
+    fn collect_virtual_table_arg(&mut self) -> Result<String> {
+        let start_token = self.current().clone();
+        let mut end_pos = start_token.end;
+        let mut depth = 0;
+        loop {
+            if self.is_eof() {
+                break;
+            }
+            match self.current().kind {
+                TokenKind::LParen => {
+                    depth += 1;
+                    end_pos = self.current().end;
+                    self.advance();
+                }
+                TokenKind::RParen => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                    end_pos = self.current().end;
+                    self.advance();
+                }
+                TokenKind::Comma if depth == 0 => {
+                    break;
+                }
+                _ => {
+                    end_pos = self.current().end;
+                    self.advance();
+                }
+            }
+        }
+        let raw = &self.source[start_token.start..end_pos];
+        Ok(raw.trim().to_string())
     }
 
     fn parse_create_table(&mut self, temporary: bool) -> Result<CreateTableStmt> {

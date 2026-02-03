@@ -18,8 +18,8 @@ use crate::executor::where_clause::{
 use crate::executor::window::{select_has_window_functions, WindowCompiler};
 use crate::parser::ast::{
     BinaryOp, ColumnRef, CommonTableExpr, CompoundOp, Distinct, Expr, FromClause, JoinFlags,
-    JoinType, LikeOp, LimitClause, Literal, OrderingTerm, ResultColumn, SelectBody, SelectCore,
-    SelectStmt, SortOrder, TableRef, WithClause,
+    JoinType, LikeOp, LimitClause, Literal, NullsOrder, OrderingTerm, ResultColumn, SelectBody,
+    SelectCore, SelectStmt, SortOrder, TableRef, WithClause,
 };
 use crate::schema::{Affinity, GeneratedStorage, Table};
 use crate::vdbe::ops::{
@@ -618,17 +618,29 @@ impl<'s> SelectCompiler<'s> {
                         .map(|t| self.extract_collation_from_expr(&t.expr, Some(&select.body)))
                         .collect();
 
-                    // Check if any custom collations are used
+                    // Compute bignull flags for NULLS FIRST/LAST
+                    let bignull: Vec<bool> = order_by
+                        .iter()
+                        .map(|t| match t.nulls {
+                            NullsOrder::First => t.order == SortOrder::Desc,
+                            NullsOrder::Last => t.order == SortOrder::Asc,
+                            NullsOrder::Default => false,
+                        })
+                        .collect();
+
+                    // Check if any custom collations or bignull flags are used
                     let has_custom_collation = collations.iter().any(|c| c != "BINARY");
+                    let has_bignull = bignull.iter().any(|&b| b);
 
                     // Open ephemeral table for sorting
-                    if has_custom_collation {
-                        // Use KeyInfo when custom collations are present
+                    if has_custom_collation || has_bignull {
+                        // Use KeyInfo when custom collations or bignull are present
                         use crate::vdbe::ops::KeyInfo;
                         use std::sync::Arc;
                         let key_info = Arc::new(KeyInfo {
                             collations,
                             sort_orders,
+                            bignull,
                             n_key_field: num_cols as u16,
                         });
                         self.emit(
@@ -887,7 +899,7 @@ impl<'s> SelectCompiler<'s> {
         let (actual_dest, sorter_cursor, order_by_cols) = if let Some(order_by) = &select.order_by {
             let sorter_cursor = self.alloc_cursor();
             let num_cols = order_by.len();
-            // Build KeyInfo with sort directions and collations
+            // Build KeyInfo with sort directions, collations, and bignull
             let key_info = KeyInfo {
                 sort_orders: order_by
                     .iter()
@@ -896,6 +908,14 @@ impl<'s> SelectCompiler<'s> {
                 collations: order_by
                     .iter()
                     .map(|t| Self::extract_collation(&t.expr))
+                    .collect(),
+                bignull: order_by
+                    .iter()
+                    .map(|t| match t.nulls {
+                        NullsOrder::First => t.order == SortOrder::Desc,
+                        NullsOrder::Last => t.order == SortOrder::Asc,
+                        NullsOrder::Default => false,
+                    })
                     .collect(),
                 n_key_field: num_cols as u16,
             };

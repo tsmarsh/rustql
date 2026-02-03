@@ -629,13 +629,30 @@ fn compare_records(key_a: &[u8], key_b: &[u8], key_info: &KeyInfo) -> Ordering {
 
     for i in 0..n_fields {
         let desc = key_info.sort_orders.get(i).copied().unwrap_or(false);
+        let bignull = key_info.bignull.get(i).copied().unwrap_or(false);
         let coll_name = key_info
             .collations
             .get(i)
             .map(|s| s.as_str())
             .unwrap_or("BINARY");
 
-        let cmp = compare_mem(&fields_a[i], &fields_b[i], coll_name);
+        // Handle NULL comparison with BIGNULL support
+        let a_null = fields_a[i].is_null();
+        let b_null = fields_b[i].is_null();
+        let cmp = if a_null || b_null {
+            match (a_null, b_null) {
+                (true, true) => Ordering::Equal,
+                (true, false) => {
+                    if bignull { Ordering::Greater } else { Ordering::Less }
+                }
+                (false, true) => {
+                    if bignull { Ordering::Less } else { Ordering::Greater }
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            compare_mem(&fields_a[i], &fields_b[i], coll_name)
+        };
 
         if cmp != Ordering::Equal {
             return if desc { cmp.reverse() } else { cmp };

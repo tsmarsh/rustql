@@ -2120,8 +2120,10 @@ impl<'a> InsertCompiler<'a> {
                 // Will be handled by the Insert opcode flags
             }
             ConflictAction::Ignore => {
-                // Skip row on conflict - handled by INSERT OR IGNORE
-                // The index-level IGNORE is handled by emit_ignore_conflict_handling above
+                // Skip entire row on any UNIQUE constraint conflict.
+                // This handles both INSERT OR IGNORE and ON CONFLICT DO NOTHING.
+                // Check ALL unique indexes (not just those with schema-level IGNORE).
+                self.emit_stmt_ignore_conflict_handling(data_base)?;
             }
             ConflictAction::Replace => {
                 // For REPLACE: check each unique index for conflicts and delete if found
@@ -2261,6 +2263,149 @@ impl<'a> InsertCompiler<'a> {
                 }
 
                 // If we get here, all columns matched - conflict! Skip this row.
+                self.emit(Opcode::Goto, 0, skip_row_label, 0, P4::Unused);
+
+                self.resolve_label(not_found_label, self.current_addr() as i32);
+                self.resolve_label(check_next_label, self.current_addr() as i32);
+            }
+
+            self.emit(Opcode::Close, idx_cursor, 0, 0, P4::Unused);
+        }
+
+        Ok(())
+    }
+
+    /// Emit code to handle statement-level IGNORE conflicts (ON CONFLICT DO NOTHING
+    /// or INSERT OR IGNORE). Checks ALL unique indexes for conflicts and skips
+    /// the entire row if any conflict is found.
+    fn emit_stmt_ignore_conflict_handling(&mut self, data_base: i32) -> Result<()> {
+        let schema = match self.schema {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        let table = match schema.tables.get(&self.table_name.to_lowercase()) {
+            Some(t) => t.clone(),
+            None => return Ok(()),
+        };
+
+        // Get ALL unique indexes (not just those with schema-level IGNORE)
+        let unique_indexes: Vec<_> = table
+            .indexes
+            .iter()
+            .filter(|idx| idx.unique)
+            .cloned()
+            .collect();
+
+        if unique_indexes.is_empty() {
+            return Ok(());
+        }
+
+        // Allocate a label to skip the entire row if any UNIQUE constraint is violated
+        let skip_row_label = self.skip_row_label.unwrap_or_else(|| {
+            let label = self.alloc_label();
+            self.skip_row_label = Some(label);
+            label
+        });
+
+        for index in &unique_indexes {
+            // Skip indexes that already have schema-level IGNORE handling
+            if index.conflict_action == Some(crate::schema::ConflictAction::Ignore) {
+                continue;
+            }
+
+            let idx_root = if index.root_page > 0 {
+                index.root_page
+            } else {
+                schema
+                    .indexes
+                    .get(&index.name.to_lowercase())
+                    .map(|i| i.root_page)
+                    .unwrap_or(0)
+            };
+
+            if idx_root == 0 {
+                continue;
+            }
+
+            // Open a read cursor on the index
+            let idx_cursor = self.alloc_cursor();
+            self.emit(
+                Opcode::OpenRead,
+                idx_cursor,
+                0,
+                (index.columns.len() + 1) as i32,
+                P4::Text(index.name.clone()),
+            );
+
+            // Build search key from new row values
+            let key_base = self.alloc_regs(index.columns.len());
+            let mut has_non_null = false;
+            for (i, col) in index.columns.iter().enumerate() {
+                if col.column_idx >= 0 {
+                    self.emit(
+                        Opcode::Copy,
+                        data_base + col.column_idx,
+                        key_base + i as i32,
+                        0,
+                        P4::Unused,
+                    );
+                    has_non_null = true;
+                } else {
+                    self.emit(Opcode::Null, 0, key_base + i as i32, 0, P4::Unused);
+                }
+            }
+
+            if has_non_null {
+                // Check if any key column is NULL - if so, skip conflict check
+                // (NULL values don't violate UNIQUE constraints)
+                let check_next_label = self.alloc_label();
+                for (i, col) in index.columns.iter().enumerate() {
+                    if col.column_idx >= 0 {
+                        self.emit(
+                            Opcode::IsNull,
+                            key_base + i as i32,
+                            check_next_label,
+                            0,
+                            P4::Unused,
+                        );
+                    }
+                }
+
+                // Make index key record for lookup
+                let key_rec_reg = self.alloc_reg();
+                self.emit(
+                    Opcode::MakeRecord,
+                    key_base,
+                    index.columns.len() as i32,
+                    key_rec_reg,
+                    P4::Unused,
+                );
+
+                // Search for existing entry with same key
+                let not_found_label = self.alloc_label();
+                self.emit(
+                    Opcode::SeekGE,
+                    idx_cursor,
+                    not_found_label,
+                    key_rec_reg,
+                    P4::Int64(index.columns.len() as i64),
+                );
+
+                // Verify equality of key columns
+                for (i, _col) in index.columns.iter().enumerate() {
+                    let col_reg = self.alloc_reg();
+                    self.emit(Opcode::Column, idx_cursor, i as i32, col_reg, P4::Unused);
+                    self.emit(
+                        Opcode::Ne,
+                        key_base + i as i32,
+                        not_found_label,
+                        col_reg,
+                        P4::Text("BINARY".to_string()),
+                    );
+                }
+
+                // Conflict found - skip entire row
                 self.emit(Opcode::Goto, 0, skip_row_label, 0, P4::Unused);
 
                 self.resolve_label(not_found_label, self.current_addr() as i32);
@@ -3327,11 +3472,11 @@ impl<'a> InsertCompiler<'a> {
 
             // Insert into index
             // Pass the index's conflict_action if it has one (e.g., UNIQUE ON CONFLICT IGNORE)
-            // Otherwise use OE_NONE (0) which will abort on constraint violation
+            // Otherwise use the statement-level conflict action (e.g., ON CONFLICT DO NOTHING)
             let p5 = if let Some(action) = idx_conflict_action {
                 (self.schema_conflict_flags(action) as u16) << OE_SHIFT
             } else {
-                0
+                (self.conflict_flags(conflict_action) as u16) << OE_SHIFT
             };
             self.ops
                 .push(VdbeOp::new(Opcode::IdxInsert, cursor, record_reg, 0).with_p5(p5));

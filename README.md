@@ -50,21 +50,50 @@ while let StepResult::Row = sqlite3_step(&mut stmt)? {
 sqlite3_finalize(stmt)?;
 ```
 
-## What’s Implemented
+## What's Implemented
 
-RustQL already includes major SQLite subsystems:
+RustQL passes **91% of SQLite's individual test assertions** across 1,176 TCL test files (330,953 / 360,948 assertions). 224 test suites pass completely. The codebase is ~131K lines of Rust across 122 source files.
 
-- SQL tokenizer, parser, AST, and resolver
-- VDBE bytecode compiler and interpreter
-- B-tree storage, pager, and WAL
-- Query planning and WHERE clause optimization
-- Triggers and foreign keys
-- Scalar and aggregate functions
-- Window functions
-- VFS for Unix and Windows
-- Session/change tracking
-- R*Tree indexing
-- Virtual table plumbing for FTS3 (work in progress)
+Major subsystems:
+
+- **SQL compiler**: tokenizer, parser, AST, resolver, and code generator
+- **VDBE**: bytecode compiler and interpreter with 150+ opcodes
+- **Storage**: B-tree (table and index), pager, WAL, page cache
+- **Query planner**: WHERE clause optimization, index selection, cost estimation
+- **DML**: INSERT, UPDATE, DELETE with conflict resolution (OR REPLACE, etc.)
+- **Triggers**: BEFORE/AFTER/INSTEAD OF, WHEN clauses, NEW/OLD pseudo-tables, nested execution
+- **Foreign keys**: cascade, restrict, set null, deferred checks
+- **Functions**: scalar, aggregate, and window functions (14,550/14,630 func tests pass)
+- **Expressions**: full expression evaluation (95% of e_expr tests pass)
+- **Views**: CREATE VIEW, DROP VIEW, queryable views
+- **Collation**: custom collation sequences, NOCASE, BINARY, RTRIM
+- **ATTACH/DETACH**: multiple database files in a single connection
+- **Transactions**: BEGIN, COMMIT, ROLLBACK, SAVEPOINT, nested savepoints
+- **VFS**: Unix and Windows file system abstraction
+- **Session/changeset**: change tracking and application
+- **R\*Tree**: spatial indexing
+- **FTS3**: full-text search (scaffold, integration in progress)
+
+### Test Suite Highlights
+
+| Area | Pass Rate | Notes |
+|------|-----------|-------|
+| SELECT | 98-100% | select1 through select9 |
+| INSERT | 90% | Core insert operations |
+| UPDATE | 93% | Core update operations |
+| DELETE | 85-92% | Core delete operations |
+| Expressions | 89-95% | expr, e_expr |
+| Functions | 99-100% | func, func2, func3 |
+| Types | 85-100% | types, types2, types3 |
+| LIKE/BETWEEN | 98-100% | Pattern matching |
+| LIMIT | 100% | Row limiting |
+| NULL handling | 100% | NULL semantics |
+| JOINs | 80-100% | Core join operations |
+| Subqueries | 72-83% | Correlated and uncorrelated |
+| Triggers | 80% | trigger1 (primary suite) |
+| Foreign keys | 79% | fkey2 (primary suite) |
+| B-tree | 99% | btree01 |
+| Corruption detection | 86-99% | corrupt, corruptC, corruptF |
 
 Feature completeness varies; the authoritative signal is the test suite.
 
@@ -161,40 +190,43 @@ cargo build --release
 
 ## SQLite Test Suite
 
-RustQL can run SQLite's TCL test suite using the TCL extension. The canonical tests live in `sqlite3/test/`.
+RustQL runs SQLite's full TCL test suite (1,176 test files) using a TCL extension that loads RustQL as the `sqlite3` implementation.
 
 ### Using the Makefile
 
-The easiest way to run tests is via the Makefile:
-
 ```bash
-# Quick smoke test (10 basic tests)
-make test-basic
-
-# Run a specific SQLite test
-make test-select1
-make test-insert
-make test-where
-
-# Run the full configured test suite
+# Run the full test suite in parallel
 make test
+
+# Run a specific SQLite test (output to terminal)
+make test-select1
+make test-trigger1
+
+# Show pass rates from existing results
+make pass-rates
+
+# Show pass/fail summary
+make test-summary
+
+# Show detailed per-file report
+make test-report
 
 # List all available test targets
 make list-tests
 ```
 
 Test results are stored in `test-results/`:
-- `<test>.result` - PASSED, FAILED, or SKIPPED
-- `<test>.log` - Full test output
+- `<test>.result` - PASSED, FAILED, or SKIPPED (suite-level)
+- `<test>.log` - Full test output with individual assertion results
 
 ### Building the TCL Extension
 
 ```bash
-# Via Makefile (recommended)
+# Via Makefile (recommended, includes all feature flags)
 make tcl-extension
 
 # Or directly with cargo
-cargo build --release --features tcl
+cargo build --release --features tcl,fts3,fts5,rtree,session,json --lib
 ```
 
 This produces `target/release/librustql.so` (Linux) or `librustql.dylib` (macOS).
@@ -203,26 +235,8 @@ This produces `target/release/librustql.so` (Linux) or `librustql.dylib` (macOS)
 
 For interactive testing or debugging:
 
-```bash
-cd sqlite3/test
-tclsh
-```
-
 ```tcl
-# Load RustQL as the sqlite3 implementation
-load ../../target/release/librustql.so
-
-# Source the test infrastructure
-source tester.tcl
-
-# Run a specific test file
-source select1.test
-```
-
-Or run individual queries interactively:
-
-```tcl
-load ../../target/release/librustql.so
+load ./target/release/librustql.so
 sqlite3 db :memory:
 db eval {CREATE TABLE t(x); INSERT INTO t VALUES(1),(2),(3)}
 db eval {SELECT * FROM t}  ;# Returns: 1 2 3

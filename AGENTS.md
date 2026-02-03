@@ -40,8 +40,12 @@ Run commands from a separate build directory when possible:
 - Until opcode and behavior parity are achieved, do not assume RustQL should “improve” or optimize beyond SQLite. Premature optimizations that diverge from SQLite are not allowed.
 
 ## Testing Guidelines
-- The primary framework is Tcl via the `testfixture` binary.
-- Use `testfixture test/<name>.test` for focused coverage and `make devtest` for broader coverage.
+- The primary framework is SQLite's TCL test suite, run against RustQL's TCL extension (`librustql.so`).
+- Use `make test` to run the full suite (1,176 tests) in parallel.
+- Use `make test-<name>` for focused coverage (e.g., `make test-select1`, `make test-trigger1`).
+- Use `make pass-rates` to see per-file assertion pass rates.
+- Use `cargo test` for Rust unit tests.
+- Current status: 91% of SQLite's individual test assertions pass (330,953 / 360,948).
 - Preserve coverage-related special comments such as `NO_TEST` or `OPTIMIZATION-IF-TRUE` in `sqlite3/src/`.
 
 ## Commit & Pull Request Guidelines

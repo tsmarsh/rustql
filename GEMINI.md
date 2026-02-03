@@ -57,20 +57,25 @@ This project has two main test suites. The primary one is the original TCL test 
     cargo test
     ```
 
-*   **Run SQLite TCL compatibility tests (requires `make tcl-extension` first):**
-    *   **Run all major tests in parallel (recommended):**
+*   **Run SQLite TCL compatibility tests (builds extension automatically):**
+    *   **Run the full test suite in parallel (1,176 tests):**
         ```bash
         make test
-        ```
-    *   **Run a quick smoke test:**
-        ```bash
-        make test-basic
         ```
     *   **Run a specific test file (e.g., `select1.test`):**
         ```bash
         make test-select1
         ```
+    *   **View per-file pass rates:**
+        ```bash
+        make pass-rates
+        ```
+    *   **View pass/fail summary:**
+        ```bash
+        make test-summary
+        ```
     *   Test results are stored in the `test-results/` directory.
+    *   Current status: **91% of SQLite's test assertions pass** (330,953 / 360,948).
 
 ### Code Quality and Formatting
 

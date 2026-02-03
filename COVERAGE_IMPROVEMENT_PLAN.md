@@ -1,243 +1,172 @@
 # RustQL Coverage Improvement Plan
 
-## Current Coverage Status
+## Current Status
 
-**Overall Coverage**: 38.1% (Needs significant improvement)
-- **Total Lines**: 12,057
-- **Covered Lines**: 4,590
-- **Branch Coverage**: 0.0% (Not measured yet)
+**SQLite TCL Test Suite Compatibility (primary metric):**
+- **Weighted assertion pass rate**: 91% (330,953 / 360,948 assertions)
+- **Test suites passing completely**: 224 / 1,176
+- **Average per-file pass rate**: 45% across 805 test files with assertions
 
-## Coverage Analysis by Module
+**Codebase size**: ~131K lines of Rust across 122 source files.
 
-### 📊 Module Coverage Breakdown
+## Strengths (90%+ pass rate)
 
-| Module | Line Coverage | Status |
-|--------|---------------|--------|
-| `src/schema` | 61.6% | ⚠️ Good |
-| `src/vdbe` | 57.2% | ⚠️ Good |
-| `src/parser` | 52.6% | ⚠️ Good |
-| `src/api` | 49.6% | ❌ Needs Work |
-| `src/executor` | 42.1% | ❌ Needs Work |
-| `src/functions` | 36.3% | ❌ Needs Work |
-| `src/os` | 27.6% | ❌ Needs Work |
-| `src/storage` | 7.5% | ❌ Critical |
-| `src/util` | 0.0% | ❌ Critical |
+These areas are near-complete and should be maintained:
 
-## 🎯 Priority Areas for Improvement
+| Area | Pass Rate | Tests |
+|------|-----------|-------|
+| SELECT | 98-100% | select1-select9 |
+| Functions | 99% | func (14,550/14,630) |
+| Expressions | 89-95% | expr, e_expr |
+| INSERT | 90% | insert |
+| UPDATE | 93% | update |
+| LIKE | 98% | like |
+| BETWEEN | 100% | between |
+| LIMIT | 100% | limit |
+| NULL | 100% | null |
+| Types | 85-100% | types, types2, types3 |
+| B-tree | 99% | btree01 |
+| Corruption detection | 86-99% | corrupt, corruptC, corruptF |
+| DELETE | 85-92% | delete, delete2, delete4 |
+| CREATE TABLE | 93% | e_createtable |
 
-### 1. **Critical: Storage Layer (7.5% coverage)**
-**Files needing immediate attention:**
-- `src/storage/btree.rs` (0.0%)
-- `src/storage/pager.rs` (11.2%)
-- `src/storage/pcache.rs` (0.0%)
-- `src/storage/wal.rs` (40.9%)
+## Priority Improvement Areas
 
-**Action Plan:**
-- ✅ **B-tree Tests**: Implement comprehensive tests for B-tree operations
-  - Tree creation, insertion, deletion
-  - Cursor navigation and traversal
-  - Page splitting and balancing
-  - Transaction rollback scenarios
+### 1. Window Functions (3-50% pass rate)
 
-- ✅ **Pager Tests**: Add tests for page cache management
-  - Page allocation and deallocation
-  - LRU eviction policies
-  - Journaling and crash recovery
-  - Memory vs. disk pager scenarios
+Window functions have the largest gap. The basic framework exists but many
+specifications fail.
 
-- ✅ **WAL Tests**: Enhance Write-Ahead Logging coverage
-  - WAL frame creation and validation
-  - Checkpoint operations
-  - Concurrent read/write scenarios
-  - WAL recovery testing
+**Key test files**: window1 (30%), window2 (8%), window3 (6%), window4 (7%), window8 (3%)
 
-### 2. **High Priority: OS Layer (27.6% coverage)**
-**Files needing attention:**
-- `src/os/vfs.rs` (9.9%)
-- `src/os/mutex.rs` (12.8%)
-- `src/os/unix.rs` (37.7%)
+**What's missing**:
+- RANGE and GROUPS frame types
+- EXCLUDE clauses
+- Complex partition-by / order-by combinations
+- Nested window function expressions
 
-**Action Plan:**
-- ✅ **VFS Tests**: Add comprehensive VFS interface tests
-  - File open/close operations
-  - Locking scenarios (shared, exclusive)
-  - Error handling for file operations
-  - Cross-platform compatibility tests
+### 2. Complex Joins (5-48% pass rate)
 
-- ✅ **Mutex Tests**: Implement concurrency testing
-  - Mutex acquisition and release
-  - Deadlock detection
-  - Priority inheritance scenarios
-  - Stress testing with multiple threads
+Simple joins work well (join 80%, join3 100%, joinE 91%), but complex
+multi-way joins and advanced join patterns are weak.
 
-### 3. **High Priority: Executor Module (42.1% coverage)**
-**Files needing attention:**
-- `src/executor/wherecode.rs` (13.9%)
-- `src/executor/select.rs` (31.5%)
-- `src/executor/prepare.rs` (43.0%)
-- `src/executor/insert.rs` (48.4%)
+**Key test files**: join7 (6%), join9 (5%), joinA (7%), joinC (0%), joinB (12%)
 
-**Action Plan:**
-- ✅ **WHERE Clause Tests**: Add comprehensive WHERE testing
-  - Index selection algorithms
-  - Query plan generation
-  - Cost estimation functions
-  - Complex predicate handling
+**What's missing**:
+- Large multi-way join trees
+- Complex ON clause predicates
+- Join reordering optimizations
 
-- ✅ **SELECT Tests**: Enhance SELECT operation coverage
-  - Various join types (INNER, LEFT, CROSS)
-  - Subquery handling
-  - Window functions
-  - DISTINCT and GROUP BY operations
+### 3. Triggers (1-80% pass rate)
 
-- ✅ **DML Tests**: Improve INSERT/UPDATE/DELETE coverage
-  - Conflict resolution scenarios
-  - Trigger integration
-  - Bulk operations
-  - Transaction boundary testing
+The trigger1 suite is at 80%, but other trigger test files are lower.
 
-### 4. **Medium Priority: API Layer (49.6% coverage)**
-**Files needing attention:**
-- `src/api/connection.rs` (35.4%)
-- `src/api/stmt.rs` (51.6%)
-- `src/api/config.rs` (54.3%)
+**Key test files**: triggerB (1%), triggerE (3%), trigger3 (16%), trigger4 (16%)
 
-**Action Plan:**
-- ✅ **Connection Tests**: Add edge case testing
-  - Concurrent connection scenarios
-  - Error recovery paths
-  - URI parsing edge cases
-  - Memory database testing
+**What's missing**:
+- RAISE() with expression arguments
+- Recursive trigger support (PRAGMA recursive_triggers)
+- Cross-database triggers (ATTACH)
+- Complex nested trigger execution
+- UPDATE triggers in more trigger suites
 
-- ✅ **Statement Tests**: Enhance prepared statement coverage
-  - Parameter binding edge cases
-  - Statement caching scenarios
-  - Large result set handling
-  - Statement finalization testing
+### 4. Collation (0-100% pass rate)
 
-### 5. **Medium Priority: Functions Module (36.3% coverage)**
-**Files needing attention:**
-- `src/functions/scalar.rs` (31.8%)
-- `src/functions/aggregate.rs` (52.9%)
+Basic collation works but advanced cases are incomplete.
 
-**Action Plan:**
-- ✅ **Scalar Function Tests**: Add comprehensive function testing
-  - Edge cases for mathematical functions
-  - String manipulation functions
-  - Date/time function testing
-  - Type coercion scenarios
+**Key test files**: collate7 (0%), collate3 (36%), collate8 (39%), collate2 (42%)
 
-- ✅ **Aggregate Function Tests**: Enhance aggregate coverage
-  - GROUP BY scenarios
-  - Window function integration
-  - NULL handling in aggregates
-  - Custom aggregate functions
+**What's missing**:
+- Custom collation sequences via API
+- Collation in index expressions
+- Unicode-aware collation
 
-## 📅 Implementation Roadmap
+### 5. Virtual Tables and FTS (0% pass rate for most)
 
-### Phase 1: Critical Storage Layer (Week 1-2)
-- **Goal**: Achieve 70%+ coverage for storage modules
-- **Focus**: B-tree, pager, WAL core functionality
-- **Success Criteria**: All storage components have basic test coverage
+Virtual table infrastructure exists but runtime dispatch is incomplete.
 
-### Phase 2: OS and Executor Layers (Week 3-4)
-- **Goal**: Achieve 60%+ coverage for OS and executor modules
-- **Focus**: VFS interface, mutex testing, query execution
-- **Success Criteria**: Core execution paths are well-tested
+**Key test files**: FTS tests mostly 0%, extension01 (0%), carray (0%)
 
-### Phase 3: API and Functions (Week 5-6)
-- **Goal**: Achieve 70%+ coverage for API and functions
-- **Focus**: Edge cases, error handling, function testing
-- **Success Criteria**: Public API is robustly tested
+**What's missing**:
+- Full virtual table xFilter/xNext/xColumn dispatch
+- FTS3 integration as a virtual table
+- Extension loading API
 
-### Phase 4: Integration and Regression (Week 7-8)
-- **Goal**: Achieve 80%+ overall coverage
-- **Focus**: Integration testing, regression test suite
-- **Success Criteria**: Comprehensive test suite with good coverage
+### 6. ALTER TABLE (3-77% pass rate)
 
-## 🔧 Testing Strategy Recommendations
+Some ALTER operations work, others don't.
 
-### 1. **Property-Based Testing**
-Implement property-based tests using `proptest` or `quickcheck` for:
-- B-tree invariants
-- Transactional properties
-- Query result correctness
-- Error handling consistency
+**Key test files**: alter2 (3%), alterqf (14%), alterlegacy (18%), alter (25%)
 
-### 2. **Fuzz Testing**
-Add fuzz testing for:
-- SQL parser edge cases
-- Malformed input handling
-- Memory safety scenarios
-- Concurrency race conditions
+**What's missing**:
+- RENAME COLUMN
+- DROP COLUMN (partial)
+- Schema migration edge cases
 
-### 3. **Integration Testing**
-Develop integration tests that:
-- Test complete query execution pipelines
-- Validate cross-module interactions
-- Test real-world usage patterns
-- Include performance benchmarks
+### 7. WHERE Optimization (0-100% pass rate)
 
-### 4. **Error Injection Testing**
-Implement fault injection for:
-- Disk I/O failures
-- Memory allocation failures
-- Network interruptions (for remote VFS)
-- Corrupt database recovery
+Core WHERE works well but advanced optimization paths are weak.
 
-## 📊 Target Coverage Metrics
+**Key test files**: where7 (6%), where8 (21%), whereE (0%), whereJ (29%)
 
-| Module | Current | Target | Status |
-|--------|---------|--------|--------|
-| Overall | 38.1% | 80%+ | ❌ Needs Work |
-| Storage | 7.5% | 70%+ | ❌ Critical |
-| OS Layer | 27.6% | 60%+ | ❌ High Priority |
-| Executor | 42.1% | 70%+ | ⚠️ Medium Priority |
-| API | 49.6% | 80%+ | ⚠️ Medium Priority |
-| Functions | 36.3% | 70%+ | ❌ High Priority |
+**What's missing**:
+- Complex OR optimization (where7 has 1,068 tests)
+- Partial index utilization
+- Skip-scan optimization
 
-## 🎯 Success Criteria
+### 8. Bind Parameters (7% pass rate)
 
-**Short-term (4 weeks):**
-- Achieve 60% overall coverage
-- All critical modules have basic test coverage
-- No modules with 0% coverage
+Parameter binding has low coverage.
 
-**Medium-term (8 weeks):**
-- Achieve 75% overall coverage
-- All core functionality thoroughly tested
-- Good error path coverage
+**Key test files**: bind (7%), bindxfer (0%)
 
-**Long-term (12 weeks):**
-- Achieve 85%+ overall coverage
-- Comprehensive test suite
-- Property-based and fuzz testing implemented
-- Continuous integration with coverage gates
+**What's missing**:
+- Named parameter binding
+- Parameter type coercion
+- Bulk binding operations
 
-## 🔄 Continuous Integration
+## Test Categories by Impact
 
-Add coverage checking to CI pipeline:
-```yaml
-- name: Check coverage
-  run: |
-    cargo tarpaulin --out Xml
-    # Fail if coverage drops below threshold
-    python3 check_coverage.py --min-overall 40 --min-storage 10
+### High impact (many assertions, moderate pass rate)
+These have the most room for total assertion gains:
+
+- window3: 71/1,071 (6%) -- 1,000 assertions to gain
+- where7: 68/1,068 (6%) -- 1,000 assertions to gain
+- joinB: 66/512 (12%) -- 446 assertions to gain
+- window8: 12/361 (3%) -- 349 assertions to gain
+- window1: 107/348 (30%) -- 241 assertions to gain
+
+### Medium impact (moderate size, low pass rate)
+- joinC: 1/256 (0%) -- 255 assertions to gain
+- triggerB: 3/202 (1%) -- 199 assertions to gain
+- window4: 17/225 (7%) -- 208 assertions to gain
+- join9: 8/150 (5%) -- 142 assertions to gain
+
+## Testing Strategy
+
+### Primary: SQLite TCL Test Suite
+The TCL test suite is the ground truth. Improvements should be measured by:
+```bash
+make test          # Run full suite in parallel
+make pass-rates    # Show per-file pass rates
+make test-report   # Detailed per-file report
 ```
 
-## 📚 Resources
+### Secondary: Rust Unit Tests
+```bash
+cargo test         # Run Rust unit tests
+```
 
-- **Tarpaulin Docs**: https://github.com/xd009642/tarpaulin
-- **Rust Testing Book**: https://doc.rust-lang.org/book/ch11-00-testing.html
-- **Property Testing**: https://altsysrq.github.io/proptest-book/intro.html
-- **Fuzz Testing**: https://rust-fuzz.github.io/book/
+### Specific Area Testing
+```bash
+make test-select1  # Run a specific test interactively
+make test-trigger1 # See individual assertion results
+```
 
-## 📝 Next Steps
+## Next Steps
 
-1. **Immediate**: Start with storage layer tests (highest priority)
-2. **Parallel**: Begin OS layer testing (VFS and mutex)
-3. **Document**: Add test coverage comments to identify gaps
-4. **Automate**: Set up CI coverage reporting
-5. **Monitor**: Track coverage trends over time
-
-**Let's get testing!** 🚀
+1. **Window functions**: Implement RANGE/GROUPS frame types for biggest assertion gains
+2. **Complex joins**: Investigate join7/join9/joinB failures for optimizer improvements
+3. **Trigger completion**: Finish RAISE() expression support and recursive triggers
+4. **WHERE optimization**: Handle OR-expansion (where7) and partial indexes
+5. **Bind parameters**: Implement named parameters and type coercion

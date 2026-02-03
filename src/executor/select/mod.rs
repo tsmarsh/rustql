@@ -1373,6 +1373,11 @@ impl<'s> SelectCompiler<'s> {
         // Join conditions determine which right table rows match; WHERE filters the final result.
         let original_where_for_null_fill = original_where.clone();
 
+        // Save join conditions before merging (needed for outer join found_match logic)
+        // For outer joins, we need to evaluate join conditions separately from WHERE
+        // to properly set found_match=1 when ON clause matches, regardless of WHERE result.
+        let join_conditions_for_outer = self.join_conditions.clone();
+
         // Merge join conditions (from NATURAL/USING/ON) with WHERE clause
         // This follows SQLite's approach of adding join conditions to pWhere
         let remaining_where = self.merge_join_conditions(original_where);
@@ -2320,33 +2325,66 @@ impl<'s> SelectCompiler<'s> {
         let loop_start_label = *loop_labels.last().unwrap_or(&self.alloc_label());
 
         // Evaluate WHERE clause, filtering out terms consumed by index seeks
-        // For outer joins, we disabled index seeks so we must compile the full WHERE clause
-        let where_skip_label = if has_outer_join {
-            // Outer join: compile full WHERE clause (index seeks were disabled)
-            if let Some(where_expr) = remaining_where.as_ref() {
-                let label = self.alloc_label();
-                self.compile_where_condition(where_expr, label)?;
-                Some(label)
-            } else {
-                None
+        // For outer joins, we need special handling:
+        // 1. Evaluate join conditions (ON clause) first - if pass, mark found_match=1
+        // 2. Then evaluate original WHERE - if fail, skip output but keep found_match=1
+        // This ensures that when a row matches ON but fails WHERE, we don't emit a null-fill.
+        let (where_skip_label, outer_join_found_match_set) = if has_outer_join {
+            // Outer join: split evaluation of join conditions vs original WHERE
+            let skip_label = self.alloc_label();
+
+            // First, evaluate just the join conditions (ON clause)
+            // If join conditions fail, this row doesn't match the join at all
+            if !join_conditions_for_outer.is_empty() {
+                // Build combined expression from join conditions
+                let mut join_expr: Option<Expr> = None;
+                for cond in &join_conditions_for_outer {
+                    join_expr = Some(match join_expr {
+                        Some(existing) => Expr::Binary {
+                            op: BinaryOp::And,
+                            left: Box::new(existing),
+                            right: Box::new(cond.clone()),
+                        },
+                        None => cond.clone(),
+                    });
+                }
+                if let Some(expr) = join_expr {
+                    // If join condition fails, skip to continuation (no match)
+                    self.compile_where_condition(&expr, skip_label)?;
+                }
             }
+
+            // Join conditions passed - mark found_match=1 BEFORE evaluating WHERE
+            // This ensures found_match is set even if WHERE later fails
+            for found_match_reg in &found_match_regs {
+                if let Some(reg) = found_match_reg {
+                    self.emit(Opcode::Integer, 1, *reg, 0, P4::Unused);
+                }
+            }
+
+            // Now evaluate original WHERE (not including join conditions)
+            if let Some(where_expr) = original_where_for_null_fill.as_ref() {
+                self.compile_where_condition(where_expr, skip_label)?;
+            }
+
+            (Some(skip_label), true) // true = we already set found_match
         } else if let Some(info) = &where_info {
             // Use optimized path: only compile terms not consumed by index seeks
             let label = self.alloc_label();
             let any_terms = self.compile_runtime_filter_terms(info, label)?;
             if any_terms {
-                Some(label)
+                (Some(label), false)
             } else {
                 // All terms were consumed by index seeks, no runtime filter needed
-                None
+                (None, false)
             }
         } else if let Some(where_expr) = remaining_where.as_ref() {
             // No query plan available, compile full WHERE clause
             let label = self.alloc_label();
             self.compile_where_condition(where_expr, label)?;
-            Some(label)
+            (Some(label), false)
         } else {
-            None
+            (None, false)
         };
 
         // Evaluate result columns
@@ -2396,9 +2434,12 @@ impl<'s> SelectCompiler<'s> {
         }
 
         // For outer joins, mark that we found a matching row
-        for found_match_reg in &found_match_regs {
-            if let Some(reg) = found_match_reg {
-                self.emit(Opcode::Integer, 1, *reg, 0, P4::Unused);
+        // Skip if we already set found_match in the split evaluation path
+        if !outer_join_found_match_set {
+            for found_match_reg in &found_match_regs {
+                if let Some(reg) = found_match_reg {
+                    self.emit(Opcode::Integer, 1, *reg, 0, P4::Unused);
+                }
             }
         }
 
@@ -5181,6 +5222,8 @@ impl<'s> SelectCompiler<'s> {
             Expr::Collate { collation, .. } => Some(collation.clone()),
             Expr::Column(col_ref) => self.get_column_collation(col_ref),
             Expr::Parens(inner) => self.get_expr_collation(inner),
+            // For unary expressions like +b, preserve the inner collation
+            Expr::Unary { expr: inner, .. } => self.get_expr_collation(inner),
             _ => None,
         }
     }

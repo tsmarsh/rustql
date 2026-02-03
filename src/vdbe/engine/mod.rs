@@ -1718,6 +1718,7 @@ impl Vdbe {
             Opcode::Eq => {
                 // P5 flags: SQLITE_NULLEQ (0x80) means NULL==NULL is true
                 // P5 lower bits contain affinity
+                // P4 can be Collation for string comparisons
                 use crate::vdbe::ops::cmp_flags;
                 let left = self.mem(op.p1);
                 let right = self.mem(op.p3);
@@ -1729,7 +1730,11 @@ impl Vdbe {
                 if !nulleq && (left.is_null() || right.is_null()) {
                     // No jump - comparison with NULL is unknown
                 } else {
-                    let cmp = left.compare_with_affinity(right, affinity);
+                    // Use collation from P4 if available, otherwise use affinity
+                    let cmp = match &op.p4 {
+                        P4::Collation(coll) => left.compare_with_collation(right, coll),
+                        _ => left.compare_with_affinity(right, affinity),
+                    };
                     if cmp == Ordering::Equal {
                         self.pc = op.p2;
                     }
@@ -1740,6 +1745,7 @@ impl Vdbe {
                 // P5 flags: SQLITE_NULLEQ (0x80) means NULL==NULL is true
                 //           JUMPIFNULL (0x10) means jump if either operand is NULL
                 //           Lower bits contain affinity
+                // P4 can be Collation for string comparisons
                 use crate::vdbe::ops::cmp_flags;
                 let left = self.mem(op.p1);
                 let right = self.mem(op.p3);
@@ -1759,7 +1765,11 @@ impl Vdbe {
                         }
                     }
                 } else {
-                    let cmp = left.compare_with_affinity(right, affinity);
+                    // Use collation from P4 if available, otherwise use affinity
+                    let cmp = match &op.p4 {
+                        P4::Collation(coll) => left.compare_with_collation(right, coll),
+                        _ => left.compare_with_affinity(right, affinity),
+                    };
                     if cmp != Ordering::Equal {
                         self.pc = op.p2;
                     }
@@ -3417,6 +3427,16 @@ impl Vdbe {
                         }
                     } else if cursor.is_ephemeral {
                         // Ephemeral table cursor - start at first row
+                        // If ephemeral_set has data but ephemeral_rows is empty,
+                        // convert set entries to rows (for IdxInsert-based collection)
+                        if cursor.ephemeral_rows.is_empty() && !cursor.ephemeral_set.is_empty() {
+                            // Convert set records to row format with sequential rowids
+                            let mut rowid: i64 = 1;
+                            for record in cursor.ephemeral_set.iter() {
+                                cursor.ephemeral_rows.push((rowid, record.clone()));
+                                rowid += 1;
+                            }
+                        }
                         cursor.ephemeral_index = 0;
                         is_empty = cursor.ephemeral_rows.is_empty();
                         if !is_empty {

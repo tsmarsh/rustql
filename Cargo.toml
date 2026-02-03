@@ -16,12 +16,14 @@ rtree = []
 session = []
 json = []
 tcl = []
+tui = ["crossterm"]
 
 [dependencies]
 bitflags = "2"
 lazy_static = "1.4"
 hex = "0.4"
 chrono = "0.4"
+crossterm = { version = "0.28", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

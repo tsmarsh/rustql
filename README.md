@@ -109,9 +109,10 @@ fts5 = []
 rtree = []
 session = []
 json = []
+tui = ["crossterm"]
 ```
 
-`fts3` enables the in-tree FTS3 implementation. `fts5` is reserved for a future port. `rtree`, `session`, and `json` compile their respective modules when enabled.
+`fts3` enables the in-tree FTS3 implementation. `fts5` is reserved for a future port. `rtree`, `session`, and `json` compile their respective modules when enabled. `tui` enables the interactive terminal database browser (see below).
 
 ## Architecture
 
@@ -156,6 +157,7 @@ More detailed docs:
 - `docs/vdbe.md`
 - `docs/btree.md`
 - `docs/differences.md`
+- [`docs/tui.md`](docs/tui.md) — TUI database browser
 
 ## Module Map
 
@@ -187,6 +189,23 @@ cargo build --features "fts3,rtree,session,json"
 # Release build
 cargo build --release
 ```
+
+## TUI Database Browser
+
+RustQL includes an interactive terminal UI for browsing tables and running queries, built with crossterm. Build with the `tui` feature flag:
+
+```bash
+cargo build --features tui
+```
+
+Launch from the REPL with `.browse`:
+
+```
+$ rustql mydb.sqlite
+rustql> .browse
+```
+
+Navigate tables with `j`/`k`, select with `Enter`, scroll data with arrow keys, type SQL with `:`, and exit with `q`. See [`docs/tui.md`](docs/tui.md) for the full usage guide and key bindings.
 
 ## SQLite Test Suite
 

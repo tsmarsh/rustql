@@ -32,6 +32,9 @@ pub mod vtab;
 #[cfg(feature = "tcl")]
 pub mod tcl_ext;
 
+#[cfg(feature = "tui")]
+pub mod tui;
+
 // Re-export main public types
 pub use error::{Error, Result};
 

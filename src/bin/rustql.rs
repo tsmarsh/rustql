@@ -154,6 +154,27 @@ impl Shell {
                     eprintln!("Error: .read requires a filename");
                 }
             }
+            ".browse" => {
+                #[cfg(feature = "tui")]
+                {
+                    let conn = self
+                        .conn
+                        .take()
+                        .ok_or_else(|| "No database connection".to_string())?;
+                    match rustql::tui::browse(conn, &self.db_path) {
+                        Ok(returned_conn) => {
+                            self.conn = Some(returned_conn);
+                        }
+                        Err(e) => {
+                            eprintln!("Browse error: {}", e);
+                        }
+                    }
+                }
+                #[cfg(not(feature = "tui"))]
+                {
+                    eprintln!("Error: .browse requires --features tui");
+                }
+            }
             ".timeout" | ".width" | ".stats" | ".timer" => {
                 // Accept but ignore these settings
             }
@@ -170,6 +191,7 @@ impl Shell {
     fn print_help(&self) {
         println!(
             r#".bail ON|OFF           Stop after hitting an error
+.browse                Browse tables interactively (requires --features tui)
 .databases             List databases
 .dump ?TABLE?          Dump database in SQL text format
 .echo ON|OFF           Turn command echo on or off

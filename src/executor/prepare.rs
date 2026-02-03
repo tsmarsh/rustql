@@ -1495,10 +1495,11 @@ impl<'s> StatementCompiler<'s> {
                     .iter()
                     .map(|col_name| {
                         // Find column definition to get collation
+                        // SQLite uses the LAST COLLATE clause when multiple are specified
                         let collation = columns.iter().find_map(|cd| {
                             if cd.name.eq_ignore_ascii_case(col_name) {
-                                // Check for COLLATE constraint
-                                cd.constraints.iter().find_map(|c| {
+                                // Check for COLLATE constraint - use rfind to get last one
+                                cd.constraints.iter().rev().find_map(|c| {
                                     if let crate::parser::ast::ColumnConstraintKind::Collate(seq) =
                                         &c.kind
                                     {

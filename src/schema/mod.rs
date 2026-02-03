@@ -716,9 +716,10 @@ fn extract_default_value(col_def_upper: &str, col_def: &str) -> Option<DefaultVa
 
 /// Extract the COLLATE value from a column definition.
 /// Returns the collation name in uppercase, or None if not specified.
+/// When multiple COLLATE clauses are present, use the LAST one (SQLite behavior).
 fn extract_collation(col_def_upper: &str) -> Option<String> {
-    // Find " COLLATE " in the column definition
-    if let Some(collate_pos) = col_def_upper.find(" COLLATE ") {
+    // Find the LAST " COLLATE " in the column definition (rfind for SQLite compatibility)
+    if let Some(collate_pos) = col_def_upper.rfind(" COLLATE ") {
         let after_collate = col_def_upper[collate_pos + 9..].trim();
         // The collation name is the first word after COLLATE
         let collation = after_collate

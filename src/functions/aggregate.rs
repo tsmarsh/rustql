@@ -43,6 +43,9 @@ pub enum AggregateState {
 
     /// MD5SUM(x) state - computes MD5 hash of concatenated values
     Md5Sum { data: Vec<u8> },
+
+    /// DECIMAL_SUM(x) state
+    DecimalSum { sum: f64, has_value: bool },
 }
 
 impl AggregateState {
@@ -64,6 +67,7 @@ impl AggregateState {
                 separator: ",".to_string(),
             }),
             "MD5SUM" => Some(AggregateState::Md5Sum { data: Vec::new() }),
+            "DECIMAL_SUM" => Some(AggregateState::DecimalSum { sum: 0.0, has_value: false }),
             _ => None,
         }
     }
@@ -212,6 +216,21 @@ impl AggregateState {
                 }
                 Ok(false)
             }
+
+            AggregateState::DecimalSum { sum, has_value } => {
+                if let Some(val) = args.first() {
+                    if !matches!(val, Value::Null) {
+                        *has_value = true;
+                        match val {
+                            Value::Integer(n) => *sum += *n as f64,
+                            Value::Real(f) => *sum += f,
+                            Value::Text(s) => { if let Ok(f) = s.parse::<f64>() { *sum += f; } }
+                            _ => {}
+                        }
+                    }
+                }
+                Ok(false)
+            }
         }
     }
 
@@ -261,6 +280,10 @@ impl AggregateState {
                 // Convert to lowercase hex string
                 let hex: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
                 Ok(Value::Text(hex))
+            }
+
+            AggregateState::DecimalSum { sum, has_value } => {
+                if *has_value { Ok(Value::Real(*sum)) } else { Ok(Value::Null) }
             }
         }
     }
@@ -413,6 +436,7 @@ pub fn is_aggregate_function(name: &str) -> bool {
             | "GROUP_CONCAT"
             | "STRING_AGG"
             | "MD5SUM"
+            | "DECIMAL_SUM"
     )
 }
 
@@ -464,6 +488,11 @@ pub fn get_aggregate_function(name: &str) -> Option<AggregateInfo> {
             name: name_upper,
             min_args: 1,
             max_args: 255, // Can take multiple arguments
+        }),
+        "DECIMAL_SUM" => Some(AggregateInfo {
+            name: name_upper,
+            min_args: 1,
+            max_args: 1,
         }),
         _ => None,
     }

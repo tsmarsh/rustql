@@ -120,6 +120,9 @@ pub struct InsertCompiler<'a> {
 
     /// Optional temp schema for trigger lookup
     temp_schema: Option<&'a Schema>,
+
+    /// INSTEAD OF triggers (for views)
+    instead_of_triggers: Vec<Arc<Trigger>>,
 }
 
 impl<'a> InsertCompiler<'a> {
@@ -147,6 +150,7 @@ impl<'a> InsertCompiler<'a> {
             dqs_dml: true, // Default: enabled for backward compatibility
             skip_row_label: None,
             temp_schema: None,
+            instead_of_triggers: Vec::new(),
         }
     }
 
@@ -174,6 +178,7 @@ impl<'a> InsertCompiler<'a> {
             dqs_dml: true, // Default: enabled for backward compatibility
             skip_row_label: None,
             temp_schema: None,
+            instead_of_triggers: Vec::new(),
         }
     }
 
@@ -207,14 +212,44 @@ impl<'a> InsertCompiler<'a> {
             ));
         }
 
-        // Check if target is a view - cannot modify views directly
-        if let Some(schema) = self.schema {
-            if schema.views.contains_key(&table_name_lower) {
+        // Check if target is a view
+        let is_view = self
+            .schema
+            .map(|s| s.views.contains_key(&table_name_lower))
+            .unwrap_or(false);
+
+        // If it's a view, check for INSTEAD OF triggers
+        let mut instead_of_triggers: Vec<Arc<Trigger>> = Vec::new();
+        if is_view {
+            if let Some(schema) = self.schema {
+                instead_of_triggers = find_matching_triggers(
+                    schema,
+                    &insert.table.name,
+                    TriggerTiming::InsteadOf,
+                    TriggerEvent::Insert,
+                    None,
+                );
+            }
+            // Also check temp schema
+            if let Some(temp_schema) = self.temp_schema {
+                instead_of_triggers.extend(find_matching_triggers(
+                    temp_schema,
+                    &insert.table.name,
+                    TriggerTiming::InsteadOf,
+                    TriggerEvent::Insert,
+                    None,
+                ));
+            }
+
+            // Only reject view modification if there are no INSTEAD OF triggers
+            if instead_of_triggers.is_empty() {
                 return Err(crate::error::Error::with_message(
                     crate::error::ErrorCode::Error,
                     format!("cannot modify {} because it is a view", insert.table.name),
                 ));
             }
+            // Store INSTEAD OF triggers for later use
+            self.instead_of_triggers = instead_of_triggers;
         }
 
         // Store table name for trigger firing
@@ -223,26 +258,32 @@ impl<'a> InsertCompiler<'a> {
         // Initialize
         self.emit(Opcode::Init, 0, 0, 0, P4::Unused);
 
-        // Open table for writing - use qualified name if schema prefix is present
-        let qualified_name = if let Some(ref schema) = insert.table.schema {
-            format!("{}.{}", schema, insert.table.name)
-        } else {
-            insert.table.name.clone()
-        };
-        self.table_cursor = self.alloc_cursor();
-        self.emit(
-            Opcode::OpenWrite,
-            self.table_cursor,
-            0, // Root page (would come from schema)
-            0,
-            P4::Text(qualified_name),
-        );
+        // For INSTEAD OF triggers on views, we don't open the view for writing
+        // We just call the trigger with the NEW values
+        if self.instead_of_triggers.is_empty() {
+            // Open table for writing - use qualified name if schema prefix is present
+            let qualified_name = if let Some(ref schema) = insert.table.schema {
+                format!("{}.{}", schema, insert.table.name)
+            } else {
+                insert.table.name.clone()
+            };
+            self.table_cursor = self.alloc_cursor();
+            self.emit(
+                Opcode::OpenWrite,
+                self.table_cursor,
+                0, // Root page (would come from schema)
+                0,
+                P4::Text(qualified_name),
+            );
+        }
 
         self.num_columns = self.infer_num_columns(insert);
         self.init_column_affinities(&insert.table.name);
 
-        // Open indexes for writing
-        self.open_indexes_for_write(&insert.table.name)?;
+        // Open indexes for writing (only for regular tables, not INSTEAD OF triggers)
+        if self.instead_of_triggers.is_empty() {
+            self.open_indexes_for_write(&insert.table.name)?;
+        }
 
         // Look up triggers from both main schema and temp schema
         // Temp triggers (even on main tables) are stored in temp_schema
@@ -510,47 +551,56 @@ impl<'a> InsertCompiler<'a> {
                 }
             }
 
-            // Handle conflict action (REPLACE deletes conflicting rows)
-            self.emit_conflict_check(conflict_action, data_base, rowid_reg)?;
-
-            // Fire BEFORE INSERT triggers
             let table_name = insert.table.name.clone();
-            self.emit_before_triggers(&table_name, data_base)?;
 
-            // Apply column affinities before making record
-            self.emit_affinity(data_base, self.num_columns as i32);
+            // For INSTEAD OF triggers on views, just call the trigger - no actual insert
+            if !self.instead_of_triggers.is_empty() {
+                // Call INSTEAD OF trigger with NEW values
+                self.emit_instead_of_triggers(&table_name, data_base)?;
+            } else {
+                // Regular insert path for tables
 
-            // Make record
-            let record_reg = self.alloc_reg();
-            self.emit(
-                Opcode::MakeRecord,
-                data_base,
-                self.num_columns as i32,
-                record_reg,
-                P4::Unused,
-            );
+                // Handle conflict action (REPLACE deletes conflicting rows)
+                self.emit_conflict_check(conflict_action, data_base, rowid_reg)?;
 
-            // Insert the record
-            // Use P4::Table for table name (for triggers), conflict flags in upper byte of P5
-            let flags = (self.conflict_flags(conflict_action) as u16) << OE_SHIFT;
-            self.emit_with_p5(
-                Opcode::Insert,
-                self.table_cursor,
-                record_reg,
-                rowid_reg,
-                P4::Table(self.table_name.clone()),
-                OPFLAG_NCHANGE | flags,
-            );
+                // Fire BEFORE INSERT triggers
+                self.emit_before_triggers(&table_name, data_base)?;
 
-            // Insert into indexes
-            self.emit_index_inserts(data_base, rowid_reg, conflict_action);
+                // Apply column affinities before making record
+                self.emit_affinity(data_base, self.num_columns as i32);
 
-            // Fire AFTER INSERT triggers
-            self.emit_after_triggers(&table_name, data_base)?;
+                // Make record
+                let record_reg = self.alloc_reg();
+                self.emit(
+                    Opcode::MakeRecord,
+                    data_base,
+                    self.num_columns as i32,
+                    record_reg,
+                    P4::Unused,
+                );
 
-            // Resolve skip_row_label if set (for UNIQUE ON CONFLICT IGNORE)
-            if let Some(skip_label) = self.skip_row_label.take() {
-                self.resolve_label(skip_label, self.current_addr() as i32);
+                // Insert the record
+                // Use P4::Table for table name (for triggers), conflict flags in upper byte of P5
+                let flags = (self.conflict_flags(conflict_action) as u16) << OE_SHIFT;
+                self.emit_with_p5(
+                    Opcode::Insert,
+                    self.table_cursor,
+                    record_reg,
+                    rowid_reg,
+                    P4::Table(self.table_name.clone()),
+                    OPFLAG_NCHANGE | flags,
+                );
+
+                // Insert into indexes
+                self.emit_index_inserts(data_base, rowid_reg, conflict_action);
+
+                // Fire AFTER INSERT triggers
+                self.emit_after_triggers(&table_name, data_base)?;
+
+                // Resolve skip_row_label if set (for UNIQUE ON CONFLICT IGNORE)
+                if let Some(skip_label) = self.skip_row_label.take() {
+                    self.resolve_label(skip_label, self.current_addr() as i32);
+                }
             }
         }
 
@@ -558,11 +608,17 @@ impl<'a> InsertCompiler<'a> {
     }
 
     fn infer_num_columns(&self, insert: &InsertStmt) -> usize {
-        // Always try to get actual table column count from schema
+        // Always try to get actual table/view column count from schema
         if let Some(schema) = self.schema {
             let table_name_lower = insert.table.name.to_lowercase();
+            // Check tables first
             if let Some(table) = schema.tables.get(&table_name_lower) {
                 return table.columns.len();
+            }
+            // Check views (for INSTEAD OF triggers)
+            if let Some(view) = schema.views.get(&table_name_lower) {
+                // Count columns from the view's SELECT result
+                return view.select.body.column_count();
             }
         }
 
@@ -876,46 +932,54 @@ impl<'a> InsertCompiler<'a> {
             }
         }
 
-        // Handle conflict (REPLACE deletes conflicting rows)
-        self.emit_conflict_check(conflict_action, data_base, rowid_reg)?;
-
-        // Fire BEFORE INSERT triggers
         let table_name = insert.table.name.clone();
-        self.emit_before_triggers(&table_name, data_base)?;
 
-        // Apply column affinities before making record
-        self.emit_affinity(data_base, self.num_columns as i32);
+        // For INSTEAD OF triggers on views, just call the trigger - no actual insert
+        if !self.instead_of_triggers.is_empty() {
+            self.emit_instead_of_triggers(&table_name, data_base)?;
+        } else {
+            // Regular insert path for tables
 
-        // Make and insert record
-        let record_reg = self.alloc_reg();
-        self.emit(
-            Opcode::MakeRecord,
-            data_base,
-            self.num_columns as i32,
-            record_reg,
-            P4::Unused,
-        );
+            // Handle conflict (REPLACE deletes conflicting rows)
+            self.emit_conflict_check(conflict_action, data_base, rowid_reg)?;
 
-        // Use P4::Table for table name (for triggers), conflict flags in upper byte of P5
-        let flags = (self.conflict_flags(conflict_action) as u16) << OE_SHIFT;
-        self.emit_with_p5(
-            Opcode::Insert,
-            self.table_cursor,
-            record_reg,
-            rowid_reg,
-            P4::Table(self.table_name.clone()),
-            OPFLAG_NCHANGE | flags,
-        );
+            // Fire BEFORE INSERT triggers
+            self.emit_before_triggers(&table_name, data_base)?;
 
-        // Insert into indexes
-        self.emit_index_inserts(data_base, rowid_reg, conflict_action);
+            // Apply column affinities before making record
+            self.emit_affinity(data_base, self.num_columns as i32);
 
-        // Fire AFTER INSERT triggers
-        self.emit_after_triggers(&table_name, data_base)?;
+            // Make and insert record
+            let record_reg = self.alloc_reg();
+            self.emit(
+                Opcode::MakeRecord,
+                data_base,
+                self.num_columns as i32,
+                record_reg,
+                P4::Unused,
+            );
 
-        // Resolve skip_row_label if set (for UNIQUE ON CONFLICT IGNORE)
-        if let Some(skip_label) = self.skip_row_label.take() {
-            self.resolve_label(skip_label, self.current_addr() as i32);
+            // Use P4::Table for table name (for triggers), conflict flags in upper byte of P5
+            let flags = (self.conflict_flags(conflict_action) as u16) << OE_SHIFT;
+            self.emit_with_p5(
+                Opcode::Insert,
+                self.table_cursor,
+                record_reg,
+                rowid_reg,
+                P4::Table(self.table_name.clone()),
+                OPFLAG_NCHANGE | flags,
+            );
+
+            // Insert into indexes
+            self.emit_index_inserts(data_base, rowid_reg, conflict_action);
+
+            // Fire AFTER INSERT triggers
+            self.emit_after_triggers(&table_name, data_base)?;
+
+            // Resolve skip_row_label if set (for UNIQUE ON CONFLICT IGNORE)
+            if let Some(skip_label) = self.skip_row_label.take() {
+                self.resolve_label(skip_label, self.current_addr() as i32);
+            }
         }
 
         // Next row in ephemeral table
@@ -1200,46 +1264,54 @@ impl<'a> InsertCompiler<'a> {
             }
         }
 
-        // Handle conflict (REPLACE deletes conflicting rows)
-        self.emit_conflict_check(conflict_action, data_base, rowid_reg)?;
-
-        // Fire BEFORE INSERT triggers
         let table_name = insert.table.name.clone();
-        self.emit_before_triggers(&table_name, data_base)?;
 
-        // Apply column affinities before making record
-        self.emit_affinity(data_base, self.num_columns as i32);
+        // For INSTEAD OF triggers on views, just call the trigger - no actual insert
+        if !self.instead_of_triggers.is_empty() {
+            self.emit_instead_of_triggers(&table_name, data_base)?;
+        } else {
+            // Regular insert path for tables
 
-        // Make and insert record
-        let record_reg = self.alloc_reg();
-        self.emit(
-            Opcode::MakeRecord,
-            data_base,
-            self.num_columns as i32,
-            record_reg,
-            P4::Unused,
-        );
+            // Handle conflict (REPLACE deletes conflicting rows)
+            self.emit_conflict_check(conflict_action, data_base, rowid_reg)?;
 
-        // Use P4::Table for table name (for triggers), conflict flags in upper byte of P5
-        let flags = (self.conflict_flags(conflict_action) as u16) << OE_SHIFT;
-        self.emit_with_p5(
-            Opcode::Insert,
-            self.table_cursor,
-            record_reg,
-            rowid_reg,
-            P4::Table(self.table_name.clone()),
-            OPFLAG_NCHANGE | flags,
-        );
+            // Fire BEFORE INSERT triggers
+            self.emit_before_triggers(&table_name, data_base)?;
 
-        // Insert into indexes
-        self.emit_index_inserts(data_base, rowid_reg, conflict_action);
+            // Apply column affinities before making record
+            self.emit_affinity(data_base, self.num_columns as i32);
 
-        // Fire AFTER INSERT triggers
-        self.emit_after_triggers(&table_name, data_base)?;
+            // Make and insert record
+            let record_reg = self.alloc_reg();
+            self.emit(
+                Opcode::MakeRecord,
+                data_base,
+                self.num_columns as i32,
+                record_reg,
+                P4::Unused,
+            );
 
-        // Resolve skip_row_label if set (for UNIQUE ON CONFLICT IGNORE)
-        if let Some(skip_label) = self.skip_row_label.take() {
-            self.resolve_label(skip_label, self.current_addr() as i32);
+            // Use P4::Table for table name (for triggers), conflict flags in upper byte of P5
+            let flags = (self.conflict_flags(conflict_action) as u16) << OE_SHIFT;
+            self.emit_with_p5(
+                Opcode::Insert,
+                self.table_cursor,
+                record_reg,
+                rowid_reg,
+                P4::Table(self.table_name.clone()),
+                OPFLAG_NCHANGE | flags,
+            );
+
+            // Insert into indexes
+            self.emit_index_inserts(data_base, rowid_reg, conflict_action);
+
+            // Fire AFTER INSERT triggers
+            self.emit_after_triggers(&table_name, data_base)?;
+
+            // Resolve skip_row_label if set (for UNIQUE ON CONFLICT IGNORE)
+            if let Some(skip_label) = self.skip_row_label.take() {
+                self.resolve_label(skip_label, self.current_addr() as i32);
+            }
         }
 
         // Next row in ephemeral table
@@ -1721,46 +1793,54 @@ impl<'a> InsertCompiler<'a> {
             self.emit(Opcode::Null, 0, reg, 0, P4::Unused);
         }
 
-        // Handle conflict (REPLACE deletes conflicting rows)
-        self.emit_conflict_check(conflict_action, data_base, rowid_reg)?;
-
-        // Fire BEFORE INSERT triggers
         let table_name = insert.table.name.clone();
-        self.emit_before_triggers(&table_name, data_base)?;
 
-        // Apply column affinities before making record
-        self.emit_affinity(data_base, self.num_columns as i32);
+        // For INSTEAD OF triggers on views, just call the trigger - no actual insert
+        if !self.instead_of_triggers.is_empty() {
+            self.emit_instead_of_triggers(&table_name, data_base)?;
+        } else {
+            // Regular insert path for tables
 
-        // Make and insert record
-        let record_reg = self.alloc_reg();
-        self.emit(
-            Opcode::MakeRecord,
-            data_base,
-            self.num_columns as i32,
-            record_reg,
-            P4::Unused,
-        );
+            // Handle conflict (REPLACE deletes conflicting rows)
+            self.emit_conflict_check(conflict_action, data_base, rowid_reg)?;
 
-        // Use P4::Table for table name (for triggers), conflict flags in upper byte of P5
-        let flags = (self.conflict_flags(conflict_action) as u16) << OE_SHIFT;
-        self.emit_with_p5(
-            Opcode::Insert,
-            self.table_cursor,
-            record_reg,
-            rowid_reg,
-            P4::Table(self.table_name.clone()),
-            OPFLAG_NCHANGE | flags,
-        );
+            // Fire BEFORE INSERT triggers
+            self.emit_before_triggers(&table_name, data_base)?;
 
-        // Insert into indexes
-        self.emit_index_inserts(data_base, rowid_reg, conflict_action);
+            // Apply column affinities before making record
+            self.emit_affinity(data_base, self.num_columns as i32);
 
-        // Fire AFTER INSERT triggers
-        self.emit_after_triggers(&table_name, data_base)?;
+            // Make and insert record
+            let record_reg = self.alloc_reg();
+            self.emit(
+                Opcode::MakeRecord,
+                data_base,
+                self.num_columns as i32,
+                record_reg,
+                P4::Unused,
+            );
 
-        // Resolve skip_row_label if set (for UNIQUE ON CONFLICT IGNORE)
-        if let Some(skip_label) = self.skip_row_label.take() {
-            self.resolve_label(skip_label, self.current_addr() as i32);
+            // Use P4::Table for table name (for triggers), conflict flags in upper byte of P5
+            let flags = (self.conflict_flags(conflict_action) as u16) << OE_SHIFT;
+            self.emit_with_p5(
+                Opcode::Insert,
+                self.table_cursor,
+                record_reg,
+                rowid_reg,
+                P4::Table(self.table_name.clone()),
+                OPFLAG_NCHANGE | flags,
+            );
+
+            // Insert into indexes
+            self.emit_index_inserts(data_base, rowid_reg, conflict_action);
+
+            // Fire AFTER INSERT triggers
+            self.emit_after_triggers(&table_name, data_base)?;
+
+            // Resolve skip_row_label if set (for UNIQUE ON CONFLICT IGNORE)
+            if let Some(skip_label) = self.skip_row_label.take() {
+                self.resolve_label(skip_label, self.current_addr() as i32);
+            }
         }
 
         Ok(())
@@ -3003,6 +3083,35 @@ impl<'a> InsertCompiler<'a> {
 
         let trigger_ops = generate_trigger_code(
             &self.after_triggers,
+            self.schema,
+            table_name,
+            None, // No OLD row for INSERT
+            Some(new_base_reg),
+            self.num_columns as i32,
+            &mut self.next_reg,
+            &mut self.next_cursor,
+            return_label,
+        )?;
+
+        for op in trigger_ops {
+            self.ops.push(op);
+        }
+
+        self.resolve_label(return_label, self.current_addr() as i32);
+
+        Ok(())
+    }
+
+    /// Emit INSTEAD OF INSERT triggers (for views)
+    fn emit_instead_of_triggers(&mut self, table_name: &str, new_base_reg: i32) -> Result<()> {
+        if self.instead_of_triggers.is_empty() {
+            return Ok(());
+        }
+
+        let return_label = self.alloc_label();
+
+        let trigger_ops = generate_trigger_code(
+            &self.instead_of_triggers,
             self.schema,
             table_name,
             None, // No OLD row for INSERT

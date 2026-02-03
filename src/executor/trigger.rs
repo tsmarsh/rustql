@@ -311,13 +311,51 @@ impl<'s> TriggerBodyCompiler<'s> {
             trigger_db_idx,
         };
 
-        // Build column map from schema
+        // Build column map from schema (check tables first, then views for INSTEAD OF triggers)
         if let Some(schema) = schema {
             let table_lower = table_name.to_lowercase();
             if let Some(table) = schema.tables.get(&table_lower) {
                 compiler.num_columns = table.columns.len();
                 for (idx, col) in table.columns.iter().enumerate() {
                     compiler.column_map.insert(col.name.to_lowercase(), idx);
+                }
+            } else if let Some(view) = schema.views.get(&table_lower) {
+                // For INSTEAD OF triggers on views, get column names from the view's SELECT
+                use crate::parser::ast::ResultColumn;
+
+                // Get column count from the view's SELECT
+                compiler.num_columns = view.select.body.column_count();
+
+                // Build column map from the view's result columns
+                let core = view.select.body.leftmost_core();
+                for (idx, col) in core.columns.iter().enumerate() {
+                    match col {
+                        ResultColumn::Expr { alias: Some(name), .. } => {
+                            // Column with explicit alias
+                            compiler.column_map.insert(name.to_lowercase(), idx);
+                        }
+                        ResultColumn::Expr { expr, alias: None } => {
+                            // Try to extract column name from expression
+                            if let crate::parser::ast::Expr::Column(col_ref) = expr {
+                                compiler.column_map.insert(col_ref.column.to_lowercase(), idx);
+                            }
+                        }
+                        ResultColumn::Star => {
+                            // For *, we can't determine individual column names without expanding
+                        }
+                        ResultColumn::TableStar(_) => {
+                            // For table.*, we can't determine individual column names without expanding
+                        }
+                    }
+                }
+
+                // If the view has explicit column names, use those instead
+                if let Some(ref columns) = view.columns {
+                    compiler.column_map.clear();
+                    compiler.num_columns = columns.len();
+                    for (idx, name) in columns.iter().enumerate() {
+                        compiler.column_map.insert(name.to_lowercase(), idx);
+                    }
                 }
             }
         }

@@ -708,6 +708,8 @@ impl Opcode {
                 | Opcode::IncrVacuum
                 | Opcode::Sort
                 | Opcode::VNext
+                | Opcode::RowSetTest
+                | Opcode::RowSetRead
         )
     }
 

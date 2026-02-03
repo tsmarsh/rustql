@@ -29,6 +29,9 @@ const INDEX_SEEK_COST: f64 = 10.0;
 /// Cost of a full table scan
 const FULL_SCAN_COST_MULT: f64 = 3.0;
 
+/// Overhead cost per rowid for RowSet operations (insert + dedup check)
+const ROWSET_OVERHEAD: f64 = 2.0;
+
 // ============================================================================
 // WhereTermFlags
 // ============================================================================
@@ -153,6 +156,31 @@ pub enum WherePlan {
         /// Index of the term containing the IN expression
         term_idx: i32,
     },
+
+    /// Multi-index OR optimization
+    /// Uses multiple indexes to satisfy different branches of an OR expression,
+    /// collecting rowids into a RowSet for deduplication
+    MultiIndexOr {
+        /// The OR branches, each with its own access plan
+        branches: Vec<OrBranch>,
+        /// Index of the OR term in the WHERE clause
+        term_idx: i32,
+    },
+}
+
+/// A single branch of an OR optimization
+#[derive(Debug, Clone)]
+pub struct OrBranch {
+    /// Access plan for this branch (RowidEq or IndexScan)
+    pub plan: WherePlan,
+    /// Index name if using index scan
+    pub index_name: Option<String>,
+    /// The expression for this OR branch
+    pub expr: Expr,
+    /// Estimated cost of this branch
+    pub cost: f64,
+    /// Estimated rows from this branch
+    pub rows: f64,
 }
 
 // ============================================================================
@@ -1897,6 +1925,27 @@ impl QueryPlanner {
             }
         }
 
+        // Check for multi-index OR optimization
+        // This allows queries like "WHERE a=1 OR b=2" to use index(a) and index(b)
+        for (term_idx, term) in self.where_clause.iter().enumerate() {
+            if term.flags.contains(WhereTermFlags::OR_INFO) && term.mask & table.mask != 0 {
+                if let Some(branches) =
+                    self.detect_or_optimization(term, table_idx, table, prereq_mask)
+                {
+                    let or_cost = self.calculate_or_cost(&branches, table.estimated_rows);
+
+                    if or_cost < best_cost {
+                        best_cost = or_cost;
+                        best_plan = WherePlan::MultiIndexOr {
+                            branches,
+                            term_idx: term_idx as i32,
+                        };
+                        level.flags |= WhereLevelFlags::MULTI_OR;
+                    }
+                }
+            }
+        }
+
         // Calculate output rows
         let output_rows = match &best_plan {
             WherePlan::RowidEq | WherePlan::PrimaryKey { .. } => 1.0,
@@ -1910,6 +1959,14 @@ impl QueryPlanner {
                 } else {
                     (table.estimated_rows as f64 * 0.1f64.powi(*eq_cols)).max(1.0)
                 }
+            }
+            WherePlan::MultiIndexOr { branches, .. } => {
+                // Output rows is sum of branch rows, capped at table size
+                branches
+                    .iter()
+                    .map(|b| b.rows)
+                    .sum::<f64>()
+                    .min(table.estimated_rows as f64)
             }
             _ => table.estimated_rows as f64 * total_selectivity,
         };
@@ -1994,6 +2051,10 @@ impl QueryPlanner {
                         }
                     }
                 }
+            }
+            WherePlan::MultiIndexOr { term_idx, .. } => {
+                // Add the OR term itself as consumed
+                level.used_terms.push(*term_idx);
             }
             WherePlan::FullScan => {
                 // No terms consumed
@@ -2103,6 +2164,263 @@ impl QueryPlanner {
                 Some(required) => required.eq_ignore_ascii_case(index_collation),
             }
         })
+    }
+
+    // ========================================================================
+    // Multi-Index OR Optimization
+    // ========================================================================
+
+    /// Detect if an OR term can use multi-index optimization
+    /// Returns the branches if optimization is possible, None otherwise
+    pub fn detect_or_optimization(
+        &self,
+        term: &WhereTerm,
+        table_idx: usize,
+        table: &TableInfo,
+        _prereq_mask: u64,
+    ) -> Option<Vec<OrBranch>> {
+        // Must have OR_INFO flag indicating this is an OR expression
+        if !term.flags.contains(WhereTermFlags::OR_INFO) {
+            return None;
+        }
+
+        // Need at least 2 branches for OR optimization
+        if term.or_terms.len() < 2 {
+            return None;
+        }
+
+        let mut branches = Vec::new();
+
+        for or_expr in &term.or_terms {
+            if let Some(branch) = self.analyze_or_branch(or_expr, table_idx, table) {
+                branches.push(branch);
+            } else {
+                // One branch not indexable = no optimization possible
+                return None;
+            }
+        }
+
+        Some(branches)
+    }
+
+    /// Analyze a single OR branch for index usage
+    fn analyze_or_branch(
+        &self,
+        expr: &Expr,
+        table_idx: usize,
+        table: &TableInfo,
+    ) -> Option<OrBranch> {
+        // Check for rowid = literal
+        if self.extract_rowid_equality(expr, table_idx).is_some() {
+            return Some(OrBranch {
+                plan: WherePlan::RowidEq,
+                index_name: None,
+                expr: expr.clone(),
+                cost: INDEX_SEEK_COST + ROW_READ_COST,
+                rows: 1.0,
+            });
+        }
+
+        // Check each index for usability
+        let mut best: Option<OrBranch> = None;
+        for index in &table.indexes {
+            if let Some(eq_cols) = self.count_or_branch_eq_cols(expr, table_idx, index) {
+                if eq_cols > 0 {
+                    let rows = self.estimate_index_rows(table, index, eq_cols);
+                    let cost = INDEX_SEEK_COST + rows * ROW_READ_COST;
+                    if best.as_ref().map_or(true, |b| cost < b.cost) {
+                        best = Some(OrBranch {
+                            plan: WherePlan::IndexScan {
+                                index_name: index.name.clone(),
+                                eq_cols,
+                                covering: false,
+                                has_range: false,
+                                range_end: None,
+                                range_start: None,
+                            },
+                            index_name: Some(index.name.clone()),
+                            expr: expr.clone(),
+                            cost,
+                            rows,
+                        });
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// Count equality columns for an OR branch expression against an index
+    /// Returns number of matching prefix columns, or None if no match
+    fn count_or_branch_eq_cols(
+        &self,
+        expr: &Expr,
+        table_idx: usize,
+        index: &IndexInfo,
+    ) -> Option<i32> {
+        // Extract equality expressions from the branch (may be ANDed)
+        let eq_exprs = self.extract_equality_exprs(expr, table_idx);
+        let mut count = 0;
+
+        // Check each index column in order (must match continuous prefix)
+        for &idx_col in &index.columns {
+            let has_eq = eq_exprs.iter().any(|(col_idx, _)| *col_idx == idx_col);
+            if has_eq {
+                count += 1;
+            } else {
+                break; // Must be continuous prefix
+            }
+        }
+
+        if count > 0 {
+            Some(count)
+        } else {
+            None
+        }
+    }
+
+    /// Extract rowid equality from an expression
+    /// Returns the value expression if this is a rowid = value expression
+    fn extract_rowid_equality<'a>(&self, expr: &'a Expr, table_idx: usize) -> Option<&'a Expr> {
+        match Self::unwrap_parens(expr) {
+            Expr::Binary { op, left, right } if *op == BinaryOp::Eq || *op == BinaryOp::Is => {
+                // Check left = rowid, right = value
+                if let Some(col_ref) = Self::get_column_ref(left) {
+                    if self.is_rowid_column(col_ref, table_idx) {
+                        return Some(right);
+                    }
+                }
+                // Check right = rowid, left = value
+                if let Some(col_ref) = Self::get_column_ref(right) {
+                    if self.is_rowid_column(col_ref, table_idx) {
+                        return Some(left);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Check if a column reference is a rowid column for the given table
+    fn is_rowid_column(&self, col_ref: &crate::parser::ast::ColumnRef, table_idx: usize) -> bool {
+        let table = &self.tables[table_idx];
+        let col_name_lower = col_ref.column.to_lowercase();
+
+        // Check if table name matches (if specified)
+        if let Some(ref tbl) = col_ref.table {
+            let tbl_lower = tbl.to_lowercase();
+            let table_name_lower = table.name.to_lowercase();
+            let alias_matches = table
+                .alias
+                .as_ref()
+                .map_or(false, |a| a.to_lowercase() == tbl_lower);
+            if tbl_lower != table_name_lower && !alias_matches {
+                return false;
+            }
+        }
+
+        // Check for rowid aliases
+        col_name_lower == "rowid"
+            || col_name_lower == "_rowid_"
+            || col_name_lower == "oid"
+            || (table.ipk_column >= 0 && {
+                // Check if this is the INTEGER PRIMARY KEY column
+                table
+                    .columns
+                    .get(table.ipk_column as usize)
+                    .map_or(false, |c| c.to_lowercase() == col_name_lower)
+            })
+    }
+
+    /// Extract equality expressions from an expression (possibly AND-connected)
+    /// Returns list of (column_idx, value_expr) pairs for the given table
+    fn extract_equality_exprs<'a>(&self, expr: &'a Expr, table_idx: usize) -> Vec<(i32, &'a Expr)> {
+        let mut results = Vec::new();
+        self.collect_equality_exprs(expr, table_idx, &mut results);
+        results
+    }
+
+    /// Helper to recursively collect equality expressions
+    fn collect_equality_exprs<'a>(
+        &self,
+        expr: &'a Expr,
+        table_idx: usize,
+        results: &mut Vec<(i32, &'a Expr)>,
+    ) {
+        match Self::unwrap_parens(expr) {
+            Expr::Binary { op, left, right } => {
+                match op {
+                    BinaryOp::And => {
+                        // Recurse into AND branches
+                        self.collect_equality_exprs(left, table_idx, results);
+                        self.collect_equality_exprs(right, table_idx, results);
+                    }
+                    BinaryOp::Eq | BinaryOp::Is => {
+                        // Check for column = value
+                        if let Some((col_idx, value)) =
+                            self.extract_column_eq(left, right, table_idx)
+                        {
+                            results.push((col_idx, value));
+                        } else if let Some((col_idx, value)) =
+                            self.extract_column_eq(right, left, table_idx)
+                        {
+                            results.push((col_idx, value));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Extract column index and value from a column = value expression
+    /// Returns (column_index, value_expr) if left is a column of table_idx
+    fn extract_column_eq<'a>(
+        &self,
+        col_expr: &Expr,
+        value_expr: &'a Expr,
+        table_idx: usize,
+    ) -> Option<(i32, &'a Expr)> {
+        if let Some(col_ref) = Self::get_column_ref(col_expr) {
+            let table = &self.tables[table_idx];
+
+            // Check if table name matches (if specified)
+            if let Some(ref tbl) = col_ref.table {
+                let tbl_lower = tbl.to_lowercase();
+                let table_name_lower = table.name.to_lowercase();
+                let alias_matches = table
+                    .alias
+                    .as_ref()
+                    .map_or(false, |a| a.to_lowercase() == tbl_lower);
+                if tbl_lower != table_name_lower && !alias_matches {
+                    return None;
+                }
+            }
+
+            // Find column index
+            let col_name_lower = col_ref.column.to_lowercase();
+            for (idx, col) in table.columns.iter().enumerate() {
+                if col.to_lowercase() == col_name_lower {
+                    return Some((idx as i32, value_expr));
+                }
+            }
+        }
+        None
+    }
+
+    /// Calculate the total cost of the OR optimization
+    pub fn calculate_or_cost(&self, branches: &[OrBranch], table_rows: i64) -> f64 {
+        let branch_cost: f64 = branches.iter().map(|b| b.cost).sum();
+        let total_rows: f64 = branches
+            .iter()
+            .map(|b| b.rows)
+            .sum::<f64>()
+            .min(table_rows as f64);
+        let rowset_cost = total_rows * ROWSET_OVERHEAD;
+        let iteration_cost = total_rows * ROW_READ_COST;
+        branch_cost + rowset_cost + iteration_cost
     }
 }
 

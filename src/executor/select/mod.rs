@@ -12,8 +12,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::executor::where_clause::{
-    IndexInfo, QueryPlanner, TermOp, WhereInfo, WhereLevel, WhereLevelFlags, WherePlan, WhereTerm,
-    WhereTermFlags,
+    IndexInfo, OrBranch, QueryPlanner, TermOp, WhereInfo, WhereLevel, WhereLevelFlags, WherePlan,
+    WhereTerm, WhereTermFlags,
 };
 use crate::executor::window::{select_has_window_functions, WindowCompiler};
 use crate::parser::ast::{
@@ -2175,6 +2175,65 @@ impl<'s> SelectCompiler<'s> {
                     scan_info.push((false, None, 0, 0, false));
                     range_end_keys.push(None);
                 }
+                Some(WherePlan::MultiIndexOr { branches, term_idx }) => {
+                    // Multi-index OR optimization: use multiple indexes for different
+                    // branches of an OR expression, collecting rowids into a RowSet
+                    // for deduplication, then iterate through the unique rowids
+
+                    // Allocate RowSet register (will hold BTreeSet<i64>)
+                    let rowset_reg = self.alloc_reg();
+                    // Initialize to NULL (RowSet will be created on first add)
+                    self.emit(Opcode::Null, 0, rowset_reg, 0, P4::Unused);
+
+                    let rowid_reg = self.alloc_reg();
+
+                    // Process each OR branch, collecting rowids into the RowSet
+                    for (i, branch) in branches.iter().enumerate() {
+                        let is_last = i == branches.len() - 1;
+                        self.compile_or_branch(
+                            cursor,
+                            branch,
+                            rowset_reg,
+                            rowid_reg,
+                            is_last,
+                            &where_info,
+                            from_idx,
+                        )?;
+                    }
+
+                    // Now iterate through the RowSet in sorted order
+                    // RowSetRead extracts smallest rowid and jumps to skip_label when empty
+                    let rowset_loop = self.alloc_label();
+                    self.resolve_label(rowset_loop, self.current_addr());
+                    self.emit(
+                        Opcode::RowSetRead,
+                        rowset_reg,
+                        skip_label,
+                        rowid_reg,
+                        P4::Unused,
+                    );
+
+                    // Seek to rowid in main table
+                    // If not found (shouldn't happen), continue to next rowid
+                    self.emit(
+                        Opcode::SeekRowid,
+                        cursor,
+                        rowset_loop,
+                        rowid_reg,
+                        P4::Unused,
+                    );
+
+                    next_labels.push(skip_label);
+                    // For MultiIndexOr, the loop label is the rowset_loop
+                    loop_labels.push(rowset_loop);
+
+                    // Mark as MultiIndexOr with a sentinel value (-1 in index_cursor)
+                    // This tells the loop end handler to emit Goto instead of Next
+                    scan_info.push((false, Some(-1), 0, 0, false));
+                    range_end_keys.push(None);
+
+                    let _ = term_idx; // Suppress unused warning
+                }
                 _ => {
                     // Check if we can use ORDER BY index scan for this table
                     // ORDER BY index scan only works for the outermost loop (loop_pos == 0)
@@ -2399,13 +2458,20 @@ impl<'s> SelectCompiler<'s> {
                     self.emit(Opcode::Next, idx_cursor, loop_label, 0, P4::Unused);
                 }
             } else if let Some(eph_cursor) = index_cursor {
-                // RowidIn case - index_cursor is the ephemeral table cursor
-                // First resolve the not_found_label so SeekRowid failures come here
-                if let Some(Some((not_found_label, _, _))) = range_end_keys.get(loop_pos) {
-                    self.resolve_label(*not_found_label, self.current_addr());
+                if eph_cursor == -1 {
+                    // MultiIndexOr case - loop_label is already the rowset_loop
+                    // SeekRowid on not-found already jumps to loop_label
+                    // Just emit Goto to continue the loop
+                    self.emit(Opcode::Goto, 0, loop_label, 0, P4::Unused);
+                } else {
+                    // RowidIn case - index_cursor is the ephemeral table cursor
+                    // First resolve the not_found_label so SeekRowid failures come here
+                    if let Some(Some((not_found_label, _, _))) = range_end_keys.get(loop_pos) {
+                        self.resolve_label(*not_found_label, self.current_addr());
+                    }
+                    // Next on the ephemeral cursor to get next value from IN list
+                    self.emit(Opcode::Next, eph_cursor, loop_label, 0, P4::Unused);
                 }
-                // Next on the ephemeral cursor to get next value from IN list
-                self.emit(Opcode::Next, eph_cursor, loop_label, 0, P4::Unused);
             } else {
                 // Full scan or rowid range - Next on table cursor
                 self.emit(Opcode::Next, cursor, loop_label, 0, P4::Unused);
@@ -8756,6 +8822,242 @@ impl<'s> SelectCompiler<'s> {
             BinaryOp::Le => Some(SQLITE_INDEX_CONSTRAINT_GE),
             _ => None,
         }
+    }
+
+    /// Compile a single OR branch for multi-index OR optimization
+    /// Collects rowids into the rowset, using RowSetTest for deduplication
+    fn compile_or_branch(
+        &mut self,
+        table_cursor: i32,
+        branch: &OrBranch,
+        rowset_reg: i32,
+        rowid_reg: i32,
+        is_last: bool,
+        where_info: &Option<WhereInfo>,
+        from_idx: usize,
+    ) -> Result<()> {
+        // iset determines RowSetTest behavior:
+        // > 0: test and insert, jump if found (dedup)
+        // == 0: always insert without testing (last branch optimization)
+        // < 0: test only, don't insert (not used here)
+        let iset = if is_last { 0i64 } else { 1i64 };
+
+        match &branch.plan {
+            WherePlan::RowidEq => {
+                // Extract rowid value from the equality expression
+                if let Expr::Binary { left, right, .. } = &branch.expr {
+                    // Determine which side is the rowid and which is the value
+                    let value_expr = if self.is_rowid_column_ref(left, from_idx) {
+                        right
+                    } else {
+                        left
+                    };
+
+                    // Compile rowid value
+                    self.compile_expr(value_expr, rowid_reg)?;
+
+                    // Skip duplicate check for last branch, add directly
+                    let skip_dup = self.alloc_label();
+                    self.emit(
+                        Opcode::RowSetTest,
+                        rowset_reg,
+                        skip_dup,
+                        rowid_reg,
+                        P4::Int64(iset),
+                    );
+                    self.resolve_label(skip_dup, self.current_addr());
+                }
+            }
+            WherePlan::IndexScan {
+                index_name,
+                eq_cols,
+                ..
+            } => {
+                // Open index cursor for this branch
+                let idx_cursor = self.alloc_cursor();
+                self.emit(
+                    Opcode::OpenRead,
+                    idx_cursor,
+                    0,
+                    0,
+                    P4::Text(index_name.clone()),
+                );
+
+                // Build the index seek key from the OR branch expression
+                let key_base_reg = self.next_reg;
+                for _ in 0..*eq_cols {
+                    self.alloc_reg();
+                }
+
+                // Extract equality values from the branch expression
+                let eq_values = self.extract_branch_eq_values(&branch.expr, from_idx);
+                for (i, (_, value_expr)) in eq_values.iter().enumerate() {
+                    if i < *eq_cols as usize {
+                        self.compile_expr(value_expr, key_base_reg + i as i32)?;
+                    }
+                }
+
+                // Build index key
+                let key_reg = self.alloc_reg();
+                self.emit(
+                    Opcode::MakeRecord,
+                    key_base_reg,
+                    *eq_cols,
+                    key_reg,
+                    P4::Unused,
+                );
+
+                // Seek to first matching entry
+                let idx_done = self.alloc_label();
+                self.emit(Opcode::SeekGE, idx_cursor, idx_done, key_reg, P4::Unused);
+
+                // Loop collecting rowids from index
+                let idx_loop = self.alloc_label();
+                self.resolve_label(idx_loop, self.current_addr());
+
+                // Check if we're still within the equality range
+                // Compare current key columns with the raw key values (not the record)
+                self.emit(
+                    Opcode::IdxGT,
+                    idx_cursor,
+                    idx_done,
+                    key_base_reg,
+                    P4::Int64(*eq_cols as i64),
+                );
+
+                // Get rowid from index
+                self.emit(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::Unused);
+
+                // Add to rowset (with duplicate check unless last branch)
+                let skip_dup = self.alloc_label();
+                self.emit(
+                    Opcode::RowSetTest,
+                    rowset_reg,
+                    skip_dup,
+                    rowid_reg,
+                    P4::Int64(iset),
+                );
+                self.resolve_label(skip_dup, self.current_addr());
+
+                // Next index entry
+                self.emit(Opcode::Next, idx_cursor, idx_loop, 0, P4::Unused);
+
+                self.resolve_label(idx_done, self.current_addr());
+                self.emit(Opcode::Close, idx_cursor, 0, 0, P4::Unused);
+            }
+            _ => {
+                // Unsupported plan type for OR branch - skip
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check if an expression is a rowid column reference for the given table
+    fn is_rowid_column_ref(&self, expr: &Expr, from_idx: usize) -> bool {
+        if let Expr::Column(col_ref) = expr {
+            let col_lower = col_ref.column.to_lowercase();
+            if col_lower == "rowid" || col_lower == "_rowid_" || col_lower == "oid" {
+                // Check table matches if specified
+                if let Some(ref tbl) = col_ref.table {
+                    if let Some(table_info) = self.tables.get(self.outer_tables_boundary + from_idx)
+                    {
+                        let tbl_lower = tbl.to_lowercase();
+                        // table_info.name is the alias (or table name if no alias)
+                        return tbl_lower == table_info.table_name.to_lowercase()
+                            || tbl_lower == table_info.name.to_lowercase();
+                    }
+                }
+                return true;
+            }
+            // Check for INTEGER PRIMARY KEY alias
+            if let Some(table_info) = self.tables.get(self.outer_tables_boundary + from_idx) {
+                if let Some(ref schema_table) = table_info.schema_table {
+                    // Find INTEGER PRIMARY KEY column (rowid alias)
+                    if let Some(ipk_col) = schema_table.columns.iter().find(|c| {
+                        c.is_primary_key && c.affinity == crate::schema::Affinity::Integer
+                    }) {
+                        if ipk_col.name.eq_ignore_ascii_case(&col_ref.column) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Extract equality values from an OR branch expression
+    /// Returns (column_index, value_expr) pairs
+    fn extract_branch_eq_values<'a>(
+        &self,
+        expr: &'a Expr,
+        from_idx: usize,
+    ) -> Vec<(i32, &'a Expr)> {
+        let mut results = Vec::new();
+        self.collect_branch_eq_values(expr, from_idx, &mut results);
+        results
+    }
+
+    fn collect_branch_eq_values<'a>(
+        &self,
+        expr: &'a Expr,
+        from_idx: usize,
+        results: &mut Vec<(i32, &'a Expr)>,
+    ) {
+        match expr {
+            Expr::Parens(inner) => self.collect_branch_eq_values(inner, from_idx, results),
+            Expr::Binary { op, left, right } => match op {
+                BinaryOp::And => {
+                    self.collect_branch_eq_values(left, from_idx, results);
+                    self.collect_branch_eq_values(right, from_idx, results);
+                }
+                BinaryOp::Eq | BinaryOp::Is => {
+                    if let Some((col_idx, value)) = self.extract_col_eq_value(left, right, from_idx)
+                    {
+                        results.push((col_idx, value));
+                    } else if let Some((col_idx, value)) =
+                        self.extract_col_eq_value(right, left, from_idx)
+                    {
+                        results.push((col_idx, value));
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    fn extract_col_eq_value<'a>(
+        &self,
+        col_expr: &Expr,
+        value_expr: &'a Expr,
+        from_idx: usize,
+    ) -> Option<(i32, &'a Expr)> {
+        if let Expr::Column(col_ref) = col_expr {
+            if let Some(table_info) = self.tables.get(self.outer_tables_boundary + from_idx) {
+                // Check table matches if specified
+                if let Some(ref tbl) = col_ref.table {
+                    let tbl_lower = tbl.to_lowercase();
+                    // table_info.name is the alias (or table name if no alias)
+                    if tbl_lower != table_info.table_name.to_lowercase()
+                        && tbl_lower != table_info.name.to_lowercase()
+                    {
+                        return None;
+                    }
+                }
+
+                // Find column index
+                if let Some(ref schema_table) = table_info.schema_table {
+                    for (i, col) in schema_table.columns.iter().enumerate() {
+                        if col.name.eq_ignore_ascii_case(&col_ref.column) {
+                            return Some((i as i32, value_expr));
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Compile an expression into a register

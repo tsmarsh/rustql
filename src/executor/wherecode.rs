@@ -162,6 +162,12 @@ impl WhereCodeGen {
                 self.code_full_scan(level_idx, level)?;
                 let _ = term_idx; // Suppress unused warning
             }
+            WherePlan::MultiIndexOr { term_idx, .. } => {
+                // MultiIndexOr is handled in select/mod.rs - this code path shouldn't be reached
+                // for normal SELECT queries, but add handling for completeness
+                self.code_full_scan(level_idx, level)?;
+                let _ = term_idx; // Suppress unused warning
+            }
         }
 
         // Generate code for remaining WHERE terms at this level

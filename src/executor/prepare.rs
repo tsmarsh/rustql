@@ -5504,6 +5504,17 @@ impl<'s> StatementCompiler<'s> {
                     display_name
                 )
             }
+            WherePlan::MultiIndexOr { branches, .. } => {
+                let names: Vec<&str> = branches
+                    .iter()
+                    .filter_map(|b| b.index_name.as_deref())
+                    .collect();
+                if names.is_empty() {
+                    format!("MULTI-INDEX OR on {}", display_name)
+                } else {
+                    format!("MULTI-INDEX OR ({}) on {}", names.join(", "), display_name)
+                }
+            }
         }
     }
 

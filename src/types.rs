@@ -8,6 +8,7 @@ use std::any::Any;
 use bitflags::bitflags;
 
 use crate::error::{ErrorCode, Result};
+use crate::vdbe::mem::format_real_sqlite;
 
 // ============================================================================
 // Numeric Type Aliases
@@ -137,27 +138,7 @@ impl Value {
         match self {
             Value::Null => String::new(),
             Value::Integer(i) => i.to_string(),
-            Value::Real(f) => {
-                // Handle special values first
-                if f.is_nan() {
-                    return "NaN".to_string();
-                }
-                if f.is_infinite() {
-                    return if *f > 0.0 {
-                        "Inf".to_string()
-                    } else {
-                        "-Inf".to_string()
-                    };
-                }
-                // SQLite displays floats with decimal point even for whole numbers
-                // e.g., 1.0 not 1, to distinguish from integers
-                let s = f.to_string();
-                if !s.contains('.') && !s.contains('e') && !s.contains('E') {
-                    format!("{}.0", s)
-                } else {
-                    s
-                }
-            }
+            Value::Real(f) => format_real_sqlite(*f),
             Value::Text(s) => s.clone(),
             Value::Blob(b) => String::from_utf8_lossy(b).into_owned(),
         }
@@ -174,15 +155,7 @@ impl Value {
         match self {
             Value::Null => Vec::new(),
             Value::Integer(i) => i.to_string().into_bytes(),
-            Value::Real(f) => {
-                // Match to_text behavior for consistency
-                let s = f.to_string();
-                if !s.contains('.') && !s.contains('e') && !s.contains('E') {
-                    format!("{}.0", s).into_bytes()
-                } else {
-                    s.into_bytes()
-                }
-            }
+            Value::Real(f) => format_real_sqlite(*f).into_bytes(),
             Value::Text(s) => s.as_bytes().to_vec(),
             Value::Blob(b) => b.clone(),
         }

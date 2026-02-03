@@ -163,8 +163,34 @@ pub fn execute_pragma(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Resul
         "checkpoint_fullfsync" => pragma_checkpoint_fullfsync(conn, pragma),
         "read_uncommitted" => pragma_read_uncommitted(conn, pragma),
         "reverse_unordered_selects" => pragma_reverse_unordered_selects(conn, pragma),
+        // Locking mode: stub - always return "normal"
+        "locking_mode" => Ok(single_text_result("normal".to_string())),
+        // WAL autocheckpoint: stub - return default 1000
+        "wal_autocheckpoint" => Ok(single_int_result(1000)),
+        // Secure delete: stub boolean pragma
+        "secure_delete" => Ok(single_int_result(0)),
+        // Journal size limit: stub - return -1 (no limit)
+        "journal_size_limit" => Ok(single_int_result(-1)),
+        // Data version: stub - return 1
+        "data_version" => Ok(single_int_result(1)),
+        // Max page count: stub
+        "max_page_count" => Ok(single_int_result(1073741823)),
+        // Collation list
+        "collation_list" => {
+            let mut rows = Vec::new();
+            rows.push(vec![Value::Integer(0), Value::Text("BINARY".to_string())]);
+            rows.push(vec![Value::Integer(1), Value::Text("NOCASE".to_string())]);
+            rows.push(vec![Value::Integer(2), Value::Text("RTRIM".to_string())]);
+            Ok(PragmaResult {
+                columns: vec!["seq".to_string(), "name".to_string()],
+                types: vec![ColumnType::Integer, ColumnType::Text],
+                rows,
+            })
+        },
+        // Compile options
+        "compile_options" => Ok(empty_result()),
         // Debug/trace pragmas - no-ops in RustQL but recognized for compatibility
-        "vdbe_trace" => Ok(empty_result()),
+        "vdbe_trace" | "parser_trace" => Ok(empty_result()),
         _ => Err(Error::with_message(
             ErrorCode::Error,
             format!("unknown pragma: {}", pragma.name),

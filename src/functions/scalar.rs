@@ -5,6 +5,7 @@
 
 use crate::error::{Error, Result};
 use crate::types::Value;
+use crate::vdbe::mem::format_real_sqlite;
 
 use super::datetime::{
     func_current_date, func_current_time, func_current_timestamp, func_date, func_datetime,
@@ -540,7 +541,7 @@ pub fn func_length(args: &[Value]) -> Result<Value> {
         Value::Text(s) => Ok(Value::Integer(s.chars().count() as i64)),
         Value::Blob(b) => Ok(Value::Integer(b.len() as i64)),
         Value::Integer(n) => Ok(Value::Integer(n.to_string().len() as i64)),
-        Value::Real(f) => Ok(Value::Integer(f.to_string().len() as i64)),
+        Value::Real(f) => Ok(Value::Integer(format_real_sqlite(*f).len() as i64)),
     }
 }
 
@@ -558,7 +559,7 @@ pub fn func_octet_length(args: &[Value]) -> Result<Value> {
         Value::Text(s) => Ok(Value::Integer(s.len() as i64)),
         Value::Blob(b) => Ok(Value::Integer(b.len() as i64)),
         Value::Integer(n) => Ok(Value::Integer(n.to_string().len() as i64)),
-        Value::Real(f) => Ok(Value::Integer(f.to_string().len() as i64)),
+        Value::Real(f) => Ok(Value::Integer(format_real_sqlite(*f).len() as i64)),
     }
 }
 
@@ -715,16 +716,44 @@ pub fn func_instr(args: &[Value]) -> Result<Value> {
         return Ok(Value::Null);
     }
 
-    let haystack = value_to_string(&args[0]);
-    let needle = value_to_string(&args[1]);
+    // If both args are blobs, do byte-level search
+    let both_blobs = matches!(args[0], Value::Blob(_)) && matches!(args[1], Value::Blob(_));
 
-    match haystack.find(&needle) {
-        Some(pos) => {
-            // Return 1-based character position
-            let char_pos = haystack[..pos].chars().count() + 1;
-            Ok(Value::Integer(char_pos as i64))
+    if both_blobs {
+        // Byte-level search
+        let haystack_bytes = match &args[0] {
+            Value::Blob(b) => b.clone(),
+            other => value_to_string(other).into_bytes(),
+        };
+        let needle_bytes = match &args[1] {
+            Value::Blob(b) => b.clone(),
+            other => value_to_string(other).into_bytes(),
+        };
+
+        if needle_bytes.is_empty() {
+            return Ok(Value::Integer(1));
         }
-        None => Ok(Value::Integer(0)),
+
+        // Find needle in haystack at byte level
+        for i in 0..=haystack_bytes.len().saturating_sub(needle_bytes.len()) {
+            if haystack_bytes[i..].starts_with(&needle_bytes) {
+                return Ok(Value::Integer((i + 1) as i64));
+            }
+        }
+        Ok(Value::Integer(0))
+    } else {
+        // String-level search
+        let haystack = value_to_string(&args[0]);
+        let needle = value_to_string(&args[1]);
+
+        match haystack.find(&needle) {
+            Some(pos) => {
+                // Return 1-based character position
+                let char_pos = haystack[..pos].chars().count() + 1;
+                Ok(Value::Integer(char_pos as i64))
+            }
+            None => Ok(Value::Integer(0)),
+        }
     }
 }
 
@@ -1041,7 +1070,7 @@ pub fn func_hex(args: &[Value]) -> Result<Value> {
         Value::Blob(b) => b.clone(),
         Value::Text(s) => s.as_bytes().to_vec(),
         Value::Integer(n) => n.to_string().as_bytes().to_vec(),
-        Value::Real(f) => f.to_string().as_bytes().to_vec(),
+        Value::Real(f) => format_real_sqlite(*f).as_bytes().to_vec(),
     };
 
     let hex: String = bytes.iter().map(|b| format!("{:02X}", b)).collect();
@@ -1312,7 +1341,7 @@ fn value_to_string(val: &Value) -> String {
     match val {
         Value::Null => String::new(),
         Value::Integer(n) => n.to_string(),
-        Value::Real(f) => f.to_string(),
+        Value::Real(f) => format_real_sqlite(*f),
         Value::Text(s) => s.clone(),
         Value::Blob(b) => String::from_utf8_lossy(b).to_string(),
     }
@@ -2076,7 +2105,7 @@ fn func_concat(args: &[Value]) -> Result<Value> {
         match arg {
             Value::Null => {}
             Value::Integer(n) => result.push_str(&n.to_string()),
-            Value::Real(f) => result.push_str(&f.to_string()),
+            Value::Real(f) => result.push_str(&format_real_sqlite(*f)),
             Value::Text(s) => result.push_str(s),
             Value::Blob(b) => result.push_str(&String::from_utf8_lossy(b)),
         }
@@ -2090,7 +2119,7 @@ fn func_concat_ws(args: &[Value]) -> Result<Value> {
         Value::Null => return Ok(Value::Null),
         Value::Text(s) => s.clone(),
         Value::Integer(n) => n.to_string(),
-        Value::Real(f) => f.to_string(),
+        Value::Real(f) => format_real_sqlite(*f),
         Value::Blob(b) => String::from_utf8_lossy(b).to_string(),
     };
     let mut parts: Vec<String> = Vec::new();
@@ -2098,7 +2127,7 @@ fn func_concat_ws(args: &[Value]) -> Result<Value> {
         match arg {
             Value::Null => {}
             Value::Integer(n) => parts.push(n.to_string()),
-            Value::Real(f) => parts.push(f.to_string()),
+            Value::Real(f) => parts.push(format_real_sqlite(*f)),
             Value::Text(s) => parts.push(s.clone()),
             Value::Blob(b) => parts.push(String::from_utf8_lossy(b).to_string()),
         }
@@ -2138,7 +2167,7 @@ impl Decimal {
                 let digits: Vec<u8> = s.bytes().map(|b| b - b'0').collect();
                 Some(Decimal { is_negative, digits, decimal_point: 0 })
             }
-            Value::Real(f) => Self::from_str(&format!("{}", f)),
+            Value::Real(f) => Self::from_str(&format_real_sqlite(*f)),
             Value::Text(s) => Self::from_str(s),
             Value::Blob(_) => None,
         }

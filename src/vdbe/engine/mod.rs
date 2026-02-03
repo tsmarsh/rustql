@@ -2379,11 +2379,11 @@ impl Vdbe {
                             && table_meta.is_none()
                             && !is_index
                         {
-                            // Use qualified name in error message (SQLite always includes schema prefix)
+                            // Use qualified name in error message
                             let error_name = if schema_name.is_some() {
                                 tname.clone()
                             } else {
-                                format!("main.{}", simple_name)
+                                simple_name.clone()
                             };
                             return Err(Error::with_message(
                                 ErrorCode::Error,
@@ -2774,13 +2774,13 @@ impl Vdbe {
                 if root_page == 0 && !is_virtual {
                     if let Some(ref tname) = table_name {
                         if !table_found {
-                            // Use qualified name in error message (SQLite always includes schema prefix)
+                            // Use qualified name in error message
                             let error_name = if schema_name.is_some() {
                                 tname.clone()
                             } else if let Some(ref sname) = simple_name {
-                                format!("main.{}", sname)
+                                sname.clone()
                             } else {
-                                format!("main.{}", tname)
+                                tname.clone()
                             };
                             return Err(Error::with_message(
                                 ErrorCode::Error,
@@ -6910,15 +6910,18 @@ impl Vdbe {
             Opcode::Cast => {
                 // Cast P1 P2: Convert value in P1 to affinity in P2
                 // P2 is an affinity character: 'A'=BLOB, 'B'=TEXT, 'C'=NUMERIC, 'D'=INTEGER, 'E'=REAL
-                let affinity = match op.p2 as u8 {
-                    b'A' => crate::schema::Affinity::Blob,
-                    b'B' => crate::schema::Affinity::Text,
-                    b'C' => crate::schema::Affinity::Numeric,
-                    b'D' => crate::schema::Affinity::Integer,
-                    b'E' => crate::schema::Affinity::Real,
-                    _ => crate::schema::Affinity::Blob,
-                };
-                self.mem_mut(op.p1).apply_affinity(affinity);
+                if op.p2 as u8 == b'D' {
+                    self.mem_mut(op.p1).cast_to_integer();
+                } else {
+                    let affinity = match op.p2 as u8 {
+                        b'A' => crate::schema::Affinity::Blob,
+                        b'B' => crate::schema::Affinity::Text,
+                        b'C' => crate::schema::Affinity::Numeric,
+                        b'E' => crate::schema::Affinity::Real,
+                        _ => crate::schema::Affinity::Blob,
+                    };
+                    self.mem_mut(op.p1).apply_affinity(affinity);
+                }
             }
 
             Opcode::Affinity => {

@@ -2858,8 +2858,10 @@ impl<'a> Parser<'a> {
             TokenKind::Integer => {
                 let text = token.text(self.source);
                 if text.starts_with("0x") || text.starts_with("0X") {
-                    let value = i64::from_str_radix(&text[2..], 16).map_err(|_| {
-                        Error::with_message(ErrorCode::Error, "invalid hex integer")
+                    // Parse as u64 first, then reinterpret as i64 (two's complement)
+                    // This handles values like 0x8000000000000000 = -9223372036854775808
+                    let value = u64::from_str_radix(&text[2..], 16).map(|u| u as i64).map_err(|_| {
+                        Error::with_message(ErrorCode::Error, format!("hex literal too big: {}", text))
                     })?;
                     Ok(Literal::Integer(value))
                 } else if let Ok(value) = text.parse::<i64>() {

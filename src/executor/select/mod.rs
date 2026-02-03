@@ -5010,7 +5010,7 @@ impl<'s> SelectCompiler<'s> {
                     let qualified_name = if let Some(ref schema) = name.schema {
                         format!("{}.{}", schema, table_name)
                     } else {
-                        format!("main.{}", table_name)
+                        table_name.clone()
                     };
                     return Err(Error::with_message(
                         ErrorCode::Error,
@@ -7300,7 +7300,7 @@ impl<'s> SelectCompiler<'s> {
                                 let error_name = if name.schema.is_some() {
                                     qualified_name.clone()
                                 } else {
-                                    format!("main.{}", table_name)
+                                    table_name.clone()
                                 };
                                 return Err(Error::with_message(
                                     ErrorCode::Error,

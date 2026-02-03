@@ -115,6 +115,113 @@ bitflags::bitflags! {
 }
 
 // ============================================================================
+// Real-to-Text Formatting (SQLite's %!.15g)
+// ============================================================================
+
+/// Format a float value using SQLite's `%!.15g` format:
+/// - 15 significant digits
+/// - Strip trailing zeros
+/// - Always include decimal point (the `!` flag)
+pub fn format_real_sqlite(value: f64) -> String {
+    if !value.is_finite() {
+        return if value.is_nan() {
+            "NaN".to_string()
+        } else if value > 0.0 {
+            "Inf".to_string()
+        } else {
+            "-Inf".to_string()
+        };
+    }
+
+    if value == 0.0 {
+        return "0.0".to_string();
+    }
+
+    let precision: usize = 15;
+    let abs_val = value.abs();
+    let log10 = abs_val.log10().floor() as i32;
+
+    // Use scientific notation if exponent < -4 or exponent >= precision
+    let use_exp = log10 < -4 || log10 >= precision as i32;
+
+    let result = if use_exp {
+        let formatted = format!("{:.*e}", precision - 1, value);
+        // Fix exponent: ensure sign and at least 2 digits
+        let fixed = fix_exponent_fmt(&formatted);
+        strip_trailing_zeros_sci(&fixed)
+    } else {
+        let decimal_places = (precision as i32 - 1 - log10).max(0) as usize;
+        let formatted = format!("{:.*}", decimal_places, value);
+        strip_trailing_zeros_fixed(&formatted)
+    };
+
+    // SQLite's `!` flag: always include decimal point
+    if !result.contains('.') {
+        if let Some(e_pos) = result.find('e').or_else(|| result.find('E')) {
+            // Insert .0 before exponent: "1e+20" → "1.0e+20"
+            format!("{}.0{}", &result[..e_pos], &result[e_pos..])
+        } else {
+            format!("{}.0", result)
+        }
+    } else {
+        result
+    }
+}
+
+/// Fix Rust's scientific notation exponent to match SQLite/C format:
+/// e.g., `1.5e18` → `1.5e+18`, `1.5e-3` → `1.5e-03`
+fn fix_exponent_fmt(s: &str) -> String {
+    if let Some(e_pos) = s.find('e') {
+        let (mantissa, exp_part) = s.split_at(e_pos);
+        let rest = &exp_part[1..]; // skip 'e'
+        let (sign, digits) = if rest.starts_with('-') {
+            ("-", &rest[1..])
+        } else if rest.starts_with('+') {
+            ("+", &rest[1..])
+        } else {
+            ("+", rest)
+        };
+        if digits.len() == 1 {
+            format!("{}e{}0{}", mantissa, sign, digits)
+        } else {
+            format!("{}e{}{}", mantissa, sign, digits)
+        }
+    } else {
+        s.to_string()
+    }
+}
+
+/// Strip trailing zeros from scientific notation, including decimal point if empty
+fn strip_trailing_zeros_sci(s: &str) -> String {
+    if let Some(e_pos) = s.find('e') {
+        let (mantissa, exp) = s.split_at(e_pos);
+        let trimmed = mantissa.trim_end_matches('0');
+        let trimmed = if trimmed.ends_with('.') {
+            &trimmed[..trimmed.len() - 1] // strip decimal point too
+        } else {
+            trimmed
+        };
+        format!("{}{}", trimmed, exp)
+    } else {
+        s.to_string()
+    }
+}
+
+/// Strip trailing zeros from fixed notation, including decimal point if empty
+fn strip_trailing_zeros_fixed(s: &str) -> String {
+    if s.contains('.') {
+        let trimmed = s.trim_end_matches('0');
+        if trimmed.ends_with('.') {
+            trimmed[..trimmed.len() - 1].to_string() // strip decimal point too
+        } else {
+            trimmed.to_string()
+        }
+    } else {
+        s.to_string()
+    }
+}
+
+// ============================================================================
 // Memory Cell
 // ============================================================================
 
@@ -359,13 +466,7 @@ impl Mem {
         } else if self.is_int() {
             self.i.to_string()
         } else if self.is_real() {
-            // SQLite always shows decimal point for real numbers
-            let s = self.r.to_string();
-            if s.contains('.') || s.contains('e') || s.contains('E') {
-                s
-            } else {
-                format!("{}.0", s)
-            }
+            format_real_sqlite(self.r)
         } else if self.is_blob() {
             String::from_utf8_lossy(&self.data).into_owned()
         } else {
@@ -382,13 +483,7 @@ impl Mem {
         } else if self.is_int() {
             self.i.to_string().into_bytes()
         } else if self.is_real() {
-            // SQLite always shows decimal point for real numbers
-            let s = self.r.to_string();
-            if s.contains('.') || s.contains('e') || s.contains('E') {
-                s.into_bytes()
-            } else {
-                format!("{}.0", s).into_bytes()
-            }
+            format_real_sqlite(self.r).into_bytes()
         } else {
             Vec::new()
         }
@@ -445,7 +540,7 @@ impl Mem {
         } else if self.is_int() {
             self.i.to_string()
         } else if self.is_real() {
-            format!("{}", self.r)
+            format_real_sqlite(self.r)
         } else if self.is_str() {
             let s = self.to_str();
             format!("'{}'", s.replace('\'', "''"))
@@ -480,6 +575,43 @@ impl Mem {
         self.data = std::mem::take(&mut other.data);
         self.collation = std::mem::take(&mut other.collation);
         other.set_null();
+    }
+
+    /// Apply explicit CAST to integer (more aggressive than affinity)
+    /// SQLite's CAST extracts leading digits: CAST('0x1234' AS INTEGER) → 0
+    pub fn cast_to_integer(&mut self) {
+        if self.is_real() {
+            self.set_int(self.r as i64);
+        } else if self.is_str() || self.is_blob() {
+            let s = self.to_str();
+            let trimmed = s.trim();
+            if let Ok(i) = trimmed.parse::<i64>() {
+                self.set_int(i);
+            } else if let Ok(r) = trimmed.parse::<f64>() {
+                self.set_int(r as i64);
+            } else {
+                // Extract leading integer portion
+                let bytes = trimmed.as_bytes();
+                let mut start = 0;
+                if !bytes.is_empty() && (bytes[0] == b'+' || bytes[0] == b'-') {
+                    start = 1;
+                }
+                let mut end = start;
+                while end < bytes.len() && bytes[end].is_ascii_digit() {
+                    end += 1;
+                }
+                if end > start {
+                    if let Ok(i) = trimmed[..end].parse::<i64>() {
+                        self.set_int(i);
+                    } else {
+                        self.set_int(0);
+                    }
+                } else {
+                    self.set_int(0);
+                }
+            }
+        }
+        // NULL stays NULL, integer stays integer
     }
 
     /// Apply type affinity
@@ -756,7 +888,7 @@ impl Mem {
                     let other_text = if other.column_type() == ColumnType::Integer {
                         other.i.to_string()
                     } else {
-                        other.r.to_string()
+                        format_real_sqlite(other.r)
                     };
                     return self.to_str().cmp(&other_text);
                 } else if use_numeric_conversion {
@@ -791,7 +923,7 @@ impl Mem {
                     let self_text = if self.column_type() == ColumnType::Integer {
                         self.i.to_string()
                     } else {
-                        self.r.to_string()
+                        format_real_sqlite(self.r)
                     };
                     return self_text.cmp(&other.to_str());
                 } else if use_numeric_conversion {
@@ -935,6 +1067,26 @@ impl fmt::Display for Mem {
 // ============================================================================
 
 impl Mem {
+    /// Classify a value as integer or real for arithmetic purposes.
+    /// SQLite converts text/blob to numeric before arithmetic, preferring integer.
+    /// Returns (is_integer, int_value, real_value).
+    fn arithmetic_numeric(&self) -> (bool, i64, f64) {
+        if self.is_int() {
+            (true, self.i, self.i as f64)
+        } else if self.is_real() {
+            (false, self.r as i64, self.r)
+        } else {
+            // Text or blob: convert to real, then check if exactly an integer
+            let r = self.to_real();
+            let i = r as i64;
+            if (i as f64) == r && r >= i64::MIN as f64 && r < (i64::MAX as f64) {
+                (true, i, r)
+            } else {
+                (false, i, r)
+            }
+        }
+    }
+
     /// Add two memory cells, storing result in self
     /// On integer overflow, SQLite converts to float
     pub fn add(&mut self, other: &Mem) -> Result<()> {
@@ -943,15 +1095,17 @@ impl Mem {
             return Ok(());
         }
 
-        if self.is_int() && other.is_int() {
-            if let Some(result) = self.i.checked_add(other.i) {
+        let (a_int, a_i, a_r) = self.arithmetic_numeric();
+        let (b_int, b_i, b_r) = other.arithmetic_numeric();
+
+        if a_int && b_int {
+            if let Some(result) = a_i.checked_add(b_i) {
                 self.set_int(result);
             } else {
-                // Integer overflow - convert to float like SQLite does
-                self.set_real(self.to_real() + other.to_real());
+                self.set_real(a_r + b_r);
             }
         } else {
-            self.set_real(self.to_real() + other.to_real());
+            self.set_real(a_r + b_r);
         }
         Ok(())
     }
@@ -964,15 +1118,17 @@ impl Mem {
             return Ok(());
         }
 
-        if self.is_int() && other.is_int() {
-            if let Some(result) = self.i.checked_sub(other.i) {
+        let (a_int, a_i, a_r) = self.arithmetic_numeric();
+        let (b_int, b_i, b_r) = other.arithmetic_numeric();
+
+        if a_int && b_int {
+            if let Some(result) = a_i.checked_sub(b_i) {
                 self.set_int(result);
             } else {
-                // Integer overflow - convert to float like SQLite does
-                self.set_real(self.to_real() - other.to_real());
+                self.set_real(a_r - b_r);
             }
         } else {
-            self.set_real(self.to_real() - other.to_real());
+            self.set_real(a_r - b_r);
         }
         Ok(())
     }
@@ -985,15 +1141,17 @@ impl Mem {
             return Ok(());
         }
 
-        if self.is_int() && other.is_int() {
-            if let Some(result) = self.i.checked_mul(other.i) {
+        let (a_int, a_i, a_r) = self.arithmetic_numeric();
+        let (b_int, b_i, b_r) = other.arithmetic_numeric();
+
+        if a_int && b_int {
+            if let Some(result) = a_i.checked_mul(b_i) {
                 self.set_int(result);
             } else {
-                // Integer overflow - convert to float like SQLite does
-                self.set_real(self.to_real() * other.to_real());
+                self.set_real(a_r * b_r);
             }
         } else {
-            self.set_real(self.to_real() * other.to_real());
+            self.set_real(a_r * b_r);
         }
         Ok(())
     }
@@ -1006,22 +1164,22 @@ impl Mem {
             return Ok(());
         }
 
-        // Integer division when both operands are integers
-        if self.is_int() && other.is_int() {
-            if other.i == 0 {
+        let (a_int, a_i, a_r) = self.arithmetic_numeric();
+        let (b_int, b_i, b_r) = other.arithmetic_numeric();
+
+        if a_int && b_int {
+            if b_i == 0 {
                 self.set_null();
-            } else if self.i == i64::MIN && other.i == -1 {
-                // Overflow case: MIN / -1 would overflow, convert to float like SQLite
-                self.set_real(self.to_real() / other.to_real());
+            } else if a_i == i64::MIN && b_i == -1 {
+                self.set_real(a_r / b_r);
             } else {
-                self.set_int(self.i / other.i);
+                self.set_int(a_i / b_i);
             }
         } else {
-            let divisor = other.to_real();
-            if divisor == 0.0 {
+            if b_r == 0.0 {
                 self.set_null();
             } else {
-                self.set_real(self.to_real() / divisor);
+                self.set_real(a_r / b_r);
             }
         }
         Ok(())
@@ -1034,12 +1192,15 @@ impl Mem {
             return Ok(());
         }
 
-        let a = self.to_int();
-        let b = other.to_int();
+        let (a_int, a_i, _) = self.arithmetic_numeric();
+        let (b_int, b_i, _) = other.arithmetic_numeric();
+
+        // Remainder always uses integer operands in SQLite
+        let a = if a_int { a_i } else { self.to_real() as i64 };
+        let b = if b_int { b_i } else { other.to_real() as i64 };
         if b == 0 {
             self.set_null();
         } else if a == i64::MIN && b == -1 {
-            // Overflow case: MIN % -1 would overflow, but the result is 0
             self.set_int(0);
         } else {
             self.set_int(a % b);

@@ -5,6 +5,7 @@
 
 use crate::error::Result;
 use crate::types::Value;
+use crate::vdbe::mem::format_real_sqlite;
 
 // ============================================================================
 // Aggregate State
@@ -209,7 +210,7 @@ impl AggregateState {
                     match val {
                         Value::Null => {}
                         Value::Integer(n) => data.extend_from_slice(n.to_string().as_bytes()),
-                        Value::Real(f) => data.extend_from_slice(f.to_string().as_bytes()),
+                        Value::Real(f) => data.extend_from_slice(format_real_sqlite(*f).as_bytes()),
                         Value::Text(s) => data.extend_from_slice(s.as_bytes()),
                         Value::Blob(b) => data.extend_from_slice(b),
                     }
@@ -515,7 +516,7 @@ fn value_to_string(val: &Value) -> String {
     match val {
         Value::Null => String::new(),
         Value::Integer(n) => n.to_string(),
-        Value::Real(f) => f.to_string(),
+        Value::Real(f) => format_real_sqlite(*f),
         Value::Text(s) => s.clone(),
         Value::Blob(b) => String::from_utf8_lossy(b).to_string(),
     }

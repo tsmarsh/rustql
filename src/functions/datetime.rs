@@ -393,7 +393,7 @@ impl DateTime {
             self.raw_s = false;
             return;
         }
-        if self.second >= -210_866_760_000.0 && self.second <= 253_402_307_999.0 {
+        if self.second >= -210_866_760_000.0 && self.second <= 253_402_300_799.0 {
             let r = self.second * 1000.0 + JD_UNIX_EPOCH_MS as f64;
             self.clear_ymd_hms_tz();
             self.i_jd = (r + 0.5) as i64;
@@ -415,8 +415,12 @@ impl DateTime {
                         "julianday modifier must be first",
                     ));
                 }
-                if self.valid_jd && self.raw_s {
-                    self.raw_s = false;
+                if self.raw_s {
+                    if self.valid_jd {
+                        self.raw_s = false;
+                    }
+                } else {
+                    self.datetime_error();
                 }
                 return Ok(());
             }

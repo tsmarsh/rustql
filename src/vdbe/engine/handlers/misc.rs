@@ -179,8 +179,14 @@ pub struct CastHandler;
 
 impl OpcodeHandler for CastHandler {
     fn execute(&self, ctx: &mut OpcodeContext, op: &VdbeOp) -> Result<OpcodeResult> {
-        let affinity = affinity_from_char((op.p2 as u8) as char);
-        ctx.mem_mut(op.p1).apply_affinity(affinity);
+        // CAST is more aggressive than affinity for INTEGER:
+        // CAST('0x1234' AS INTEGER) → 0 (extracts leading digits)
+        if op.p2 as u8 == b'D' {
+            ctx.mem_mut(op.p1).cast_to_integer();
+        } else {
+            let affinity = affinity_from_char((op.p2 as u8) as char);
+            ctx.mem_mut(op.p1).apply_affinity(affinity);
+        }
         Ok(OpcodeResult::Continue)
     }
 

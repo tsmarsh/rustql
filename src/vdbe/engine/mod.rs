@@ -10515,26 +10515,34 @@ fn compare_records_with_collations_bignull(
 
         let bignull = sort_bignull.get(i).copied().unwrap_or(false);
 
-        let cmp = match (a_mem, b_mem) {
-            (None, None) => Ordering::Equal,
-            (None, Some(_)) => {
-                if bignull { Ordering::Greater } else { Ordering::Less }
-            }
-            (Some(_), None) => {
-                if bignull { Ordering::Less } else { Ordering::Greater }
-            }
-            (Some(a_val), Some(b_val)) => {
-                let collation_name = sort_collations
-                    .get(i)
-                    .map(|s| s.as_str())
-                    .unwrap_or("BINARY");
-                let custom_fn = collation_fns.get(i).and_then(|opt| opt.as_ref());
+        // Check for NULL values - both None (missing type) and Some(null_mem)
+        let a_is_null = a_mem.as_ref().map_or(true, |m| m.is_null());
+        let b_is_null = b_mem.as_ref().map_or(true, |m| m.is_null());
 
-                if let Some(coll_fn) = custom_fn {
-                    a_val.compare_with_collation_fn(&b_val, collation_name, Some(coll_fn.as_ref()))
-                } else {
-                    a_val.compare_with_collation(&b_val, collation_name)
+        let cmp = if a_is_null || b_is_null {
+            match (a_is_null, b_is_null) {
+                (true, true) => Ordering::Equal,
+                (true, false) => {
+                    if bignull { Ordering::Greater } else { Ordering::Less }
                 }
+                (false, true) => {
+                    if bignull { Ordering::Less } else { Ordering::Greater }
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            let a_val = a_mem.unwrap();
+            let b_val = b_mem.unwrap();
+            let collation_name = sort_collations
+                .get(i)
+                .map(|s| s.as_str())
+                .unwrap_or("BINARY");
+            let custom_fn = collation_fns.get(i).and_then(|opt| opt.as_ref());
+
+            if let Some(coll_fn) = custom_fn {
+                a_val.compare_with_collation_fn(&b_val, collation_name, Some(coll_fn.as_ref()))
+            } else {
+                a_val.compare_with_collation(&b_val, collation_name)
             }
         };
 

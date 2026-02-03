@@ -772,7 +772,105 @@ impl<'s> SelectCompiler<'s> {
         match body {
             SelectBody::Select(core) => self.compile_select_core(core, dest),
             SelectBody::Compound { op, left, right } => {
-                self.compile_compound(*op, left, right, dest)
+                // For deep UNION ALL chains (e.g., VALUES with many rows),
+                // flatten the left-deep tree into an iterative compilation
+                // to avoid stack overflow from deep recursion.
+                if *op == CompoundOp::UnionAll {
+                    let mut bodies = Vec::new();
+                    let mut current = body;
+                    while let SelectBody::Compound {
+                        op: CompoundOp::UnionAll,
+                        left: l,
+                        right: r,
+                    } = current
+                    {
+                        bodies.push(r.as_ref());
+                        current = l.as_ref();
+                    }
+                    bodies.push(current);
+                    bodies.reverse();
+
+                    // If the chain is short enough, use the normal recursive path
+                    if bodies.len() <= 200 {
+                        return self.compile_compound(*op, left, right, dest);
+                    }
+
+                    // Iterative compilation for long UNION ALL chains
+                    self.is_compound = true;
+                    let saved_limit_reg = self.limit_counter_reg.take();
+                    let saved_offset_reg = self.offset_counter_reg.take();
+                    let saved_limit_done = self.limit_done_label.take();
+
+                    let result_cursor = self.alloc_cursor();
+                    self.emit(Opcode::OpenEphemeral, result_cursor, 0, 0, P4::Unused);
+
+                    let eph_dest = SelectDest::EphemTable {
+                        cursor: result_cursor,
+                    };
+
+                    for (i, part) in bodies.iter().enumerate() {
+                        self.tables.clear();
+                        self.outer_tables_boundary = 0;
+                        if i > 0 {
+                            // Keep column names from first body only
+                        } else {
+                            self.result_column_names.clear();
+                        }
+                        match part {
+                            SelectBody::Select(core) => {
+                                self.compile_select_core(core, &eph_dest)?;
+                            }
+                            SelectBody::Compound { op: inner_op, left: l, right: r } => {
+                                self.compile_compound(*inner_op, l, r, &eph_dest)?;
+                            }
+                        }
+                        if i == 0 {
+                            self.compound_column_count = self.result_column_names.len();
+                        }
+                    }
+
+                    let saved_column_names = self.result_column_names.clone();
+
+                    // Read back from ephemeral table and output
+                    self.limit_counter_reg = saved_limit_reg;
+                    self.offset_counter_reg = saved_offset_reg;
+                    self.limit_done_label = saved_limit_done;
+
+                    let skip_label = self.alloc_label();
+                    self.emit(Opcode::Rewind, result_cursor, skip_label, 0, P4::Unused);
+                    let loop_label = self.alloc_label();
+                    self.resolve_label(loop_label, self.current_addr());
+
+                    let col_count = self.compound_column_count.max(1);
+                    let out_base_reg = self.alloc_regs(col_count);
+                    for i in 0..col_count {
+                        self.emit(
+                            Opcode::Column,
+                            result_cursor,
+                            i as i32,
+                            out_base_reg + i as i32,
+                            P4::Unused,
+                        );
+                    }
+
+                    let after_output_label = self.alloc_label();
+                    self.output_row_with_limit(dest, out_base_reg, col_count, after_output_label)?;
+                    self.resolve_label(after_output_label, self.current_addr());
+
+                    self.emit(Opcode::Next, result_cursor, loop_label, 0, P4::Unused);
+                    self.resolve_label(skip_label, self.current_addr());
+                    self.emit(Opcode::Close, result_cursor, 0, 0, P4::Unused);
+
+                    self.result_column_names = saved_column_names;
+
+                    if let Some(done_label) = self.limit_done_label {
+                        self.resolve_label(done_label, self.current_addr());
+                    }
+
+                    Ok(())
+                } else {
+                    self.compile_compound(*op, left, right, dest)
+                }
             }
         }
     }
@@ -8500,8 +8598,11 @@ impl<'s> SelectCompiler<'s> {
                             {
                                 if let Some(al) = alias {
                                     if al.to_lowercase() == col_lower {
-                                        // Found alias - recursively get collation from underlying expr
-                                        return self.extract_collation_from_expr(col_expr, body);
+                                        // Found alias - recursively get collation from underlying expr.
+                                        // Pass None for body to prevent treating integer literals
+                                        // in the aliased expression as positional ORDER BY references
+                                        // (e.g., SELECT 1 AS z ... ORDER BY z should not treat 1 as column position).
+                                        return self.extract_collation_from_expr(col_expr, None);
                                     }
                                 }
                             }
@@ -8522,7 +8623,9 @@ impl<'s> SelectCompiler<'s> {
                         match result_col {
                             ResultColumn::Expr { expr: col_expr, .. } => {
                                 if col_pos == idx {
-                                    return self.extract_collation_from_expr(col_expr, body);
+                                    // Pass None for body to prevent infinite recursion
+                                    // when the result expression itself is an integer literal
+                                    return self.extract_collation_from_expr(col_expr, None);
                                 }
                                 col_pos += 1;
                             }
@@ -9372,7 +9475,8 @@ impl<'s> SelectCompiler<'s> {
                     if matches.is_empty() {
                         // Search outer tables in REVERSE order (closest scope first)
                         // to match SQLite's behavior of preferring the nearest enclosing scope
-                        for table_idx in (0..self.outer_tables_boundary).rev() {
+                        let boundary = self.outer_tables_boundary.min(self.tables.len());
+                        for table_idx in (0..boundary).rev() {
                             let tinfo = &self.tables[table_idx];
                             if self.is_column_coalesced(table_idx, &col_lower) {
                                 continue;

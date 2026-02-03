@@ -2870,7 +2870,20 @@ impl<'a> Parser<'a> {
             TokenKind::Blob => {
                 let text = token.text(self.source);
                 // X'...' or x'...'
+                // Must end with closing quote and have even number of hex digits
+                if text.len() < 3 || !text.ends_with('\'') {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        format!("unrecognized token: \"{}\"", text),
+                    ));
+                }
                 let hex = &text[2..text.len() - 1];
+                if hex.len() % 2 != 0 {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        format!("unrecognized token: \"{}\"", text),
+                    ));
+                }
                 let bytes = (0..hex.len())
                     .step_by(2)
                     .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))

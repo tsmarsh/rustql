@@ -1038,14 +1038,20 @@ pub fn func_zeroblob(args: &[Value]) -> Result<Value> {
 
     let n = value_to_i64(&args[0]);
     if n < 0 {
+        // SQLite returns an empty blob for negative zeroblob sizes
+        return Ok(Value::Blob(vec![]));
+    }
+
+    // SQLite's SQLITE_MAX_LENGTH defaults to 1,000,000,000
+    // Return error for oversized requests
+    if n > 999_999_999 {
         return Err(Error::with_message(
-            crate::error::ErrorCode::Error,
-            "zeroblob() size must be non-negative",
+            crate::error::ErrorCode::TooBig,
+            "string or blob too big",
         ));
     }
 
-    // Limit size to prevent memory exhaustion
-    let n = n.min(1_000_000_000) as usize;
+    let n = n as usize;
     Ok(Value::Blob(vec![0u8; n]))
 }
 

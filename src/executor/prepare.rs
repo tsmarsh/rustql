@@ -4093,6 +4093,7 @@ impl<'s> StatementCompiler<'s> {
             Expr::Subquery(q) => Self::select_has_parameters(q),
             Expr::Exists { subquery, .. } => Self::select_has_parameters(subquery),
             Expr::Parens(e) => Self::expr_has_parameters(e),
+            Expr::Vector(exprs) => exprs.iter().any(|e| Self::expr_has_parameters(e)),
             Expr::Raise { .. } => false,
         }
     }
@@ -4479,6 +4480,10 @@ impl<'s> StatementCompiler<'s> {
             }
             Expr::Collate { expr, collation } => {
                 format!("{} COLLATE {}", self.expr_to_sql(expr), collation)
+            }
+            Expr::Vector(exprs) => {
+                let inner: Vec<String> = exprs.iter().map(|e| self.expr_to_sql(e)).collect();
+                format!("({})", inner.join(", "))
             }
             _ => "?".to_string(), // Fallback for any remaining expressions
         }
@@ -6155,6 +6160,11 @@ impl<'s> StatementCompiler<'s> {
                 }
             }
             Expr::Exists { .. } | Expr::Subquery(_) => {}
+            Expr::Vector(exprs) => {
+                for e in exprs {
+                    self.collect_expr_columns(e, refs);
+                }
+            }
             Expr::Literal(_) | Expr::Variable(_) | Expr::Raise { .. } => {}
         }
     }

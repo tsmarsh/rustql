@@ -128,6 +128,7 @@ pub fn expr_usage(expr: &Expr, tables: &[(String, Option<String>, u64)]) -> u64 
         }
         Expr::Function(call) => function_usage(call, tables),
         Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => select_usage(subquery, tables),
+        Expr::Vector(exprs) => exprs.iter().fold(0, |mask, e| mask | expr_usage(e, tables)),
     }
 }
 
@@ -470,6 +471,9 @@ pub fn expr_usage_with_columns(
         Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => {
             select_usage_with_columns(subquery, tables)
         }
+        Expr::Vector(exprs) => exprs
+            .iter()
+            .fold(0, |mask, e| mask | expr_usage_with_columns(e, tables)),
     }
 }
 

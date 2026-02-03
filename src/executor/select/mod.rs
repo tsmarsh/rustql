@@ -6550,6 +6550,11 @@ impl<'s> SelectCompiler<'s> {
                 self.collect_columns_from_select(select, columns);
             }
             Expr::Literal(_) | Expr::Variable(_) | Expr::Raise { .. } => {}
+            Expr::Vector(exprs) => {
+                for e in exprs {
+                    self.collect_columns_recursive(e, columns);
+                }
+            }
         }
     }
 

@@ -27,37 +27,8 @@ TEST_DIR := sqlite3/test
 RESULT_DIR := test-results
 TCL_WRAPPER := scripts/run_sqlite_test.tcl
 
-# List of SQLite tests to run (add more as compatibility improves)
-SQLITE_TESTS := \
-	select1 select2 select3 select4 select5 select6 select7 \
-	insert insert2 insert3 \
-	update delete \
-	expr \
-	where where2 where3 \
-	join join2 join3 \
-	subquery \
-	trigger trigger2 \
-	view \
-	index index2 \
-	null \
-	types types2 types3 \
-	cast \
-	coalesce \
-	between \
-	distinct \
-	limit \
-	orderby1 \
-	func func2 func3 \
-	date \
-	printf \
-	like like2 \
-	glob \
-	attach \
-	vacuum \
-	pragma pragma2 \
-	trans trans2 \
-	savepoint \
-	collate1 collate2 collate3
+# Discover all SQLite tests dynamically
+SQLITE_TESTS := $(shell ls $(TEST_DIR)/*.test 2>/dev/null | xargs -n1 basename | sed 's/\.test$$//' | sort)
 
 # Source files for dependency tracking
 RUST_SOURCES := $(shell find src -name '*.rs' 2>/dev/null)

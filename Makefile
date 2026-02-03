@@ -231,7 +231,7 @@ test-report:
 		if [ -f "$$log" ]; then \
 			name=$$(basename "$$log" .log); \
 			pass=$$(grep -cE "^$${name}-.*\.\.\. Ok" "$$log" 2>/dev/null | tr -d '[:space:]'); \
-			total=$$(grep -cE "^$${name}-[0-9]" "$$log" 2>/dev/null | tr -d '[:space:]'); \
+			total=$$(grep -cE "^$${name}-.*\.\.\." "$$log" 2>/dev/null | tr -d '[:space:]'); \
 			pass=$${pass:-0}; \
 			total=$${total:-0}; \
 			if [ "$$total" -gt 0 ] 2>/dev/null; then \
@@ -247,7 +247,7 @@ test-report:
 		if [ -f "$$log" ]; then \
 			name=$$(basename "$$log" .log); \
 			pass=$$(grep -cE "^$${name}-.*\.\.\. Ok" "$$log" 2>/dev/null | tr -d '[:space:]'); \
-			total=$$(grep -cE "^$${name}-[0-9]" "$$log" 2>/dev/null | tr -d '[:space:]'); \
+			total=$$(grep -cE "^$${name}-.*\.\.\." "$$log" 2>/dev/null | tr -d '[:space:]'); \
 			pass=$${pass:-0}; \
 			total=$${total:-0}; \
 			if [ "$$total" -gt 0 ] 2>/dev/null; then \
@@ -276,7 +276,7 @@ pass-rates:
 	for t in $(SQLITE_TESTS); do \
 		if [ -f "$(RESULT_DIR)/$$t.log" ]; then \
 			pass=$$(grep -cE "^$$t-.*\.\.\. Ok$$" "$(RESULT_DIR)/$$t.log" 2>/dev/null | tr -d '[:space:]'); \
-			total=$$(grep -cE "^$$t-[0-9].*\.\.\." "$(RESULT_DIR)/$$t.log" 2>/dev/null | tr -d '[:space:]'); \
+			total=$$(grep -cE "^$$t-.*\.\.\." "$(RESULT_DIR)/$$t.log" 2>/dev/null | tr -d '[:space:]'); \
 			pass=$${pass:-0}; \
 			total=$${total:-0}; \
 			if [ "$$total" -gt 0 ] 2>/dev/null; then \

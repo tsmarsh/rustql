@@ -10383,6 +10383,13 @@ impl<'s> SelectCompiler<'s> {
                 };
                 self.emit(Opcode::Cast, dest_reg, affinity as i32, 0, P4::Unused);
             }
+            Expr::Raise { .. } => {
+                // RAISE() is only valid within trigger programs
+                return Err(Error::with_message(
+                    ErrorCode::Error,
+                    "RAISE() may only be used within a trigger-program".to_string(),
+                ));
+            }
             _ => {
                 // For other expression types, emit NULL as placeholder
                 self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);

@@ -325,16 +325,23 @@ impl<'s> DeleteCompiler<'s> {
             return self.compile_delete_with_limit(delete);
         }
 
+        // Check if we have triggers. When triggers exist, we need to collect
+        // rowids first before deletion to avoid cursor corruption. A trigger
+        // body might delete rows that the main cursor hasn't visited yet.
+        let has_before_triggers = !self.before_triggers.is_empty();
+        let has_after_triggers = !self.after_triggers.is_empty();
+        if has_before_triggers || has_after_triggers {
+            return self.compile_delete_with_triggers(delete);
+        }
+
         // Precompute subqueries that reference the target table BEFORE the loop
         // This ensures stable results even as rows are deleted
         if let Some(where_expr) = &delete.where_clause {
             self.precompute_subqueries(where_expr)?;
         }
 
-        let has_before_triggers = !self.before_triggers.is_empty();
-        let has_after_triggers = !self.after_triggers.is_empty();
-
         // Simple delete - just iterate and delete matching rows
+        // (no triggers, so cursor corruption is not a concern)
         let loop_start_label = self.alloc_label();
         let loop_end_label = self.alloc_label();
 
@@ -536,6 +543,118 @@ impl<'s> DeleteCompiler<'s> {
 
         // Resolve the return label to point to the instruction after all trigger ops
         self.resolve_label(return_label, self.current_addr() as i32);
+        Ok(())
+    }
+
+    /// Compile DELETE when triggers are present using two-pass approach.
+    /// First pass: collect rowids of rows to delete.
+    /// Second pass: delete each row and fire triggers.
+    /// This ensures that if a trigger deletes rows from the same table,
+    /// the cursor doesn't get corrupted and we don't skip or double-process rows.
+    fn compile_delete_with_triggers(&mut self, delete: &DeleteStmt) -> Result<()> {
+        // Precompute subqueries before the loop
+        if let Some(where_expr) = &delete.where_clause {
+            self.precompute_subqueries(where_expr)?;
+        }
+
+        let has_before_triggers = !self.before_triggers.is_empty();
+        let has_after_triggers = !self.after_triggers.is_empty();
+
+        // Create ephemeral table to store rowids to delete
+        let ephemeral_cursor = self.alloc_cursor();
+        self.emit(Opcode::OpenEphemeral, ephemeral_cursor, 1, 0, P4::Unused);
+
+        // Phase 1: Collect rowids
+        let collect_loop_start = self.alloc_label();
+        let collect_loop_end = self.alloc_label();
+
+        self.emit(Opcode::Rewind, self.table_cursor, collect_loop_end, 0, P4::Unused);
+        self.resolve_label(collect_loop_start, self.current_addr() as i32);
+
+        if let Some(where_expr) = &delete.where_clause {
+            self.subquery_counter = 0;
+            let skip_label = self.alloc_label();
+            self.compile_where_check(where_expr, skip_label)?;
+
+            let rowid_reg = self.alloc_reg();
+            self.emit(Opcode::Rowid, self.table_cursor, rowid_reg, 0, P4::Unused);
+            let record_reg = self.alloc_reg();
+            self.emit(Opcode::MakeRecord, rowid_reg, 1, record_reg, P4::Unused);
+            self.emit(Opcode::IdxInsert, ephemeral_cursor, record_reg, 0, P4::Unused);
+
+            self.resolve_label(skip_label, self.current_addr() as i32);
+        } else {
+            let rowid_reg = self.alloc_reg();
+            self.emit(Opcode::Rowid, self.table_cursor, rowid_reg, 0, P4::Unused);
+            let record_reg = self.alloc_reg();
+            self.emit(Opcode::MakeRecord, rowid_reg, 1, record_reg, P4::Unused);
+            self.emit(Opcode::IdxInsert, ephemeral_cursor, record_reg, 0, P4::Unused);
+        }
+
+        self.emit(Opcode::Next, self.table_cursor, collect_loop_start, 0, P4::Unused);
+        self.resolve_label(collect_loop_end, self.current_addr() as i32);
+
+        // Phase 2: Delete rows with triggers
+        let delete_loop_start = self.alloc_label();
+        let delete_loop_end = self.alloc_label();
+
+        // Allocate OLD row registers if needed
+        let old_base_reg = if has_before_triggers || has_after_triggers {
+            let reg = self.alloc_reg();
+            for _ in 1..self.num_columns {
+                self.alloc_reg();
+            }
+            Some(reg)
+        } else {
+            None
+        };
+
+        self.emit(Opcode::Rewind, ephemeral_cursor, delete_loop_end, 0, P4::Unused);
+        self.resolve_label(delete_loop_start, self.current_addr() as i32);
+
+        // Get rowid from ephemeral table
+        let rowid_reg = self.alloc_reg();
+        self.emit(Opcode::Column, ephemeral_cursor, 0, rowid_reg, P4::Unused);
+
+        // Skip if row no longer exists (deleted by trigger)
+        let skip_delete_label = self.alloc_label();
+        self.emit(Opcode::NotExists, self.table_cursor, skip_delete_label, rowid_reg, P4::Unused);
+
+        // Load OLD row
+        if let Some(old_reg) = old_base_reg {
+            self.emit_load_row(old_reg)?;
+        }
+
+        // BEFORE triggers
+        if has_before_triggers {
+            self.emit_before_triggers(&delete.table.name, old_base_reg, rowid_reg)?;
+        }
+
+        // Delete from indexes
+        self.emit_index_deletes(rowid_reg);
+
+        // Delete the row
+        self.emit_with_p5(
+            Opcode::Delete,
+            self.table_cursor,
+            0,
+            0,
+            P4::Table(delete.table.name.clone()),
+            OPFLAG_NCHANGE,
+        );
+
+        // AFTER triggers
+        if has_after_triggers {
+            self.emit_after_triggers(&delete.table.name, old_base_reg, rowid_reg)?;
+        }
+
+        self.resolve_label(skip_delete_label, self.current_addr() as i32);
+        self.emit(Opcode::Next, ephemeral_cursor, delete_loop_start, 0, P4::Unused);
+        self.resolve_label(delete_loop_end, self.current_addr() as i32);
+
+        // Close ephemeral cursor
+        self.emit(Opcode::Close, ephemeral_cursor, 0, 0, P4::Unused);
+
         Ok(())
     }
 

@@ -9440,6 +9440,14 @@ impl<'s> SelectCompiler<'s> {
                     // If either operand is a column with numeric affinity, use NUMERIC (2)
                     // Otherwise use BLOB (0) for type ordering
                     let cmp_affinity = self.get_comparison_affinity(left, right);
+                    // Get collation for string comparisons (from COLLATE or column definition)
+                    let cmp_collation = self.get_comparison_collation(left, right);
+                    // Build P4 based on collation availability
+                    let cmp_p4 = if let Some(ref coll) = cmp_collation {
+                        P4::Collation(coll.clone())
+                    } else {
+                        P4::Unused
+                    };
 
                     // Comparison opcodes are jump-based: Eq P1 P2 P3 means
                     // "if r[P1] == r[P3], jump to P2"
@@ -9469,7 +9477,7 @@ impl<'s> SelectCompiler<'s> {
                             right_reg,
                             true_label,
                             left_reg,
-                            P4::Unused,
+                            cmp_p4.clone(),
                             0x80,
                         );
                         self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
@@ -9491,13 +9499,13 @@ impl<'s> SelectCompiler<'s> {
                         // Compare: if condition is true, jump to true_label
                         // Comparison opcode format: P1=right operand, P2=jump target, P3=left operand
                         // Lt P1 P2 P3 means "jump to P2 if r[P3] < r[P1]"
-                        // P5 contains affinity for type coercion
+                        // P4 contains collation, P5 contains affinity for type coercion
                         self.emit_with_p5(
                             cmp_opcode,
                             right_reg,
                             true_label,
                             left_reg,
-                            P4::Unused,
+                            cmp_p4,
                             cmp_affinity,
                         );
 

@@ -5239,9 +5239,13 @@ impl<'s> StatementCompiler<'s> {
 
         let base_reg = 1;
         for (i, detail) in details.iter().enumerate() {
+            // IDs start from 2 to avoid collision with parent=0 (the virtual root).
+            // SQLite uses selectid*N+table_idx which is always >= 2.
+            // If id==0 and parent==0, the TCL append_graph helper enters an
+            // infinite recursion because node 0 becomes its own child.
             ops.push(Self::make_op(
                 Opcode::Integer,
-                i as i32,
+                (i as i32) + 2,
                 base_reg,
                 0,
                 P4::Unused,

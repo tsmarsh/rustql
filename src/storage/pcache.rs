@@ -100,6 +100,16 @@ impl PCache {
         self.n_ref_sum = 0;
     }
 
+    /// Change the page size. This clears the cache since existing pages
+    /// have the old size.
+    pub fn set_page_size(&mut self, page_size: usize) {
+        if page_size != self.page_size {
+            self.close();
+            self.page_size = page_size;
+            self.cache = Box::new(PCache1::new(page_size, self.extra_size, self.purgeable));
+        }
+    }
+
     pub fn set_cache_size(&mut self, n_cache_size: i32) {
         self.cache_size = n_cache_size;
         self.cache.set_cache_size(n_cache_size);

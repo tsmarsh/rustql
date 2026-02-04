@@ -656,6 +656,23 @@ impl Pager {
             let _ = self.rollback();
         }
 
+        // Checkpoint and close WAL if in WAL mode
+        if self.wal.is_some() {
+            // End any active read transaction first
+            if let Some(ref mut wal) = self.wal {
+                let _ = wal.end_read_transaction();
+            }
+            // Checkpoint all WAL data back to the database file
+            // Use Truncate mode to also delete/truncate the WAL file
+            let _ = self.checkpoint(CheckpointMode::Truncate);
+
+            // Now close the WAL
+            if let Some(ref mut wal) = self.wal {
+                let _ = wal.close();
+            }
+        }
+        self.wal = None;
+
         // Release locks
         self.unlock(LockLevel::None)?;
 
@@ -695,12 +712,27 @@ impl Pager {
         if !page_size.is_power_of_two() {
             return Err(Error::new(ErrorCode::Misuse));
         }
-        if self.state != PagerState::Open {
+
+        // In SQLite, page size can be changed on a new database before any
+        // real content is written. We allow it in:
+        //   - Open state (no lock)
+        //   - Reader state when db has only the initial empty page (db_size <= 1
+        //     and not in WAL mode, since WAL may contain more pages)
+        //   - Writer state if the database is still fresh (db_file_size == 0)
+        let is_fresh_db = self.db_size <= 1 && self.db_file_size <= 1 && !self.is_wal_mode();
+        if self.state != PagerState::Open
+            && !(self.state == PagerState::Reader && is_fresh_db)
+            && !(self.state >= PagerState::Writer && self.db_file_size == 0)
+        {
             return Err(Error::new(ErrorCode::Misuse));
         }
 
-        self.page_size = page_size;
-        let reserve = reserve.max(0) as u32;
+        if page_size != self.page_size {
+            self.page_size = page_size;
+            // Update page cache to use new page size
+            self.pcache.set_page_size(page_size as usize);
+        }
+        let reserve = if reserve >= 0 { reserve as u32 } else { self.page_size - self.usable_size };
         self.usable_size = page_size - reserve.min(page_size - 480);
         self.tmp_space = vec![0u8; page_size as usize];
 
@@ -813,13 +845,30 @@ impl Pager {
                 }
 
                 if is_new_page {
-                    // New page - read from disk if file is open
-                    if let Some(ref mut fd) = self.fd {
-                        let offset = ((pgno - 1) as i64) * (self.page_size as i64);
-                        let _ = fd.read(&mut page.data, offset);
-                        self.n_read += 1;
+                    // New page - check WAL first, then read from disk
+                    let mut read_from_wal = false;
+                    if self.wal.is_some() {
+                        // Check if page is in the WAL
+                        let frame = {
+                            let wal = self.wal.as_ref().unwrap();
+                            wal.find_frame(pgno).unwrap_or(0)
+                        };
+                        if frame > 0 {
+                            if let Some(ref mut wal) = self.wal {
+                                if wal.read_frame(frame, &mut page.data).is_ok() {
+                                    read_from_wal = true;
+                                }
+                            }
+                        }
                     }
-                    // Update cache with disk data
+                    if !read_from_wal {
+                        if let Some(ref mut fd) = self.fd {
+                            let offset = ((pgno - 1) as i64) * (self.page_size as i64);
+                            let _ = fd.read(&mut page.data, offset);
+                        }
+                    }
+                    self.n_read += 1;
+                    // Update cache with data
                     self.update_cache_page(cache_page, &page.data);
                 } else {
                     // Existing page - copy from cache
@@ -838,12 +887,28 @@ impl Pager {
         // Set pager pointer so Drop can write back dirty pages
         page.pager = Some(self as *mut Pager);
 
-        // Read from disk if file is open and page exists
-        if let Some(ref mut fd) = self.fd {
-            let offset = ((pgno - 1) as i64) * (self.page_size as i64);
-            let _ = fd.read(&mut page.data, offset);
-            self.n_read += 1;
+        // Read from WAL first if in WAL mode, then fall back to disk
+        let mut read_from_wal = false;
+        if self.wal.is_some() {
+            let frame = {
+                let wal = self.wal.as_ref().unwrap();
+                wal.find_frame(pgno).unwrap_or(0)
+            };
+            if frame > 0 {
+                if let Some(ref mut wal) = self.wal {
+                    if wal.read_frame(frame, &mut page.data).is_ok() {
+                        read_from_wal = true;
+                    }
+                }
+            }
         }
+        if !read_from_wal {
+            if let Some(ref mut fd) = self.fd {
+                let offset = ((pgno - 1) as i64) * (self.page_size as i64);
+                let _ = fd.read(&mut page.data, offset);
+            }
+        }
+        self.n_read += 1;
 
         page.n_ref = 1;
         self.n_miss += 1;
@@ -951,8 +1016,20 @@ impl Pager {
             return Ok(());
         }
 
-        // Acquire shared lock on database file
-        self.lock(LockLevel::Shared)?;
+        if self.is_wal_mode() {
+            // WAL mode: begin a read transaction on the WAL
+            if let Some(ref mut wal) = self.wal {
+                wal.begin_read_transaction()?;
+                // In WAL mode, database size may come from WAL header
+                let wal_db_size = wal.db_size();
+                if wal_db_size > 0 {
+                    self.db_size = wal_db_size;
+                }
+            }
+        } else {
+            // Acquire shared lock on database file
+            self.lock(LockLevel::Shared)?;
+        }
 
         // Read database size from file
         if let Some(ref fd) = self.fd {
@@ -979,19 +1056,26 @@ impl Pager {
             self.shared_lock()?;
         }
 
-        // Acquire reserved lock
-        self.lock(LockLevel::Reserved)?;
+        if self.is_wal_mode() {
+            // WAL mode: begin a write transaction on the WAL
+            if let Some(ref mut wal) = self.wal {
+                wal.begin_write_transaction()?;
+            }
+        } else {
+            // Acquire reserved lock
+            self.lock(LockLevel::Reserved)?;
+        }
 
         // Save original database size
         self.db_orig_size = self.db_size;
 
-        // Open the journal file
+        // Open the journal file (skipped in WAL mode)
         self.open_journal()?;
 
         self.state = PagerState::Writer;
 
-        // If exclusive requested, upgrade to exclusive lock
-        if exclusive {
+        // If exclusive requested, upgrade to exclusive lock (non-WAL only)
+        if exclusive && !self.is_wal_mode() {
             self.lock(LockLevel::Exclusive)?;
             self.state = PagerState::WriterLocked;
         }
@@ -999,26 +1083,80 @@ impl Pager {
         Ok(())
     }
 
-    /// Commit phase one - sync journal (sqlite3PagerCommitPhaseOne)
+    /// Commit phase one - sync journal / write WAL frames (sqlite3PagerCommitPhaseOne)
     pub fn commit_phase_one(&mut self, _super_journal: Option<&str>) -> Result<()> {
         if self.state < PagerState::Writer {
             return Ok(());
         }
 
-        // Sync the journal
-        if let Some(ref mut jfd) = self.jfd {
-            jfd.sync(SyncFlags::NORMAL)?;
-        }
+        if self.is_wal_mode() {
+            // WAL mode: collect dirty pages and write them as WAL frames
+            let mut pages: Vec<(Pgno, Vec<u8>)> = Vec::new();
+            let mut current = self.pcache.dirty_list();
+            while let Some(page) = current {
+                unsafe {
+                    let page_ref = page.as_ref();
+                    if !page_ref.flags.contains(PgFlags::DONT_WRITE) {
+                        pages.push((page_ref.pgno, page_ref.data.clone()));
+                        self.n_write += 1;
+                    }
+                    current = page_ref.dirty_next;
+                }
+            }
 
-        // Acquire exclusive lock
-        self.lock(LockLevel::Exclusive)?;
-        self.state = PagerState::WriterLocked;
+            if !pages.is_empty() {
+                let page_size = self.page_size;
+                let db_size = self.db_size;
+                let sync_flags = if self.no_sync {
+                    SyncFlags::empty()
+                } else {
+                    SyncFlags::NORMAL
+                };
+                // Build reference slice for write_frames
+                let page_refs: Vec<(Pgno, &[u8])> =
+                    pages.iter().map(|(pgno, data)| (*pgno, data.as_slice())).collect();
+                if let Some(ref mut wal) = self.wal {
+                    wal.write_frames(page_size, &page_refs, db_size, true, sync_flags)?;
+                }
+            }
+
+            self.state = PagerState::WriterLocked;
+        } else {
+            // Non-WAL mode: sync the journal
+            if let Some(ref mut jfd) = self.jfd {
+                jfd.sync(SyncFlags::NORMAL)?;
+            }
+
+            // Acquire exclusive lock
+            self.lock(LockLevel::Exclusive)?;
+            self.state = PagerState::WriterLocked;
+        }
 
         Ok(())
     }
 
     /// Commit phase two - write pages and finalize (sqlite3PagerCommitPhaseTwo)
     pub fn commit_phase_two(&mut self) -> Result<()> {
+        if self.is_wal_mode() {
+            // WAL mode: frames were written in phase one; just clean up
+            self.pcache.clean_all();
+            self.savepoints.clear();
+
+            if self.db_size > self.db_file_size {
+                self.db_file_size = self.db_size;
+            }
+
+            // End write transaction on WAL
+            if let Some(ref mut wal) = self.wal {
+                wal.end_write_transaction()?;
+            }
+
+            // In WAL mode, stay in Reader state (don't release read lock)
+            self.state = PagerState::Reader;
+
+            return Ok(());
+        }
+
         if self.state < PagerState::WriterLocked {
             return Ok(());
         }
@@ -1079,6 +1217,27 @@ impl Pager {
     /// Rollback transaction (sqlite3PagerRollback)
     pub fn rollback(&mut self) -> Result<()> {
         if self.state < PagerState::Writer {
+            return Ok(());
+        }
+
+        if self.is_wal_mode() {
+            // WAL mode rollback: undo frames written in this transaction
+            if let Some(ref mut wal) = self.wal {
+                wal.undo(|_pgno| Ok(()))?;
+                wal.end_write_transaction()?;
+            }
+
+            // Clear dirty pages and reload from WAL/disk
+            self.pcache.clean_all();
+
+            // Restore original database size
+            self.db_size = self.db_orig_size;
+
+            self.savepoints.clear();
+
+            // Stay in Reader state in WAL mode
+            self.state = PagerState::Reader;
+
             return Ok(());
         }
 
@@ -1269,7 +1428,14 @@ impl Pager {
     /// Release shared read lock and return to open state.
     pub fn unlock_read(&mut self) -> Result<()> {
         if self.state == PagerState::Reader {
-            self.unlock(LockLevel::None)?;
+            if self.is_wal_mode() {
+                // WAL mode: end read transaction
+                if let Some(ref mut wal) = self.wal {
+                    wal.end_read_transaction()?;
+                }
+            } else {
+                self.unlock(LockLevel::None)?;
+            }
             self.state = PagerState::Open;
         }
         Ok(())
@@ -1286,7 +1452,8 @@ impl Pager {
         }
 
         // In memory mode doesn't need a journal file
-        if self.journal_mode == JournalMode::Off || self.mem_db {
+        // WAL mode uses the WAL file instead of a journal
+        if self.journal_mode == JournalMode::Off || self.journal_mode == JournalMode::Wal || self.mem_db {
             return Ok(());
         }
 

@@ -1437,6 +1437,11 @@ impl SqliteConnection {
             let vfs = FileVfs;
             Btree::open(&vfs, btree_path, None, btree_flags, open_flags)?
         };
+        // Sync page_size and journal_mode from the btree/pager
+        if let Ok(shared) = btree.shared.read() {
+            self.dbs[db_idx].page_size = shared.page_size;
+            self.dbs[db_idx].journal_mode = shared.pager.get_journal_mode();
+        }
         self.dbs[db_idx].btree = Some(btree);
         let mut new_schema = None;
         let btree = self.dbs[db_idx].btree.clone();
@@ -1538,6 +1543,12 @@ pub fn sqlite3_open_v2(
 
         match open_result {
             Ok(btree) => {
+                // Sync page_size and journal_mode from the btree/pager
+                // so the connection-level state matches the on-disk state.
+                if let Ok(shared) = btree.shared.read() {
+                    main_db.page_size = shared.page_size;
+                    main_db.journal_mode = shared.pager.get_journal_mode();
+                }
                 main_db.btree = Some(btree);
                 if let (Some(ref btree), Some(ref schema)) =
                     (main_db.btree.as_ref(), main_db.schema.as_ref())

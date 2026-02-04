@@ -619,7 +619,12 @@ fn pragma_page_size(
     let db = lookup_db_mut(conn, schema_name)?;
     if let Some(value) = pragma_value_i64(pragma) {
         if value > 0 {
-            db.page_size = value as u32;
+            let new_page_size = value as u32;
+            db.page_size = new_page_size;
+            // Propagate page size change to the btree/pager
+            if let Some(ref btree) = db.btree {
+                let _ = btree.set_page_size(new_page_size, -1, false);
+            }
         }
     }
     if pragma.value.is_none() {
@@ -868,6 +873,26 @@ fn pragma_journal_mode(
     if let Some(value) = pragma_value_string(pragma) {
         saw_value = true;
         if let Some(mode) = journal_mode_from_str(&value) {
+            let old_mode = db.journal_mode;
+
+            // When switching to/from WAL mode, we need to actually open/close
+            // WAL on the pager via the btree.
+            if let Some(ref btree) = db.btree {
+                // If switching to WAL mode, commit any pending transaction first
+                // and delete the journal file, just like SQLite does.
+                if mode == JournalMode::Wal && old_mode != JournalMode::Wal {
+                    // Commit any pending write transaction before switching
+                    let _ = btree.commit();
+                    // Write WAL version bytes and commit, then open WAL mode
+                    let _ = btree.set_wal_version_and_open();
+                } else if mode != JournalMode::Wal && old_mode == JournalMode::Wal {
+                    // Switching from WAL mode
+                    let _ = btree.close_wal();
+                }
+                // Set the journal mode on the pager
+                let _ = btree.set_journal_mode(mode);
+            }
+
             db.journal_mode = mode;
         }
     }
@@ -922,7 +947,9 @@ fn pragma_auto_vacuum(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Resul
                     AutoVacuum::Full => BTREE_AUTOVACUUM_FULL,
                     AutoVacuum::Incremental => BTREE_AUTOVACUUM_INCR,
                 };
-                btree.set_auto_vacuum(btree_mode)?;
+                // Ignore errors - setting auto_vacuum on an existing database
+                // with data is a no-op (SQLite silently ignores it)
+                let _ = btree.set_auto_vacuum(btree_mode);
             }
         }
         return Ok(empty_result());

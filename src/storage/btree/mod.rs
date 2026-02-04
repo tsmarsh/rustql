@@ -13,7 +13,7 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::schema::Schema;
 use crate::shared_cache;
 use crate::storage::pager::{
-    JournalMode, Pager, PagerFlags, PagerGetFlags, PagerOpenFlags, SavepointOp,
+    JournalMode, Pager, PagerFlags, PagerGetFlags, PagerOpenFlags, PagerState, SavepointOp,
 };
 use crate::types::{Connection, LockLevel, OpenFlags, Pgno, RowId, Value, Vfs};
 use crate::util::bitvec::BitVec;
@@ -1168,6 +1168,109 @@ fn load_freelist(shared: &mut BtShared) -> Result<()> {
     Ok(())
 }
 
+/// Initialize page 1 with the SQLite file header and empty sqlite_master btree.
+/// This is used both during new-database creation and when page_size is changed
+/// on a fresh database before any schema is written.
+fn initialize_page1(shared: &mut BtShared) -> Result<()> {
+    shared.pager.db_size = 1;
+    shared.n_page = 1;
+
+    let mut page = shared.pager.get(1, PagerGetFlags::empty())?;
+    let _ = shared.pager.write(&mut page);
+    page.data.fill(0);
+
+    // Write SQLite file header (first 100 bytes)
+    // See https://www.sqlite.org/fileformat.html#the_database_header
+
+    // Magic header string at offset 0-15
+    page.data[0..16].copy_from_slice(b"SQLite format 3\0");
+
+    // Page size at offset 16-17 (big-endian)
+    let ps = if shared.page_size == 65536 {
+        1u16 // 65536 is stored as 1
+    } else {
+        shared.page_size as u16
+    };
+    page.data[16..18].copy_from_slice(&ps.to_be_bytes());
+
+    // File format versions at offset 18-19
+    page.data[18] = 1; // Write version (1 = legacy)
+    page.data[19] = 1; // Read version (1 = legacy)
+
+    // Reserved space at end of each page at offset 20
+    page.data[20] = 0;
+
+    // B-tree payload fractions at offset 21-23 (MUST have these exact values)
+    page.data[21] = 64; // Max embedded payload fraction
+    page.data[22] = 32; // Min embedded payload fraction
+    page.data[23] = 32; // Leaf payload fraction
+
+    // File change counter at offset 24-27
+    page.data[24..28].copy_from_slice(&1u32.to_be_bytes());
+
+    // Database size in pages at offset 28-31
+    page.data[28..32].copy_from_slice(&1u32.to_be_bytes());
+
+    // First freelist trunk page at offset 32-35 (0 = no freelist)
+    page.data[32..36].copy_from_slice(&0u32.to_be_bytes());
+
+    // Total freelist pages at offset 36-39
+    page.data[36..40].copy_from_slice(&0u32.to_be_bytes());
+
+    // Schema cookie at offset 40-43
+    page.data[40..44].copy_from_slice(&0u32.to_be_bytes());
+
+    // Schema format number at offset 44-47 (4 = current format)
+    page.data[44..48].copy_from_slice(&4u32.to_be_bytes());
+
+    // Default page cache size at offset 48-51
+    page.data[48..52].copy_from_slice(&0u32.to_be_bytes());
+
+    // Largest root b-tree page (auto-vacuum) at offset 52-55
+    page.data[52..56].copy_from_slice(&0u32.to_be_bytes());
+
+    // Text encoding at offset 56-59 (1 = UTF-8)
+    page.data[56..60].copy_from_slice(&1u32.to_be_bytes());
+
+    // User version at offset 60-63
+    page.data[60..64].copy_from_slice(&0u32.to_be_bytes());
+
+    // Incremental vacuum mode at offset 64-67
+    page.data[64..68].copy_from_slice(&0u32.to_be_bytes());
+
+    // Application ID at offset 68-71
+    page.data[68..72].copy_from_slice(&0u32.to_be_bytes());
+
+    // Reserved for expansion at offset 72-91 (must be zero)
+    page.data[72..92].fill(0);
+
+    // Version-valid-for number at offset 92-95
+    page.data[92..96].copy_from_slice(&1u32.to_be_bytes());
+
+    // SQLite version number at offset 96-99 (3.45.0 = 3045000)
+    page.data[96..100].copy_from_slice(&3045000u32.to_be_bytes());
+
+    // Write empty leaf btree header at offset 100
+    let header_offset = 100usize;
+    // Leaf page with intkey (for sqlite_master which is a table)
+    page.data[header_offset] =
+        BTREE_PAGEFLAG_LEAF | BTREE_PAGEFLAG_INTKEY | BTREE_PAGEFLAG_LEAFDATA;
+    // First freeblock = 0
+    page.data[header_offset + 1] = 0;
+    page.data[header_offset + 2] = 0;
+    // Number of cells = 0
+    page.data[header_offset + 3] = 0;
+    page.data[header_offset + 4] = 0;
+    // Cell content offset = usable_size (end of page)
+    let cell_offset = shared.usable_size as u16;
+    page.data[header_offset + 5..header_offset + 7]
+        .copy_from_slice(&cell_offset.to_be_bytes());
+    // Fragmented free bytes = 0
+    page.data[header_offset + 7] = 0;
+
+    Ok(())
+}
+
 /// Update the database header on page 1 before commit.
 /// This ensures the header reflects the current database state for SQLite compatibility.
 fn update_database_header(shared: &mut BtShared) -> Result<()> {
@@ -1186,8 +1289,25 @@ fn update_database_header(shared: &mut BtShared) -> Result<()> {
     // Bytes 28-31: Database size in pages
     write_u32(&mut page1.data, 28, shared.pager.db_size)?;
 
+    // Bytes 52-55: Auto-vacuum flag
+    let auto_vacuum_value: u32 = if shared.auto_vacuum == BTREE_AUTOVACUUM_NONE { 0 } else { 1 };
+    write_u32(&mut page1.data, 52, auto_vacuum_value)?;
+
+    // Bytes 64-67: Incremental vacuum flag
+    let incr_vacuum_value: u32 = if shared.incr_vacuum != 0 { 1 } else { 0 };
+    write_u32(&mut page1.data, 64, incr_vacuum_value)?;
+
     // Bytes 92-95: Version-valid-for number (should match change counter)
     write_u32(&mut page1.data, 92, change_counter.wrapping_add(1))?;
+
+    // Bytes 18-19: Write/read version for WAL mode
+    if shared.pager.is_wal_mode() {
+        page1.data[18] = 2; // WAL write version
+        page1.data[19] = 2; // WAL read version
+    }
+
+    // Write modified data back to the pager cache
+    shared.pager.write_page_to_cache(&page1);
 
     Ok(())
 }
@@ -3791,6 +3911,27 @@ impl Btree {
                     shared.auto_vacuum = header.auto_vacuum;
                     shared.incr_vacuum = header.incr_vacuum;
 
+                    // Detect WAL mode from database header (read_version == 2)
+                    if header.read_version == 2 {
+                        // Database is in WAL mode - open the WAL file
+                        let _ = shared.pager.open_wal();
+                        // Update database size from WAL (recover may have found
+                        // frames with a larger database size than the db file)
+                        if let Some(ref wal) = shared.pager.wal {
+                            let wal_db_size = wal.db_size();
+                            if wal_db_size > 0 {
+                                shared.pager.db_size = wal_db_size;
+                            }
+                        }
+                        // Clear the page cache so that subsequent reads go through
+                        // the WAL (the pages we read from disk may be stale).
+                        // Also reset pager state to Open so shared_lock can
+                        // properly initialize WAL read transactions.
+                        shared.pager.pcache.clean_all();
+                        shared.pager.pcache.truncate(0);
+                        shared.pager.state = PagerState::Open;
+                    }
+
                     // Load persistent freelist from trunk pages
                     let _ = load_freelist(&mut shared);
                 }
@@ -3807,100 +3948,7 @@ impl Btree {
 
         // For a new database, initialize page 1 with empty sqlite_master btree
         if is_new_db {
-            // Reserve page 1 for the database header and sqlite_master
-            shared.pager.db_size = 1;
-            shared.n_page = 1;
-
-            // Initialize page 1 with database header and empty btree
-            if let Ok(mut page) = shared.pager.get(1, PagerGetFlags::empty()) {
-                let _ = shared.pager.write(&mut page);
-                page.data.fill(0);
-
-                // Write SQLite file header (first 100 bytes)
-                // See https://www.sqlite.org/fileformat.html#the_database_header
-
-                // Magic header string at offset 0-15
-                page.data[0..16].copy_from_slice(b"SQLite format 3\0");
-
-                // Page size at offset 16-17 (big-endian)
-                let ps = shared.page_size as u16;
-                page.data[16..18].copy_from_slice(&ps.to_be_bytes());
-
-                // File format versions at offset 18-19
-                page.data[18] = 1; // Write version (1 = legacy)
-                page.data[19] = 1; // Read version (1 = legacy)
-
-                // Reserved space at end of each page at offset 20
-                page.data[20] = 0;
-
-                // B-tree payload fractions at offset 21-23 (MUST have these exact values)
-                page.data[21] = 64; // Max embedded payload fraction
-                page.data[22] = 32; // Min embedded payload fraction
-                page.data[23] = 32; // Leaf payload fraction
-
-                // File change counter at offset 24-27
-                page.data[24..28].copy_from_slice(&1u32.to_be_bytes());
-
-                // Database size in pages at offset 28-31
-                page.data[28..32].copy_from_slice(&1u32.to_be_bytes());
-
-                // First freelist trunk page at offset 32-35 (0 = no freelist)
-                page.data[32..36].copy_from_slice(&0u32.to_be_bytes());
-
-                // Total freelist pages at offset 36-39
-                page.data[36..40].copy_from_slice(&0u32.to_be_bytes());
-
-                // Schema cookie at offset 40-43
-                page.data[40..44].copy_from_slice(&0u32.to_be_bytes());
-
-                // Schema format number at offset 44-47 (4 = current format)
-                page.data[44..48].copy_from_slice(&4u32.to_be_bytes());
-
-                // Default page cache size at offset 48-51
-                page.data[48..52].copy_from_slice(&0u32.to_be_bytes());
-
-                // Largest root b-tree page (auto-vacuum) at offset 52-55
-                page.data[52..56].copy_from_slice(&0u32.to_be_bytes());
-
-                // Text encoding at offset 56-59 (1 = UTF-8)
-                page.data[56..60].copy_from_slice(&1u32.to_be_bytes());
-
-                // User version at offset 60-63
-                page.data[60..64].copy_from_slice(&0u32.to_be_bytes());
-
-                // Incremental vacuum mode at offset 64-67
-                page.data[64..68].copy_from_slice(&0u32.to_be_bytes());
-
-                // Application ID at offset 68-71
-                page.data[68..72].copy_from_slice(&0u32.to_be_bytes());
-
-                // Reserved for expansion at offset 72-91 (must be zero)
-                page.data[72..92].fill(0);
-
-                // Version-valid-for number at offset 92-95
-                page.data[92..96].copy_from_slice(&1u32.to_be_bytes());
-
-                // SQLite version number at offset 96-99 (3.45.0 = 3045000)
-                page.data[96..100].copy_from_slice(&3045000u32.to_be_bytes());
-
-                // Write empty leaf btree header at offset 100
-                let header_offset = 100usize;
-                // Leaf page with intkey (for sqlite_master which is a table)
-                page.data[header_offset] =
-                    BTREE_PAGEFLAG_LEAF | BTREE_PAGEFLAG_INTKEY | BTREE_PAGEFLAG_LEAFDATA;
-                // First freeblock = 0
-                page.data[header_offset + 1] = 0;
-                page.data[header_offset + 2] = 0;
-                // Number of cells = 0
-                page.data[header_offset + 3] = 0;
-                page.data[header_offset + 4] = 0;
-                // Cell content offset = usable_size (end of page)
-                let cell_offset = shared.usable_size as u16;
-                page.data[header_offset + 5..header_offset + 7]
-                    .copy_from_slice(&cell_offset.to_be_bytes());
-                // Fragmented free bytes = 0
-                page.data[header_offset + 7] = 0;
-            }
+            let _ = initialize_page1(&mut shared);
 
             // Commit the initial database header so it won't be rolled back
             // by subsequent failed operations
@@ -4043,15 +4091,47 @@ impl Btree {
             .shared
             .write()
             .map_err(|_| Error::new(ErrorCode::Internal))?;
+        let old_page_size = shared.page_size;
         shared.pager.set_page_size(page_size, reserve)?;
         shared.page_size = shared.pager.page_size;
         shared.usable_size = shared.pager.usable_size;
+        shared.temp_space = vec![0u8; shared.page_size as usize];
         shared.update_payload_params();
         if reserve >= 0 && reserve <= u8::MAX as i32 {
             shared.reserve_wanted = reserve as u8;
         }
         if fix {
             shared.bts_flags.insert(BtsFlags::PAGESIZE_FIXED);
+        }
+        // If page size actually changed on a fresh database (only page 1 with
+        // empty sqlite_master), reinitialize page 1 at the new size and commit.
+        // This ensures the on-disk file matches the new page size.
+        if shared.page_size != old_page_size && shared.n_page <= 1 {
+            shared.page1 = None; // Clear stale page1 reference
+            let _ = initialize_page1(&mut shared);
+            let _ = shared.pager.commit_phase_one(None);
+            let _ = shared.pager.commit_phase_two();
+            // Truncate the file to the new page size (the old file may be larger
+            // because it was written at the old page size)
+            let new_file_size = shared.page_size as i64; // 1 page * new page_size
+            if let Some(ref mut fd) = shared.pager.fd {
+                let _ = fd.truncate(new_file_size);
+            }
+            shared.pager.db_file_size = 1;
+
+            // Rebuild page1 reference at the new page size
+            let page1_limits = PageLimits::for_page1(shared.page_size, shared.usable_size);
+            if let Ok(page) = shared.pager.get(1, PagerGetFlags::empty()) {
+                if let Ok(mem_page) = MemPage::parse_with_shared(
+                    1,
+                    page.data.clone(),
+                    page1_limits,
+                    Some(&shared),
+                ) {
+                    let _ = mem_page.validate_layout(page1_limits);
+                    shared.page1 = Some(mem_page);
+                }
+            }
         }
         Ok(())
     }
@@ -4155,6 +4235,10 @@ impl Btree {
             .shared
             .write()
             .map_err(|_| Error::new(ErrorCode::Internal))?;
+        // Only do commit work if there's an active write transaction
+        if shared.in_transaction == TransState::None {
+            return Ok(());
+        }
         // Run auto-vacuum if enabled (relocates pages before commit)
         auto_vacuum_commit(&mut shared)?;
         // Save freelist to disk before committing
@@ -4171,12 +4255,14 @@ impl Btree {
             .shared
             .write()
             .map_err(|_| Error::new(ErrorCode::Internal))?;
-        shared.pager.commit_phase_two()?;
-        shared.in_transaction = TransState::None;
-        self.in_trans
-            .store(TransState::None as u8, Ordering::SeqCst);
-        drop(shared);
-        self.clear_table_locks();
+        if shared.in_transaction != TransState::None {
+            shared.pager.commit_phase_two()?;
+            shared.in_transaction = TransState::None;
+            self.in_trans
+                .store(TransState::None as u8, Ordering::SeqCst);
+            drop(shared);
+            self.clear_table_locks();
+        }
         Ok(())
     }
 
@@ -5145,9 +5231,97 @@ impl Btree {
         }
 
         // WAL checkpoint would be implemented here
-        // For now, return success with zero frames
-        // Full implementation requires WAL integration (Phase 4)
-        Ok((0, 0))
+        // Perform checkpoint via pager
+        let mut shared = self
+            .shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
+        shared.pager.checkpoint(crate::storage::wal::CheckpointMode::Passive)
+    }
+
+    /// Open WAL mode on this btree (sqlite3BtreeSetVersion)
+    pub fn open_wal(&self) -> Result<()> {
+        let mut shared = self
+            .shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
+        shared.pager.open_wal()
+    }
+
+    /// Write WAL version bytes to page 1 and then open WAL mode.
+    /// This ensures the db file header indicates WAL mode before switching,
+    /// so that other connections can detect WAL mode from the database file.
+    pub fn set_wal_version_and_open(&self) -> Result<()> {
+        let mut shared = self
+            .shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
+
+        // Get page 1 and make all modifications in a single scope
+        // to avoid multiple PgHdr objects for the same page.
+        {
+            let mut page = shared.pager.get(1, PagerGetFlags::empty())?;
+            shared.pager.write(&mut page)?;
+
+            // Write WAL version bytes (18=2, 19=2)
+            page.data[18] = 2; // Write version = WAL
+            page.data[19] = 2; // Read version = WAL
+
+            // Also update change counter and database size (like update_database_header)
+            let change_counter = u32::from_be_bytes([
+                page.data[24], page.data[25], page.data[26], page.data[27],
+            ]);
+            let _ = write_u32(&mut page.data, 24, change_counter.wrapping_add(1));
+            let _ = write_u32(&mut page.data, 28, shared.pager.db_size);
+            let auto_vacuum_value: u32 = if shared.auto_vacuum == BTREE_AUTOVACUUM_NONE { 0 } else { 1 };
+            let _ = write_u32(&mut page.data, 52, auto_vacuum_value);
+            let incr_vacuum_value: u32 = if shared.incr_vacuum != 0 { 1 } else { 0 };
+            let _ = write_u32(&mut page.data, 64, incr_vacuum_value);
+            let _ = write_u32(&mut page.data, 92, change_counter.wrapping_add(1));
+
+            // page is dropped here, writing back to cache via Drop
+        }
+
+        // Update page1 in shared
+        if let Some(ref mut page1) = shared.page1 {
+            if page1.data.len() >= 20 {
+                page1.data[18] = 2;
+                page1.data[19] = 2;
+            }
+        }
+
+        // Commit this change to the db file (using rollback journal)
+        shared.pager.commit_phase_one(None)?;
+        shared.pager.commit_phase_two()?;
+
+        // Now open WAL mode
+        shared.pager.open_wal()
+    }
+
+    /// Close WAL mode and return to rollback journal
+    pub fn close_wal(&self) -> Result<()> {
+        let mut shared = self
+            .shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
+        shared.pager.close_wal()
+    }
+
+    /// Set journal mode on the pager
+    pub fn set_journal_mode(&self, mode: JournalMode) -> Result<JournalMode> {
+        let mut shared = self
+            .shared
+            .write()
+            .map_err(|_| Error::new(ErrorCode::Internal))?;
+        shared.pager.set_journal_mode(mode)
+    }
+
+    /// Get journal mode from the pager
+    pub fn get_journal_mode(&self) -> JournalMode {
+        self.shared
+            .read()
+            .map(|shared| shared.pager.get_journal_mode())
+            .unwrap_or(JournalMode::Delete)
     }
 
     /// sqlite3BtreeGetFilename
@@ -5212,7 +5386,7 @@ impl Btree {
             .write()
             .map_err(|_| Error::new(ErrorCode::Internal))?;
 
-        // Can only set auto-vacuum mode on an empty database
+        // Can only set auto-vacuum mode on an empty database (no user tables)
         if shared.pager.page_count() > 1 {
             return Err(Error::new(ErrorCode::Error));
         }
@@ -5224,12 +5398,15 @@ impl Btree {
         shared.auto_vacuum = mode;
         shared.incr_vacuum = if mode == BTREE_AUTOVACUUM_INCR { 1 } else { 0 };
 
+        // For a fresh database (only page 1 with the header, no user tables),
+        // just set the in-memory flags and update the in-memory page1 copy.
+        // The values will be written to the database file during the next commit
+        // via update_database_header().
+        // Avoid triggering a pager write here because:
+        //   1. It would create a journal file prematurely
+        //   2. It could prevent PRAGMA journal_mode = wal from switching modes
         let auto_vacuum_value = if mode == BTREE_AUTOVACUUM_NONE { 0 } else { 1 };
         let incr_vacuum_value = if mode == BTREE_AUTOVACUUM_INCR { 1 } else { 0 };
-        let mut page = shared.pager.get(1, PagerGetFlags::empty())?;
-        shared.pager.write(&mut page)?;
-        write_u32(&mut page.data, 52, auto_vacuum_value)?;
-        write_u32(&mut page.data, 64, incr_vacuum_value)?;
         if let Some(ref mut page1) = shared.page1 {
             let _ = write_u32(&mut page1.data, 52, auto_vacuum_value);
             let _ = write_u32(&mut page1.data, 64, incr_vacuum_value);

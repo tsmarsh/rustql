@@ -710,7 +710,7 @@ pub struct InsertStmt {
     pub alias: Option<String>,
     pub columns: Option<Vec<String>>,
     pub source: InsertSource,
-    pub on_conflict: Option<OnConflict>,
+    pub on_conflict: Vec<OnConflict>,
     pub returning: Option<Vec<ResultColumn>>,
 }
 
@@ -1439,6 +1439,7 @@ pub struct FunctionCall {
     pub name: String,
     pub args: FunctionArgs,
     pub distinct: bool,
+    pub order_by: Option<Vec<OrderingTerm>>,
     pub filter: Option<Box<Expr>>,
     pub over: Option<Over>,
 }

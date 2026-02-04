@@ -787,6 +787,7 @@ mod tests {
             name: "row_number".to_string(),
             args: FunctionArgs::Star,
             distinct: false,
+            order_by: None,
             filter: None,
             over: Some(Over::Spec(WindowSpec {
                 base: None,
@@ -802,6 +803,7 @@ mod tests {
             name: "count".to_string(),
             args: FunctionArgs::Star,
             distinct: false,
+            order_by: None,
             filter: None,
             over: None,
         });

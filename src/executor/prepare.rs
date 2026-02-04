@@ -997,7 +997,7 @@ impl<'s> StatementCompiler<'s> {
         }
 
         // ON CONFLICT DO UPDATE
-        if let Some(on_conflict) = &insert.on_conflict {
+        for on_conflict in &insert.on_conflict {
             if let ConflictResolution::Update {
                 assignments,
                 where_clause,
@@ -6219,6 +6219,7 @@ impl<'s> StatementCompiler<'s> {
                     name: func.name.clone(),
                     args,
                     distinct: func.distinct,
+                    order_by: func.order_by.clone(),
                     filter: func.filter.clone(),
                     over: func.over.clone(),
                 })

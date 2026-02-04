@@ -167,7 +167,7 @@ impl<'a> Resolver<'a> {
             InsertSource::DefaultValues => {}
         }
 
-        if let Some(conflict) = &mut insert.on_conflict {
+        for conflict in &mut insert.on_conflict {
             if let Some(where_clause) = conflict
                 .target
                 .as_mut()

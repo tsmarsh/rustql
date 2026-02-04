@@ -378,7 +378,7 @@ impl<'a> InsertCompiler<'a> {
         }
 
         // Handle conflict action - UPSERT ON CONFLICT DO NOTHING maps to Ignore
-        let conflict_action = if let Some(ref oc) = insert.on_conflict {
+        let conflict_action = if let Some(oc) = insert.on_conflict.first() {
             match oc.action {
                 crate::parser::ast::ConflictResolution::Nothing => ConflictAction::Ignore,
                 crate::parser::ast::ConflictResolution::Update { .. } => {
@@ -4352,7 +4352,7 @@ mod tests {
                 Expr::Literal(Literal::String("Alice".to_string())),
                 Expr::Literal(Literal::Integer(30)),
             ]]),
-            on_conflict: None,
+            on_conflict: Vec::new(),
             returning: None,
         };
 
@@ -4381,7 +4381,7 @@ mod tests {
                 Expr::Literal(Literal::String("Bob".to_string())),
                 Expr::Literal(Literal::Integer(25)),
             ]]),
-            on_conflict: None,
+            on_conflict: Vec::new(),
             returning: None,
         };
 
@@ -4403,7 +4403,7 @@ mod tests {
                 "age".to_string(),
             ]),
             source: InsertSource::DefaultValues,
-            on_conflict: None,
+            on_conflict: Vec::new(),
             returning: None,
         };
 
@@ -4423,7 +4423,7 @@ mod tests {
             alias: None,
             columns: None,
             source: InsertSource::Values(vec![vec![Expr::Literal(Literal::Integer(1))]]),
-            on_conflict: None,
+            on_conflict: Vec::new(),
             returning: None,
         };
 
@@ -4448,7 +4448,7 @@ mod tests {
                 vec![Expr::Literal(Literal::Integer(2))],
                 vec![Expr::Literal(Literal::Integer(3))],
             ]),
-            on_conflict: None,
+            on_conflict: Vec::new(),
             returning: None,
         };
 
@@ -4518,7 +4518,7 @@ mod tests {
             alias: None,
             columns: None,
             source: InsertSource::Select(Box::new(select)),
-            on_conflict: None,
+            on_conflict: Vec::new(),
             returning: None,
         };
 

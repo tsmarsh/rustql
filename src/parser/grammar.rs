@@ -53,6 +53,10 @@ impl<'a> Parser<'a> {
                 if self.check(TokenKind::Transaction) {
                     self.advance();
                 }
+                // Consume optional transaction name (SQLite allows: COMMIT TRANSACTION 'name')
+                if self.check(TokenKind::String) || self.check(TokenKind::Identifier) {
+                    self.advance();
+                }
                 Ok(Stmt::Commit)
             }
             TokenKind::Rollback => self.parse_rollback(),
@@ -717,6 +721,33 @@ impl<'a> Parser<'a> {
             } else {
                 let inner = self.parse_table_ref()?;
                 self.expect(TokenKind::RParen)?;
+                // If there's an alias (AS name), wrap as subquery like SQLite does
+                let alias = self.parse_table_alias()?;
+                if alias.is_some() {
+                    // Convert (t1 JOIN t2) AS alias into SELECT * FROM (t1 JOIN t2) with alias
+                    let inner_from = FromClause {
+                        tables: vec![inner],
+                    };
+                    let body = SelectBody::Select(SelectCore {
+                        distinct: Distinct::All,
+                        columns: vec![ResultColumn::Star],
+                        from: Some(inner_from),
+                        where_clause: None,
+                        group_by: None,
+                        having: None,
+                        window: None,
+                    });
+                    let query = SelectStmt {
+                        with: None,
+                        body,
+                        order_by: None,
+                        limit: None,
+                    };
+                    return Ok(TableRef::Subquery {
+                        query: Box::new(query),
+                        alias,
+                    });
+                }
                 return Ok(TableRef::Parens(Box::new(inner)));
             }
         }
@@ -1009,12 +1040,11 @@ impl<'a> Parser<'a> {
             InsertSource::Select(Box::new(self.parse_select_stmt()?))
         };
 
-        let on_conflict = if self.match_token(TokenKind::On) {
+        let mut on_conflict = Vec::new();
+        while self.match_token(TokenKind::On) {
             self.expect(TokenKind::Conflict)?;
-            Some(self.parse_on_conflict()?)
-        } else {
-            None
-        };
+            on_conflict.push(self.parse_on_conflict()?);
+        }
 
         let returning = self.parse_returning()?;
 
@@ -2173,6 +2203,10 @@ impl<'a> Parser<'a> {
             self.match_token(TokenKind::Savepoint);
             Some(self.expect_identifier()?)
         } else {
+            // Consume optional transaction name (SQLite allows: ROLLBACK TRANSACTION 'name')
+            if self.check(TokenKind::String) || self.check(TokenKind::Identifier) {
+                self.advance();
+            }
             None
         };
 
@@ -2508,6 +2542,39 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_in_expr(&mut self, left: Expr, negated: bool) -> Result<Expr> {
+        // SQLite allows "expr IN tablename" as shorthand for
+        // "expr IN (SELECT * FROM tablename)"
+        if !self.check(TokenKind::LParen) {
+            let name = self.parse_qualified_name()?;
+            let table_ref = TableRef::Table {
+                name: name.clone(),
+                alias: None,
+                indexed_by: None,
+            };
+            let from = FromClause {
+                tables: vec![table_ref],
+            };
+            let query = SelectStmt {
+                with: None,
+                body: SelectBody::Select(SelectCore {
+                    distinct: Distinct::All,
+                    columns: vec![ResultColumn::Star],
+                    from: Some(from),
+                    where_clause: None,
+                    group_by: None,
+                    having: None,
+                    window: None,
+                }),
+                order_by: None,
+                limit: None,
+            };
+            return Ok(Expr::In {
+                expr: Box::new(left),
+                list: InList::Subquery(Box::new(query)),
+                negated,
+            });
+        }
+
         self.expect(TokenKind::LParen)?;
 
         let list = if self.check(TokenKind::Select)
@@ -2744,8 +2811,14 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_primary_expr(&mut self) -> Result<Expr> {
-        // Literals
-        if self.check(TokenKind::Integer)
+        // TRUE/FALSE: treat as identifier if followed by '.' (e.g., false.col)
+        // In SQLite, true/false are identifiers that resolve to 0/1 only
+        // when no column with that name exists.
+        if (self.check(TokenKind::True) || self.check(TokenKind::False))
+            && self.peek_is(TokenKind::Dot)
+        {
+            // Fall through to identifier/column-reference parsing below
+        } else if self.check(TokenKind::Integer)
             || self.check(TokenKind::Float)
             || self.check(TokenKind::String)
             || self.check(TokenKind::Blob)
@@ -3085,6 +3158,14 @@ impl<'a> Parser<'a> {
             FunctionArgs::Exprs(self.parse_expr_list()?)
         };
 
+        // Parse optional ORDER BY inside function call (aggregate ORDER BY, SQLite 3.44+)
+        let order_by = if self.match_token(TokenKind::Order) {
+            self.expect(TokenKind::By)?;
+            Some(self.parse_ordering_terms()?)
+        } else {
+            None
+        };
+
         self.expect(TokenKind::RParen)?;
 
         let filter = if self.match_token(TokenKind::Filter) {
@@ -3112,6 +3193,7 @@ impl<'a> Parser<'a> {
             name,
             args,
             distinct,
+            order_by,
             filter,
             over,
         }))
@@ -3135,6 +3217,10 @@ impl<'a> Parser<'a> {
         } else {
             &self.tokens[self.tokens.len() - 1]
         }
+    }
+
+    fn peek_is(&self, kind: TokenKind) -> bool {
+        self.peek().kind == kind
     }
 
     fn advance(&mut self) {

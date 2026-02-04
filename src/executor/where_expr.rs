@@ -673,6 +673,7 @@ mod tests {
                 source_text: None,
             })]),
             distinct: false,
+            order_by: None,
             filter: Some(Box::new(Expr::Literal(Literal::Integer(1)))),
             over: None,
         });

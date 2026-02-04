@@ -451,6 +451,7 @@ impl<'s> SelectCompiler<'s> {
                     args.iter().map(Self::convert_schema_expr_to_ast).collect(),
                 ),
                 distinct: *distinct,
+                order_by: None,
                 filter: None,
                 over: None,
             }),
@@ -6631,6 +6632,7 @@ impl<'s> SelectCompiler<'s> {
                     name: func.name.clone(),
                     args,
                     distinct: func.distinct,
+                    order_by: func.order_by.clone(),
                     filter: func.filter.clone(),
                     over: func.over.clone(),
                 })
@@ -6731,6 +6733,7 @@ impl<'s> SelectCompiler<'s> {
                     name: func.name.clone(),
                     args,
                     distinct: func.distinct,
+                    order_by: func.order_by.clone(),
                     filter: func.filter.clone(),
                     over: func.over.clone(),
                 })

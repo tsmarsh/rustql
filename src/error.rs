@@ -634,6 +634,9 @@ pub struct Error {
     pub message: Option<String>,
     /// Byte offset in SQL for parse errors
     pub offset: Option<i32>,
+    /// On-error action from trigger RAISE: 1=ROLLBACK, 2=ABORT, 3=FAIL
+    /// Used by the statement executor to determine rollback behavior
+    pub on_error_action: Option<u8>,
 }
 
 impl Error {
@@ -644,6 +647,7 @@ impl Error {
             extended: None,
             message: None,
             offset: None,
+            on_error_action: None,
         }
     }
 
@@ -654,6 +658,7 @@ impl Error {
             extended: None,
             message: Some(msg.into()),
             offset: None,
+            on_error_action: None,
         }
     }
 
@@ -664,6 +669,7 @@ impl Error {
             extended: Some(ext),
             message: None,
             offset: None,
+            on_error_action: None,
         }
     }
 
@@ -674,6 +680,7 @@ impl Error {
             extended: Some(ext),
             message: None,
             offset: None,
+            on_error_action: None,
         }
     }
 
@@ -684,6 +691,7 @@ impl Error {
             extended: None,
             message: Some(msg.into()),
             offset: Some(offset),
+            on_error_action: None,
         }
     }
 
@@ -780,6 +788,7 @@ impl From<std::io::Error> for Error {
             extended,
             message: Some(e.to_string()),
             offset: None,
+            on_error_action: None,
         }
     }
 }

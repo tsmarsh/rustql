@@ -496,6 +496,9 @@ impl<'a> InsertCompiler<'a> {
                     self.emit(Opcode::Goto, 0, done_rowid, 0, P4::Unused);
                     // Value is not NULL - use it as rowid
                     self.resolve_label(skip_newrowid, self.current_addr() as i32);
+                    // MustBeInt: Enforce that IPK values are integers
+                    // P2=0 means error if not convertible (not a jump)
+                    self.emit(Opcode::MustBeInt, temp_reg, 0, 0, P4::Unused);
                     self.emit(Opcode::Copy, temp_reg, rowid_reg, 0, P4::Unused);
                     self.resolve_label(done_rowid, self.current_addr() as i32);
                 } else {

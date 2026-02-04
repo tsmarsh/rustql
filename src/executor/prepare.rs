@@ -4502,7 +4502,14 @@ impl<'s> StatementCompiler<'s> {
     fn stmt_to_sql(&self, stmt: &Stmt) -> String {
         match stmt {
             Stmt::Update(update) => {
-                let mut sql = format!("UPDATE {} SET ", update.table.name);
+                let mut sql = match &update.or_action {
+                    Some(ConflictAction::Replace) => format!("UPDATE OR REPLACE {} SET ", update.table.name),
+                    Some(ConflictAction::Abort) => format!("UPDATE OR ABORT {} SET ", update.table.name),
+                    Some(ConflictAction::Rollback) => format!("UPDATE OR ROLLBACK {} SET ", update.table.name),
+                    Some(ConflictAction::Fail) => format!("UPDATE OR FAIL {} SET ", update.table.name),
+                    Some(ConflictAction::Ignore) => format!("UPDATE OR IGNORE {} SET ", update.table.name),
+                    None => format!("UPDATE {} SET ", update.table.name),
+                };
                 let assignments: Vec<String> = update
                     .assignments
                     .iter()
@@ -4519,7 +4526,14 @@ impl<'s> StatementCompiler<'s> {
                 sql
             }
             Stmt::Insert(insert) => {
-                let mut sql = format!("INSERT INTO {}", insert.table.name);
+                let mut sql = match &insert.or_action {
+                    Some(ConflictAction::Replace) => format!("REPLACE INTO {}", insert.table.name),
+                    Some(ConflictAction::Abort) => format!("INSERT OR ABORT INTO {}", insert.table.name),
+                    Some(ConflictAction::Rollback) => format!("INSERT OR ROLLBACK INTO {}", insert.table.name),
+                    Some(ConflictAction::Fail) => format!("INSERT OR FAIL INTO {}", insert.table.name),
+                    Some(ConflictAction::Ignore) => format!("INSERT OR IGNORE INTO {}", insert.table.name),
+                    None => format!("INSERT INTO {}", insert.table.name),
+                };
                 if let Some(ref cols) = insert.columns {
                     sql.push_str(" (");
                     sql.push_str(&cols.join(", "));

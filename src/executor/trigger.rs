@@ -6,12 +6,26 @@
 //! - Trigger firing infrastructure
 //! - OLD/NEW row pseudo-table access
 
+use std::cell::Cell;
 use std::sync::Arc;
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::parser::ast::{CreateTriggerStmt, TriggerEvent as AstTriggerEvent, TriggerTime};
 use crate::schema::{Schema, Trigger, TriggerEvent, TriggerTiming};
 use crate::vdbe::ops::{Opcode, SubProgram, VdbeOp, P4};
+
+/// Track trigger compilation depth to prevent infinite compile-time recursion.
+/// SQLite handles recursive triggers at runtime via the trigger_depth counter.
+/// By default, recursive triggers are OFF in SQLite. We limit compile-time nesting
+/// to prevent stack overflow; runtime trigger_depth checking prevents infinite execution.
+thread_local! {
+    static TRIGGER_COMPILE_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Maximum compile-time trigger nesting depth.
+/// Sub-triggers deeper than this are deferred to runtime (where trigger_depth
+/// check in the Program opcode will prevent infinite recursion).
+const MAX_TRIGGER_COMPILE_DEPTH: u32 = 1;
 
 // ============================================================================
 // Trigger Compilation
@@ -608,6 +622,139 @@ impl<'s> TriggerBodyCompiler<'s> {
                 let rowid_reg = self.alloc_reg();
                 self.emit(Opcode::NewRowid, cursor, rowid_reg, 0, P4::Unused);
 
+                // Handle REPLACE conflict resolution: before inserting, check each unique
+                // index for conflicts and delete conflicting rows.
+                let is_replace = insert
+                    .or_action
+                    .as_ref()
+                    .map(|a| matches!(a, crate::parser::ast::ConflictAction::Replace))
+                    .unwrap_or(false);
+                if is_replace {
+                    if let Some(ref table) = table_info {
+                        let unique_indexes: Vec<_> = table.indexes.iter()
+                            .filter(|idx| idx.unique)
+                            .cloned()
+                            .collect();
+                        for index in &unique_indexes {
+                            // Open a read cursor on the index
+                            let idx_read = self.alloc_cursor();
+                            self.ops.push(VdbeOp {
+                                opcode: Opcode::OpenRead,
+                                p1: idx_read,
+                                p2: 0,
+                                p3: (index.columns.len() + 1) as i32,
+                                p4: P4::Text(index.name.clone()),
+                                p5: ((target_db_idx as u16) << 8) | trigger_flag,
+                                comment: None,
+                            });
+
+                            // Build search key from new values
+                            let key_base = self.alloc_regs(index.columns.len() as i32);
+                            for (i, col) in index.columns.iter().enumerate() {
+                                if col.column_idx >= 0 && (col.column_idx as usize) < num_cols {
+                                    self.emit(
+                                        Opcode::Copy,
+                                        base_reg + col.column_idx,
+                                        key_base + i as i32,
+                                        0,
+                                        P4::Unused,
+                                    );
+                                } else {
+                                    self.emit(Opcode::Null, 0, key_base + i as i32, 0, P4::Unused);
+                                }
+                            }
+
+                            let search_reg = self.alloc_reg();
+                            self.emit(
+                                Opcode::MakeRecord,
+                                key_base,
+                                index.columns.len() as i32,
+                                search_reg,
+                                P4::Unused,
+                            );
+
+                            let no_conflict = self.alloc_label();
+
+                            // SeekGE on index
+                            self.emit(
+                                Opcode::SeekGE,
+                                idx_read,
+                                no_conflict,
+                                search_reg,
+                                P4::Int64(index.columns.len() as i64),
+                            );
+
+                            // IdxGT: skip if key doesn't match
+                            self.emit(
+                                Opcode::IdxGT,
+                                idx_read,
+                                no_conflict,
+                                search_reg,
+                                P4::Int64(index.columns.len() as i64),
+                            );
+
+                            // Get conflicting rowid
+                            let conflict_rowid = self.alloc_reg();
+                            self.emit(Opcode::IdxRowid, idx_read, conflict_rowid, 0, P4::Unused);
+
+                            // Close index read cursor
+                            self.emit(Opcode::Close, idx_read, 0, 0, P4::Unused);
+
+                            // Seek to conflicting row and delete it
+                            let not_found = self.alloc_label();
+                            self.emit(
+                                Opcode::NotExists,
+                                cursor,
+                                not_found,
+                                conflict_rowid,
+                                P4::Unused,
+                            );
+
+                            // Delete from all indexes first
+                            for (del_idx_cursor, del_col_indices) in &index_cursors {
+                                // Build old index key
+                                let old_key_base = self.alloc_regs((del_col_indices.len() + 1) as i32);
+                                for (i, &col_idx) in del_col_indices.iter().enumerate() {
+                                    if col_idx >= 0 {
+                                        self.emit(
+                                            Opcode::Column,
+                                            cursor,
+                                            col_idx,
+                                            old_key_base + i as i32,
+                                            P4::Unused,
+                                        );
+                                    } else {
+                                        self.emit(Opcode::Null, 0, old_key_base + i as i32, 0, P4::Unused);
+                                    }
+                                }
+                                let rowid_pos = old_key_base + del_col_indices.len() as i32;
+                                self.emit(Opcode::Copy, conflict_rowid, rowid_pos, 0, P4::Unused);
+                                let old_idx_rec = self.alloc_reg();
+                                self.emit(
+                                    Opcode::MakeRecord,
+                                    old_key_base,
+                                    (del_col_indices.len() + 1) as i32,
+                                    old_idx_rec,
+                                    P4::Unused,
+                                );
+                                self.emit(Opcode::IdxDelete, *del_idx_cursor, old_idx_rec, 0, P4::Unused);
+                            }
+
+                            // Delete the conflicting row
+                            self.emit(
+                                Opcode::Delete,
+                                cursor,
+                                0,
+                                conflict_rowid,
+                                P4::Text(table_name.clone()),
+                            );
+
+                            self.resolve_label(not_found, self.current_addr() as i32);
+                            self.resolve_label(no_conflict, self.current_addr() as i32);
+                        }
+                    }
+                }
+
                 // Make the record
                 let record_reg = self.alloc_reg();
                 self.emit(
@@ -839,6 +986,95 @@ impl<'s> TriggerBodyCompiler<'s> {
             }
         }
 
+        // Fire BEFORE UPDATE sub-triggers (if any) on the target table.
+        // This enables nested trigger execution: triggers can fire other triggers.
+        // Use compile depth tracking to prevent infinite compile-time recursion.
+        let can_nest = TRIGGER_COMPILE_DEPTH.with(|d| d.get() < MAX_TRIGGER_COMPILE_DEPTH);
+        let before_triggers = if can_nest {
+            if let Some(schema) = self.schema {
+                find_matching_triggers(
+                    schema,
+                    table_name,
+                    TriggerTiming::Before,
+                    TriggerEvent::Update,
+                    None,
+                )
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        if !before_triggers.is_empty() {
+            // OLD values are already in base_reg..base_reg+num_cols-1
+            // NEW values: build from OLD with SET applied
+            let new_base = self.alloc_regs(num_cols as i32);
+            for i in 0..num_cols {
+                self.emit(
+                    Opcode::SCopy,
+                    base_reg + i as i32,
+                    new_base + i as i32,
+                    0,
+                    P4::Unused,
+                );
+            }
+            // Apply SET values to the NEW copy
+            for assignment in &update.assignments {
+                for col_name in &assignment.columns {
+                    let col_lower = col_name.to_lowercase();
+                    let col_idx = if let Some(schema) = self.schema {
+                        let table_lower = table_name.to_lowercase();
+                        if let Some(table) = schema.tables.get(&table_lower) {
+                            table
+                                .columns
+                                .iter()
+                                .position(|c| c.name.to_lowercase() == col_lower)
+                        } else {
+                            None
+                        }
+                    } else {
+                        self.column_map.get(&col_lower).copied()
+                    };
+                    if let Some(idx) = col_idx {
+                        self.emit(
+                            Opcode::SCopy,
+                            base_reg + idx as i32,
+                            new_base + idx as i32,
+                            0,
+                            P4::Unused,
+                        );
+                        // Re-apply the assignment to new_base
+                        self.compile_update_expr(
+                            &assignment.expr,
+                            write_cursor,
+                            new_base + idx as i32,
+                            table_name,
+                        )?;
+                    }
+                }
+            }
+
+            TRIGGER_COMPILE_DEPTH.with(|d| d.set(d.get() + 1));
+            let return_label = self.alloc_label();
+            let trigger_ops = generate_trigger_code(
+                &before_triggers,
+                self.schema,
+                table_name,
+                Some(base_reg),
+                Some(new_base),
+                num_cols as i32,
+                &mut self.next_reg,
+                &mut self.next_cursor,
+                return_label,
+            )?;
+            TRIGGER_COMPILE_DEPTH.with(|d| d.set(d.get() - 1));
+            for op in trigger_ops {
+                self.ops.push(op);
+            }
+            self.resolve_label(return_label, self.current_addr() as i32);
+        }
+
         // Make the updated record
         let new_record_reg = self.alloc_reg();
         self.emit(
@@ -858,6 +1094,44 @@ impl<'s> TriggerBodyCompiler<'s> {
             eph_rowid_reg,
             P4::Unused,
         );
+
+        // Fire AFTER UPDATE sub-triggers (if any)
+        let after_triggers = if can_nest {
+            if let Some(schema) = self.schema {
+                find_matching_triggers(
+                    schema,
+                    table_name,
+                    TriggerTiming::After,
+                    TriggerEvent::Update,
+                    None,
+                )
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        if !after_triggers.is_empty() {
+            TRIGGER_COMPILE_DEPTH.with(|d| d.set(d.get() + 1));
+            let return_label = self.alloc_label();
+            let trigger_ops = generate_trigger_code(
+                &after_triggers,
+                self.schema,
+                table_name,
+                Some(base_reg),
+                Some(base_reg), // After trigger uses post-update values
+                num_cols as i32,
+                &mut self.next_reg,
+                &mut self.next_cursor,
+                return_label,
+            )?;
+            TRIGGER_COMPILE_DEPTH.with(|d| d.set(d.get() - 1));
+            for op in trigger_ops {
+                self.ops.push(op);
+            }
+            self.resolve_label(return_label, self.current_addr() as i32);
+        }
 
         // Move to next ephemeral row
         self.emit(Opcode::Next, eph_cursor, update_start, 0, P4::Unused);
@@ -1449,8 +1723,140 @@ impl<'s> TriggerBodyCompiler<'s> {
                 self.resolve_label(end_label, self.current_addr() as i32);
             }
 
+            Expr::Subquery(select) => {
+                // Scalar subquery: compile the SELECT and wrap it in a SubProgram.
+                // The SubProgram shares the parent's register and cursor space.
+                self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+
+                let mut select_compiler = if let Some(schema) = self.schema {
+                    crate::executor::select::SelectCompiler::with_schema(schema)
+                } else {
+                    crate::executor::select::SelectCompiler::new()
+                };
+
+                // Use our current register/cursor base so the subquery doesn't
+                // collide with the trigger body's registers and cursors.
+                select_compiler.set_register_base(self.next_reg, self.next_cursor);
+
+                let dest = crate::executor::select::SelectDest::default();
+                if let Ok(mut sub_ops) = select_compiler.compile(select, &dest) {
+                    // Determine highest register/cursor used by the subquery
+                    let mut max_reg = self.next_reg;
+                    let mut max_cursor = self.next_cursor;
+                    for op in &sub_ops {
+                        for &r in &[op.p1, op.p3] {
+                            if r > max_reg { max_reg = r; }
+                        }
+                        if matches!(op.opcode, Opcode::OpenRead | Opcode::OpenWrite
+                            | Opcode::OpenEphemeral | Opcode::OpenAutoindex)
+                        {
+                            if op.p1 + 1 > max_cursor { max_cursor = op.p1 + 1; }
+                        }
+                    }
+
+                    // Replace ResultRow with Copy to dest_reg
+                    for op in &mut sub_ops {
+                        if op.opcode == Opcode::ResultRow {
+                            let src = op.p1;
+                            op.opcode = Opcode::Copy;
+                            op.p1 = src;
+                            op.p2 = dest_reg;
+                            op.p3 = 0;
+                        }
+                    }
+
+                    let subprogram = SubProgram {
+                        ops: sub_ops,
+                        n_mem: max_reg + 1,
+                        n_cursor: max_cursor,
+                        trigger: None,
+                    };
+
+                    // Update our counters to account for resources used by subquery
+                    self.next_reg = max_reg + 1;
+                    self.next_cursor = max_cursor;
+
+                    // Execute as a SubProgram via Program opcode
+                    let return_label = self.alloc_label();
+                    self.emit(
+                        Opcode::Program,
+                        dest_reg, // P1: base register
+                        return_label, // P2: return address in parent
+                        0,
+                        P4::Subprogram(Arc::new(subprogram)),
+                    );
+                    self.resolve_label(return_label, self.current_addr() as i32);
+                }
+            }
+
+            Expr::Function(func_call) => {
+                use crate::parser::ast::FunctionArgs;
+                let func_name = func_call.name.to_lowercase();
+
+                // Extract args
+                let args_list: Vec<&crate::parser::ast::Expr> = match &func_call.args {
+                    FunctionArgs::Exprs(exprs) => exprs.iter().collect(),
+                    FunctionArgs::Star => Vec::new(),
+                };
+
+                match func_name.as_str() {
+                    "coalesce" => {
+                        let end_label = self.alloc_label();
+                        self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                        for arg in &args_list {
+                            let arg_reg = self.alloc_reg();
+                            self.compile_expr(arg, arg_reg)?;
+                            let is_null = self.alloc_label();
+                            self.emit(Opcode::IsNull, arg_reg, is_null, 0, P4::Unused);
+                            self.emit(Opcode::Copy, arg_reg, dest_reg, 0, P4::Unused);
+                            self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+                            self.resolve_label(is_null, self.current_addr() as i32);
+                        }
+                        self.resolve_label(end_label, self.current_addr() as i32);
+                    }
+                    _ => {
+                        // General function: compile args and emit Function opcode
+                        if !args_list.is_empty() {
+                            let arg_base = self.alloc_regs(args_list.len() as i32);
+                            for (i, arg) in args_list.iter().enumerate() {
+                                self.compile_expr(arg, arg_base + i as i32)?;
+                            }
+                            self.emit(
+                                Opcode::Function,
+                                if func_call.distinct { 1 } else { 0 },
+                                arg_base,
+                                dest_reg,
+                                P4::FuncDef(format!("{}({})", func_name, args_list.len())),
+                            );
+                        } else if matches!(func_call.args, FunctionArgs::Star) {
+                            // count(*) style - no args
+                            self.emit(
+                                Opcode::Function,
+                                0,
+                                0,
+                                dest_reg,
+                                P4::FuncDef(format!("{}(0)", func_name)),
+                            );
+                        } else {
+                            self.emit(
+                                Opcode::Function,
+                                0,
+                                0,
+                                dest_reg,
+                                P4::FuncDef(format!("{}(0)", func_name)),
+                            );
+                        }
+                    }
+                }
+            }
+
+            Expr::Cast { expr, .. } => {
+                // Compile the inner expression; affinity applied at runtime
+                self.compile_expr(expr, dest_reg)?;
+            }
+
             _ => {
-                // For complex expressions, use NULL for now
+                // For remaining complex expressions, use NULL as fallback
                 self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
             }
         }

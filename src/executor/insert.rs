@@ -26,6 +26,9 @@ fn is_rowid_alias(name: &str) -> bool {
 /// Flag to indicate that this operation should update the change counter
 const OPFLAG_NCHANGE: u16 = 0x01;
 
+/// Flag to indicate that this operation should update the last_insert_rowid
+const OPFLAG_LASTROWID: u16 = 0x20;
+
 /// Shift amount for conflict resolution in P5
 /// OE values are stored in upper byte (bits 8-15) to avoid overlap with OPFLAGS
 const OE_SHIFT: u16 = 8;
@@ -123,6 +126,9 @@ pub struct InsertCompiler<'a> {
 
     /// INSTEAD OF triggers (for views)
     instead_of_triggers: Vec<Arc<Trigger>>,
+
+    /// Whether this is a WITHOUT ROWID table
+    without_rowid: bool,
 }
 
 impl<'a> InsertCompiler<'a> {
@@ -151,6 +157,7 @@ impl<'a> InsertCompiler<'a> {
             skip_row_label: None,
             temp_schema: None,
             instead_of_triggers: Vec::new(),
+            without_rowid: false,
         }
     }
 
@@ -179,6 +186,7 @@ impl<'a> InsertCompiler<'a> {
             skip_row_label: None,
             temp_schema: None,
             instead_of_triggers: Vec::new(),
+            without_rowid: false,
         }
     }
 
@@ -190,6 +198,16 @@ impl<'a> InsertCompiler<'a> {
     /// Set the DQS_DML flag (double-quoted string literals in DML)
     pub fn set_dqs_dml(&mut self, enabled: bool) {
         self.dqs_dml = enabled;
+    }
+
+    /// Return the insert flags for a real table insert.
+    /// Includes OPFLAG_NCHANGE and OPFLAG_LASTROWID (unless WITHOUT ROWID).
+    fn insert_flags(&self) -> u16 {
+        if self.without_rowid {
+            OPFLAG_NCHANGE
+        } else {
+            OPFLAG_NCHANGE | OPFLAG_LASTROWID
+        }
     }
 
     /// Set parameter names for Variable compilation
@@ -254,6 +272,13 @@ impl<'a> InsertCompiler<'a> {
 
         // Store table name for trigger firing
         self.table_name = insert.table.name.clone();
+
+        // Check if this is a WITHOUT ROWID table
+        if let Some(schema) = self.schema {
+            if let Some(table) = schema.tables.get(&table_name_lower) {
+                self.without_rowid = table.without_rowid;
+            }
+        }
 
         // Initialize
         self.emit(Opcode::Init, 0, 0, 0, P4::Unused);
@@ -571,6 +596,9 @@ impl<'a> InsertCompiler<'a> {
             } else {
                 // Regular insert path for tables
 
+                // Check CHECK constraints before inserting
+                self.emit_check_constraints(data_base)?;
+
                 // Handle conflict action (REPLACE deletes conflicting rows)
                 self.emit_conflict_check(conflict_action, data_base, rowid_reg)?;
 
@@ -592,14 +620,14 @@ impl<'a> InsertCompiler<'a> {
 
                 // Insert the record
                 // Use P4::Table for table name (for triggers), conflict flags in upper byte of P5
-                let flags = (self.conflict_flags(conflict_action) as u16) << OE_SHIFT;
+                let flags = (self.effective_ipk_conflict_flags(conflict_action) as u16) << OE_SHIFT;
                 self.emit_with_p5(
                     Opcode::Insert,
                     self.table_cursor,
                     record_reg,
                     rowid_reg,
                     P4::Table(self.table_name.clone()),
-                    OPFLAG_NCHANGE | flags,
+                    self.insert_flags() | flags,
                 );
 
                 // Insert into indexes
@@ -951,6 +979,9 @@ impl<'a> InsertCompiler<'a> {
         } else {
             // Regular insert path for tables
 
+            // Check CHECK constraints before inserting
+            self.emit_check_constraints(data_base)?;
+
             // Handle conflict (REPLACE deletes conflicting rows)
             self.emit_conflict_check(conflict_action, data_base, rowid_reg)?;
 
@@ -971,14 +1002,14 @@ impl<'a> InsertCompiler<'a> {
             );
 
             // Use P4::Table for table name (for triggers), conflict flags in upper byte of P5
-            let flags = (self.conflict_flags(conflict_action) as u16) << OE_SHIFT;
+            let flags = (self.effective_ipk_conflict_flags(conflict_action) as u16) << OE_SHIFT;
             self.emit_with_p5(
                 Opcode::Insert,
                 self.table_cursor,
                 record_reg,
                 rowid_reg,
                 P4::Table(self.table_name.clone()),
-                OPFLAG_NCHANGE | flags,
+                self.insert_flags() | flags,
             );
 
             // Insert into indexes
@@ -1283,6 +1314,9 @@ impl<'a> InsertCompiler<'a> {
         } else {
             // Regular insert path for tables
 
+            // Check CHECK constraints before inserting
+            self.emit_check_constraints(data_base)?;
+
             // Handle conflict (REPLACE deletes conflicting rows)
             self.emit_conflict_check(conflict_action, data_base, rowid_reg)?;
 
@@ -1303,14 +1337,14 @@ impl<'a> InsertCompiler<'a> {
             );
 
             // Use P4::Table for table name (for triggers), conflict flags in upper byte of P5
-            let flags = (self.conflict_flags(conflict_action) as u16) << OE_SHIFT;
+            let flags = (self.effective_ipk_conflict_flags(conflict_action) as u16) << OE_SHIFT;
             self.emit_with_p5(
                 Opcode::Insert,
                 self.table_cursor,
                 record_reg,
                 rowid_reg,
                 P4::Table(self.table_name.clone()),
-                OPFLAG_NCHANGE | flags,
+                self.insert_flags() | flags,
             );
 
             // Insert into indexes
@@ -1798,10 +1832,25 @@ impl<'a> InsertCompiler<'a> {
         let data_base = self.next_reg;
         let _data_regs = self.alloc_regs(self.num_columns);
 
+        // Look up column defaults from schema
+        let table_lower = insert.table.name.to_lowercase();
+        let table_columns: Vec<Option<crate::schema::DefaultValue>> = if let Some(schema) = self.schema {
+            if let Some(table) = schema.tables.get(&table_lower) {
+                table.columns.iter().map(|c| c.default_value.clone()).collect()
+            } else {
+                vec![None; self.num_columns]
+            }
+        } else {
+            vec![None; self.num_columns]
+        };
+
         for i in 0..self.num_columns {
             let reg = data_base + i as i32;
-            // In real implementation, would evaluate column default
-            self.emit(Opcode::Null, 0, reg, 0, P4::Unused);
+            if let Some(Some(default)) = table_columns.get(i) {
+                self.emit_default_value(default, reg)?;
+            } else {
+                self.emit(Opcode::Null, 0, reg, 0, P4::Unused);
+            }
         }
 
         let table_name = insert.table.name.clone();
@@ -1811,6 +1860,9 @@ impl<'a> InsertCompiler<'a> {
             self.emit_instead_of_triggers(&table_name, data_base)?;
         } else {
             // Regular insert path for tables
+
+            // Check CHECK constraints before inserting
+            self.emit_check_constraints(data_base)?;
 
             // Handle conflict (REPLACE deletes conflicting rows)
             self.emit_conflict_check(conflict_action, data_base, rowid_reg)?;
@@ -1832,14 +1884,14 @@ impl<'a> InsertCompiler<'a> {
             );
 
             // Use P4::Table for table name (for triggers), conflict flags in upper byte of P5
-            let flags = (self.conflict_flags(conflict_action) as u16) << OE_SHIFT;
+            let flags = (self.effective_ipk_conflict_flags(conflict_action) as u16) << OE_SHIFT;
             self.emit_with_p5(
                 Opcode::Insert,
                 self.table_cursor,
                 record_reg,
                 rowid_reg,
                 P4::Table(self.table_name.clone()),
-                OPFLAG_NCHANGE | flags,
+                self.insert_flags() | flags,
             );
 
             // Insert into indexes
@@ -2109,6 +2161,12 @@ impl<'a> InsertCompiler<'a> {
         // This handles "UNIQUE ON CONFLICT IGNORE" at the column/table level
         self.emit_ignore_conflict_handling(data_base)?;
 
+        // Check for schema-level REPLACE conflict actions on indexes/columns.
+        // These apply even when the INSERT itself has no explicit OR REPLACE.
+        if action == ConflictAction::Abort || action == ConflictAction::Rollback || action == ConflictAction::Fail {
+            self.emit_schema_replace_conflict_handling(data_base)?;
+        }
+
         match action {
             ConflictAction::Abort => {
                 // Default behavior - abort on constraint violation
@@ -2130,6 +2188,40 @@ impl<'a> InsertCompiler<'a> {
                 self.emit_replace_conflict_handling(data_base)?;
             }
         }
+        Ok(())
+    }
+
+    /// Emit code to handle schema-level REPLACE conflicts for indexes/columns with
+    /// ON CONFLICT REPLACE. These apply when the INSERT has no explicit conflict action
+    /// (e.g. plain INSERT, not INSERT OR REPLACE).
+    fn emit_schema_replace_conflict_handling(&mut self, data_base: i32) -> Result<()> {
+        let schema = match self.schema {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        let table = match schema.tables.get(&self.table_name.to_lowercase()) {
+            Some(t) => t.clone(),
+            None => return Ok(()),
+        };
+
+        // Check for indexes with conflict_action = Replace
+        let replace_indexes: Vec<_> = table
+            .indexes
+            .iter()
+            .filter(|idx| {
+                idx.unique && idx.conflict_action == Some(crate::schema::ConflictAction::Replace)
+            })
+            .cloned()
+            .collect();
+
+        if replace_indexes.is_empty() {
+            return Ok(());
+        }
+
+        // Handle REPLACE for these specific indexes
+        self.emit_replace_conflict_handling(data_base)?;
+
         Ok(())
     }
 
@@ -2952,6 +3044,29 @@ impl<'a> InsertCompiler<'a> {
         }
     }
 
+    /// Get the effective IPK conflict flags, considering schema-level ON CONFLICT.
+    /// If the INSERT has no explicit conflict action (Abort), check the IPK column's
+    /// schema-level ON CONFLICT action.
+    fn effective_ipk_conflict_flags(&self, action: ConflictAction) -> i64 {
+        if action != ConflictAction::Abort {
+            return self.conflict_flags(action);
+        }
+        // Check schema for IPK column ON CONFLICT
+        if let Some(schema) = self.schema {
+            let table_lower = self.table_name.to_lowercase();
+            if let Some(table) = schema.tables.get(&table_lower) {
+                for col in &table.columns {
+                    if col.is_primary_key {
+                        if let Some(ref conflict) = col.unique_conflict {
+                            return self.schema_conflict_flags(conflict.clone());
+                        }
+                    }
+                }
+            }
+        }
+        self.conflict_flags(action)
+    }
+
     /// Get Insert opcode flags for schema conflict action
     /// Must match OE_* constants in vdbe/engine/state.rs
     fn schema_conflict_flags(&self, action: crate::schema::ConflictAction) -> i64 {
@@ -2991,7 +3106,7 @@ impl<'a> InsertCompiler<'a> {
                 self.emit(Opcode::String8, 0, dest_reg, 0, P4::Text(s.clone()));
             }
             DefaultValue::Blob(b) => {
-                self.emit(Opcode::Blob, 0, dest_reg, 0, P4::Blob(b.clone()));
+                self.emit(Opcode::Blob, b.len() as i32, dest_reg, 0, P4::Blob(b.clone()));
             }
             DefaultValue::Expr(_expr) => {
                 // For expression defaults, emit NULL as fallback for now
@@ -3194,6 +3309,456 @@ impl<'a> InsertCompiler<'a> {
             }
         }
         Ok(())
+    }
+
+    // ========================================================================
+    // CHECK constraint methods
+    // ========================================================================
+
+    /// Emit CHECK constraint verification code.
+    /// Called after loading column values into registers but before the INSERT.
+    /// data_base: register containing first column value
+    fn emit_check_constraints(&mut self, data_base: i32) -> Result<()> {
+        let schema = match self.schema {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        let table = match schema.tables.get(&self.table_name.to_lowercase()) {
+            Some(t) => t.clone(),
+            None => return Ok(()),
+        };
+
+        if table.checks.is_empty() {
+            return Ok(());
+        }
+
+        // Build column name -> register mapping
+        let col_map: Vec<(String, i32)> = table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, col)| (col.name.to_lowercase(), data_base + i as i32))
+            .collect();
+
+        for (check_expr, check_text) in &table.checks {
+            let result_reg = self.alloc_reg();
+            self.compile_check_expr(check_expr, result_reg, &col_map)?;
+
+            // CHECK passes if result is NULL or truthy (non-zero)
+            let pass_label = self.alloc_label();
+
+            // IsNull: if NULL, skip to pass (NULL does not fail CHECK)
+            self.emit(Opcode::IsNull, result_reg, pass_label, 0, P4::Unused);
+            // If: if truthy (non-zero), skip to pass
+            self.emit(Opcode::If, result_reg, pass_label, 0, P4::Unused);
+
+            // Fall through: result is 0 (false) -> CHECK constraint failed
+            let check_text = if check_text.is_empty() { Self::expr_to_sql(check_expr) } else { check_text.clone() };
+            self.emit(
+                Opcode::Halt,
+                19, // SQLITE_CONSTRAINT
+                2,  // OE_ABORT
+                0,
+                P4::Text(format!("CHECK constraint failed: {}", check_text)),
+            );
+
+            self.resolve_label(pass_label, self.current_addr() as i32);
+        }
+
+        Ok(())
+    }
+
+    /// Compile a CHECK constraint expression (schema::Expr), resolving column
+    /// references to the data registers containing the values being inserted.
+    fn compile_check_expr(
+        &mut self,
+        expr: &crate::schema::Expr,
+        dest_reg: i32,
+        col_map: &[(String, i32)],
+    ) -> Result<()> {
+        use crate::schema::{BinaryOp as SBinOp, UnaryOp as SUnOp, Expr as SExpr};
+        match expr {
+            SExpr::Null => {
+                self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+            }
+            SExpr::Integer(n) => {
+                if *n >= i32::MIN as i64 && *n <= i32::MAX as i64 {
+                    self.emit(Opcode::Integer, *n as i32, dest_reg, 0, P4::Unused);
+                } else {
+                    self.emit(Opcode::Int64, 0, dest_reg, 0, P4::Int64(*n));
+                }
+            }
+            SExpr::Real(f) => {
+                self.emit(Opcode::Real, 0, dest_reg, 0, P4::Real(*f));
+            }
+            SExpr::String(s) => {
+                self.emit(Opcode::String8, 0, dest_reg, 0, P4::Text(s.clone()));
+            }
+            SExpr::Blob(b) => {
+                self.emit(
+                    Opcode::Blob,
+                    b.len() as i32,
+                    dest_reg,
+                    0,
+                    P4::Blob(b.clone()),
+                );
+            }
+            SExpr::Column { table: _, column } => {
+                // Resolve column name to data register
+                let col_name = column.to_lowercase();
+                if let Some((_, reg)) = col_map.iter().find(|(name, _)| *name == col_name) {
+                    self.emit(Opcode::Copy, *reg, dest_reg, 0, P4::Unused);
+                } else {
+                    self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                }
+            }
+            SExpr::BinaryOp { left, op, right } => {
+                let left_reg = self.alloc_reg();
+                let right_reg = self.alloc_reg();
+                self.compile_check_expr(left, left_reg, col_map)?;
+                self.compile_check_expr(right, right_reg, col_map)?;
+
+                match op {
+                    SBinOp::Eq | SBinOp::Ne | SBinOp::Lt | SBinOp::Le
+                    | SBinOp::Gt | SBinOp::Ge | SBinOp::Is | SBinOp::IsNot => {
+                        let is_is = matches!(op, SBinOp::Is | SBinOp::IsNot);
+                        let cmp_opcode = match op {
+                            SBinOp::Eq | SBinOp::Is => Opcode::Eq,
+                            SBinOp::Ne | SBinOp::IsNot => Opcode::Ne,
+                            SBinOp::Lt => Opcode::Lt,
+                            SBinOp::Le => Opcode::Le,
+                            SBinOp::Gt => Opcode::Gt,
+                            SBinOp::Ge => Opcode::Ge,
+                            _ => unreachable!(),
+                        };
+
+                        let collation = Self::extract_check_collation_schema(left, right);
+                        let cmp_p4 = if let Some(ref coll) = collation {
+                            P4::Collation(coll.clone())
+                        } else {
+                            P4::Unused
+                        };
+
+                        let true_label = self.alloc_label();
+                        let end_label = self.alloc_label();
+
+                        if is_is {
+                            self.emit(Opcode::Integer, 0, dest_reg, 0, P4::Unused);
+                            self.emit_with_p5(
+                                cmp_opcode, right_reg, true_label, left_reg, cmp_p4, 0x80,
+                            );
+                            self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+                            self.resolve_label(true_label, self.current_addr() as i32);
+                            self.emit(Opcode::Integer, 1, dest_reg, 0, P4::Unused);
+                            self.resolve_label(end_label, self.current_addr() as i32);
+                        } else {
+                            let null_label = self.alloc_label();
+                            self.emit(Opcode::IsNull, left_reg, null_label, 0, P4::Unused);
+                            self.emit(Opcode::IsNull, right_reg, null_label, 0, P4::Unused);
+                            self.emit(Opcode::Integer, 0, dest_reg, 0, P4::Unused);
+                            self.emit_with_p5(
+                                cmp_opcode, right_reg, true_label, left_reg, cmp_p4, 0,
+                            );
+                            self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+                            self.resolve_label(true_label, self.current_addr() as i32);
+                            self.emit(Opcode::Integer, 1, dest_reg, 0, P4::Unused);
+                            self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+                            self.resolve_label(null_label, self.current_addr() as i32);
+                            self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                            self.resolve_label(end_label, self.current_addr() as i32);
+                        }
+                    }
+                    SBinOp::And => {
+                        let false_label = self.alloc_label();
+                        let end_label = self.alloc_label();
+                        let null_label = self.alloc_label();
+                        self.emit(Opcode::IsNull, left_reg, null_label, 0, P4::Unused);
+                        self.emit(Opcode::IfNot, left_reg, false_label, 0, P4::Unused);
+                        self.emit(Opcode::Copy, right_reg, dest_reg, 0, P4::Unused);
+                        self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+                        self.resolve_label(false_label, self.current_addr() as i32);
+                        self.emit(Opcode::Integer, 0, dest_reg, 0, P4::Unused);
+                        self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+                        self.resolve_label(null_label, self.current_addr() as i32);
+                        self.emit(Opcode::IsNull, right_reg, end_label, 0, P4::Unused);
+                        self.emit(Opcode::IfNot, right_reg, false_label, 0, P4::Unused);
+                        self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                        self.resolve_label(end_label, self.current_addr() as i32);
+                    }
+                    SBinOp::Or => {
+                        let true_label = self.alloc_label();
+                        let end_label = self.alloc_label();
+                        let null_label = self.alloc_label();
+                        self.emit(Opcode::IsNull, left_reg, null_label, 0, P4::Unused);
+                        self.emit(Opcode::If, left_reg, true_label, 0, P4::Unused);
+                        self.emit(Opcode::Copy, right_reg, dest_reg, 0, P4::Unused);
+                        self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+                        self.resolve_label(true_label, self.current_addr() as i32);
+                        self.emit(Opcode::Integer, 1, dest_reg, 0, P4::Unused);
+                        self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+                        self.resolve_label(null_label, self.current_addr() as i32);
+                        self.emit(Opcode::IsNull, right_reg, end_label, 0, P4::Unused);
+                        self.emit(Opcode::If, right_reg, true_label, 0, P4::Unused);
+                        self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                        self.resolve_label(end_label, self.current_addr() as i32);
+                    }
+                    _ => {
+                        let opcode = match op {
+                            SBinOp::Add => Opcode::Add,
+                            SBinOp::Sub => Opcode::Subtract,
+                            SBinOp::Mul => Opcode::Multiply,
+                            SBinOp::Div => Opcode::Divide,
+                            SBinOp::Mod => Opcode::Remainder,
+                            SBinOp::Concat => Opcode::Concat,
+                            SBinOp::BitAnd => Opcode::BitAnd,
+                            SBinOp::BitOr => Opcode::BitOr,
+                            SBinOp::LeftShift => Opcode::ShiftLeft,
+                            SBinOp::RightShift => Opcode::ShiftRight,
+                            _ => Opcode::Add,
+                        };
+                        self.emit(opcode, left_reg, right_reg, dest_reg, P4::Unused);
+                    }
+                }
+            }
+            SExpr::UnaryOp { op, operand } => {
+                self.compile_check_expr(operand, dest_reg, col_map)?;
+                match op {
+                    SUnOp::Neg => {
+                        let zero_reg = self.alloc_reg();
+                        self.emit(Opcode::Integer, 0, zero_reg, 0, P4::Unused);
+                        self.emit(Opcode::Subtract, dest_reg, zero_reg, dest_reg, P4::Unused);
+                    }
+                    SUnOp::Not => {
+                        self.emit(Opcode::Not, dest_reg, dest_reg, 0, P4::Unused);
+                    }
+                    SUnOp::BitNot => {
+                        self.emit(Opcode::BitNot, dest_reg, dest_reg, 0, P4::Unused);
+                    }
+                    SUnOp::Plus => {} // No-op
+                }
+            }
+            SExpr::In { expr, list, negated } => {
+                let expr_reg = self.alloc_reg();
+                self.compile_check_expr(expr, expr_reg, col_map)?;
+                let found_label = self.alloc_label();
+                let end_label = self.alloc_label();
+                for item in list {
+                    let item_reg = self.alloc_reg();
+                    self.compile_check_expr(item, item_reg, col_map)?;
+                    self.emit(Opcode::Eq, item_reg, found_label, expr_reg, P4::Unused);
+                }
+                self.emit(
+                    Opcode::Integer,
+                    if *negated { 1 } else { 0 },
+                    dest_reg, 0, P4::Unused,
+                );
+                self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+                self.resolve_label(found_label, self.current_addr() as i32);
+                self.emit(
+                    Opcode::Integer,
+                    if *negated { 0 } else { 1 },
+                    dest_reg, 0, P4::Unused,
+                );
+                self.resolve_label(end_label, self.current_addr() as i32);
+            }
+            SExpr::IsNull { expr: inner, negated } => {
+                self.compile_check_expr(inner, dest_reg, col_map)?;
+                let true_label = self.alloc_label();
+                let end_label = self.alloc_label();
+                self.emit(Opcode::IsNull, dest_reg, true_label, 0, P4::Unused);
+                self.emit(
+                    Opcode::Integer,
+                    if *negated { 1 } else { 0 },
+                    dest_reg, 0, P4::Unused,
+                );
+                self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+                self.resolve_label(true_label, self.current_addr() as i32);
+                self.emit(
+                    Opcode::Integer,
+                    if *negated { 0 } else { 1 },
+                    dest_reg, 0, P4::Unused,
+                );
+                self.resolve_label(end_label, self.current_addr() as i32);
+            }
+            SExpr::Between { expr, low, high, negated } => {
+                let expr_reg = self.alloc_reg();
+                let low_reg = self.alloc_reg();
+                let high_reg = self.alloc_reg();
+                self.compile_check_expr(expr, expr_reg, col_map)?;
+                self.compile_check_expr(low, low_reg, col_map)?;
+                self.compile_check_expr(high, high_reg, col_map)?;
+                let false_label = self.alloc_label();
+                let end_label = self.alloc_label();
+                self.emit(Opcode::Lt, low_reg, false_label, expr_reg, P4::Unused);
+                self.emit(Opcode::Gt, high_reg, false_label, expr_reg, P4::Unused);
+                self.emit(
+                    Opcode::Integer,
+                    if *negated { 0 } else { 1 },
+                    dest_reg, 0, P4::Unused,
+                );
+                self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
+                self.resolve_label(false_label, self.current_addr() as i32);
+                self.emit(
+                    Opcode::Integer,
+                    if *negated { 1 } else { 0 },
+                    dest_reg, 0, P4::Unused,
+                );
+                self.resolve_label(end_label, self.current_addr() as i32);
+            }
+            SExpr::Collate { expr, .. } => {
+                self.compile_check_expr(expr, dest_reg, col_map)?;
+            }
+            SExpr::Function { name, args, .. } => {
+                let arg_base = self.next_reg;
+                for arg in args {
+                    let reg = self.alloc_reg();
+                    self.compile_check_expr(arg, reg, col_map)?;
+                }
+                self.emit(
+                    Opcode::Function,
+                    args.len() as i32,
+                    arg_base,
+                    dest_reg,
+                    P4::Text(name.clone()),
+                );
+            }
+            SExpr::Cast { expr, type_name } => {
+                self.compile_check_expr(expr, dest_reg, col_map)?;
+                self.emit(
+                    Opcode::Affinity,
+                    dest_reg,
+                    1,
+                    0,
+                    P4::Text(type_name.clone()),
+                );
+            }
+            _ => {
+                // Unsupported expression - default to NULL (which passes CHECK)
+                self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+            }
+        }
+        Ok(())
+    }
+
+    /// Extract COLLATE clause from schema Expr operands
+    fn extract_check_collation_schema(
+        left: &crate::schema::Expr,
+        right: &crate::schema::Expr,
+    ) -> Option<String> {
+        if let crate::schema::Expr::Collate { collation, .. } = left {
+            return Some(collation.clone());
+        }
+        if let crate::schema::Expr::Collate { collation, .. } = right {
+            return Some(collation.clone());
+        }
+        None
+    }
+
+    /// Convert a schema::Expr to SQL text for CHECK constraint error messages
+    fn expr_to_sql(expr: &crate::schema::Expr) -> String {
+        use crate::schema::{BinaryOp as SBinOp, UnaryOp as SUnOp, Expr as SExpr};
+        match expr {
+            SExpr::Null => "NULL".to_string(),
+            SExpr::Integer(n) => n.to_string(),
+            SExpr::Real(f) => format!("{}", f),
+            SExpr::String(s) => format!("'{}'", s),
+            SExpr::Blob(b) => format!("X'{}'", hex::encode(b)),
+            SExpr::Column { table, column } => {
+                if let Some(ref t) = table {
+                    format!("{}.{}", t, column)
+                } else {
+                    column.clone()
+                }
+            }
+            SExpr::BinaryOp { left, op, right } => {
+                let op_str = match op {
+                    SBinOp::Add => "+",
+                    SBinOp::Sub => "-",
+                    SBinOp::Mul => "*",
+                    SBinOp::Div => "/",
+                    SBinOp::Mod => "%",
+                    SBinOp::Eq => "=",
+                    SBinOp::Ne => "<>",
+                    SBinOp::Lt => "<",
+                    SBinOp::Le => "<=",
+                    SBinOp::Gt => ">",
+                    SBinOp::Ge => ">=",
+                    SBinOp::And => " AND ",
+                    SBinOp::Or => " OR ",
+                    SBinOp::Is => " IS ",
+                    SBinOp::IsNot => " IS NOT ",
+                    SBinOp::Concat => "||",
+                    SBinOp::BitAnd => "&",
+                    SBinOp::BitOr => "|",
+                    SBinOp::LeftShift => "<<",
+                    SBinOp::RightShift => ">>",
+                    SBinOp::Glob => " GLOB ",
+                    SBinOp::Match => " MATCH ",
+                    SBinOp::Regexp => " REGEXP ",
+                };
+                // Operators that already have leading/trailing spaces don't need extra.
+                // For comparison and arithmetic operators, add spaces around them
+                // to match SQLite's CHECK error message formatting.
+                let needs_space = !op_str.starts_with(' ') && !op_str.ends_with(' ');
+                if needs_space {
+                    format!("{} {} {}", Self::expr_to_sql(left), op_str, Self::expr_to_sql(right))
+                } else {
+                    format!("{}{}{}", Self::expr_to_sql(left), op_str, Self::expr_to_sql(right))
+                }
+            }
+            SExpr::UnaryOp { op, operand } => {
+                match op {
+                    SUnOp::Neg => format!("-{}", Self::expr_to_sql(operand)),
+                    SUnOp::Not => format!("NOT {}", Self::expr_to_sql(operand)),
+                    SUnOp::BitNot => format!("~{}", Self::expr_to_sql(operand)),
+                    SUnOp::Plus => format!("+{}", Self::expr_to_sql(operand)),
+                }
+            }
+            SExpr::Collate { expr, collation } => {
+                format!("{} COLLATE {}", Self::expr_to_sql(expr), collation)
+            }
+            SExpr::IsNull { expr: inner, negated } => {
+                if *negated {
+                    format!("{} IS NOT NULL", Self::expr_to_sql(inner))
+                } else {
+                    format!("{} IS NULL", Self::expr_to_sql(inner))
+                }
+            }
+            SExpr::Between { expr, low, high, negated } => {
+                if *negated {
+                    format!(
+                        "{} NOT BETWEEN {} AND {}",
+                        Self::expr_to_sql(expr),
+                        Self::expr_to_sql(low),
+                        Self::expr_to_sql(high)
+                    )
+                } else {
+                    format!(
+                        "{} BETWEEN {} AND {}",
+                        Self::expr_to_sql(expr),
+                        Self::expr_to_sql(low),
+                        Self::expr_to_sql(high)
+                    )
+                }
+            }
+            SExpr::In { expr, list, negated } => {
+                let items: Vec<_> = list.iter().map(|e| Self::expr_to_sql(e)).collect();
+                if *negated {
+                    format!("{} NOT IN ({})", Self::expr_to_sql(expr), items.join(","))
+                } else {
+                    format!("{} IN ({})", Self::expr_to_sql(expr), items.join(","))
+                }
+            }
+            SExpr::Function { name, args, .. } => {
+                let parts: Vec<_> = args.iter().map(|e| Self::expr_to_sql(e)).collect();
+                format!("{}({})", name, parts.join(","))
+            }
+            SExpr::Cast { expr, type_name } => {
+                format!("CAST({} AS {})", Self::expr_to_sql(expr), type_name)
+            }
+            _ => "?".to_string(),
+        }
     }
 
     // ========================================================================

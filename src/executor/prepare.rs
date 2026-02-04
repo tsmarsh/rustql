@@ -1937,14 +1937,34 @@ impl<'s> StatementCompiler<'s> {
                         // Add column constraints
                         for constraint in &col.constraints {
                             match &constraint.kind {
-                                ColumnConstraintKind::PrimaryKey { autoincrement, .. } => {
+                                ColumnConstraintKind::PrimaryKey { autoincrement, conflict, .. } => {
                                     col_sql.push_str(" PRIMARY KEY");
+                                    if let Some(action) = conflict {
+                                        col_sql.push_str(" ON CONFLICT ");
+                                        col_sql.push_str(match action {
+                                            crate::parser::ast::ConflictAction::Abort => "ABORT",
+                                            crate::parser::ast::ConflictAction::Rollback => "ROLLBACK",
+                                            crate::parser::ast::ConflictAction::Fail => "FAIL",
+                                            crate::parser::ast::ConflictAction::Ignore => "IGNORE",
+                                            crate::parser::ast::ConflictAction::Replace => "REPLACE",
+                                        });
+                                    }
                                     if *autoincrement {
                                         col_sql.push_str(" AUTOINCREMENT");
                                     }
                                 }
-                                ColumnConstraintKind::NotNull { .. } => {
+                                ColumnConstraintKind::NotNull { conflict } => {
                                     col_sql.push_str(" NOT NULL");
+                                    if let Some(action) = conflict {
+                                        col_sql.push_str(" ON CONFLICT ");
+                                        col_sql.push_str(match action {
+                                            crate::parser::ast::ConflictAction::Abort => "ABORT",
+                                            crate::parser::ast::ConflictAction::Rollback => "ROLLBACK",
+                                            crate::parser::ast::ConflictAction::Fail => "FAIL",
+                                            crate::parser::ast::ConflictAction::Ignore => "IGNORE",
+                                            crate::parser::ast::ConflictAction::Replace => "REPLACE",
+                                        });
+                                    }
                                 }
                                 ColumnConstraintKind::Unique { conflict } => {
                                     col_sql.push_str(" UNIQUE");
@@ -2032,6 +2052,11 @@ impl<'s> StatementCompiler<'s> {
                                         }
                                     }
                                 }
+                                ColumnConstraintKind::Check(expr) => {
+                                    col_sql.push_str(" CHECK(");
+                                    col_sql.push_str(&self.expr_to_sql(expr));
+                                    col_sql.push(')');
+                                }
                                 _ => {}
                             }
                         }
@@ -2095,7 +2120,7 @@ impl<'s> StatementCompiler<'s> {
                         }
                         TableConstraintKind::Check(expr) => {
                             sql.push_str("CHECK (");
-                            sql.push_str(&format!("{:?}", expr));
+                            sql.push_str(&self.expr_to_sql(expr));
                             sql.push(')');
                         }
                         TableConstraintKind::ForeignKey {
@@ -2131,6 +2156,12 @@ impl<'s> StatementCompiler<'s> {
             }
         }
         sql.push(')');
+        if create.without_rowid {
+            sql.push_str(" WITHOUT ROWID");
+        }
+        if create.strict {
+            sql.push_str(" STRICT");
+        }
         sql
     }
 

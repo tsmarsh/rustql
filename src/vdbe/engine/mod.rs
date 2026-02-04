@@ -5596,7 +5596,7 @@ impl Vdbe {
                                         OE_ABORT | OE_FAIL => {
                                             // Return constraint violation error
                                             let table_name = match &op.p4 {
-                                                P4::Text(s) => s.as_str(),
+                                                P4::Text(s) | P4::Table(s) => s.as_str(),
                                                 _ => "table",
                                             };
                                             let col_name =
@@ -5613,7 +5613,7 @@ impl Vdbe {
                                             // Rollback transaction and return error
                                             let _ = btree.rollback(0, false);
                                             let table_name = match &op.p4 {
-                                                P4::Text(s) => s.as_str(),
+                                                P4::Text(s) | P4::Table(s) => s.as_str(),
                                                 _ => "table",
                                             };
                                             let col_name =

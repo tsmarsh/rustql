@@ -583,8 +583,8 @@ pub struct Table {
     pub indexes: Vec<Arc<Index>>,
     /// Foreign key constraints
     pub foreign_keys: Vec<ForeignKey>,
-    /// CHECK constraints
-    pub checks: Vec<Expr>,
+    /// CHECK constraints (parsed expression, original SQL text)
+    pub checks: Vec<(Expr, String)>,
     /// Is WITHOUT ROWID table
     pub without_rowid: bool,
     /// Is STRICT table
@@ -948,6 +948,7 @@ fn ast_expr_to_schema_expr(ast_expr: &ast::Expr) -> Expr {
                 name: Some(name.clone()),
             },
         },
+        ast::Expr::Parens(inner) => ast_expr_to_schema_expr(inner),
         // For unsupported expressions, return NULL
         _ => Expr::Null,
     }
@@ -1156,8 +1157,39 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
 
     let paren_pos = after_create.find('(')?;
     let table_name = after_create[..paren_pos].trim().to_string();
-    let columns_str = after_create[paren_pos + 1..].trim();
-    let columns_str = columns_str.strip_suffix(')')?;
+    let after_paren = after_create[paren_pos + 1..].trim();
+
+    // Find the matching closing parenthesis (accounting for nested parens)
+    let mut depth = 1;
+    let mut close_pos = None;
+    for (i, ch) in after_paren.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close_pos = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close_pos = close_pos?;
+    let columns_str = &after_paren[..close_pos];
+
+    // Parse suffix after closing paren for WITHOUT ROWID / STRICT
+    let suffix = after_paren[close_pos + 1..].trim().to_uppercase();
+    let mut without_rowid = false;
+    let mut strict = false;
+    for part in suffix.split(',') {
+        let part = part.trim();
+        if part == "WITHOUT ROWID" {
+            without_rowid = true;
+        } else if part == "STRICT" {
+            strict = true;
+        }
+    }
 
     // Parse columns and table constraints
     // We need to be careful about commas inside parentheses (e.g., UNIQUE(c, d))
@@ -1263,19 +1295,30 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
             col_def_upper.contains(" PRIMARY KEY") || col_def_upper.contains(" PRIMARY");
         let is_not_null = col_def_upper.contains(" NOT NULL");
 
-        // Extract UNIQUE ON CONFLICT action if present
-        let unique_conflict = if is_unique {
-            // Look for "UNIQUE ON CONFLICT <action>" pattern
-            if let Some(pos) = col_def_upper.find("UNIQUE ON CONFLICT") {
-                let after = &col_def_upper[pos + "UNIQUE ON CONFLICT".len()..].trim_start();
-                let action_str = after.split_whitespace().next().unwrap_or("");
-                match action_str {
-                    "IGNORE" => Some(ConflictAction::Ignore),
-                    "REPLACE" => Some(ConflictAction::Replace),
-                    "ABORT" => Some(ConflictAction::Abort),
-                    "FAIL" => Some(ConflictAction::Fail),
-                    "ROLLBACK" => Some(ConflictAction::Rollback),
-                    _ => None,
+        // Extract ON CONFLICT action for UNIQUE or PRIMARY KEY constraints
+        let unique_conflict = if is_unique || is_primary_key {
+            // Look for "UNIQUE ON CONFLICT <action>" or "PRIMARY KEY ON CONFLICT <action>" pattern
+            let search_key = if is_primary_key && col_def_upper.contains("PRIMARY KEY ON CONFLICT") {
+                Some("PRIMARY KEY ON CONFLICT")
+            } else if is_unique && col_def_upper.contains("UNIQUE ON CONFLICT") {
+                Some("UNIQUE ON CONFLICT")
+            } else {
+                None
+            };
+            if let Some(key) = search_key {
+                if let Some(pos) = col_def_upper.find(key) {
+                    let after = &col_def_upper[pos + key.len()..].trim_start();
+                    let action_str = after.split_whitespace().next().unwrap_or("");
+                    match action_str {
+                        "IGNORE" => Some(ConflictAction::Ignore),
+                        "REPLACE" => Some(ConflictAction::Replace),
+                        "ABORT" => Some(ConflictAction::Abort),
+                        "FAIL" => Some(ConflictAction::Fail),
+                        "ROLLBACK" => Some(ConflictAction::Rollback),
+                        _ => None,
+                    }
+                } else {
+                    None
                 }
             } else {
                 None
@@ -1415,6 +1458,10 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
         }
     }
 
+    // Try to extract CHECK constraints by parsing the full SQL with the AST parser.
+    // This handles both column-level CHECK(expr) and table-level CHECK(expr).
+    let checks = extract_check_constraints(sql);
+
     Some(Table {
         name: table_name,
         db_idx: if is_temp { 1 } else { 0 },
@@ -1423,9 +1470,9 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
         primary_key,
         indexes: index_list,
         foreign_keys: Vec::new(),
-        checks: Vec::new(),
-        without_rowid: false,
-        strict: false,
+        checks,
+        without_rowid,
+        strict,
         is_virtual: false,
         virtual_module: None,
         virtual_args: Vec::new(),
@@ -1433,6 +1480,42 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
         sql: Some(sql.to_string()),
         row_estimate: 0,
     })
+}
+
+/// Extract CHECK constraints from a CREATE TABLE SQL string by parsing
+/// with the full AST parser and converting to schema Exprs.
+fn extract_check_constraints(sql: &str) -> Vec<(Expr, String)> {
+    use crate::parser::ast;
+
+    let stmt = match crate::parser::grammar::parse(sql) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    let create = match stmt {
+        ast::Stmt::CreateTable(ct) => ct,
+        _ => return Vec::new(),
+    };
+
+    let mut checks = Vec::new();
+
+    if let ast::TableDefinition::Columns { columns, constraints } = &create.definition {
+        for col_def in columns {
+            for constraint in &col_def.constraints {
+                if let ast::ColumnConstraintKind::Check(expr) = &constraint.kind {
+                    checks.push((ast_expr_to_schema_expr(expr), String::new()));
+                }
+            }
+        }
+
+        for constraint in constraints {
+            if let ast::TableConstraintKind::Check(expr) = &constraint.kind {
+                checks.push((ast_expr_to_schema_expr(expr), String::new()));
+            }
+        }
+    }
+
+    checks
 }
 
 /// Parse a CREATE INDEX SQL string into an Index struct.
@@ -2358,7 +2441,7 @@ impl Schema {
                 // Note: Implicit index creation should happen at table creation time
             }
             ColumnConstraint::Check(expr) => {
-                table.checks.push(expr.clone());
+                table.checks.push((expr.clone(), String::new()));
             }
             ColumnConstraint::Default(value) => {
                 column.default_value = Some(value.clone());
@@ -2516,7 +2599,7 @@ impl Schema {
                 }
             }
             TableConstraint::Check(expr) => {
-                table.checks.push(expr.clone());
+                table.checks.push((expr.clone(), String::new()));
             }
             TableConstraint::ForeignKey {
                 columns,

@@ -17,7 +17,7 @@ use super::ffi::{
     Tcl_NewListObj, Tcl_Obj, Tcl_SetObjResult, Tcl_SetVar, Tcl_SetVar2Ex, TCL_ERROR,
     TCL_GLOBAL_ONLY, TCL_OK,
 };
-use super::helpers::{obj_to_string, set_result_int, set_result_string, string_to_obj};
+use super::helpers::{obj_to_string, set_result_int, set_result_string, set_result_wide_int, string_to_obj};
 use super::user_func::{clear_current_interp, set_current_interp};
 use super::{CONNECTIONS, FUNCTION_DESTRUCTORS, NULL_VALUES, USER_COLLATIONS, USER_FUNCTIONS};
 
@@ -586,7 +586,7 @@ pub unsafe extern "C" fn db_method_cmd(
             CONNECTIONS.with(|connections| {
                 let conns = connections.borrow();
                 if let Some(conn) = conns.get(db_name) {
-                    set_result_int(interp, sqlite3_last_insert_rowid(conn) as c_int);
+                    set_result_wide_int(interp, sqlite3_last_insert_rowid(conn));
                 } else {
                     set_result_int(interp, 0);
                 }

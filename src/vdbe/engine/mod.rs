@@ -2881,7 +2881,7 @@ impl Vdbe {
                                     cursor.btree_cursor = Some(bt_cursor);
                                 }
                                 Err(e) => {
-                                    eprintln!("DEBUG OpenWrite: cursor creation failed for root_page={}: {:?}", root_page, e);
+                                    return Err(e);
                                 }
                             }
                         }

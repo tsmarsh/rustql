@@ -620,7 +620,6 @@ impl<'s> SelectCompiler<'s> {
                         SelectBody::Compound { .. } => false,
                     }
                 };
-                eprintln!("[DEBUG ORDER] has_wf={} order_satisfied={} order_by_len={}", has_wf, order_satisfied, order_by.len());
                 if order_satisfied {
                     // Index scan provides correct order, no sorter needed
                     (dest.clone(), None, None)

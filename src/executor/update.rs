@@ -522,6 +522,8 @@ impl<'s> UpdateCompiler<'s> {
                     // INTEGER PRIMARY KEY update - compile expression and store for rowid
                     let temp_reg = self.alloc_reg();
                     self.compile_expr(&assignment.expr, temp_reg)?;
+                    // MustBeInt: Enforce that IPK values are integers
+                    self.emit(Opcode::MustBeInt, temp_reg, 0, 0, P4::Unused);
                     new_rowid_reg = Some(temp_reg);
                     continue; // Don't add to regular assignments
                 }

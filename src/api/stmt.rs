@@ -594,6 +594,33 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
         vdbe.set_column_names(stmt.column_names.clone());
 
         stmt.vdbe = Some(vdbe);
+
+        // Create an implicit savepoint for DML statements in explicit transactions.
+        // This allows ABORT (the default error action) to roll back just this
+        // statement while keeping the rest of the transaction intact.
+        // SQLite wraps each DML in an implicit savepoint for this purpose.
+        if !stmt.read_only && !skip_auto_txn {
+            if let Some(conn_ptr) = stmt.conn_ptr {
+                let conn = unsafe { &*conn_ptr };
+                if !conn.get_autocommit() {
+                    // Create a savepoint at the current point
+                    if let Some(main_db) = conn.find_db("main") {
+                        if let Some(ref btree) = main_db.btree {
+                            use crate::storage::pager::SavepointOp;
+                            let idx = conn.savepoints.len() as i32;
+                            let _ = btree.savepoint(SavepointOp::Begin, idx);
+                        }
+                    }
+                    if conn.dbs.len() > 1 {
+                        if let Some(ref btree) = conn.dbs[1].btree {
+                            use crate::storage::pager::SavepointOp;
+                            let idx = conn.savepoints.len() as i32;
+                            let _ = btree.savepoint(SavepointOp::Begin, idx);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Execute one step
@@ -623,6 +650,23 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
                             }
                         }
                         conn.transaction_state = crate::api::TransactionState::None;
+                    } else {
+                        // In explicit transaction: release the implicit statement savepoint
+                        // so the changes become part of the transaction
+                        if let Some(main_db) = conn.find_db("main") {
+                            if let Some(ref btree) = main_db.btree {
+                                use crate::storage::pager::SavepointOp;
+                                let idx = conn.savepoints.len() as i32;
+                                let _ = btree.savepoint(SavepointOp::Release, idx);
+                            }
+                        }
+                        if conn.dbs.len() > 1 {
+                            if let Some(ref btree) = conn.dbs[1].btree {
+                                use crate::storage::pager::SavepointOp;
+                                let idx = conn.savepoints.len() as i32;
+                                let _ = btree.savepoint(SavepointOp::Release, idx);
+                            }
+                        }
                     }
                 }
             }
@@ -671,30 +715,75 @@ pub fn sqlite3_step(stmt: &mut PreparedStmt) -> Result<StepResult> {
                 let conn = unsafe { &mut *conn_ptr };
                 conn.set_error_from(&e);
             }
-            // Rollback on error - both in autocommit mode and explicit transactions
-            // This matches SQLite behavior where errors within a transaction cause
-            // automatic rollback to maintain database consistency
-            if let Some(conn_ptr) = stmt.conn_ptr {
-                let conn = unsafe { &*conn_ptr };
-                if let Some(main_db) = conn.find_db("main") {
-                    if let Some(ref btree) = main_db.btree {
-                        let _ = btree.rollback(0, false);
+
+            // Determine rollback behavior based on on_error_action:
+            // 1 = ROLLBACK: full transaction rollback, switch to autocommit
+            // 2 = ABORT (default): statement-level rollback only, keep transaction
+            // 3 = FAIL: no rollback at all, keep partial changes
+            let on_error = e.on_error_action.unwrap_or(2); // Default to ABORT
+
+            if on_error == 3 {
+                // FAIL: Do NOT rollback. Keep partial changes from the current statement.
+                // Just return the error.
+            } else if on_error == 2 {
+                // ABORT: Statement-level rollback.
+                // In SQLite, each DML statement runs within an implicit savepoint.
+                // ABORT rolls back just that statement, keeping the rest of the transaction.
+                if let Some(conn_ptr) = stmt.conn_ptr {
+                    let conn = unsafe { &*conn_ptr };
+                    if conn.get_autocommit() {
+                        // In autocommit mode, rollback the implicit transaction
+                        if let Some(main_db) = conn.find_db("main") {
+                            if let Some(ref btree) = main_db.btree {
+                                let _ = btree.rollback(0, false);
+                            }
+                        }
+                        if conn.dbs.len() > 1 {
+                            if let Some(ref btree) = conn.dbs[1].btree {
+                                let _ = btree.rollback(0, false);
+                            }
+                        }
+                    } else {
+                        // In explicit transaction: rollback to the statement savepoint
+                        // Use savepoint index 0 (the statement-level savepoint)
+                        // This undoes only this statement's changes
+                        if let Some(main_db) = conn.find_db("main") {
+                            if let Some(ref btree) = main_db.btree {
+                                use crate::storage::pager::SavepointOp;
+                                let savepoint_idx = conn.savepoints.len() as i32;
+                                let _ = btree.savepoint(SavepointOp::Rollback, savepoint_idx);
+                            }
+                        }
+                        if conn.dbs.len() > 1 {
+                            if let Some(ref btree) = conn.dbs[1].btree {
+                                use crate::storage::pager::SavepointOp;
+                                let savepoint_idx = conn.savepoints.len() as i32;
+                                let _ = btree.savepoint(SavepointOp::Rollback, savepoint_idx);
+                            }
+                        }
                     }
                 }
-                // Also rollback temp btree if it exists
-                if conn.dbs.len() > 1 {
-                    if let Some(ref btree) = conn.dbs[1].btree {
-                        let _ = btree.rollback(0, false);
+            } else {
+                // ROLLBACK (on_error==1) or other: Full transaction rollback
+                if let Some(conn_ptr) = stmt.conn_ptr {
+                    let conn = unsafe { &*conn_ptr };
+                    if let Some(main_db) = conn.find_db("main") {
+                        if let Some(ref btree) = main_db.btree {
+                            let _ = btree.rollback(0, false);
+                        }
                     }
-                }
-                // If we were in an explicit transaction, reset to autocommit mode
-                // so subsequent BEGIN statements will work
-                if !conn.get_autocommit() {
-                    conn.autocommit
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    // Call rollback hook if configured
-                    if let Some(hook) = conn.rollback_hook.as_ref() {
-                        hook();
+                    if conn.dbs.len() > 1 {
+                        if let Some(ref btree) = conn.dbs[1].btree {
+                            let _ = btree.rollback(0, false);
+                        }
+                    }
+                    // Full ROLLBACK: reset to autocommit mode
+                    if !conn.get_autocommit() {
+                        conn.autocommit
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        if let Some(hook) = conn.rollback_hook.as_ref() {
+                            hook();
+                        }
                     }
                 }
             }

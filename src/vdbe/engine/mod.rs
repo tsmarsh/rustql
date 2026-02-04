@@ -1466,6 +1466,14 @@ impl Vdbe {
                 if let P4::Text(ref msg) = op.p4 {
                     self.error_msg = Some(msg.clone());
                 }
+                // P3 non-zero: use register P3 as the error message (SQLite 3.46+)
+                // This allows RAISE() with expression arguments
+                if op.p3 > 0 {
+                    let msg_str = self.mem(op.p3).to_str();
+                    if !msg_str.is_empty() {
+                        self.error_msg = Some(msg_str);
+                    }
+                }
 
                 // Check for RAISE(IGNORE) - P2=4 (OE_IGNORE)
                 if op.p2 == 4 && !self.subprogram_stack.is_empty() {
@@ -1506,6 +1514,9 @@ impl Vdbe {
                         if is_trigger_constraint {
                             let mut err = Error::with_message(self.rc, msg);
                             err.extended = Some(ExtendedErrorCode::ConstraintTrigger);
+                            // Carry the on-error action (1=ROLLBACK, 2=ABORT, 3=FAIL)
+                            // so the statement executor can determine rollback behavior
+                            err.on_error_action = Some(op.p2 as u8);
                             return Err(err);
                         }
                         return Err(Error::with_message(self.rc, msg));
@@ -1522,6 +1533,7 @@ impl Vdbe {
                         if is_trigger_constraint {
                             let mut err = Error::with_message(self.rc, msg);
                             err.extended = Some(ExtendedErrorCode::ConstraintTrigger);
+                            err.on_error_action = Some(op.p2 as u8);
                             return Err(err);
                         }
                         return Err(Error::with_message(self.rc, msg));
@@ -2380,8 +2392,12 @@ impl Vdbe {
                             && !is_index
                         {
                             // Use qualified name in error message
+                            // When executing inside a trigger (subprogram), SQLite
+                            // qualifies unqualified table names with "main." in errors
                             let error_name = if schema_name.is_some() {
                                 tname.clone()
+                            } else if self.trigger_depth > 0 {
+                                format!("main.{}", simple_name)
                             } else {
                                 simple_name.clone()
                             };
@@ -2775,8 +2791,12 @@ impl Vdbe {
                     if let Some(ref tname) = table_name {
                         if !table_found {
                             // Use qualified name in error message
+                            // When inside a trigger, qualify with "main." like SQLite
                             let error_name = if schema_name.is_some() {
                                 tname.clone()
+                            } else if self.trigger_depth > 0 {
+                                let base = simple_name.as_deref().unwrap_or(tname.as_str());
+                                format!("main.{}", base)
                             } else if let Some(ref sname) = simple_name {
                                 sname.clone()
                             } else {
@@ -3607,6 +3627,12 @@ impl Vdbe {
             }
 
             Opcode::Next => {
+                // Clear raise_ignore flag at row boundaries.
+                // When RAISE(IGNORE) fires in a trigger, it should skip just the
+                // current row's operations (Delete, MakeRecord, Insert, etc.)
+                // and then continue with the next row.
+                self.raise_ignore = false;
+
                 // Move cursor to next row, jump to P2 if has more rows
                 // Note: search_count is incremented only on successful advancement (inside has_more block)
                 let mut has_more = false;
@@ -3768,6 +3794,9 @@ impl Vdbe {
             }
 
             Opcode::Prev => {
+                // Clear raise_ignore at row boundaries (same as Next)
+                self.raise_ignore = false;
+
                 // Move cursor to previous row, jump to P2 if has more rows
                 // Note: search_count is incremented only on successful advancement (inside has_more block)
                 let mut has_more = false;
@@ -5308,10 +5337,9 @@ impl Vdbe {
                 // P5 = flags (conflict resolution)
 
                 // Check if RAISE(IGNORE) was called - skip this insert
+                // Don't clear the flag: it persists until Next opcode.
                 if self.raise_ignore {
-                    self.raise_ignore = false;
                     // Don't increment n_change - row was ignored
-                    self.pc += 1;
                     return Ok(ExecResult::Continue);
                 }
 
@@ -6045,10 +6073,11 @@ impl Vdbe {
                 // P5 = flags (OPFLAG_* constants)
 
                 // Check if RAISE(IGNORE) was called - skip this delete
+                // Don't clear the flag: it must persist through Delete+MakeRecord+Insert
+                // for the entire row, and gets cleared at the Next opcode.
                 if self.raise_ignore {
-                    self.raise_ignore = false;
                     // Don't change n_change - row was ignored
-                    self.pc += 1;
+                    // Skip to next instruction without executing the delete
                     return Ok(ExecResult::Continue);
                 }
 
@@ -6583,6 +6612,8 @@ impl Vdbe {
             }
 
             Opcode::SorterNext => {
+                // Clear raise_ignore at row boundaries (same as Next)
+                self.raise_ignore = false;
                 // SorterNext P1 P2: Advance to next sorted row. Jump to P2 if more rows.
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     cursor.sorter_index += 1;
@@ -7390,6 +7421,12 @@ impl Vdbe {
                 // For ephemeral indexes: insert into set
                 // For btree indexes: insert into btree
                 // P5 upper byte contains conflict resolution mode (OE_ABORT, OE_IGNORE, etc.)
+
+                // Check if RAISE(IGNORE) was called - skip this index insert
+                if self.raise_ignore {
+                    return Ok(ExecResult::Continue);
+                }
+
                 let record = self.mem(op.p2).to_blob();
                 let btree_arc = self.btree.clone();
                 let schema = self.schema.clone();

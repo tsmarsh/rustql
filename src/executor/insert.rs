@@ -497,38 +497,45 @@ impl<'a> InsertCompiler<'a> {
                 }
             }
 
-            // Handle rowid: either from explicit value or auto-generated
-            if has_explicit_rowid {
-                // Compile the explicit rowid expression to a temp register
-                let temp_reg = self.alloc_reg();
-                self.compile_expr(&row[explicit_rowid_idx], temp_reg)?;
+            // For INSTEAD OF triggers on views, skip rowid handling entirely
+            // (views don't have rowids, and the cursor is not open)
+            if self.instead_of_triggers.is_empty() {
+                // Handle rowid: either from explicit value or auto-generated
+                if has_explicit_rowid {
+                    // Compile the explicit rowid expression to a temp register
+                    let temp_reg = self.alloc_reg();
+                    self.compile_expr(&row[explicit_rowid_idx], temp_reg)?;
 
-                // If the value is NULL, generate new rowid; otherwise use the value
-                let skip_newrowid = self.alloc_label();
-                self.emit(Opcode::NotNull, temp_reg, skip_newrowid, 0, P4::Unused);
-                // Value is NULL - generate new rowid
-                self.emit(
-                    Opcode::NewRowid,
-                    self.table_cursor,
-                    rowid_reg,
-                    0,
-                    P4::Unused,
-                );
-                let done_rowid = self.alloc_label();
-                self.emit(Opcode::Goto, 0, done_rowid, 0, P4::Unused);
-                // Value is not NULL - use it as rowid
-                self.resolve_label(skip_newrowid, self.current_addr() as i32);
-                self.emit(Opcode::Copy, temp_reg, rowid_reg, 0, P4::Unused);
-                self.resolve_label(done_rowid, self.current_addr() as i32);
-            } else {
-                // No explicit rowid - auto-generate
-                self.emit(
-                    Opcode::NewRowid,
-                    self.table_cursor,
-                    rowid_reg,
-                    0,
-                    P4::Unused,
-                );
+                    // If the value is NULL, generate new rowid; otherwise use the value
+                    let skip_newrowid = self.alloc_label();
+                    self.emit(Opcode::NotNull, temp_reg, skip_newrowid, 0, P4::Unused);
+                    // Value is NULL - generate new rowid
+                    self.emit(
+                        Opcode::NewRowid,
+                        self.table_cursor,
+                        rowid_reg,
+                        0,
+                        P4::Unused,
+                    );
+                    let done_rowid = self.alloc_label();
+                    self.emit(Opcode::Goto, 0, done_rowid, 0, P4::Unused);
+                    // Value is not NULL - use it as rowid
+                    self.resolve_label(skip_newrowid, self.current_addr() as i32);
+                    // MustBeInt: Enforce that IPK values are integers
+                    // P2=0 means error if not convertible (not a jump)
+                    self.emit(Opcode::MustBeInt, temp_reg, 0, 0, P4::Unused);
+                    self.emit(Opcode::Copy, temp_reg, rowid_reg, 0, P4::Unused);
+                    self.resolve_label(done_rowid, self.current_addr() as i32);
+                } else {
+                    // No explicit rowid - auto-generate
+                    self.emit(
+                        Opcode::NewRowid,
+                        self.table_cursor,
+                        rowid_reg,
+                        0,
+                        P4::Unused,
+                    );
+                }
             }
 
             // Allocate registers for column values
@@ -656,8 +663,37 @@ impl<'a> InsertCompiler<'a> {
             }
             // Check views (for INSTEAD OF triggers)
             if let Some(view) = schema.views.get(&table_name_lower) {
-                // Count columns from the view's SELECT result
-                return view.select.body.column_count();
+                // If the view has explicit column names, use that count
+                if let Some(ref cols) = view.columns {
+                    return cols.len();
+                }
+                // Otherwise expand * from the view's SELECT by examining result columns
+                let core = view.select.body.leftmost_core();
+                let mut count = 0;
+                for col in &core.columns {
+                    match col {
+                        crate::parser::ast::ResultColumn::Star => {
+                            // Expand * by looking at all FROM sources
+                            if let Some(ref from) = core.from {
+                                for table_ref in &from.tables {
+                                    Self::count_table_ref_columns(table_ref, schema, &mut count);
+                                }
+                            }
+                        }
+                        crate::parser::ast::ResultColumn::TableStar(ref tname) => {
+                            let src_lower = tname.to_lowercase();
+                            if let Some(src_table) = schema.tables.get(&src_lower) {
+                                count += src_table.columns.len();
+                            } else {
+                                count += 1;
+                            }
+                        }
+                        crate::parser::ast::ResultColumn::Expr { .. } => {
+                            count += 1;
+                        }
+                    }
+                }
+                return count;
             }
         }
 
@@ -673,6 +709,45 @@ impl<'a> InsertCompiler<'a> {
             InsertSource::Values(rows) => rows.first().map(|row| row.len()).unwrap_or(0),
             InsertSource::Select(select) => self.count_select_columns(select),
             InsertSource::DefaultValues => 1,
+        }
+    }
+
+    /// Count columns from a TableRef (for view * expansion)
+    fn count_table_ref_columns(
+        table_ref: &crate::parser::ast::TableRef,
+        schema: &Schema,
+        count: &mut usize,
+    ) {
+        use crate::parser::ast::TableRef;
+        match table_ref {
+            TableRef::Table { name, .. } => {
+                let src_lower = name.name.to_lowercase();
+                if let Some(src_table) = schema.tables.get(&src_lower) {
+                    *count += src_table.columns.len();
+                } else if let Some(src_view) = schema.views.get(&src_lower) {
+                    if let Some(ref vcols) = src_view.columns {
+                        *count += vcols.len();
+                    } else {
+                        // Approximate: use column_count which may not expand *
+                        *count += src_view.select.body.column_count();
+                    }
+                } else {
+                    *count += 1;
+                }
+            }
+            TableRef::Join { left, right, .. } => {
+                Self::count_table_ref_columns(left, schema, count);
+                Self::count_table_ref_columns(right, schema, count);
+            }
+            TableRef::Subquery { query, .. } => {
+                *count += query.body.column_count();
+            }
+            TableRef::TableFunction { .. } => {
+                *count += 1;
+            }
+            TableRef::Parens(inner) => {
+                Self::count_table_ref_columns(inner, schema, count);
+            }
         }
     }
 

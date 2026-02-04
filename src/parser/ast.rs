@@ -546,48 +546,25 @@ fn flatten_table_ref(table_ref: &TableRef, items: &mut Vec<SrcItem>, join_type: 
                         indexed_by: None,
                             });
                 }
-                // For nested joins on the right side of an OUTER JOIN, we must
-                // convert the entire parenthesized group into a subquery so the
-                // inner join is evaluated first and the whole result is null-filled
-                // as a unit.  E.g. `t1 LEFT JOIN (t2 JOIN t3)` must null-fill
-                // both t2 and t3 together when there's no match, not independently.
+                // Always flatten parenthesized joins so that individual table
+                // names remain visible to the outer query for column resolution.
                 //
-                // For INNER joins the flat model works fine, so just flatten.
+                // For LEFT JOIN (t2 JOIN t3 ON ...), all tables in the
+                // parenthesized group inherit the LEFT join flag so they are
+                // all null-filled together when there's no match.
                 TableRef::Join { .. } | TableRef::Parens(_) => {
+                    let start_idx = items.len();
+                    flatten_table_ref(actual_right, items, actual_jt);
+                    // Apply constraint to first item added from right side
+                    if start_idx < items.len() {
+                        items[start_idx].on_clause = on_clause;
+                        items[start_idx].using_columns = using_columns;
+                    }
+                    // For outer joins, propagate LEFT flag to all tables in
+                    // the group so they are all null-filled together
                     if actual_jt.contains(JoinFlags::LEFT) {
-                        // Convert the parenthesized join to a subquery:
-                        //   SELECT * FROM <inner_join>
-                        let subquery = Box::new(SelectStmt {
-                            with: None,
-                            body: SelectBody::Select(SelectCore {
-                                distinct: Distinct::All,
-                                columns: vec![ResultColumn::Star],
-                                from: Some(FromClause {
-                                    tables: vec![actual_right.clone()],
-                                }),
-                                where_clause: None,
-                                group_by: None,
-                                having: None,
-                                window: None,
-                            }),
-                            order_by: None,
-                            limit: None,
-                        });
-                        items.push(SrcItem {
-                            source: TableSource::Subquery(subquery),
-                            alias: None,
-                            join_type: actual_jt,
-                            on_clause,
-                            using_columns,
-                            indexed_by: None,
-                                    });
-                    } else {
-                        let start_idx = items.len();
-                        flatten_table_ref(actual_right, items, actual_jt);
-                        // Apply constraint to first item added from right side
-                        if start_idx < items.len() {
-                            items[start_idx].on_clause = on_clause;
-                            items[start_idx].using_columns = using_columns;
+                        for item in &mut items[start_idx..] {
+                            item.join_type.insert(JoinFlags::LEFT);
                         }
                     }
                 }

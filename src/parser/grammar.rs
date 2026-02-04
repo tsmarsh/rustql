@@ -1404,7 +1404,7 @@ impl<'a> Parser<'a> {
 
         loop {
             // Check if this looks like a column definition
-            if !self.check(TokenKind::Identifier) && !self.check(TokenKind::String) {
+            if !self.check(TokenKind::Identifier) && !self.check(TokenKind::String) && !self.current().kind.is_keyword() {
                 break;
             }
 
@@ -1437,7 +1437,7 @@ impl<'a> Parser<'a> {
     fn parse_column_def(&mut self) -> Result<ColumnDef> {
         let name = self.expect_identifier()?;
 
-        let type_name = if self.check(TokenKind::Identifier) && !self.is_column_constraint_start() {
+        let type_name = if (self.check(TokenKind::Identifier) || self.current().kind.is_keyword()) && !self.is_column_constraint_start() {
             Some(self.parse_type_name()?)
         } else {
             None
@@ -1473,7 +1473,7 @@ impl<'a> Parser<'a> {
         let mut name = self.expect_identifier()?;
 
         // Handle multi-word type names like "VARYING CHARACTER"
-        while self.check(TokenKind::Identifier) && !self.is_column_constraint_start() {
+        while (self.check(TokenKind::Identifier) || self.current().kind.is_keyword()) && !self.is_column_constraint_start() {
             name.push(' ');
             name.push_str(&self.expect_identifier()?);
         }

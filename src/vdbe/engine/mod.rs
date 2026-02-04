@@ -1466,6 +1466,14 @@ impl Vdbe {
                 if let P4::Text(ref msg) = op.p4 {
                     self.error_msg = Some(msg.clone());
                 }
+                // P3 non-zero: use register P3 as the error message (SQLite 3.46+)
+                // This allows RAISE() with expression arguments
+                if op.p3 > 0 {
+                    let msg_str = self.mem(op.p3).to_str();
+                    if !msg_str.is_empty() {
+                        self.error_msg = Some(msg_str);
+                    }
+                }
 
                 // Check for RAISE(IGNORE) - P2=4 (OE_IGNORE)
                 if op.p2 == 4 && !self.subprogram_stack.is_empty() {
@@ -2380,8 +2388,12 @@ impl Vdbe {
                             && !is_index
                         {
                             // Use qualified name in error message
+                            // When executing inside a trigger (subprogram), SQLite
+                            // qualifies unqualified table names with "main." in errors
                             let error_name = if schema_name.is_some() {
                                 tname.clone()
+                            } else if self.trigger_depth > 0 {
+                                format!("main.{}", simple_name)
                             } else {
                                 simple_name.clone()
                             };
@@ -2775,8 +2787,12 @@ impl Vdbe {
                     if let Some(ref tname) = table_name {
                         if !table_found {
                             // Use qualified name in error message
+                            // When inside a trigger, qualify with "main." like SQLite
                             let error_name = if schema_name.is_some() {
                                 tname.clone()
+                            } else if self.trigger_depth > 0 {
+                                let base = simple_name.as_deref().unwrap_or(tname.as_str());
+                                format!("main.{}", base)
                             } else if let Some(ref sname) = simple_name {
                                 sname.clone()
                             } else {

@@ -323,44 +323,100 @@ impl<'s> TriggerBodyCompiler<'s> {
                 // For INSTEAD OF triggers on views, get column names from the view's SELECT
                 use crate::parser::ast::ResultColumn;
 
-                // Get column count from the view's SELECT
-                compiler.num_columns = view.select.body.column_count();
-
-                // Build column map from the view's result columns
-                let core = view.select.body.leftmost_core();
-                for (idx, col) in core.columns.iter().enumerate() {
-                    match col {
-                        ResultColumn::Expr { alias: Some(name), .. } => {
-                            // Column with explicit alias
-                            compiler.column_map.insert(name.to_lowercase(), idx);
-                        }
-                        ResultColumn::Expr { expr, alias: None } => {
-                            // Try to extract column name from expression
-                            if let crate::parser::ast::Expr::Column(col_ref) = expr {
-                                compiler.column_map.insert(col_ref.column.to_lowercase(), idx);
-                            }
-                        }
-                        ResultColumn::Star => {
-                            // For *, we can't determine individual column names without expanding
-                        }
-                        ResultColumn::TableStar(_) => {
-                            // For table.*, we can't determine individual column names without expanding
-                        }
-                    }
-                }
-
-                // If the view has explicit column names, use those instead
+                // If the view has explicit column names, use those
                 if let Some(ref columns) = view.columns {
-                    compiler.column_map.clear();
                     compiler.num_columns = columns.len();
                     for (idx, name) in columns.iter().enumerate() {
                         compiler.column_map.insert(name.to_lowercase(), idx);
                     }
+                } else {
+                    // Expand view columns from the SELECT, handling * by looking at source tables
+                    let core = view.select.body.leftmost_core();
+                    let mut col_idx = 0usize;
+                    for col in &core.columns {
+                        match col {
+                            ResultColumn::Expr { alias: Some(name), .. } => {
+                                compiler.column_map.insert(name.to_lowercase(), col_idx);
+                                col_idx += 1;
+                            }
+                            ResultColumn::Expr { expr, alias: None } => {
+                                if let crate::parser::ast::Expr::Column(col_ref) = expr {
+                                    compiler.column_map.insert(col_ref.column.to_lowercase(), col_idx);
+                                }
+                                col_idx += 1;
+                            }
+                            ResultColumn::Star => {
+                                // Expand * by looking at all FROM source tables
+                                if let Some(ref from) = core.from {
+                                    for table_ref in &from.tables {
+                                        Self::expand_star_columns(table_ref, schema, &mut compiler.column_map, &mut col_idx);
+                                    }
+                                }
+                            }
+                            ResultColumn::TableStar(ref tname) => {
+                                // Expand table.* by looking at the specific table
+                                let src_lower = tname.to_lowercase();
+                                if let Some(src_table) = schema.tables.get(&src_lower) {
+                                    for src_col in &src_table.columns {
+                                        compiler.column_map.insert(src_col.name.to_lowercase(), col_idx);
+                                        col_idx += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    compiler.num_columns = col_idx;
                 }
             }
         }
 
         compiler
+    }
+
+    /// Expand * from a TableRef into column_map, recursing into JOINs
+    fn expand_star_columns(
+        table_ref: &crate::parser::ast::TableRef,
+        schema: &Schema,
+        column_map: &mut std::collections::HashMap<String, usize>,
+        col_idx: &mut usize,
+    ) {
+        use crate::parser::ast::TableRef;
+        match table_ref {
+            TableRef::Table { name, .. } => {
+                let src_lower = name.name.to_lowercase();
+                if let Some(src_table) = schema.tables.get(&src_lower) {
+                    for src_col in &src_table.columns {
+                        column_map.insert(src_col.name.to_lowercase(), *col_idx);
+                        *col_idx += 1;
+                    }
+                } else if let Some(src_view) = schema.views.get(&src_lower) {
+                    // For nested views, use explicit column names if available
+                    if let Some(ref vcols) = src_view.columns {
+                        for name in vcols {
+                            column_map.insert(name.to_lowercase(), *col_idx);
+                            *col_idx += 1;
+                        }
+                    } else {
+                        *col_idx += src_view.select.body.column_count();
+                    }
+                } else {
+                    *col_idx += 1;
+                }
+            }
+            TableRef::Join { left, right, .. } => {
+                Self::expand_star_columns(left, schema, column_map, col_idx);
+                Self::expand_star_columns(right, schema, column_map, col_idx);
+            }
+            TableRef::Subquery { query, .. } => {
+                *col_idx += query.body.column_count();
+            }
+            TableRef::TableFunction { .. } => {
+                *col_idx += 1;
+            }
+            TableRef::Parens(inner) => {
+                Self::expand_star_columns(inner, schema, column_map, col_idx);
+            }
+        }
     }
 
     /// Allocate a register
@@ -1309,7 +1365,7 @@ impl<'s> TriggerBodyCompiler<'s> {
 
             Expr::Raise { action, message } => {
                 // RAISE function in triggers
-                use crate::parser::ast::RaiseAction;
+                use crate::parser::ast::{RaiseAction, RaiseMessage};
 
                 // P1 = error code, P2 = on-conflict action
                 // SQLITE_CONSTRAINT = 19
@@ -1320,12 +1376,21 @@ impl<'s> TriggerBodyCompiler<'s> {
                     RaiseAction::Fail => (19, 3),     // SQLITE_CONSTRAINT, OE_FAIL = 3
                 };
 
-                let p4 = match message {
-                    Some(msg) => P4::Text(msg.clone()),
-                    None => P4::Unused,
-                };
-
-                self.emit(Opcode::Halt, p1, p2, 0, p4);
+                match message {
+                    Some(RaiseMessage::Literal(msg)) => {
+                        self.emit(Opcode::Halt, p1, p2, 0, P4::Text(msg.clone()));
+                    }
+                    Some(RaiseMessage::Expr(expr)) => {
+                        // Evaluate expression into a register
+                        let msg_reg = self.alloc_reg();
+                        self.compile_expr(expr, msg_reg)?;
+                        // Halt with P3=register containing the message
+                        self.emit(Opcode::Halt, p1, p2, msg_reg, P4::Unused);
+                    }
+                    None => {
+                        self.emit(Opcode::Halt, p1, p2, 0, P4::Unused);
+                    }
+                }
             }
 
             Expr::Case {

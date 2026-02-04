@@ -4383,7 +4383,14 @@ impl<'s> StatementCompiler<'s> {
                     RaiseAction::Fail => "FAIL",
                 };
                 if let Some(msg) = message {
-                    format!("RAISE({}, '{}')", action_str, msg.replace('\'', "''"))
+                    match msg {
+                        crate::parser::ast::RaiseMessage::Literal(s) => {
+                            format!("RAISE({}, '{}')", action_str, s.replace('\'', "''"))
+                        }
+                        crate::parser::ast::RaiseMessage::Expr(e) => {
+                            format!("RAISE({}, {})", action_str, self.expr_to_sql(e))
+                        }
+                    }
                 } else {
                     format!("RAISE({})", action_str)
                 }

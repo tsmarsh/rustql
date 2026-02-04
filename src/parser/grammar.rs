@@ -3004,7 +3004,15 @@ impl<'a> Parser<'a> {
 
         let message = if action != RaiseAction::Ignore {
             self.expect(TokenKind::Comma)?;
-            Some(self.expect_string()?)
+            // SQLite 3.46+ allows arbitrary expressions as the RAISE message
+            if self.check(TokenKind::String) {
+                // Simple string literal (traditional behavior)
+                Some(crate::parser::ast::RaiseMessage::Literal(self.expect_string()?))
+            } else {
+                // Arbitrary expression (new behavior)
+                let expr = self.parse_expr()?;
+                Some(crate::parser::ast::RaiseMessage::Expr(Box::new(expr)))
+            }
         } else {
             None
         };

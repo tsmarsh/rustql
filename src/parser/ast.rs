@@ -1221,7 +1221,8 @@ pub enum Expr {
     // RAISE function
     Raise {
         action: RaiseAction,
-        message: Option<String>,
+        /// String literal message (traditional) or expression (SQLite 3.46+)
+        message: Option<RaiseMessage>,
     },
 }
 
@@ -1437,6 +1438,15 @@ pub enum RaiseAction {
     Rollback,
     Abort,
     Fail,
+}
+
+/// RAISE message - can be a simple string literal or an arbitrary expression
+#[derive(Debug, Clone, PartialEq)]
+pub enum RaiseMessage {
+    /// Simple string literal (traditional RAISE behavior)
+    Literal(String),
+    /// Arbitrary expression evaluated at runtime (SQLite 3.46+)
+    Expr(Box<Expr>),
 }
 
 // ============================================================================

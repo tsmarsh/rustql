@@ -2562,6 +2562,11 @@ impl<'s> SelectCompiler<'s> {
                     if let Some(reg) = found_match_regs[from_idx] {
                         self.emit(Opcode::Integer, 1, reg, 0, P4::Unused);
                     }
+                } else if let Some(reg) = found_match_regs[from_idx] {
+                    // No conditions for this LEFT JOIN table (e.g. LEFT JOIN t2
+                    // with no ON clause = cross join).  Being inside the loop
+                    // means a row exists, so unconditionally mark found_match.
+                    self.emit(Opcode::Integer, 1, reg, 0, P4::Unused);
                 }
             }
 
@@ -2808,6 +2813,32 @@ impl<'s> SelectCompiler<'s> {
                     let null_result_regs = self.compile_result_columns(&core.columns)?;
                     self.result_column_names.truncate(saved_result_column_names);
                     self.columns.truncate(saved_columns);
+
+                    // Check DISTINCT before outputting the null row
+                    if let Some(distinct_cursor) = distinct_cursor {
+                        let null_record_reg = self.alloc_reg();
+                        self.emit(
+                            Opcode::MakeRecord,
+                            null_result_regs.0,
+                            null_result_regs.1 as i32,
+                            null_record_reg,
+                            P4::Unused,
+                        );
+                        self.emit(
+                            Opcode::IdxGE,
+                            distinct_cursor,
+                            skip_null_output,
+                            null_record_reg,
+                            P4::Int64(null_result_regs.1 as i64),
+                        );
+                        self.emit(
+                            Opcode::IdxInsert,
+                            distinct_cursor,
+                            null_record_reg,
+                            0,
+                            P4::Unused,
+                        );
+                    }
 
                     // Output the null row
                     self.output_row(dest, null_result_regs.0, null_result_regs.1)?;
@@ -6540,10 +6571,16 @@ impl<'s> SelectCompiler<'s> {
                 }
 
                 for col_name in common_cols {
-                    // Generate: prev_table.col = current_table.col
+                    // Find the first non-coalesced left table that has this column.
+                    // For a chain like `t1 NATURAL JOIN t2 NATURAL JOIN t3`, when
+                    // processing t3, column `x` shared by t1 and t3 (but coalesced
+                    // in t2) must generate `t1.x = t3.x`, not `t2.x = t3.x`.
+                    let left_table_idx =
+                        self.find_left_table_for_column(i, &col_name).unwrap_or(i - 1);
+                    let left_table_name = self.tables[left_table_idx].name.clone();
                     let left_expr = Expr::Column(ColumnRef {
                         database: None,
-                        table: Some(self.tables[i - 1].name.clone()),
+                        table: Some(left_table_name),
                         column: col_name.clone(),
                         column_index: None,
                         source_text: None,
@@ -6572,24 +6609,32 @@ impl<'s> SelectCompiler<'s> {
                     self.coalesced_columns.insert(i, excluded);
                 }
 
-                // For self-joins (same table name without distinct aliases),
-                // use synthetic table identifiers that encode the table index
-                // Format: __tbl_idx_N__ where N is the index in self.tables
-                let prev_table = &self.tables[i - 1];
-                let left_table_id = if prev_table.name == current_table.name {
-                    // Self-join: use synthetic identifier to disambiguate
-                    format!("__tbl_idx_{}__", i - 1)
-                } else {
-                    prev_table.name.clone()
-                };
-                let right_table_id = if prev_table.name == current_table.name {
-                    format!("__tbl_idx_{}__", i)
-                } else {
-                    current_table.name.clone()
-                };
-
                 for col_name in using_cols {
-                    // Generate: prev_table.col = current_table.col
+                    // Find the first non-coalesced left table that has this column.
+                    // For chains like `t1 JOIN t2 USING(y) JOIN t3 USING(x)`:
+                    //   - USING(x) on t3 must reference t1.x (not t2.x, since t2
+                    //     doesn't even have x).
+                    // For chains like `t1 LEFT JOIN t2 USING(a) LEFT JOIN t3 USING(a)`:
+                    //   - USING(a) on t3 must reference t1.a (since t2.a is coalesced).
+                    //     This ensures the join condition is `t1.a = t3.a` which works
+                    //     even when t2 yields NULL from the LEFT JOIN.
+                    let left_table_idx =
+                        self.find_left_table_for_column(i, col_name).unwrap_or(i - 1);
+                    let left_table = &self.tables[left_table_idx];
+
+                    // For self-joins (same table name without distinct aliases),
+                    // use synthetic table identifiers that encode the table index
+                    let left_table_id = if left_table.name == current_table.name {
+                        format!("__tbl_idx_{}__", left_table_idx)
+                    } else {
+                        left_table.name.clone()
+                    };
+                    let right_table_id = if left_table.name == current_table.name {
+                        format!("__tbl_idx_{}__", i)
+                    } else {
+                        current_table.name.clone()
+                    };
+
                     let left_expr = Expr::Column(ColumnRef {
                         database: None,
                         table: Some(left_table_id.clone()),
@@ -6692,20 +6737,23 @@ impl<'s> SelectCompiler<'s> {
                 let col_name = col_ref.column.to_lowercase();
 
                 // Check if column exists in any table to the left (index <= join_index)
+                // The join_index is relative to the SrcList (the current FROM clause),
+                // but self.tables may include outer query tables before
+                // outer_tables_boundary.  Offset by the boundary to check the
+                // correct range.
+                let base = self.outer_tables_boundary;
                 let mut found_left = false;
-                for idx in 0..=join_index {
-                    if idx < self.tables.len() {
-                        let table = &self.tables[idx];
-                        if self.table_has_column(table, &col_name) {
-                            found_left = true;
-                            break;
-                        }
+                for idx in base..=(base + join_index).min(self.tables.len().saturating_sub(1)) {
+                    let table = &self.tables[idx];
+                    if self.table_has_column(table, &col_name) {
+                        found_left = true;
+                        break;
                     }
                 }
 
                 // Check if column exists ONLY in tables to the right
                 if !found_left {
-                    for idx in (join_index + 1)..self.tables.len() {
+                    for idx in (base + join_index + 1)..self.tables.len() {
                         let table = &self.tables[idx];
                         if self.table_has_column(table, &col_name) {
                             return Err(Error::with_message(
@@ -6737,17 +6785,15 @@ impl<'s> SelectCompiler<'s> {
                                 // Unqualified column in alias - check if it resolves to right tables
                                 let alias_col_name = alias_col.column.to_lowercase();
                                 let mut alias_found_left = false;
-                                for idx in 0..=join_index {
-                                    if idx < self.tables.len() {
-                                        let table = &self.tables[idx];
-                                        if self.table_has_column(table, &alias_col_name) {
-                                            alias_found_left = true;
-                                            break;
-                                        }
+                                for idx in base..=(base + join_index).min(self.tables.len().saturating_sub(1)) {
+                                    let table = &self.tables[idx];
+                                    if self.table_has_column(table, &alias_col_name) {
+                                        alias_found_left = true;
+                                        break;
                                     }
                                 }
                                 if !alias_found_left {
-                                    for idx in (join_index + 1)..self.tables.len() {
+                                    for idx in (base + join_index + 1)..self.tables.len() {
                                         let table = &self.tables[idx];
                                         if self.table_has_column(table, &alias_col_name) {
                                             return Err(Error::with_message(
@@ -6971,6 +7017,33 @@ impl<'s> SelectCompiler<'s> {
         } else {
             false
         }
+    }
+
+    /// Find the first (left-most) table to the left of `current_idx` that has a
+    /// column named `col_name` and for which that column has NOT been coalesced
+    /// away by a prior USING/NATURAL join. Returns the table index if found.
+    ///
+    /// This is essential for multi-table USING/NATURAL JOIN chains such as:
+    ///   `t1 JOIN t2 USING(y) JOIN t3 USING(x)`
+    /// where `x` exists in t1 but not in t2. The equality for the t3 USING
+    /// must reference t1, not t2.
+    fn find_left_table_for_column(&self, current_idx: usize, col_name: &str) -> Option<usize> {
+        let col_lower = col_name.to_lowercase();
+        // Search from left-most to right-most among all tables before current_idx.
+        // Return the first table that (a) has the column and (b) that column is
+        // not coalesced away.
+        for idx in 0..current_idx {
+            // Check if column is coalesced in this table
+            if let Some(excluded) = self.coalesced_columns.get(&idx) {
+                if excluded.contains(&col_lower) {
+                    continue;
+                }
+            }
+            if self.table_has_column(&self.tables[idx], &col_lower) {
+                return Some(idx);
+            }
+        }
+        None
     }
 
     /// Find column names that exist in both the current table and any previous table

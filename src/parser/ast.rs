@@ -482,8 +482,23 @@ fn flatten_table_ref(table_ref: &TableRef, items: &mut Vec<SrcItem>, join_type: 
             right,
             constraint,
         } => {
+            // Transform RIGHT JOIN into LEFT JOIN by swapping left/right tables.
+            // A RIGHT JOIN B ON cond  ===  B LEFT JOIN A ON cond
+            // This avoids needing separate right-join null-fill logic in the executor.
+            // FULL JOIN (LEFT|RIGHT) is left as-is for now.
+            let is_right_only = jt.contains(JoinFlags::RIGHT) && !jt.contains(JoinFlags::LEFT);
+            let (actual_left, actual_right, actual_jt) = if is_right_only {
+                // Swap: remove RIGHT, add LEFT, keep NATURAL/OUTER/CROSS/INNER as appropriate
+                let mut new_flags = *jt;
+                new_flags.remove(JoinFlags::RIGHT);
+                new_flags.insert(JoinFlags::LEFT);
+                (right.as_ref(), left.as_ref(), new_flags)
+            } else {
+                (left.as_ref(), right.as_ref(), *jt)
+            };
+
             // Flatten left side first (with inherited join_type for first item)
-            flatten_table_ref(left, items, join_type);
+            flatten_table_ref(actual_left, items, join_type);
 
             // Right side gets the actual join type and constraint
             let (on_clause, using_columns) = match constraint {
@@ -493,7 +508,7 @@ fn flatten_table_ref(table_ref: &TableRef, items: &mut Vec<SrcItem>, join_type: 
             };
 
             // Flatten right side with the join info
-            match right.as_ref() {
+            match actual_right {
                 TableRef::Table {
                     name,
                     alias,
@@ -502,21 +517,21 @@ fn flatten_table_ref(table_ref: &TableRef, items: &mut Vec<SrcItem>, join_type: 
                     items.push(SrcItem {
                         source: TableSource::Table(name.clone()),
                         alias: alias.clone(),
-                        join_type: *jt,
+                        join_type: actual_jt,
                         on_clause,
                         using_columns,
                         indexed_by: indexed_by.clone(),
-                    });
+                            });
                 }
                 TableRef::Subquery { query, alias } => {
                     items.push(SrcItem {
                         source: TableSource::Subquery(query.clone()),
                         alias: alias.clone(),
-                        join_type: *jt,
+                        join_type: actual_jt,
                         on_clause,
                         using_columns,
                         indexed_by: None,
-                    });
+                            });
                 }
                 TableRef::TableFunction { name, args, alias } => {
                     items.push(SrcItem {
@@ -525,21 +540,55 @@ fn flatten_table_ref(table_ref: &TableRef, items: &mut Vec<SrcItem>, join_type: 
                             args: args.clone(),
                         },
                         alias: alias.clone(),
-                        join_type: *jt,
+                        join_type: actual_jt,
                         on_clause,
                         using_columns,
                         indexed_by: None,
-                    });
+                            });
                 }
-                // For nested joins on the right, we need to handle recursively
-                // but apply the constraint to the first item of the right side
+                // For nested joins on the right side of an OUTER JOIN, we must
+                // convert the entire parenthesized group into a subquery so the
+                // inner join is evaluated first and the whole result is null-filled
+                // as a unit.  E.g. `t1 LEFT JOIN (t2 JOIN t3)` must null-fill
+                // both t2 and t3 together when there's no match, not independently.
+                //
+                // For INNER joins the flat model works fine, so just flatten.
                 TableRef::Join { .. } | TableRef::Parens(_) => {
-                    let start_idx = items.len();
-                    flatten_table_ref(right, items, *jt);
-                    // Apply constraint to first item added from right side
-                    if start_idx < items.len() {
-                        items[start_idx].on_clause = on_clause;
-                        items[start_idx].using_columns = using_columns;
+                    if actual_jt.contains(JoinFlags::LEFT) {
+                        // Convert the parenthesized join to a subquery:
+                        //   SELECT * FROM <inner_join>
+                        let subquery = Box::new(SelectStmt {
+                            with: None,
+                            body: SelectBody::Select(SelectCore {
+                                distinct: Distinct::All,
+                                columns: vec![ResultColumn::Star],
+                                from: Some(FromClause {
+                                    tables: vec![actual_right.clone()],
+                                }),
+                                where_clause: None,
+                                group_by: None,
+                                having: None,
+                                window: None,
+                            }),
+                            order_by: None,
+                            limit: None,
+                        });
+                        items.push(SrcItem {
+                            source: TableSource::Subquery(subquery),
+                            alias: None,
+                            join_type: actual_jt,
+                            on_clause,
+                            using_columns,
+                            indexed_by: None,
+                                    });
+                    } else {
+                        let start_idx = items.len();
+                        flatten_table_ref(actual_right, items, actual_jt);
+                        // Apply constraint to first item added from right side
+                        if start_idx < items.len() {
+                            items[start_idx].on_clause = on_clause;
+                            items[start_idx].using_columns = using_columns;
+                        }
                     }
                 }
             }

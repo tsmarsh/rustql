@@ -117,8 +117,10 @@ pub struct SelectCompiler<'s> {
     /// Counter for anonymous subquery naming (subquery-0, subquery-1, etc.)
     next_subquery: usize,
     /// Join conditions collected from ON/USING/NATURAL in FROM clause
-    /// These are merged with WHERE clause during compilation
-    join_conditions: Vec<Expr>,
+    /// Each entry is (table_index, expr) where table_index is the FROM item
+    /// the condition belongs to (i.e., the right-hand table of the join pair).
+    /// These are merged with WHERE clause during compilation.
+    join_conditions: Vec<(usize, Expr)>,
     /// Columns to exclude from * expansion for each table (for NATURAL/USING coalescing)
     /// Key: table index, Value: set of column names to exclude
     coalesced_columns: HashMap<usize, std::collections::HashSet<String>>,
@@ -1491,18 +1493,98 @@ impl<'s> SelectCompiler<'s> {
         // Join conditions determine which right table rows match; WHERE filters the final result.
         let original_where_for_null_fill = original_where.clone();
 
-        // Save join conditions before merging (needed for outer join found_match logic)
-        // For outer joins, we need to evaluate join conditions separately from WHERE
-        // to properly set found_match=1 when ON clause matches, regardless of WHERE result.
-        let join_conditions_for_outer = self.join_conditions.clone();
+        // Separate join conditions into per-table groups.
+        // For outer joins, we need per-table conditions to properly handle found_match.
+        // Inner join conditions can be merged into WHERE since they filter the same way.
+        // Classify join conditions per-table, separated by inner vs outer join type.
+        // Inner join conditions are applied at the loop level for their table.
+        // Outer join conditions need special found_match handling.
+        let mut outer_join_conditions_per_table: HashMap<usize, Vec<Expr>> = HashMap::new();
+        let mut inner_join_conditions_per_table: HashMap<usize, Vec<Expr>> = HashMap::new();
 
-        // Merge join conditions (from NATURAL/USING/ON) with WHERE clause
-        // This follows SQLite's approach of adding join conditions to pWhere
-        let remaining_where = self.merge_join_conditions(original_where);
+        for (table_idx, cond) in &self.join_conditions {
+            let table_idx_local = table_idx.saturating_sub(self.outer_tables_boundary);
+            let is_outer = self.tables.get(*table_idx)
+                .map(|t| t.join_type.is_outer())
+                .unwrap_or(false);
+            if is_outer {
+                outer_join_conditions_per_table
+                    .entry(table_idx_local)
+                    .or_default()
+                    .push(cond.clone());
+            } else {
+                inner_join_conditions_per_table
+                    .entry(table_idx_local)
+                    .or_default()
+                    .push(cond.clone());
+            }
+        }
+
+        // Build remaining WHERE: only includes original WHERE clause.
+        // Inner join conditions will be applied at their respective loop levels.
+        // Outer join conditions will be applied at the innermost level with found_match.
+        // For the non-outer-join path, merge everything into WHERE as before.
+        let mut remaining_where = original_where.clone();
+        if outer_join_conditions_per_table.values().all(|v| v.is_empty())
+            && inner_join_conditions_per_table.values().all(|v| v.is_empty())
+        {
+            // No special handling needed - merge all conditions as before
+            let conditions = std::mem::take(&mut self.join_conditions);
+            for (_table_idx, cond) in conditions {
+                remaining_where = Some(match remaining_where {
+                    Some(existing) => Expr::Binary {
+                        op: BinaryOp::And,
+                        left: Box::new(existing),
+                        right: Box::new(cond),
+                    },
+                    None => cond,
+                });
+            }
+        } else {
+            // For the non-outer path (fallback), merge all conditions
+            for conds in inner_join_conditions_per_table.values() {
+                for cond in conds {
+                    remaining_where = Some(match remaining_where {
+                        Some(existing) => Expr::Binary {
+                            op: BinaryOp::And,
+                            left: Box::new(existing),
+                            right: Box::new(cond.clone()),
+                        },
+                        None => cond.clone(),
+                    });
+                }
+            }
+            for conds in outer_join_conditions_per_table.values() {
+                for cond in conds {
+                    remaining_where = Some(match remaining_where {
+                        Some(existing) => Expr::Binary {
+                            op: BinaryOp::And,
+                            left: Box::new(existing),
+                            right: Box::new(cond.clone()),
+                        },
+                        None => cond.clone(),
+                    });
+                }
+            }
+            self.join_conditions.clear();
+        }
 
         // Check for constant-false WHERE clause (e.g., WHERE 0)
-        // In this case, skip all loop generation and return immediately - no rows match
-        if self.is_constant_false_where(remaining_where.as_ref()) {
+        // In this case, skip all loop generation and return immediately - no rows match.
+        // IMPORTANT: Only check the original WHERE clause, not merged join conditions.
+        // For outer joins, a constant-false ON condition (e.g., LEFT JOIN ab ON 0) should
+        // NOT skip all rows - the left table rows should still be output with NULLs.
+        // Only a constant-false user WHERE clause means truly no rows are returned.
+        let any_outer_join = self.tables.iter()
+            .skip(self.outer_tables_boundary)
+            .any(|t| t.join_type.is_outer());
+        let false_check_target = if any_outer_join {
+            // For outer joins, only check the user's original WHERE
+            original_where.as_ref()
+        } else {
+            remaining_where.as_ref()
+        };
+        if self.is_constant_false_where(false_check_target) {
             // Still need to populate result_column_names for subquery column resolution
             // even though we won't output any rows
             self.populate_result_column_names(&core.columns);
@@ -1603,6 +1685,14 @@ impl<'s> SelectCompiler<'s> {
         let mut loop_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
         let mut next_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
         let mut found_match_regs: Vec<Option<i32>> = Vec::with_capacity(table_cursors.len());
+        // Per-table continue labels for inner join conditions evaluated at each loop level.
+        // When an inner join condition fails at table i's loop level, jump to this label
+        // (which resolves to just before Next for table i).
+        let mut per_table_continue_labels: Vec<Option<i32>> = vec![None; table_cursors.len()];
+        // Labels for null-fill jump-back: when table i's null-fill runs, jump to this label
+        // to re-run the next table's found_match init and loop logic.
+        // This allows inner tables to still run when an outer table is null-filled.
+        let mut null_fill_resume_labels: Vec<Option<i32>> = vec![None; table_cursors.len()];
 
         // Emit Rewind/loop structure for each table level
         // First, allocate found_match registers for outer joins (but don't emit initialization yet)
@@ -2429,10 +2519,70 @@ impl<'s> SelectCompiler<'s> {
                 }
             }
 
+            // Emit per-table join conditions right after the loop starts.
+            // Both inner and outer join conditions are evaluated at their table's loop level.
+            //
+            // For INNER joins: if condition fails, skip to Next for this table.
+            // For OUTER joins: if condition fails, skip to Next for this table.
+            //   When the loop exhausts without found_match, the null-fill path handles
+            //   NullRow and re-runs inner tables. Setting found_match here (on pass)
+            //   prevents the null-fill from running.
+            if has_outer_join && from_idx > 0 {
+                let inner_conds = inner_join_conditions_per_table
+                    .get(&from_idx)
+                    .cloned()
+                    .unwrap_or_default();
+                let outer_conds = outer_join_conditions_per_table
+                    .get(&from_idx)
+                    .cloned()
+                    .unwrap_or_default();
+                let all_conds: Vec<Expr> = inner_conds.into_iter().chain(outer_conds.into_iter()).collect();
+
+                if !all_conds.is_empty() {
+                    // Allocate a label that will resolve to just before Next for this table
+                    let table_skip = self.alloc_label();
+                    per_table_continue_labels[from_idx] = Some(table_skip);
+
+                    let mut combined: Option<Expr> = None;
+                    for cond in &all_conds {
+                        combined = Some(match combined {
+                            Some(existing) => Expr::Binary {
+                                op: BinaryOp::And,
+                                left: Box::new(existing),
+                                right: Box::new(cond.clone()),
+                            },
+                            None => cond.clone(),
+                        });
+                    }
+                    if let Some(expr) = combined {
+                        self.compile_where_condition(&expr, table_skip)?;
+                    }
+
+                    // Conditions passed - set found_match for outer joins
+                    if let Some(reg) = found_match_regs[from_idx] {
+                        self.emit(Opcode::Integer, 1, reg, 0, P4::Unused);
+                    }
+                }
+            }
+
             // Initialize found_match for the NEXT table (if it's an outer join)
-            // This must be INSIDE the current loop (after loop_label) so it resets on each iteration
+            // This must be INSIDE the current loop (after loop_label) so it resets on each iteration.
+            //
+            // Also record the resume label for null-fill jump-back.
+            // When this table is null-filled, we need to re-run the next table's logic.
+            // This is needed for BOTH outer and inner joins that follow:
+            // - For outer joins: the inner table might still match and output rows
+            // - For inner joins: the inner join condition needs to be re-checked (and will fail on NullRow)
             if loop_pos + 1 < iteration_order.len() {
                 let next_from_idx = iteration_order[loop_pos + 1];
+                // Record the resume point for null-fill: this is where the next table's
+                // found_match init + Rewind starts.
+                if found_match_regs[from_idx].is_some() {
+                    let init_label = self.alloc_label();
+                    self.resolve_label(init_label, self.current_addr());
+                    null_fill_resume_labels[from_idx] = Some(init_label);
+                }
+                // Initialize found_match for the next outer-joined table
                 if let Some(reg) = found_match_regs[next_from_idx] {
                     self.emit(Opcode::Integer, 0, reg, 0, P4::Unused);
                 }
@@ -2442,50 +2592,19 @@ impl<'s> SelectCompiler<'s> {
         // Inner loop start is the innermost loop label
         let loop_start_label = *loop_labels.last().unwrap_or(&self.alloc_label());
 
-        // Evaluate WHERE clause, filtering out terms consumed by index seeks
-        // For outer joins, we need special handling:
-        // 1. Evaluate join conditions (ON clause) first - if pass, mark found_match=1
-        // 2. Then evaluate original WHERE - if fail, skip output but keep found_match=1
-        // This ensures that when a row matches ON but fails WHERE, we don't emit a null-fill.
+        // Evaluate WHERE clause at the innermost loop level.
+        // For outer joins: join conditions have already been checked at each table's
+        // loop level (setting found_match). Here we only need the original WHERE clause.
         let (where_skip_label, outer_join_found_match_set) = if has_outer_join {
-            // Outer join: split evaluation of join conditions vs original WHERE
-            let skip_label = self.alloc_label();
-
-            // First, evaluate just the join conditions (ON clause)
-            // If join conditions fail, this row doesn't match the join at all
-            if !join_conditions_for_outer.is_empty() {
-                // Build combined expression from join conditions
-                let mut join_expr: Option<Expr> = None;
-                for cond in &join_conditions_for_outer {
-                    join_expr = Some(match join_expr {
-                        Some(existing) => Expr::Binary {
-                            op: BinaryOp::And,
-                            left: Box::new(existing),
-                            right: Box::new(cond.clone()),
-                        },
-                        None => cond.clone(),
-                    });
-                }
-                if let Some(expr) = join_expr {
-                    // If join condition fails, skip to continuation (no match)
-                    self.compile_where_condition(&expr, skip_label)?;
-                }
-            }
-
-            // Join conditions passed - mark found_match=1 BEFORE evaluating WHERE
-            // This ensures found_match is set even if WHERE later fails
-            for found_match_reg in &found_match_regs {
-                if let Some(reg) = found_match_reg {
-                    self.emit(Opcode::Integer, 1, *reg, 0, P4::Unused);
-                }
-            }
-
-            // Now evaluate original WHERE (not including join conditions)
+            // Only evaluate the original WHERE clause (user's WHERE, not join conditions).
+            // All outer join conditions were already applied per-table at their loop levels.
             if let Some(where_expr) = original_where_for_null_fill.as_ref() {
+                let skip_label = self.alloc_label();
                 self.compile_where_condition(where_expr, skip_label)?;
+                (Some(skip_label), true)
+            } else {
+                (None, true)
             }
-
-            (Some(skip_label), true) // true = we already set found_match
         } else if let Some(info) = &where_info {
             // Use optimized path: only compile terms not consumed by index seeks
             let label = self.alloc_label();
@@ -2587,6 +2706,11 @@ impl<'s> SelectCompiler<'s> {
                 .copied()
                 .unwrap_or((false, None, 0, 0, false));
 
+            // Resolve per-table continue label (for inner join condition skip at this loop level)
+            if let Some(label) = per_table_continue_labels[from_idx] {
+                self.resolve_label(label, self.current_addr());
+            }
+
             if is_rowid_eq {
                 // Rowid equality - no Next needed, just resolve skip label
                 // (single row lookup, no iteration)
@@ -2658,27 +2782,36 @@ impl<'s> SelectCompiler<'s> {
                 // Set cursor to null row mode (columns will return NULL)
                 self.emit(Opcode::NullRow, cursor, 0, 0, P4::Unused);
 
-                // Re-evaluate the ORIGINAL WHERE clause (not including join conditions) with the null row
-                // This is critical for LEFT JOIN with WHERE on the left table
-                // e.g., SELECT * FROM t1 LEFT JOIN t2 ON true WHERE t1.a IS NULL
-                // The null-fill row should only be output if the original WHERE passes.
-                // Join conditions are NOT re-evaluated because they already determined that no
-                // right table rows matched - the null-fill is the correct behavior for outer joins.
-                if let Some(where_expr) = original_where_for_null_fill.as_ref() {
-                    self.compile_where_condition(where_expr, skip_null_output)?;
+                // If there are inner tables after this one, we need to re-run their logic
+                // with this table in NullRow mode. Jump back to the resume point which
+                // initializes the next table's found_match and starts its loop.
+                // This follows SQLite's approach where null-fill for table i causes
+                // table i+1..n to be re-evaluated (they might still match).
+                if let Some(resume_label) = null_fill_resume_labels[from_idx] {
+                    // Set found_match to 1 to prevent re-running null-fill for this table
+                    // (we've already decided it should be NullRow)
+                    self.emit(Opcode::Integer, 1, found_match_reg, 0, P4::Unused);
+                    // Jump back to re-run inner table logic with NullRow for this table
+                    self.emit(Opcode::Goto, 0, resume_label, 0, P4::Unused);
+                } else {
+                    // This is the innermost outer-joined table (or there are no more tables)
+                    // Just output the null-fill row directly.
+
+                    // Re-evaluate the ORIGINAL WHERE clause (not including join conditions) with the null row
+                    if let Some(where_expr) = original_where_for_null_fill.as_ref() {
+                        self.compile_where_condition(where_expr, skip_null_output)?;
+                    }
+
+                    // Re-evaluate result columns with null row
+                    let saved_result_column_names = self.result_column_names.len();
+                    let saved_columns = self.columns.len();
+                    let null_result_regs = self.compile_result_columns(&core.columns)?;
+                    self.result_column_names.truncate(saved_result_column_names);
+                    self.columns.truncate(saved_columns);
+
+                    // Output the null row
+                    self.output_row(dest, null_result_regs.0, null_result_regs.1)?;
                 }
-
-                // Re-evaluate result columns with null row
-                // Save column metadata since compile_result_columns adds to these vectors
-                let saved_result_column_names = self.result_column_names.len();
-                let saved_columns = self.columns.len();
-                let null_result_regs = self.compile_result_columns(&core.columns)?;
-                // Restore column metadata (don't double-count columns for null row output)
-                self.result_column_names.truncate(saved_result_column_names);
-                self.columns.truncate(saved_columns);
-
-                // Output the null row
-                self.output_row(dest, null_result_regs.0, null_result_regs.1)?;
 
                 // Skip null output target
                 self.resolve_label(skip_null_output, self.current_addr());
@@ -6427,7 +6560,7 @@ impl<'s> SelectCompiler<'s> {
                         left: Box::new(left_expr),
                         right: Box::new(right_expr),
                     };
-                    self.join_conditions.push(eq_expr);
+                    self.join_conditions.push((i, eq_expr));
                 }
             }
             // Handle USING clause
@@ -6476,7 +6609,7 @@ impl<'s> SelectCompiler<'s> {
                         left: Box::new(left_expr),
                         right: Box::new(right_expr),
                     };
-                    self.join_conditions.push(eq_expr);
+                    self.join_conditions.push((i, eq_expr));
                 }
             }
             // Handle ON clause
@@ -6494,7 +6627,7 @@ impl<'s> SelectCompiler<'s> {
                 }
 
                 // on_expr is &Box<Expr>, so we need to deref twice to get &Expr
-                self.join_conditions.push((**on_expr).clone());
+                self.join_conditions.push((i, (**on_expr).clone()));
             }
         }
 
@@ -6902,7 +7035,7 @@ impl<'s> SelectCompiler<'s> {
         // Build combined expression: original_where AND cond1 AND cond2 AND ...
         let mut result = original_where;
 
-        for cond in conditions {
+        for (_table_idx, cond) in conditions {
             result = Some(match result {
                 Some(existing) => Expr::Binary {
                     op: BinaryOp::And,

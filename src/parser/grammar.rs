@@ -3548,6 +3548,18 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_order_by_with_window_function() {
+        let stmt = parse("SELECT a, sum(a) OVER () FROM t ORDER BY a").unwrap();
+        if let Stmt::Select(select) = stmt {
+            assert!(select.order_by.is_some(), "ORDER BY should be present after window function");
+            let order_by = select.order_by.unwrap();
+            assert_eq!(order_by.len(), 1);
+        } else {
+            panic!("expected Select");
+        }
+    }
+
+    #[test]
     fn test_parse_limit() {
         let stmt = parse("SELECT * FROM users LIMIT 10 OFFSET 5").unwrap();
         if let Stmt::Select(select) = stmt {

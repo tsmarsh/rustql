@@ -4737,12 +4737,9 @@ impl Vdbe {
                 }
             }
 
-            Opcode::AggFinal | Opcode::AggValue => {
-                // As emitted by compiler:
-                // P1 = accumulator register (source)
-                // P2 = destination register (where result goes)
-                // P3 = 0 (unused)
-                // P4 = function name
+            Opcode::AggFinal => {
+                // AggFinal: Finalize aggregate and REMOVE state
+                // P1 = accumulator register, P2 = destination register, P4 = function name
                 let acc_reg = op.p1;
                 let dest_reg = op.p2;
 
@@ -4753,7 +4750,6 @@ impl Vdbe {
                 };
 
                 if let Some(state) = self.agg_contexts.remove(&acc_reg) {
-                    // Finalize and store result
                     match state.finalize() {
                         Ok(value) => {
                             *self.mem_mut(dest_reg) = Mem::from_value(&value);
@@ -4763,8 +4759,42 @@ impl Vdbe {
                         }
                     }
                 } else {
-                    // No state means no rows were processed
-                    // For COUNT, should return 0; for others, NULL
+                    if func_name.eq_ignore_ascii_case("COUNT") {
+                        self.mem_mut(dest_reg).set_int(0);
+                    } else if func_name.eq_ignore_ascii_case("TOTAL") {
+                        self.mem_mut(dest_reg).set_real(0.0);
+                    } else {
+                        self.mem_mut(dest_reg).set_null();
+                    }
+                }
+            }
+
+            Opcode::AggValue => {
+                // AggValue: Read current aggregate value WITHOUT removing state
+                // This is used by window functions to get running aggregate values.
+                // P1 = accumulator register, P2 = destination register, P4 = function name
+                let acc_reg = op.p1;
+                let dest_reg = op.p2;
+
+                let func_name = match &op.p4 {
+                    P4::Text(s) => s.as_str(),
+                    P4::FuncDef(s) => s.as_str(),
+                    _ => "",
+                };
+
+                if let Some(state) = self.agg_contexts.get(&acc_reg) {
+                    // Clone the state and finalize the clone to get current value
+                    // without destroying the running state
+                    let cloned = state.clone();
+                    match cloned.finalize() {
+                        Ok(value) => {
+                            *self.mem_mut(dest_reg) = Mem::from_value(&value);
+                        }
+                        Err(_) => {
+                            self.mem_mut(dest_reg).set_null();
+                        }
+                    }
+                } else {
                     if func_name.eq_ignore_ascii_case("COUNT") {
                         self.mem_mut(dest_reg).set_int(0);
                     } else if func_name.eq_ignore_ascii_case("TOTAL") {
@@ -9192,23 +9222,70 @@ impl Vdbe {
             // Aggregation Operations (SQLite parity)
             // ==================================================================
             Opcode::AggStep1 => {
-                // Aggregate step with single argument
-                // Same as AggStep but optimized for single arg
-                // No-op placeholder - handled by AggStep
+                // AggStep1: Same semantics as AggStep but with P5 encoding for arg count
+                // P1 = 0 for step, 1 for inverse
+                // P2 = argument base register
+                // P3 = accumulator register
+                // P4 = function name
+                // P5 = argument count
+                let func_name = match &op.p4 {
+                    P4::Text(s) => s.as_str(),
+                    P4::FuncDef(s) => s.as_str(),
+                    _ => "",
+                };
+
+                let is_inverse = op.p1 != 0;
+                let argc = op.p5 as usize;
+                let arg_base = op.p2;
+                let acc_reg = op.p3;
+
+                if !is_inverse {
+                    // Normal step - same as AggStep
+                    let mut args = Vec::with_capacity(argc);
+                    for i in 0..argc {
+                        args.push(self.mem(arg_base + i as i32).to_value());
+                    }
+
+                    let state = self.agg_contexts.entry(acc_reg).or_insert_with(|| {
+                        AggregateState::new(func_name).unwrap_or(AggregateState::Count { count: 0 })
+                    });
+
+                    let _ = state.step(&args);
+                }
+                // For inverse (is_inverse=true), we would remove a value from the aggregate.
+                // This is used for sliding window frames. Not yet implemented.
             }
 
             Opcode::AggInverse => {
                 // Aggregate inverse for window functions
-                // Used to remove a row from a running aggregate
-                // No-op (window functions limited)
+                // Used to remove a row from a running aggregate (sliding window frame).
+                // P2 = argument base register, P3 = accumulator, P4 = function name, P5 = argc
+                // For now, this is a no-op (only affects frame-based window functions).
             }
 
             // ==================================================================
             // Sorting Operations (SQLite parity)
             // ==================================================================
             Opcode::SorterOpen => {
-                // Open a sorter cursor - handled by OpenEphemeral for now
-                // This opcode just marks intent to use sorter functionality
+                // Open a sorter cursor - same as OpenEphemeral but for sorting
+                // P1 = cursor number, P2 = number of key columns
+                // P4 = KeyInfo with sort orders and collations
+                self.open_cursor(op.p1, 0, true)?;
+                if let Some(cursor) = self.cursor_mut(op.p1) {
+                    cursor.is_ephemeral = true;
+                    cursor.n_field = op.p2;
+                    match &op.p4 {
+                        P4::Blob(dirs) => {
+                            cursor.sort_desc = dirs.iter().map(|&b| b != 0).collect();
+                        }
+                        P4::KeyInfo(key_info) => {
+                            cursor.sort_desc = key_info.sort_orders.clone();
+                            cursor.sort_collations = key_info.collations.clone();
+                            cursor.sort_bignull = key_info.bignull.clone();
+                        }
+                        _ => {}
+                    }
+                }
             }
 
             Opcode::Sort => {

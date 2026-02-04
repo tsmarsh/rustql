@@ -68,6 +68,11 @@ pub struct SelectCompiler<'s> {
     has_aggregates: bool,
     /// Has window functions?
     has_window_functions: bool,
+    /// Window function result registers, keyed by a unique ID for each window function call.
+    /// Used during expression compilation to substitute the pre-computed value.
+    window_func_regs: HashMap<usize, i32>,
+    /// Counter for assigning unique IDs to window function calls
+    window_func_counter: usize,
     /// GROUP BY expressions
     group_by_regs: Vec<i32>,
     /// Expanded column names (populated during compile)
@@ -170,6 +175,8 @@ impl<'s> SelectCompiler<'s> {
             is_compound: false,
             has_aggregates: false,
             has_window_functions: false,
+            window_func_regs: HashMap::new(),
+            window_func_counter: 0,
             group_by_regs: Vec::new(),
             result_column_names: Vec::new(),
             result_aliases: HashMap::new(),
@@ -239,6 +246,8 @@ impl<'s> SelectCompiler<'s> {
             is_compound: false,
             has_aggregates: false,
             has_window_functions: false,
+            window_func_regs: HashMap::new(),
+            window_func_counter: 0,
             group_by_regs: Vec::new(),
             result_column_names: Vec::new(),
             result_aliases: HashMap::new(),
@@ -598,10 +607,20 @@ impl<'s> SelectCompiler<'s> {
                 (dest.clone(), None, None)
             } else {
                 // Check if ORDER BY is satisfied by an index scan
-                let order_satisfied = match &select.body {
-                    SelectBody::Select(core) => self.check_order_by_satisfied(core, order_by),
-                    SelectBody::Compound { .. } => false,
+                // Window functions reorder rows internally, so index order is never preserved
+                let has_wf = match &select.body {
+                    SelectBody::Select(core) => select_has_window_functions(core),
+                    _ => false,
                 };
+                let order_satisfied = if has_wf {
+                    false
+                } else {
+                    match &select.body {
+                        SelectBody::Select(core) => self.check_order_by_satisfied(core, order_by),
+                        SelectBody::Compound { .. } => false,
+                    }
+                };
+                eprintln!("[DEBUG ORDER] has_wf={} order_satisfied={} order_by_len={}", has_wf, order_satisfied, order_by.len());
                 if order_satisfied {
                     // Index scan provides correct order, no sorter needed
                     (dest.clone(), None, None)
@@ -2871,236 +2890,739 @@ impl<'s> SelectCompiler<'s> {
 
     /// Compile SELECT with window functions
     ///
-    /// Window functions require special handling:
-    /// 1. First compile the base query into an ephemeral table
-    /// 2. Sort by PARTITION BY + ORDER BY
-    /// 3. Process each partition, computing window function values
-    /// 4. Output rows with window function results
+    /// Strategy overview:
+    /// 1. Collect all source rows into a sorter sorted by PARTITION BY + ORDER BY
+    /// 2. Pass 1: Iterate sorted rows to compute whole-partition aggregates (stored per-partition)
+    /// 3. Pass 2: Iterate sorted rows again, computing running aggregates and ranking functions,
+    ///    and outputting rows with all window function values filled in.
     fn compile_with_window_functions(
         &mut self,
         core: &SelectCore,
         dest: &SelectDest,
     ) -> Result<()> {
-        use crate::executor::window::{WindowFunc, WindowFuncType};
+        use crate::executor::window::WindowFuncType;
 
-        // Create a WindowCompiler to analyze and compile window functions
-        let mut window_compiler = WindowCompiler::new(self.next_reg, self.next_cursor);
+        // Populate result column names so ORDER BY can resolve column references
+        self.populate_result_column_names(&core.columns);
 
-        // Collect window function information
-        let window_funcs = window_compiler.collect_window_functions(core)?;
-
-        if window_funcs.is_empty() {
-            // No window functions after all, fall back to regular compilation
-            return self.compile_simple_select(core, dest);
+        // =====================================================================
+        // Step 0: Analyze window functions
+        // =====================================================================
+        struct WinFuncInfo {
+            func_type: WindowFuncType,
+            name: String,
+            args: Vec<Expr>,
+            filter: Option<Box<Expr>>,
+            partition_by: Option<Vec<Expr>>,
+            order_by: Option<Vec<OrderingTerm>>,
+            frame: Option<crate::parser::ast::WindowFrame>,
+            result_reg: i32,
+            wf_index: usize,
+            /// True if this is a whole-partition aggregate (no ORDER BY)
+            is_whole_partition: bool,
         }
 
-        // Group by window specification
-        let windows = window_compiler.group_by_window(window_funcs.clone())?;
+        let mut win_funcs: Vec<WinFuncInfo> = Vec::new();
+        let mut wf_counter = 0usize;
 
-        // Update our register/cursor counters
-        self.next_reg = window_compiler.next_reg();
-        self.next_cursor = window_compiler.next_cursor();
-
-        // For aggregate window functions with empty OVER(), we need to:
-        // 1. Allocate accumulator registers
-        // 2. Emit AggStep during row collection
-        // 3. Emit AggFinal after collection
-        // 4. Use finalized value during output
-        //
-        // Identify simple aggregate window functions (AGG() OVER() with no partition/order)
-        let mut simple_agg_window_funcs: Vec<(usize, String, Vec<Expr>, i32, i32)> = Vec::new(); // (col_index, agg_name, args, accum_reg, final_reg)
-        for func in &window_funcs {
-            let is_empty_spec = func.spec.partition_by.is_none()
-                && func.spec.order_by.is_none()
-                && func.spec.frame.is_none();
-
-            if is_empty_spec {
-                if let WindowFuncType::Aggregate(agg_name) = &func.func_type {
-                    let accum_reg = self.alloc_reg();
-                    let final_reg = self.alloc_reg();
-                    // Initialize accumulator to NULL
-                    self.emit(Opcode::Null, 0, accum_reg, 0, P4::Unused);
-                    simple_agg_window_funcs.push((
-                        func.col_index,
-                        agg_name.clone(),
-                        func.args.clone(),
-                        accum_reg,
-                        final_reg,
-                    ));
+        fn collect_wf_from_expr(
+            expr: &Expr,
+            funcs: &mut Vec<(String, Vec<Expr>, Option<Box<Expr>>, Option<Vec<Expr>>, Option<Vec<OrderingTerm>>, Option<crate::parser::ast::WindowFrame>, usize)>,
+            counter: &mut usize,
+            named_windows: &HashMap<String, crate::parser::ast::WindowSpec>,
+        ) {
+            match expr {
+                Expr::Function(crate::parser::ast::FunctionCall { name, args, filter, over: Some(over), .. }) => {
+                    let spec = match over {
+                        crate::parser::ast::Over::Spec(s) => {
+                            if let Some(base_name) = &s.base {
+                                if let Some(base) = named_windows.get(base_name) {
+                                    crate::parser::ast::WindowSpec {
+                                        base: None,
+                                        partition_by: s.partition_by.clone().or_else(|| base.partition_by.clone()),
+                                        order_by: s.order_by.clone().or_else(|| base.order_by.clone()),
+                                        frame: s.frame.clone().or_else(|| base.frame.clone()),
+                                    }
+                                } else { s.clone() }
+                            } else { s.clone() }
+                        }
+                        crate::parser::ast::Over::Window(wname) => {
+                            named_windows.get(wname).cloned().unwrap_or(crate::parser::ast::WindowSpec {
+                                base: None, partition_by: None, order_by: None, frame: None,
+                            })
+                        }
+                    };
+                    let expr_args = match args {
+                        crate::parser::ast::FunctionArgs::Exprs(exprs) => exprs.clone(),
+                        crate::parser::ast::FunctionArgs::Star => Vec::new(),
+                    };
+                    let idx = *counter;
+                    *counter += 1;
+                    funcs.push((name.clone(), expr_args, filter.clone(), spec.partition_by, spec.order_by, spec.frame, idx));
                 }
+                Expr::Binary { left, right, .. } => {
+                    collect_wf_from_expr(left, funcs, counter, named_windows);
+                    collect_wf_from_expr(right, funcs, counter, named_windows);
+                }
+                Expr::Unary { expr: inner, .. } => {
+                    collect_wf_from_expr(inner, funcs, counter, named_windows);
+                }
+                Expr::Cast { expr: inner, .. } => {
+                    collect_wf_from_expr(inner, funcs, counter, named_windows);
+                }
+                _ => {}
             }
         }
 
-        // Step 1: Open ephemeral table to store intermediate results
-        let eph_cursor = self.alloc_cursor();
-        self.emit(Opcode::OpenEphemeral, eph_cursor, 0, 0, P4::Unused);
+        let mut named_windows: HashMap<String, crate::parser::ast::WindowSpec> = HashMap::new();
+        if let Some(window_defs) = &core.window {
+            for def in window_defs {
+                named_windows.insert(def.name.clone(), def.spec.clone());
+            }
+        }
 
-        // Step 2: Collect table cursors
-        let table_cursors: Vec<i32> = self
-            .tables
-            .iter()
+        let mut raw_funcs = Vec::new();
+        for col in &core.columns {
+            if let ResultColumn::Expr { expr, .. } = col {
+                collect_wf_from_expr(expr, &mut raw_funcs, &mut wf_counter, &named_windows);
+            }
+        }
+
+        if raw_funcs.is_empty() {
+            return self.compile_simple_select(core, dest);
+        }
+
+        for (name, args, filter, partition_by, order_by, frame, idx) in raw_funcs {
+            let func_type = WindowFuncType::from_name(&name)
+                .unwrap_or(WindowFuncType::Aggregate(name.to_uppercase()));
+            let result_reg = self.alloc_reg();
+            self.window_func_regs.insert(idx, result_reg);
+
+            // Determine if this is a whole-partition aggregate:
+            // An aggregate with no ORDER BY and no explicit frame ending at CURRENT ROW
+            let has_order = order_by.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
+            let has_frame_current_row = frame.as_ref().map(|f| {
+                matches!(f.end, Some(crate::parser::ast::WindowFrameBound::CurrentRow))
+            }).unwrap_or(false);
+            let is_whole_partition = match &func_type {
+                WindowFuncType::Aggregate(_) => !has_order && !has_frame_current_row,
+                _ => false,
+            };
+
+            win_funcs.push(WinFuncInfo {
+                func_type, name: name.to_uppercase(), args, filter,
+                partition_by, order_by, frame, result_reg, wf_index: idx,
+                is_whole_partition,
+            });
+        }
+
+        // =====================================================================
+        // Step 1: Collect source rows into a sorter
+        // =====================================================================
+        let primary_partition: Vec<Expr> = win_funcs.first()
+            .and_then(|f| f.partition_by.clone())
+            .unwrap_or_default();
+        let primary_order: Vec<OrderingTerm> = win_funcs.first()
+            .and_then(|f| f.order_by.clone())
+            .unwrap_or_default();
+
+        let partition_count = primary_partition.len();
+        let order_count = primary_order.len();
+        let sort_key_count = partition_count + order_count;
+
+        let sorter_cursor = self.alloc_cursor();
+        if sort_key_count > 0 {
+            let mut sort_orders = vec![false; partition_count];
+            let mut collations = vec!["BINARY".to_string(); partition_count];
+            let mut bignull = vec![false; partition_count];
+            for term in &primary_order {
+                sort_orders.push(matches!(term.order, SortOrder::Desc));
+                collations.push("BINARY".to_string());
+                bignull.push(false);
+            }
+            let ki = KeyInfo { sort_orders, collations, bignull, n_key_field: sort_key_count as u16 };
+            self.emit(Opcode::SorterOpen, sorter_cursor, sort_key_count as i32, 0,
+                P4::KeyInfo(std::sync::Arc::new(ki)));
+        } else {
+            self.emit(Opcode::OpenEphemeral, sorter_cursor, 0, 0, P4::Unused);
+        }
+
+        // Collect table cursors and generate nested loop
+        let table_cursors: Vec<i32> = self.tables.iter()
             .skip(self.outer_tables_boundary)
-            .map(|t| t.cursor)
-            .collect();
+            .map(|t| t.cursor).collect();
 
-        // Generate proper nested loop structure for cross joins
-        let mut loop_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
-        let mut done_labels: Vec<i32> = Vec::with_capacity(table_cursors.len());
+        let mut loop_labels = Vec::with_capacity(table_cursors.len());
+        let mut done_labels = Vec::with_capacity(table_cursors.len());
         for cursor in &table_cursors {
             let done_label = self.alloc_label();
             self.emit(Opcode::Rewind, *cursor, done_label, 0, P4::Unused);
             done_labels.push(done_label);
-
-            // Mark loop start for this level
             let loop_label = self.alloc_label();
             self.resolve_label(loop_label, self.current_addr());
             loop_labels.push(loop_label);
         }
 
-        // The innermost loop label is used for WHERE skip target
-        let _loop_start_label = *loop_labels.last().unwrap_or(&self.alloc_label());
-
-        // Evaluate WHERE clause
         let where_skip_label = if let Some(where_expr) = &core.where_clause {
             let label = self.alloc_label();
             self.compile_where_condition(where_expr, label)?;
             Some(label)
-        } else {
-            None
-        };
+        } else { None };
 
-        // Evaluate all result columns (except window functions get placeholders)
+        // Compile result columns (non-window cols get real values, window cols get NULL)
         let (result_base, result_count) = self.compile_result_columns_for_window(core)?;
 
-        // For simple aggregate window functions, emit AggStep to accumulate values
-        for (_, agg_name, args, accum_reg, _) in &simple_agg_window_funcs {
-            // Compile arguments
-            let argc = args.len();
-            let arg_base = self.alloc_regs(argc.max(1));
-
-            if argc == 0 {
-                // For COUNT(*) etc., use NULL argument
-                self.emit(Opcode::Null, 0, arg_base, 0, P4::Unused);
-            } else {
-                for (i, arg) in args.iter().enumerate() {
-                    self.compile_expr(arg, arg_base + i as i32)?;
-                }
-            }
-
-            // Emit AggStep: P1=argc, P2=arg_base, P3=accum, P4=func_name
-            self.emit(
-                Opcode::AggStep,
-                argc.max(1) as i32,
-                arg_base,
-                *accum_reg,
-                P4::Text(agg_name.clone()),
-            );
+        // Compile partition and order key columns
+        let sort_key_base = self.alloc_regs(sort_key_count.max(1));
+        for (i, expr) in primary_partition.iter().enumerate() {
+            self.compile_expr(expr, sort_key_base + i as i32)?;
+        }
+        for (i, term) in primary_order.iter().enumerate() {
+            self.compile_expr(&term.expr, sort_key_base + (partition_count + i) as i32)?;
         }
 
-        // Store into ephemeral table
-        let record_reg = self.alloc_reg();
-        self.emit(
-            Opcode::MakeRecord,
-            result_base,
-            result_count as i32,
-            record_reg,
-            P4::Unused,
-        );
-        self.emit(Opcode::NewRowid, eph_cursor, result_base, 0, P4::Unused);
-        self.emit(
-            Opcode::Insert,
-            eph_cursor,
-            record_reg,
-            result_base,
-            P4::Unused,
-        );
+        // Compile window function arguments as extra record columns
+        let mut wf_arg_regs = Vec::new();
+        for wf in &win_funcs {
+            let arg_reg = self.alloc_reg();
+            if !wf.args.is_empty() {
+                self.compile_expr(&wf.args[0], arg_reg)?;
+            } else {
+                self.emit(Opcode::Null, 0, arg_reg, 0, P4::Unused);
+            }
+            wf_arg_regs.push(arg_reg);
+        }
 
-        // WHERE skip target
+        // Save all source table column values as extra record fields.
+        // This allows the output pass to resolve column references from the
+        // stored record instead of the (now-consumed) table cursors.
+        // source_col_map: (cursor, col_idx) -> offset within source_col_regs
+        let mut source_col_map: Vec<(i32, i32)> = Vec::new();
+        let tables_snapshot: Vec<_> = self.tables.iter()
+            .skip(self.outer_tables_boundary)
+            .map(|t| (t.cursor, t.schema_table.as_ref().map(|s| s.columns.len()).unwrap_or(0)))
+            .collect();
+        let mut source_col_regs = Vec::new();
+        for &(cursor, num_cols) in &tables_snapshot {
+            for col_idx in 0..num_cols {
+                let reg = self.alloc_reg();
+                self.emit(Opcode::Column, cursor, col_idx as i32, reg, P4::Unused);
+                source_col_regs.push(reg);
+                source_col_map.push((cursor, col_idx as i32));
+            }
+        }
+        let source_col_count = source_col_regs.len();
+
+        // Build record: [sort_keys, result_cols, wf_args, source_cols]
+        let total_cols = sort_key_count + result_count + win_funcs.len() + source_col_count;
+        let record_base = self.alloc_regs(total_cols);
+        for i in 0..sort_key_count {
+            self.emit(Opcode::Copy, sort_key_base + i as i32, record_base + i as i32, 0, P4::Unused);
+        }
+        for i in 0..result_count {
+            self.emit(Opcode::Copy, result_base + i as i32, record_base + (sort_key_count + i) as i32, 0, P4::Unused);
+        }
+        for (i, arg_reg) in wf_arg_regs.iter().enumerate() {
+            self.emit(Opcode::Copy, *arg_reg, record_base + (sort_key_count + result_count + i) as i32, 0, P4::Unused);
+        }
+        let source_col_record_offset = sort_key_count + result_count + win_funcs.len();
+        for (i, src_reg) in source_col_regs.iter().enumerate() {
+            self.emit(Opcode::Copy, *src_reg, record_base + (source_col_record_offset + i) as i32, 0, P4::Unused);
+        }
+
+        let rec_reg = self.alloc_reg();
+        self.emit(Opcode::MakeRecord, record_base, total_cols as i32, rec_reg, P4::Unused);
+
+        if sort_key_count > 0 {
+            self.emit(Opcode::SorterInsert, sorter_cursor, rec_reg, 0, P4::Unused);
+        } else {
+            let rowid_reg = self.alloc_reg();
+            self.emit(Opcode::NewRowid, sorter_cursor, rowid_reg, 0, P4::Unused);
+            self.emit(Opcode::Insert, sorter_cursor, rec_reg, rowid_reg, P4::Unused);
+        }
+
         if let Some(label) = where_skip_label {
             self.resolve_label(label, self.current_addr());
         }
 
-        // Generate Next for each table in reverse order (innermost first)
         for i in (0..table_cursors.len()).rev() {
-            let cursor = table_cursors[i];
-            let loop_label = loop_labels[i];
-
-            // Next on this cursor, jump back to its loop start
-            self.emit(Opcode::Next, cursor, loop_label, 0, P4::Unused);
-
-            // Resolve done label for this level
+            self.emit(Opcode::Next, table_cursors[i], loop_labels[i], 0, P4::Unused);
             self.resolve_label(done_labels[i], self.current_addr());
         }
 
-        // Finalize simple aggregate window functions
-        for (_, agg_name, _, accum_reg, final_reg) in &simple_agg_window_funcs {
-            // Emit AggFinal: P1=accum, P2=dest, P4=func_name
-            self.emit(
-                Opcode::AggFinal,
-                *accum_reg,
-                *final_reg,
-                0,
-                P4::Text(agg_name.clone()),
-            );
+        // =====================================================================
+        // Step 2: Pass 1 - Compute whole-partition aggregates
+        // =====================================================================
+        // For whole-partition aggregates, we need the complete aggregate value
+        // before outputting any row. We do a first pass to compute these.
+        // The result is stored in finalized_agg_regs[wf_idx].
+        //
+        // For efficiency, if there are no whole-partition aggregates, skip pass 1.
+
+        let has_whole_partition_aggs = win_funcs.iter().any(|wf| wf.is_whole_partition);
+
+        // Allocate registers for finalized whole-partition agg values
+        // These persist across pass 1 to pass 2
+        let mut wp_agg_accum_regs: Vec<i32> = Vec::new();
+        let mut wp_agg_final_regs: Vec<i32> = Vec::new();
+        for _wf in &win_funcs {
+            wp_agg_accum_regs.push(self.alloc_reg());
+            wp_agg_final_regs.push(self.alloc_reg());
         }
 
-        // Step 3: Now process window functions
-        // (Skip the old window compiler ops as we handle simple aggregates directly)
-        let _window_ops = window_compiler.take_ops();
-        // Only call compile_window_functions for non-simple window functions
-        // For now we skip this as we handle simple aggregates directly
-        // window_compiler.compile_window_functions(&windows, result_base, result_count)?;
-        // let window_ops = window_compiler.take_ops();
-        // for op in window_ops {
-        //     self.ops.push(op);
-        // }
+        // Open an ephemeral table to store per-partition whole-partition aggregate values.
+        // Layout: [partition_key_cols..., agg_value_0, agg_value_1, ...]
+        let wp_lookup_cursor = self.alloc_cursor();
+        let wp_agg_count = win_funcs.iter().filter(|wf| wf.is_whole_partition).count();
 
-        // Step 4: Read from ephemeral table and output with window results
-        let done_label = self.alloc_label();
-        self.emit(Opcode::Rewind, eph_cursor, done_label, 0, P4::Unused);
+        if has_whole_partition_aggs {
+            let wp_lookup_cols = partition_count + wp_agg_count;
+            self.emit(Opcode::OpenEphemeral, wp_lookup_cursor, wp_lookup_cols as i32, 0, P4::Unused);
 
-        let read_loop = self.current_addr();
+            // Initialize accumulators and partition tracking BEFORE the loop
+            for (wf_idx, wf) in win_funcs.iter().enumerate() {
+                if wf.is_whole_partition {
+                    self.emit(Opcode::Null, 0, wp_agg_accum_regs[wf_idx], 0, P4::Unused);
+                }
+            }
 
-        // Build a map of col_index -> final_reg for simple aggregate window functions
-        let simple_agg_map: HashMap<usize, i32> = simple_agg_window_funcs
-            .iter()
-            .map(|(col_idx, _, _, _, final_reg)| (*col_idx, *final_reg))
-            .collect();
+            let p1_read_base = self.alloc_regs(total_cols);
+            let p1_data_reg = self.alloc_reg();
+            let p1_prev_partition = self.alloc_regs(partition_count.max(1));
+            let p1_first_flag = self.alloc_reg();
 
-        // Read column values, but for simple aggregate window functions,
-        // use the finalized value instead of reading from ephemeral table
-        for i in 0..result_count {
-            if let Some(final_reg) = simple_agg_map.get(&i) {
-                // Use the finalized aggregate value
-                self.emit(
-                    Opcode::Copy,
-                    *final_reg,
-                    result_base + i as i32,
-                    0,
-                    P4::Unused,
-                );
+            self.emit(Opcode::Integer, 1, p1_first_flag, 0, P4::Unused);
+            for i in 0..partition_count {
+                self.emit(Opcode::Null, 0, p1_prev_partition + i as i32, 0, P4::Unused);
+            }
+
+            // Sort and iterate pass 1
+            let pass1_done = self.alloc_label();
+            if sort_key_count > 0 {
+                self.emit(Opcode::SorterSort, sorter_cursor, pass1_done, 0, P4::Unused);
             } else {
-                // Read from ephemeral table
-                self.emit(
-                    Opcode::Column,
-                    eph_cursor,
-                    i as i32,
-                    result_base + i as i32,
-                    P4::Unused,
-                );
+                self.emit(Opcode::Rewind, sorter_cursor, pass1_done, 0, P4::Unused);
+            }
+
+            let pass1_loop = self.current_addr();
+
+            // Read record columns (inside loop)
+            if sort_key_count > 0 {
+                self.emit(Opcode::SorterData, sorter_cursor, p1_data_reg, 0, P4::Unused);
+            }
+            for i in 0..total_cols {
+                self.emit(Opcode::Column, sorter_cursor, i as i32, p1_read_base + i as i32, P4::Unused);
+            }
+
+            let p1_no_change = self.alloc_label();
+            if partition_count > 0 {
+                let p1_changed = self.alloc_label();
+                for i in 0..partition_count {
+                    self.emit_with_p5(Opcode::Ne, p1_read_base + i as i32, p1_changed,
+                        p1_prev_partition + i as i32, P4::Unused, 0x10);
+                }
+                self.emit(Opcode::IfNot, p1_first_flag, p1_no_change, 0, P4::Unused);
+
+                self.resolve_label(p1_changed, self.current_addr());
+
+                // On partition change: finalize accumulators for PREVIOUS partition
+                // and store them in the lookup table
+                let skip_store = self.alloc_label();
+                self.emit(Opcode::If, p1_first_flag, skip_store, 0, P4::Unused);
+
+                // Build lookup record: [prev_partition_keys..., finalized_aggs...]
+                let wp_rec_base = self.alloc_regs(partition_count + wp_agg_count);
+                for i in 0..partition_count {
+                    self.emit(Opcode::Copy, p1_prev_partition + i as i32,
+                        wp_rec_base + i as i32, 0, P4::Unused);
+                }
+                let mut agg_offset = 0;
+                for (wf_idx, wf) in win_funcs.iter().enumerate() {
+                    if !wf.is_whole_partition { continue; }
+                    if let WindowFuncType::Aggregate(ref agg_name) = wf.func_type {
+                        self.emit(Opcode::AggFinal, wp_agg_accum_regs[wf_idx],
+                            wp_rec_base + (partition_count + agg_offset) as i32, 0,
+                            P4::Text(agg_name.clone()));
+                    }
+                    agg_offset += 1;
+                }
+                let wp_rec_reg = self.alloc_reg();
+                self.emit(Opcode::MakeRecord, wp_rec_base,
+                    (partition_count + wp_agg_count) as i32, wp_rec_reg, P4::Unused);
+                let wp_rowid_reg = self.alloc_reg();
+                self.emit(Opcode::NewRowid, wp_lookup_cursor, wp_rowid_reg, 0, P4::Unused);
+                self.emit(Opcode::Insert, wp_lookup_cursor, wp_rec_reg, wp_rowid_reg, P4::Unused);
+
+                self.resolve_label(skip_store, self.current_addr());
+
+                // Reset accumulators for new partition
+                for (wf_idx, wf) in win_funcs.iter().enumerate() {
+                    if wf.is_whole_partition {
+                        self.emit(Opcode::Null, 0, wp_agg_accum_regs[wf_idx], 0, P4::Unused);
+                    }
+                }
+
+                for i in 0..partition_count {
+                    self.emit(Opcode::Copy, p1_read_base + i as i32, p1_prev_partition + i as i32, 0, P4::Unused);
+                }
+                self.emit(Opcode::Integer, 0, p1_first_flag, 0, P4::Unused);
+            } else {
+                self.emit(Opcode::IfNot, p1_first_flag, p1_no_change, 0, P4::Unused);
+                self.emit(Opcode::Integer, 0, p1_first_flag, 0, P4::Unused);
+            }
+            self.resolve_label(p1_no_change, self.current_addr());
+
+            // Accumulate aggregate values
+            for (wf_idx, wf) in win_funcs.iter().enumerate() {
+                if !wf.is_whole_partition { continue; }
+                if let WindowFuncType::Aggregate(ref agg_name) = wf.func_type {
+                    let wf_arg_col = sort_key_count + result_count + wf_idx;
+                    let arg_reg = self.alloc_reg();
+                    let argc;
+                    if wf.args.is_empty() {
+                        argc = 0;
+                        self.emit(Opcode::Null, 0, arg_reg, 0, P4::Unused);
+                    } else {
+                        argc = 1;
+                        self.emit(Opcode::Copy, p1_read_base + wf_arg_col as i32, arg_reg, 0, P4::Unused);
+                    }
+                    self.emit(Opcode::AggStep, argc, arg_reg, wp_agg_accum_regs[wf_idx], P4::Text(agg_name.clone()));
+                }
+            }
+
+            if sort_key_count > 0 {
+                self.emit(Opcode::SorterNext, sorter_cursor, pass1_loop as i32, 0, P4::Unused);
+            } else {
+                self.emit(Opcode::Next, sorter_cursor, pass1_loop as i32, 0, P4::Unused);
+            }
+
+            self.resolve_label(pass1_done, self.current_addr());
+
+            // Finalize and store the LAST partition's aggregates
+            if partition_count > 0 {
+                let wp_rec_base = self.alloc_regs(partition_count + wp_agg_count);
+                for i in 0..partition_count {
+                    self.emit(Opcode::Copy, p1_prev_partition + i as i32,
+                        wp_rec_base + i as i32, 0, P4::Unused);
+                }
+                let mut agg_offset = 0;
+                for (wf_idx, wf) in win_funcs.iter().enumerate() {
+                    if !wf.is_whole_partition { continue; }
+                    if let WindowFuncType::Aggregate(ref agg_name) = wf.func_type {
+                        self.emit(Opcode::AggFinal, wp_agg_accum_regs[wf_idx],
+                            wp_rec_base + (partition_count + agg_offset) as i32, 0,
+                            P4::Text(agg_name.clone()));
+                    }
+                    agg_offset += 1;
+                }
+                let wp_rec_reg = self.alloc_reg();
+                self.emit(Opcode::MakeRecord, wp_rec_base,
+                    (partition_count + wp_agg_count) as i32, wp_rec_reg, P4::Unused);
+                let wp_rowid_reg = self.alloc_reg();
+                self.emit(Opcode::NewRowid, wp_lookup_cursor, wp_rowid_reg, 0, P4::Unused);
+                self.emit(Opcode::Insert, wp_lookup_cursor, wp_rec_reg, wp_rowid_reg, P4::Unused);
+            } else {
+                // Non-partitioned: just finalize into wp_agg_final_regs
+                for (wf_idx, wf) in win_funcs.iter().enumerate() {
+                    if !wf.is_whole_partition { continue; }
+                    if let WindowFuncType::Aggregate(ref agg_name) = wf.func_type {
+                        self.emit(Opcode::AggFinal, wp_agg_accum_regs[wf_idx], wp_agg_final_regs[wf_idx], 0,
+                            P4::Text(agg_name.clone()));
+                    }
+                }
             }
         }
 
-        // Output the row
-        self.output_row(dest, result_base, result_count)?;
+        // =====================================================================
+        // Step 3: Pass 2 - Output rows with all window function values
+        // =====================================================================
 
-        // Next row
-        self.emit(Opcode::Next, eph_cursor, read_loop as i32, 0, P4::Unused);
+        // Allocate and initialize all tracking registers BEFORE the sort loop
+        let read_base = self.alloc_regs(total_cols);
+        let data_reg = self.alloc_reg(); // for SorterData
+        let prev_partition_base = self.alloc_regs(partition_count.max(1));
+        let row_num_reg = self.alloc_reg();
+        let partition_first_flag = self.alloc_reg();
+        let prev_order_base = self.alloc_regs(order_count.max(1));
 
-        self.resolve_label(done_label, self.current_addr());
+        struct WfState { accum_reg: i32, rank_reg: i32, dense_rank_reg: i32 }
+        let mut wf_states: Vec<WfState> = Vec::new();
+        for _wf in &win_funcs {
+            wf_states.push(WfState {
+                accum_reg: self.alloc_reg(),
+                rank_reg: self.alloc_reg(),
+                dense_rank_reg: self.alloc_reg(),
+            });
+        }
 
-        // Close cursors
-        self.emit(Opcode::Close, eph_cursor, 0, 0, P4::Unused);
+        let has_partitioned_wp_aggs = win_funcs.iter().any(|wf| wf.is_whole_partition && wf.partition_by.as_ref().map(|v| !v.is_empty()).unwrap_or(false));
+        let mut wp2_accum_regs: Vec<i32> = Vec::new();
+        if has_partitioned_wp_aggs {
+            for _wf in &win_funcs {
+                wp2_accum_regs.push(self.alloc_reg());
+            }
+        }
+
+        // Initialize state registers (BEFORE the loop)
+        self.emit(Opcode::Integer, 1, partition_first_flag, 0, P4::Unused);
+        self.emit(Opcode::Integer, 0, row_num_reg, 0, P4::Unused);
+        for state in &wf_states {
+            self.emit(Opcode::Null, 0, state.accum_reg, 0, P4::Unused);
+            self.emit(Opcode::Integer, 1, state.rank_reg, 0, P4::Unused);
+            self.emit(Opcode::Integer, 0, state.dense_rank_reg, 0, P4::Unused);
+        }
+        for i in 0..partition_count {
+            self.emit(Opcode::Null, 0, prev_partition_base + i as i32, 0, P4::Unused);
+        }
+        for i in 0..order_count {
+            self.emit(Opcode::Null, 0, prev_order_base + i as i32, 0, P4::Unused);
+        }
+
+        // Start the sort loop
+        let sort_done_label = self.alloc_label();
+        if sort_key_count > 0 {
+            self.emit(Opcode::SorterSort, sorter_cursor, sort_done_label, 0, P4::Unused);
+        } else {
+            self.emit(Opcode::Rewind, sorter_cursor, sort_done_label, 0, P4::Unused);
+        }
+
+        let sort_loop = self.current_addr();
+
+        // Read the record (inside the loop)
+        if sort_key_count > 0 {
+            self.emit(Opcode::SorterData, sorter_cursor, data_reg, 0, P4::Unused);
+        }
+        for i in 0..total_cols {
+            self.emit(Opcode::Column, sorter_cursor, i as i32, read_base + i as i32, P4::Unused);
+        }
+
+        // ----- Partition boundary detection -----
+        let no_partition_change = self.alloc_label();
+        if partition_count > 0 {
+            let partition_changed = self.alloc_label();
+            for i in 0..partition_count {
+                // Use JUMPIFNULL (p5=0x10) so NULL prev key triggers "changed" on first row
+                self.emit_with_p5(Opcode::Ne, read_base + i as i32, partition_changed,
+                    prev_partition_base + i as i32, P4::Unused, 0x10);
+            }
+            self.emit(Opcode::IfNot, partition_first_flag, no_partition_change, 0, P4::Unused);
+
+            self.resolve_label(partition_changed, self.current_addr());
+            self.emit(Opcode::Integer, 0, row_num_reg, 0, P4::Unused);
+
+            // Reset aggregate accumulators: use AggFinal to clear the agg_contexts,
+            // then set the register to NULL for a fresh start
+            for (wf_idx, wf) in win_funcs.iter().enumerate() {
+                let state = &wf_states[wf_idx];
+                if let WindowFuncType::Aggregate(ref agg_name) = wf.func_type {
+                    // AggFinal clears the agg_context entry
+                    self.emit(Opcode::AggFinal, state.accum_reg, state.accum_reg, 0,
+                        P4::Text(agg_name.clone()));
+                }
+                self.emit(Opcode::Null, 0, state.accum_reg, 0, P4::Unused);
+                self.emit(Opcode::Integer, 1, state.rank_reg, 0, P4::Unused);
+                self.emit(Opcode::Integer, 0, state.dense_rank_reg, 0, P4::Unused);
+            }
+
+            // Look up whole-partition aggregate values from the lookup table
+            if has_whole_partition_aggs && partition_count > 0 {
+                // Scan wp_lookup_cursor to find the row matching current partition key
+                let lookup_done = self.alloc_label();
+                self.emit(Opcode::Rewind, wp_lookup_cursor, lookup_done, 0, P4::Unused);
+                let lookup_loop = self.current_addr();
+
+                // Compare each partition key column
+                let lookup_next = self.alloc_label();
+                for i in 0..partition_count {
+                    let lookup_col_reg = self.alloc_reg();
+                    self.emit(Opcode::Column, wp_lookup_cursor, i as i32, lookup_col_reg, P4::Unused);
+                    self.emit_with_p5(Opcode::Ne, read_base + i as i32, lookup_next,
+                        lookup_col_reg, P4::Unused, 0x10);
+                }
+
+                // Match found: read aggregate values into wp_agg_final_regs
+                let mut agg_offset = 0;
+                for (wf_idx, wf) in win_funcs.iter().enumerate() {
+                    if !wf.is_whole_partition { continue; }
+                    self.emit(Opcode::Column, wp_lookup_cursor,
+                        (partition_count + agg_offset) as i32,
+                        wp_agg_final_regs[wf_idx], P4::Unused);
+                    agg_offset += 1;
+                }
+                self.emit(Opcode::Goto, 0, lookup_done, 0, P4::Unused);
+
+                self.resolve_label(lookup_next, self.current_addr());
+                self.emit(Opcode::Next, wp_lookup_cursor, lookup_loop as i32, 0, P4::Unused);
+                self.resolve_label(lookup_done, self.current_addr());
+            }
+
+            for i in 0..order_count {
+                self.emit(Opcode::Null, 0, prev_order_base + i as i32, 0, P4::Unused);
+            }
+            for i in 0..partition_count {
+                self.emit(Opcode::Copy, read_base + i as i32, prev_partition_base + i as i32, 0, P4::Unused);
+            }
+            self.emit(Opcode::Integer, 0, partition_first_flag, 0, P4::Unused);
+        } else {
+            self.emit(Opcode::IfNot, partition_first_flag, no_partition_change, 0, P4::Unused);
+            self.emit(Opcode::Integer, 0, partition_first_flag, 0, P4::Unused);
+        }
+        self.resolve_label(no_partition_change, self.current_addr());
+
+        // Row number increment
+        self.emit(Opcode::AddImm, row_num_reg, 1, 0, P4::Unused);
+
+        // ----- Order key change detection -----
+        let order_same = self.alloc_label();
+        let order_changed = self.alloc_label();
+        if order_count > 0 {
+            for i in 0..order_count {
+                // Use JUMPIFNULL (p5=0x10) so NULL prev key triggers "changed" on first row
+                self.emit_with_p5(Opcode::Ne, read_base + (partition_count + i) as i32,
+                    order_changed, prev_order_base + i as i32, P4::Unused, 0x10);
+            }
+            self.emit(Opcode::Goto, 0, order_same, 0, P4::Unused);
+
+            self.resolve_label(order_changed, self.current_addr());
+            for state in &wf_states {
+                self.emit(Opcode::Copy, row_num_reg, state.rank_reg, 0, P4::Unused);
+                self.emit(Opcode::AddImm, state.dense_rank_reg, 1, 0, P4::Unused);
+            }
+            for i in 0..order_count {
+                self.emit(Opcode::Copy, read_base + (partition_count + i) as i32,
+                    prev_order_base + i as i32, 0, P4::Unused);
+            }
+            self.resolve_label(order_same, self.current_addr());
+        } else {
+            self.resolve_label(order_changed, self.current_addr());
+            self.resolve_label(order_same, self.current_addr());
+        }
+
+        // ----- Compute each window function's value -----
+        for (wf_idx, wf) in win_funcs.iter().enumerate() {
+            let state = &wf_states[wf_idx];
+            let wf_arg_col = sort_key_count + result_count + wf_idx;
+
+            match &wf.func_type {
+                WindowFuncType::Aggregate(agg_name) => {
+                    if wf.is_whole_partition {
+                        let is_partitioned = wf.partition_by.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
+                        if !is_partitioned {
+                            // Non-partitioned whole-partition aggregate: use pre-computed value from pass 1
+                            self.emit(Opcode::Copy, wp_agg_final_regs[wf_idx], wf.result_reg, 0, P4::Unused);
+                        } else {
+                            // Partitioned whole-partition aggregate: use value looked up
+                            // from the wp_lookup table on partition boundary
+                            self.emit(Opcode::Copy, wp_agg_final_regs[wf_idx], wf.result_reg, 0, P4::Unused);
+                        }
+                    } else {
+                        // Running aggregate (has ORDER BY)
+                        let arg_reg = self.alloc_reg();
+                        let argc;
+                        if wf.args.is_empty() {
+                            // count(*) - zero args
+                            argc = 0;
+                            self.emit(Opcode::Null, 0, arg_reg, 0, P4::Unused);
+                        } else {
+                            argc = 1;
+                            self.emit(Opcode::Copy, read_base + wf_arg_col as i32, arg_reg, 0, P4::Unused);
+                        }
+                        self.emit(Opcode::AggStep, argc, arg_reg, state.accum_reg, P4::Text(agg_name.clone()));
+                        self.emit(Opcode::AggValue, state.accum_reg, wf.result_reg, 0, P4::Text(agg_name.clone()));
+                    }
+                }
+                WindowFuncType::RowNumber => {
+                    self.emit(Opcode::Copy, row_num_reg, wf.result_reg, 0, P4::Unused);
+                }
+                WindowFuncType::Rank => {
+                    self.emit(Opcode::Copy, state.rank_reg, wf.result_reg, 0, P4::Unused);
+                }
+                WindowFuncType::DenseRank => {
+                    self.emit(Opcode::Copy, state.dense_rank_reg, wf.result_reg, 0, P4::Unused);
+                }
+                WindowFuncType::Ntile => {
+                    // ntile: not properly implementable in single pass, use row_number placeholder
+                    self.emit(Opcode::Copy, row_num_reg, wf.result_reg, 0, P4::Unused);
+                }
+                WindowFuncType::PercentRank => {
+                    self.emit(Opcode::Real, 0, wf.result_reg, 0, P4::Real(0.0));
+                }
+                WindowFuncType::CumeDist => {
+                    self.emit(Opcode::Real, 0, wf.result_reg, 0, P4::Real(1.0));
+                }
+                WindowFuncType::Lag | WindowFuncType::Lead
+                | WindowFuncType::FirstValue | WindowFuncType::LastValue
+                | WindowFuncType::NthValue => {
+                    self.emit(Opcode::Null, 0, wf.result_reg, 0, P4::Unused);
+                }
+            }
+        }
+
+        // ----- Compose final output columns -----
+        // Set up saved_column_regs so that compile_expr for column references
+        // reads from the stored record instead of the (consumed) table cursors.
+        let mut saved_col_map = HashMap::new();
+        for (i, &(cursor, col_idx)) in source_col_map.iter().enumerate() {
+            saved_col_map.insert((cursor, col_idx), read_base + (source_col_record_offset + i) as i32);
+        }
+        self.saved_column_regs = Some(saved_col_map);
+
+        let output_base = self.alloc_regs(result_count);
+        self.window_func_counter = 0;
+
+        for (col_idx, col) in core.columns.iter().enumerate() {
+            match col {
+                ResultColumn::Star => {
+                    let tables_snapshot: Vec<_> = self.tables.clone();
+                    let coalesced_snapshot = self.coalesced_columns.clone();
+                    let mut star_col = 0;
+                    for (table_idx, table) in tables_snapshot.iter().enumerate() {
+                        let excluded_cols = coalesced_snapshot.get(&table_idx);
+                        if let Some(schema_table) = &table.schema_table {
+                            for col_def in &schema_table.columns {
+                                if let Some(excluded) = excluded_cols {
+                                    if excluded.contains(&col_def.name.to_lowercase()) { continue; }
+                                }
+                                self.emit(Opcode::Copy,
+                                    read_base + (sort_key_count + star_col) as i32,
+                                    output_base + star_col as i32, 0, P4::Unused);
+                                star_col += 1;
+                            }
+                        }
+                    }
+                }
+                ResultColumn::TableStar { .. } => {
+                    self.emit(Opcode::Copy,
+                        read_base + (sort_key_count + col_idx) as i32,
+                        output_base + col_idx as i32, 0, P4::Unused);
+                }
+                ResultColumn::Expr { expr, .. } => {
+                    if crate::executor::window::has_window_function(expr) {
+                        // Mixed expression: compile_expr will use saved_column_regs
+                        // for column references and window_func_regs for window funcs
+                        self.compile_expr(expr, output_base + col_idx as i32)?;
+                    } else {
+                        self.emit(Opcode::Copy,
+                            read_base + (sort_key_count + col_idx) as i32,
+                            output_base + col_idx as i32, 0, P4::Unused);
+                    }
+                }
+            }
+        }
+
+        self.output_row(dest, output_base, result_count)?;
+
+        self.saved_column_regs = None;
+
+        if sort_key_count > 0 {
+            self.emit(Opcode::SorterNext, sorter_cursor, sort_loop as i32, 0, P4::Unused);
+        } else {
+            self.emit(Opcode::Next, sorter_cursor, sort_loop as i32, 0, P4::Unused);
+        }
+
+        self.resolve_label(sort_done_label, self.current_addr());
+
+        self.emit(Opcode::Close, sorter_cursor, 0, 0, P4::Unused);
         for cursor in &table_cursors {
             self.emit(Opcode::Close, *cursor, 0, 0, P4::Unused);
         }
@@ -9963,6 +10485,21 @@ impl<'s> SelectCompiler<'s> {
                 }
             }
             Expr::Function(func_call) => {
+                // If this is a window function call (has OVER clause), look up
+                // the pre-computed result register from window_func_regs
+                if func_call.over.is_some() && !self.window_func_regs.is_empty() {
+                    let idx = self.window_func_counter;
+                    self.window_func_counter += 1;
+                    if let Some(&reg) = self.window_func_regs.get(&idx) {
+                        self.emit(Opcode::Copy, reg, dest_reg, 0, P4::Unused);
+                        return Ok(());
+                    }
+                    // If no register found, fall through to regular handling
+                    // (will produce NULL for unhandled window functions)
+                    self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
+                    return Ok(());
+                }
+
                 // Check if this is an aggregate function with pre-computed results
                 let name_upper = func_call.name.to_uppercase();
                 let arg_count = match &func_call.args {
@@ -10063,8 +10600,15 @@ impl<'s> SelectCompiler<'s> {
                     let is_tcl_function = crate::tcl_ext::has_tcl_user_function(&func_call.name);
                     #[cfg(not(feature = "tcl"))]
                     let is_tcl_function = false;
+                    let is_window_function = matches!(
+                        name_upper.as_str(),
+                        "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "NTILE"
+                            | "PERCENT_RANK" | "CUME_DIST" | "LAG" | "LEAD"
+                            | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE"
+                    );
                     let is_known_function = is_aggregate
                         || is_connection_function
+                        || is_window_function
                         || crate::functions::get_scalar_function(&func_call.name).is_some()
                         || is_tcl_function;
                     if !is_known_function {

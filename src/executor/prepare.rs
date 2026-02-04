@@ -1373,6 +1373,10 @@ impl<'s> StatementCompiler<'s> {
 
             let mut auto_idx_num = 0;
 
+            // Track column sets that already have autoindexes to avoid duplicates.
+            // SQLite deduplicates when the same column(s) have both UNIQUE and PRIMARY KEY.
+            let mut indexed_column_sets: Vec<Vec<String>> = Vec::new();
+
             // Create indexes for column-level UNIQUE and PRIMARY KEY constraints
             for col_def in columns {
                 // Check column type for INTEGER PRIMARY KEY (rowid alias)
@@ -1383,8 +1387,8 @@ impl<'s> StatementCompiler<'s> {
                     .unwrap_or_default();
                 let is_integer_type = col_type_upper == "INTEGER";
 
+                let mut col_needs_index = false;
                 for constraint in &col_def.constraints {
-                    // Create index for UNIQUE constraint
                     let needs_index = match &constraint.kind {
                         crate::parser::ast::ColumnConstraintKind::Unique { .. } => true,
                         crate::parser::ast::ColumnConstraintKind::PrimaryKey { .. } => {
@@ -1393,45 +1397,55 @@ impl<'s> StatementCompiler<'s> {
                         }
                         _ => false,
                     };
-
                     if needs_index {
-                        auto_idx_num += 1;
-                        let index_name =
-                            format!("sqlite_autoindex_{}_{}", create.name.name, auto_idx_num);
-                        let index_sql = format!(
-                            "CREATE UNIQUE INDEX {} ON {}({})",
-                            index_name, create.name.name, col_def.name
-                        );
-
-                        // CreateBtree for the index (BLOBKEY for index btrees)
-                        // Use same db_idx as the table
-                        ops.push(Self::make_op(
-                            Opcode::CreateBtree,
-                            db_idx,
-                            reg_index_page,
-                            BTREE_BLOBKEY as i32,
-                            P4::Unused,
-                        ));
-
-                        // ParseSchema to register the index in schema cache
-                        ops.push(Self::make_op(
-                            Opcode::ParseSchema,
-                            db_idx,
-                            reg_index_page,
-                            0,
-                            P4::Text(index_sql.clone()),
-                        ));
-
-                        // Insert into sqlite_master (auto-index has NULL SQL)
-                        self.append_sqlite_master_insert_index(
-                            &mut ops,
-                            cursor_id,
-                            &index_name,
-                            &create.name.name,
-                            reg_index_page,
-                            None, // Auto-indexes have NULL SQL field
-                        );
+                        col_needs_index = true;
                     }
+                }
+
+                // Only create one autoindex per column, even if both UNIQUE and PK
+                if col_needs_index {
+                    let col_set = vec![col_def.name.to_lowercase()];
+                    if indexed_column_sets.contains(&col_set) {
+                        continue; // Already indexed
+                    }
+                    indexed_column_sets.push(col_set);
+
+                    auto_idx_num += 1;
+                    let index_name =
+                        format!("sqlite_autoindex_{}_{}", create.name.name, auto_idx_num);
+                    let index_sql = format!(
+                        "CREATE UNIQUE INDEX {} ON {}({})",
+                        index_name, create.name.name, col_def.name
+                    );
+
+                    // CreateBtree for the index (BLOBKEY for index btrees)
+                    // Use same db_idx as the table
+                    ops.push(Self::make_op(
+                        Opcode::CreateBtree,
+                        db_idx,
+                        reg_index_page,
+                        BTREE_BLOBKEY as i32,
+                        P4::Unused,
+                    ));
+
+                    // ParseSchema to register the index in schema cache
+                    ops.push(Self::make_op(
+                        Opcode::ParseSchema,
+                        db_idx,
+                        reg_index_page,
+                        0,
+                        P4::Text(index_sql.clone()),
+                    ));
+
+                    // Insert into sqlite_master (auto-index has NULL SQL)
+                    self.append_sqlite_master_insert_index(
+                        &mut ops,
+                        cursor_id,
+                        &index_name,
+                        &create.name.name,
+                        reg_index_page,
+                        None, // Auto-indexes have NULL SQL field
+                    );
                 }
             }
 
@@ -1477,8 +1491,6 @@ impl<'s> StatementCompiler<'s> {
                     _ => continue,
                 };
 
-                auto_idx_num += 1;
-                let index_name = format!("sqlite_autoindex_{}_{}", create.name.name, auto_idx_num);
                 let col_names: Vec<String> = idx_cols
                     .iter()
                     .filter_map(|c| {
@@ -1489,6 +1501,16 @@ impl<'s> StatementCompiler<'s> {
                         }
                     })
                     .collect();
+
+                // Deduplicate: skip if same column set already has an autoindex
+                let col_set: Vec<String> = col_names.iter().map(|n| n.to_lowercase()).collect();
+                if indexed_column_sets.contains(&col_set) {
+                    continue; // Already indexed by column-level or earlier table-level constraint
+                }
+                indexed_column_sets.push(col_set);
+
+                auto_idx_num += 1;
+                let index_name = format!("sqlite_autoindex_{}_{}", create.name.name, auto_idx_num);
 
                 // Build index SQL with collation from column definitions
                 let col_specs: Vec<String> = col_names
@@ -2565,31 +2587,39 @@ impl<'s> StatementCompiler<'s> {
         ));
 
         // Compare type first - skip if type doesn't match
-        // next_label points to the Next instruction: current + 3 ops (Ne, Ne, Delete)
-        let next_label = ops.len() + 3;
+        // Layout: Ne(type)->next, Ne(name)->next, Delete, Goto->end, Next->loop
+        let next_label_placeholder = ops.len();
         ops.push(Self::make_op(
             Opcode::Ne,
             reg_type_col,
-            next_label as i32,
+            0, // will be fixed to next_label
             reg_target_type,
             P4::Unused,
         ));
 
         // Compare with target name - skip if name doesn't match
-        // Still jump to the same Next instruction
-        let next_label2 = ops.len() + 2; // current + 2 ops (Ne, Delete)
+        let name_ne_placeholder = ops.len();
         ops.push(Self::make_op(
             Opcode::Ne,
             reg_name_col,
-            next_label2 as i32,
+            0, // will be fixed to next_label
             reg_target_name,
             P4::Unused,
         ));
 
-        // Delete the current row
+        // Delete the current row, then break the loop (only one entry to delete)
         ops.push(Self::make_op(Opcode::Delete, cursor_id, 0, 0, P4::Unused));
+        let goto_end_placeholder = ops.len();
+        ops.push(Self::make_op(
+            Opcode::Goto,
+            0,
+            0, // will be fixed to end_addr
+            0,
+            P4::Unused,
+        ));
 
-        // Next row
+        // Next row (only reached when no delete happened)
+        let next_label = ops.len();
         ops.push(Self::make_op(
             Opcode::Next,
             cursor_id,
@@ -2598,9 +2628,14 @@ impl<'s> StatementCompiler<'s> {
             P4::Unused,
         ));
 
-        // End of loop - fix the Rewind jump address
+        // Fix jump targets
+        ops[next_label_placeholder].p2 = next_label as i32;
+        ops[name_ne_placeholder].p2 = next_label as i32;
+
+        // End of loop - fix the Rewind jump address and Goto->end
         let end_addr = ops.len();
         ops[rewind_addr].p2 = end_addr as i32;
+        ops[goto_end_placeholder].p2 = end_addr as i32;
     }
 
     /// Delete entries from sqlite_master where tbl_name matches (for cascading drops)
@@ -2612,17 +2647,20 @@ impl<'s> StatementCompiler<'s> {
         tbl_name: &str,
     ) {
         // sqlite_master columns: type, name, tbl_name, rootpage, sql
-        // We need to scan and find rows where tbl_name (column 2) matches
-        // and type is 'trigger' or 'index'
+        // We need to delete all rows where tbl_name (column 2) matches
+        // and type is 'trigger' or 'index'.
+        //
+        // Strategy: use a restart loop. After each delete, Rewind back to the
+        // start and scan again. This avoids cursor navigation issues during
+        // multi-page btree deletion. O(n^2) but sqlite_master is always small.
 
-        // Use high register numbers to avoid conflicts
         let reg_type_col = 32;
         let reg_tbl_name_col = 33;
         let reg_target = 34;
         let reg_trigger_type = 35;
         let reg_index_type = 36;
 
-        // Store the target tbl_name to match
+        // Store the target tbl_name and type strings
         ops.push(Self::make_op(
             Opcode::String8,
             0,
@@ -2630,8 +2668,6 @@ impl<'s> StatementCompiler<'s> {
             0,
             P4::Text(tbl_name.to_string()),
         ));
-
-        // Store "trigger" and "index" for type comparison
         ops.push(Self::make_op(
             Opcode::String8,
             0,
@@ -2647,18 +2683,18 @@ impl<'s> StatementCompiler<'s> {
             P4::Text("index".to_string()),
         ));
 
-        // Rewind to start of sqlite_master
+        // Outer loop: Rewind to start, scan for a matching entry, delete it, repeat.
+        // When a full scan finds no matches, we're done.
         let rewind_addr = ops.len();
-        let end_label = 0; // Will be fixed later
         ops.push(Self::make_op(
             Opcode::Rewind,
             cursor_id,
-            end_label,
+            0, // will be fixed to end_addr
             0,
             P4::Unused,
         ));
 
-        // Loop: read type column (column 0) and tbl_name column (column 2)
+        // Inner scan loop
         let loop_start = ops.len();
         ops.push(Self::make_op(
             Opcode::Column,
@@ -2675,45 +2711,59 @@ impl<'s> StatementCompiler<'s> {
             P4::Unused,
         ));
 
-        // Skip if tbl_name doesn't match - jump to Next instruction
-        // After this Ne, we have: Ne(trigger), Delete, Ne(index), Delete, Next
-        // That's 5 more ops, so Next is at current + 5
-        let next_label = ops.len() + 5;
+        // If tbl_name doesn't match, skip to Next
+        let ne_tblname_placeholder = ops.len();
         ops.push(Self::make_op(
             Opcode::Ne,
             reg_tbl_name_col,
-            next_label as i32,
+            0, // -> next_label
             reg_target,
             P4::Unused,
         ));
 
-        // Check if type is 'trigger' - if so, delete
-        let check_index_label = ops.len() + 2;
+        // Check if type is 'trigger'
+        let ne_trigger_placeholder = ops.len();
         ops.push(Self::make_op(
             Opcode::Ne,
             reg_type_col,
-            check_index_label as i32,
+            0, // -> check_index_label
             reg_trigger_type,
             P4::Unused,
         ));
 
-        // Delete the trigger row
+        // Type is 'trigger' and tbl_name matches: delete and restart
         ops.push(Self::make_op(Opcode::Delete, cursor_id, 0, 0, P4::Unused));
+        ops.push(Self::make_op(
+            Opcode::Goto,
+            0,
+            rewind_addr as i32,
+            0,
+            P4::Unused,
+        ));
 
-        // Check if type is 'index' - if so, delete
-        let next_label2 = ops.len() + 2;
+        // check_index: Check if type is 'index'
+        let check_index_label = ops.len();
+        let ne_index_placeholder = ops.len();
         ops.push(Self::make_op(
             Opcode::Ne,
             reg_type_col,
-            next_label2 as i32,
+            0, // -> next_label
             reg_index_type,
             P4::Unused,
         ));
 
-        // Delete the index row
+        // Type is 'index' and tbl_name matches: delete and restart
         ops.push(Self::make_op(Opcode::Delete, cursor_id, 0, 0, P4::Unused));
+        ops.push(Self::make_op(
+            Opcode::Goto,
+            0,
+            rewind_addr as i32,
+            0,
+            P4::Unused,
+        ));
 
-        // Next row
+        // next_label: No match, advance to next row
+        let next_label = ops.len();
         ops.push(Self::make_op(
             Opcode::Next,
             cursor_id,
@@ -2722,9 +2772,15 @@ impl<'s> StatementCompiler<'s> {
             P4::Unused,
         ));
 
-        // End of loop - fix the Rewind jump address
+        // If Next falls through (no more rows), the full scan found no matches.
+        // This means all matching entries have been deleted. Done.
         let end_addr = ops.len();
+
+        // Fix jump targets
         ops[rewind_addr].p2 = end_addr as i32;
+        ops[ne_tblname_placeholder].p2 = next_label as i32;
+        ops[ne_trigger_placeholder].p2 = check_index_label as i32;
+        ops[ne_index_placeholder].p2 = next_label as i32;
     }
 
     fn compile_create_index(&mut self, create: &CreateIndexStmt) -> Result<Vec<VdbeOp>> {
@@ -2735,6 +2791,29 @@ impl<'s> StatementCompiler<'s> {
         let table_name = &create.table;
         let table_name_lower = table_name.to_lowercase();
         let db_idx = self.resolve_db_idx(&create.name, false)?;
+
+        // Reject index names starting with "sqlite_" - reserved for internal use
+        if index_name_lower.starts_with("sqlite_") {
+            return Err(crate::error::Error::with_message(
+                crate::error::ErrorCode::Error,
+                format!("object name reserved for internal use: {}", index_name),
+            ));
+        }
+
+        // Check for TEMP index on non-TEMP table
+        if db_idx == 1 {
+            // Index is in temp schema - verify table is also in temp
+            let table_in_temp = self
+                .temp_schema
+                .map(|s| s.tables.contains_key(&table_name_lower))
+                .unwrap_or(false);
+            if !table_in_temp {
+                return Err(crate::error::Error::with_message(
+                    crate::error::ErrorCode::Error,
+                    format!("cannot create a TEMP index on non-TEMP table \"{}\"", table_name),
+                ));
+            }
+        }
 
         // Get the schema for the target database
         let target_schema = self.schema_for_db_idx(db_idx);
@@ -2755,6 +2834,30 @@ impl<'s> StatementCompiler<'s> {
                 ));
             }
 
+            // Check if index name conflicts with an existing table name
+            if schema.tables.contains_key(&index_name_lower) {
+                return Err(crate::error::Error::with_message(
+                    crate::error::ErrorCode::Error,
+                    format!("there is already a table named {}", index_name),
+                ));
+            }
+
+            // Check if index name conflicts with an existing view name
+            if schema.views.contains_key(&index_name_lower) {
+                return Err(crate::error::Error::with_message(
+                    crate::error::ErrorCode::Error,
+                    format!("there is already a view named {}", index_name),
+                ));
+            }
+
+            // Check if target is sqlite_master - cannot create index on system tables
+            if table_name_lower == "sqlite_master" || table_name_lower == "sqlite_schema" {
+                return Err(crate::error::Error::with_message(
+                    crate::error::ErrorCode::Error,
+                    format!("table {} may not be indexed", table_name),
+                ));
+            }
+
             // Check if target is a view - cannot create index on views
             if schema.views.contains_key(&table_name_lower) {
                 return Err(crate::error::Error::with_message(
@@ -2765,10 +2868,49 @@ impl<'s> StatementCompiler<'s> {
 
             // Check if target table exists in the target schema
             if !schema.tables.contains_key(&table_name_lower) {
+                // SQLite qualifies with the schema name: "no such table: main.test1"
+                let schema_prefix = if db_idx == 0 {
+                    "main."
+                } else if db_idx == 1 {
+                    "temp."
+                } else {
+                    ""
+                };
                 return Err(crate::error::Error::with_message(
                     crate::error::ErrorCode::Error,
-                    format!("no such table: {}", table_name),
+                    format!("no such table: {}{}", schema_prefix, table_name),
                 ));
+            }
+
+            // Validate that all indexed columns exist in the table
+            if let Some(table) = schema.tables.get(&table_name_lower) {
+                for idx_col in &create.columns {
+                    let col_name = match &idx_col.column {
+                        crate::parser::ast::IndexedColumnKind::Name(n) => Some(n.clone()),
+                        crate::parser::ast::IndexedColumnKind::Expr(e) => {
+                            // Extract column name from expression if it's a simple column ref
+                            if let Expr::Column(col) = e.as_ref() {
+                                Some(col.column.clone())
+                            } else if let Expr::Collate { expr, .. } = e.as_ref() {
+                                if let Expr::Column(col) = expr.as_ref() {
+                                    Some(col.column.clone())
+                                } else {
+                                    None // Complex expression - skip column validation
+                                }
+                            } else {
+                                None // Expression index - skip column validation
+                            }
+                        }
+                    };
+                    if let Some(ref name) = col_name {
+                        if !table.columns.iter().any(|c| c.name.eq_ignore_ascii_case(name)) {
+                            return Err(crate::error::Error::with_message(
+                                crate::error::ErrorCode::Error,
+                                format!("no such column: {}", name),
+                            ));
+                        }
+                    }
+                }
             }
         }
 
@@ -3132,6 +3274,14 @@ impl<'s> StatementCompiler<'s> {
     }
 
     fn compile_create_view(&mut self, create: &CreateViewStmt) -> Result<Vec<VdbeOp>> {
+        // Reject view names starting with "sqlite_" - reserved for internal use
+        if create.name.name.to_lowercase().starts_with("sqlite_") {
+            return Err(crate::error::Error::with_message(
+                crate::error::ErrorCode::Error,
+                format!("object name reserved for internal use: {}", create.name.name),
+            ));
+        }
+
         // Check for parameters in the view definition - not allowed
         if Self::select_has_parameters(&create.query) {
             return Err(crate::error::Error::with_message(
@@ -3299,6 +3449,14 @@ impl<'s> StatementCompiler<'s> {
     }
 
     fn compile_create_trigger(&mut self, create: &CreateTriggerStmt) -> Result<Vec<VdbeOp>> {
+        // Reject trigger names starting with "sqlite_" - reserved for internal use
+        if create.name.name.to_lowercase().starts_with("sqlite_") {
+            return Err(crate::error::Error::with_message(
+                crate::error::ErrorCode::Error,
+                format!("object name reserved for internal use: {}", create.name.name),
+            ));
+        }
+
         // Determine the database for the trigger
         let trigger_db_idx = self.resolve_db_idx(&create.name, create.temporary)?;
 
@@ -4821,6 +4979,13 @@ impl<'s> StatementCompiler<'s> {
 
         // Check for reserved names (sqlite_master, etc.) - cannot be dropped
         if name_lower.starts_with("sqlite_") {
+            if kind == "index" && name_lower.starts_with("sqlite_autoindex_") {
+                // SQLite-compatible error message for autoindexes
+                return Err(crate::error::Error::with_message(
+                    crate::error::ErrorCode::Error,
+                    "index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped".to_string(),
+                ));
+            }
             return Err(crate::error::Error::with_message(
                 crate::error::ErrorCode::Error,
                 format!("{} {} may not be dropped", kind, name),

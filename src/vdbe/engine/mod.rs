@@ -6355,11 +6355,17 @@ impl Vdbe {
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if let Some(ref mut bt_cursor) = cursor.btree_cursor {
                         let res = if cursor.is_index {
-                            bt_cursor.index_moveto(&UnpackedRecord::new(index_key.clone()))?
+                            // SeekGE: default_rc = +1 means prefix matches position cursor
+                            // at the first matching entry (entry treated as > target)
+                            let mut rec = UnpackedRecord::new(index_key.clone());
+                            rec.default_rc = 1;
+                            bt_cursor.index_moveto(&rec)?
                         } else {
                             bt_cursor.table_moveto(rowid_key, false)?
                         };
 
+                        // RustQL inverted convention: res==1 means all entries < target
+                        // (cursor at last entry, which is < target). Need to advance.
                         if res == 1 {
                             let _ = bt_cursor.next(0);
                         }
@@ -6389,11 +6395,19 @@ impl Vdbe {
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if let Some(ref mut bt_cursor) = cursor.btree_cursor {
                         let res = if cursor.is_index {
-                            bt_cursor.index_moveto(&UnpackedRecord::new(index_key.clone()))?
+                            // SeekGT: default_rc = -1 means prefix matches are treated
+                            // as "entry < target", so moveto skips past all of them.
+                            let mut rec = UnpackedRecord::new(index_key.clone());
+                            rec.default_rc = -1;
+                            bt_cursor.index_moveto(&rec)?
                         } else {
                             bt_cursor.table_moveto(rowid_key, false)?
                         };
 
+                        // RustQL inverted convention:
+                        // res==0: exact match, need to advance past it
+                        // res==1: all entries < target, advance to end (invalid)
+                        // res==-1: cursor already at entry > target, stay
                         if res >= 0 {
                             let _ = bt_cursor.next(0);
                         }
@@ -6423,11 +6437,18 @@ impl Vdbe {
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if let Some(ref mut bt_cursor) = cursor.btree_cursor {
                         let res = if cursor.is_index {
-                            bt_cursor.index_moveto(&UnpackedRecord::new(index_key.clone()))?
+                            // SeekLE: default_rc = -1 means prefix matches are treated
+                            // as "entry < target", so moveto skips past all prefix entries
+                            // and lands at first entry > target. Then previous() goes back.
+                            let mut rec = UnpackedRecord::new(index_key.clone());
+                            rec.default_rc = -1;
+                            bt_cursor.index_moveto(&rec)?
                         } else {
                             bt_cursor.table_moveto(rowid_key, false)?
                         };
 
+                        // RustQL inverted convention:
+                        // res==-1: cursor at entry > target, need to go back
                         if res < 0 {
                             let _ = bt_cursor.previous(0);
                         }
@@ -6457,12 +6478,19 @@ impl Vdbe {
                 if let Some(cursor) = self.cursor_mut(op.p1) {
                     if let Some(ref mut bt_cursor) = cursor.btree_cursor {
                         let res = if cursor.is_index {
-                            bt_cursor.index_moveto(&UnpackedRecord::new(index_key.clone()))?
+                            // SeekLT: default_rc = +1 means prefix matches are treated
+                            // as "entry > target". Then previous() goes to entry before.
+                            let mut rec = UnpackedRecord::new(index_key.clone());
+                            rec.default_rc = 1;
+                            bt_cursor.index_moveto(&rec)?
                         } else {
                             bt_cursor.table_moveto(rowid_key, false)?
                         };
 
-                        if res >= 0 {
+                        // RustQL inverted convention:
+                        // res==-1: cursor at entry > target, need to go back
+                        // res==0: exact match, need to go back (strictly less than)
+                        if res <= 0 {
                             let _ = bt_cursor.previous(0);
                         }
 

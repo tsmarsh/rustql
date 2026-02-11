@@ -1482,7 +1482,8 @@ impl Vdbe {
 
                 // Determine if this is a trigger RAISE error (P2 = 1, 2, or 3 with P1 = SQLITE_CONSTRAINT)
                 // P2: 1=ROLLBACK, 2=ABORT, 3=FAIL, 4=IGNORE
-                let is_trigger_constraint = self.rc == ErrorCode::Constraint && op.p2 >= 1 && op.p2 <= 3;
+                let is_trigger_constraint =
+                    self.rc == ErrorCode::Constraint && op.p2 >= 1 && op.p2 <= 3;
 
                 // Check if we're in a subprogram (trigger)
                 if let Some((
@@ -1722,9 +1723,12 @@ impl Vdbe {
             }
 
             Opcode::Copy => {
-                // Copy P1 to P2
-                let val = self.mem(op.p1).clone();
-                self.set_mem(op.p2, val);
+                // Copy P3+1 registers from P1..P1+P3 to P2..P2+P3
+                let count = op.p3 + 1;
+                for i in 0..count {
+                    let val = self.mem(op.p1 + i).clone();
+                    self.set_mem(op.p2 + i, val);
+                }
             }
 
             Opcode::SCopy => {
@@ -6582,7 +6586,9 @@ impl Vdbe {
                     )
                 });
 
-                if let Some((is_empty, num_key_cols, sort_desc, sort_collations, sort_bignull)) = cursor_info {
+                if let Some((is_empty, num_key_cols, sort_desc, sort_collations, sort_bignull)) =
+                    cursor_info
+                {
                     if is_empty {
                         self.pc = op.p2;
                     } else {
@@ -6997,19 +7003,45 @@ impl Vdbe {
             }
 
             Opcode::Cast => {
-                // Cast P1 P2: Convert value in P1 to affinity in P2
+                // Cast P1 P2: Hard type conversion of value in P1
                 // P2 is an affinity character: 'A'=BLOB, 'B'=TEXT, 'C'=NUMERIC, 'D'=INTEGER, 'E'=REAL
-                if op.p2 as u8 == b'D' {
-                    self.mem_mut(op.p1).cast_to_integer();
+                let m = self.mem_mut(op.p1);
+                if m.is_null() {
+                    // NULL stays NULL regardless of target type
                 } else {
-                    let affinity = match op.p2 as u8 {
-                        b'A' => crate::schema::Affinity::Blob,
-                        b'B' => crate::schema::Affinity::Text,
-                        b'C' => crate::schema::Affinity::Numeric,
-                        b'E' => crate::schema::Affinity::Real,
-                        _ => crate::schema::Affinity::Blob,
-                    };
-                    self.mem_mut(op.p1).apply_affinity(affinity);
+                    match op.p2 as u8 {
+                        b'A' => {
+                            // BLOB: convert to text representation, then re-tag as blob
+                            let bytes = m.to_str().into_bytes();
+                            m.set_blob(&bytes);
+                        }
+                        b'B' => {
+                            // TEXT: convert to text representation
+                            let s = m.to_str();
+                            m.set_str(&s);
+                        }
+                        b'C' => {
+                            // NUMERIC: prefer integer, then real
+                            m.apply_affinity(crate::schema::Affinity::Numeric);
+                        }
+                        b'D' => {
+                            // INTEGER: hard cast
+                            m.cast_to_integer();
+                        }
+                        b'E' => {
+                            // REAL: hard cast — non-numeric text becomes 0.0
+                            if m.is_int() {
+                                let v = m.to_int() as f64;
+                                m.set_real(v);
+                            } else if m.is_str() || m.is_blob() {
+                                let s = m.to_str();
+                                let v = s.trim().parse::<f64>().unwrap_or(0.0);
+                                m.set_real(v);
+                            }
+                            // real stays real, null handled above
+                        }
+                        _ => {}
+                    }
                 }
             }
 
@@ -9366,7 +9398,9 @@ impl Vdbe {
                     )
                 });
 
-                if let Some((is_empty, num_key_cols, sort_desc, sort_collations, sort_bignull)) = cursor_info {
+                if let Some((is_empty, num_key_cols, sort_desc, sort_collations, sort_bignull)) =
+                    cursor_info
+                {
                     if is_empty {
                         self.pc = op.p2;
                     } else {
@@ -10668,10 +10702,18 @@ fn compare_records_with_collations_bignull(
             match (a_is_null, b_is_null) {
                 (true, true) => Ordering::Equal,
                 (true, false) => {
-                    if bignull { Ordering::Greater } else { Ordering::Less }
+                    if bignull {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    }
                 }
                 (false, true) => {
-                    if bignull { Ordering::Less } else { Ordering::Greater }
+                    if bignull {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    }
                 }
                 _ => unreachable!(),
             }

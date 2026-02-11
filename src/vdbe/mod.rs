@@ -40,5 +40,5 @@ pub use bytecode::{
 
 pub use engine::{
     get_like_count, get_search_count, get_sort_count, get_sort_flag, get_step_count,
-    reset_like_count, reset_search_count, reset_sort_count, reset_step_count,
+    reset_like_count, reset_search_count, reset_sort_count, reset_step_count, ExecResult, Vdbe,
 };

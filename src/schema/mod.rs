@@ -1295,6 +1295,26 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
             col_def_upper.contains(" PRIMARY KEY") || col_def_upper.contains(" PRIMARY");
         let is_not_null = col_def_upper.contains(" NOT NULL");
 
+        // Extract ON CONFLICT action for NOT NULL constraint
+        let not_null_conflict = if is_not_null {
+            if let Some(pos) = col_def_upper.find("NOT NULL ON CONFLICT") {
+                let after = &col_def_upper[pos + "NOT NULL ON CONFLICT".len()..].trim_start();
+                let action_str = after.split_whitespace().next().unwrap_or("");
+                match action_str {
+                    "IGNORE" => Some(ConflictAction::Ignore),
+                    "REPLACE" => Some(ConflictAction::Replace),
+                    "ABORT" => Some(ConflictAction::Abort),
+                    "FAIL" => Some(ConflictAction::Fail),
+                    "ROLLBACK" => Some(ConflictAction::Rollback),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Extract ON CONFLICT action for UNIQUE or PRIMARY KEY constraints
         let unique_conflict = if is_unique || is_primary_key {
             // Look for "UNIQUE ON CONFLICT <action>" or "PRIMARY KEY ON CONFLICT <action>" pattern
@@ -1366,7 +1386,7 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
             type_name,
             affinity,
             not_null: is_not_null,
-            not_null_conflict: None,
+            not_null_conflict,
             default_value,
             collation,
             is_primary_key,

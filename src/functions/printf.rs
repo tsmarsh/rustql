@@ -16,7 +16,7 @@ bitflags! {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct PrintfSpec {
     flags: FormatFlags,
     width: i32,
@@ -203,8 +203,23 @@ fn format_arg(spec: &PrintfSpec, arg: &Value) -> Result<String> {
         'g' | 'G' => format_float(spec, arg.to_f64(), spec.specifier),
         's' => format_string(spec, &arg.to_text()),
         'c' => {
-            let c = std::char::from_u32(arg.to_i64() as u32).unwrap_or('\u{FFFD}');
-            format_string(spec, &c.to_string())
+            // In SQLite, %c with a text argument uses the first character of the string.
+            // With an integer argument, it uses the character with that Unicode code point.
+            let c = match arg {
+                Value::Text(s) if !s.is_empty() => s.chars().next().unwrap_or('\0'),
+                _ => std::char::from_u32(arg.to_i64() as u32).unwrap_or('\u{FFFD}'),
+            };
+            // SQLite: precision for %c means repeat the character N times
+            let count = if spec.precision > 0 {
+                spec.precision as usize
+            } else {
+                1
+            };
+            let s: String = std::iter::repeat(c).take(count).collect();
+            // Don't re-apply precision truncation - it's already the right length
+            let mut adjusted_spec = *spec;
+            adjusted_spec.precision = -1;
+            format_string(&adjusted_spec, &s)
         }
         'p' => format_pointer(spec, arg.to_i64() as u64),
         'q' => format_sql_escape(spec, &arg.to_text()),

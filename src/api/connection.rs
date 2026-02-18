@@ -1625,15 +1625,52 @@ fn load_schema_from_btree(
                 }
             }
             "index" => {
+                let idx_name = values.get(1).map(Mem::to_str).unwrap_or_default();
                 if let Some(mut index) = parse_create_index_sql(&sql, &tbl_name, root_page, schema)
                 {
                     // Set db_idx from the database this schema was loaded from
                     index.db_idx = db_idx;
                     let name = index.name.to_lowercase();
+                    // Also update the matching entry in table.indexes with the real root_page
+                    if let Some(table) = schema.tables.get_mut(&tbl_name.to_lowercase()) {
+                        let table_mut = Arc::make_mut(table);
+                        if let Some(tidx) = table_mut
+                            .indexes
+                            .iter_mut()
+                            .find(|i| i.name.eq_ignore_ascii_case(&index.name))
+                        {
+                            let mut updated = (**tidx).clone();
+                            updated.root_page = root_page;
+                            updated.db_idx = db_idx;
+                            *tidx = Arc::new(updated);
+                        }
+                    }
                     schema
                         .indexes
                         .entry(name)
                         .or_insert_with(|| Arc::new(index));
+                } else if !idx_name.is_empty() && root_page > 0 {
+                    // Auto-index with NULL SQL: update root_page in table.indexes
+                    // and add to schema.indexes for conflict resolution lookups
+                    let idx_name_lower = idx_name.to_lowercase();
+                    if let Some(table) = schema.tables.get_mut(&tbl_name.to_lowercase()) {
+                        let table_mut = Arc::make_mut(table);
+                        if let Some(tidx) = table_mut
+                            .indexes
+                            .iter_mut()
+                            .find(|i| i.name.eq_ignore_ascii_case(&idx_name))
+                        {
+                            let mut updated = (**tidx).clone();
+                            updated.root_page = root_page;
+                            updated.db_idx = db_idx;
+                            *tidx = Arc::new(updated.clone());
+                            // Also add to schema.indexes
+                            schema
+                                .indexes
+                                .entry(idx_name_lower)
+                                .or_insert_with(|| Arc::new(updated));
+                        }
+                    }
                 }
             }
             "view" => {

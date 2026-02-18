@@ -47,6 +47,12 @@ pub enum AggregateState {
 
     /// DECIMAL_SUM(x) state
     DecimalSum { sum: f64, has_value: bool },
+
+    /// JSON_GROUP_ARRAY(x) state
+    JsonGroupArray { values: Vec<Value> },
+
+    /// JSON_GROUP_OBJECT(name, value) state
+    JsonGroupObject { pairs: Vec<(String, Value)> },
 }
 
 impl AggregateState {
@@ -72,6 +78,8 @@ impl AggregateState {
                 sum: 0.0,
                 has_value: false,
             }),
+            "JSON_GROUP_ARRAY" => Some(AggregateState::JsonGroupArray { values: Vec::new() }),
+            "JSON_GROUP_OBJECT" => Some(AggregateState::JsonGroupObject { pairs: Vec::new() }),
             _ => None,
         }
     }
@@ -239,6 +247,28 @@ impl AggregateState {
                 }
                 Ok(false)
             }
+
+            AggregateState::JsonGroupArray { values } => {
+                if let Some(val) = args.first() {
+                    values.push(val.clone());
+                }
+                Ok(false)
+            }
+
+            AggregateState::JsonGroupObject { pairs } => {
+                if args.len() >= 2 {
+                    let key = match &args[0] {
+                        Value::Null => String::new(), // NULL key becomes empty string
+                        Value::Text(s) => s.clone(),
+                        other => other.to_text(),
+                    };
+                    // Skip entries with NULL keys (SQLite skips them)
+                    if !matches!(args[0], Value::Null) {
+                        pairs.push((key, args[1].clone()));
+                    }
+                }
+                Ok(false)
+            }
         }
     }
 
@@ -288,6 +318,26 @@ impl AggregateState {
                 // Convert to lowercase hex string
                 let hex: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
                 Ok(Value::Text(hex))
+            }
+
+            AggregateState::JsonGroupArray { values } => {
+                // Convert values to JSON array string
+                use crate::functions::json::{json_to_string_pub, sql_to_json_for_agg};
+                let json_vals: Vec<_> = values.iter().map(sql_to_json_for_agg).collect();
+                Ok(Value::Text(json_to_string_pub(
+                    &crate::functions::json::JsonValue::Array(json_vals),
+                )))
+            }
+
+            AggregateState::JsonGroupObject { pairs } => {
+                use crate::functions::json::{json_to_string_pub, sql_to_json_for_agg};
+                let json_pairs: Vec<_> = pairs
+                    .iter()
+                    .map(|(k, v)| (k.clone(), sql_to_json_for_agg(v)))
+                    .collect();
+                Ok(Value::Text(json_to_string_pub(
+                    &crate::functions::json::JsonValue::Object(json_pairs),
+                )))
             }
 
             AggregateState::DecimalSum { sum, has_value } => {
@@ -449,6 +499,8 @@ pub fn is_aggregate_function(name: &str) -> bool {
             | "STRING_AGG"
             | "MD5SUM"
             | "DECIMAL_SUM"
+            | "JSON_GROUP_ARRAY"
+            | "JSON_GROUP_OBJECT"
     )
 }
 
@@ -505,6 +557,16 @@ pub fn get_aggregate_function(name: &str) -> Option<AggregateInfo> {
             name: name_upper,
             min_args: 1,
             max_args: 1,
+        }),
+        "JSON_GROUP_ARRAY" => Some(AggregateInfo {
+            name: name_upper,
+            min_args: 1,
+            max_args: 1,
+        }),
+        "JSON_GROUP_OBJECT" => Some(AggregateInfo {
+            name: name_upper,
+            min_args: 2,
+            max_args: 2,
         }),
         _ => None,
     }

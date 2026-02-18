@@ -2771,6 +2771,23 @@ impl<'a> Parser<'a> {
     fn parse_unary_expr(&mut self) -> Result<Expr> {
         if self.match_token(TokenKind::Minus) {
             let expr = self.parse_unary_expr()?;
+            // Constant-fold negation of numeric literals
+            match &expr {
+                Expr::Literal(Literal::Integer(n)) => {
+                    // i64::MIN cannot be represented as a positive integer,
+                    // but wrapping negation handles it correctly
+                    return Ok(Expr::Literal(Literal::Integer(n.wrapping_neg())));
+                }
+                Expr::Literal(Literal::Float(f)) => {
+                    // Special case: 9223372036854775808.0 (i64::MAX+1) when negated
+                    // should become i64::MIN (-9223372036854775808)
+                    if *f == 9223372036854775808.0 {
+                        return Ok(Expr::Literal(Literal::Integer(i64::MIN)));
+                    }
+                    return Ok(Expr::Literal(Literal::Float(-f)));
+                }
+                _ => {}
+            }
             return Ok(Expr::Unary {
                 op: UnaryOp::Neg,
                 expr: Box::new(expr),

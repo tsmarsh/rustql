@@ -1511,16 +1511,16 @@ impl Vdbe {
                             .error_msg
                             .clone()
                             .unwrap_or_else(|| "constraint failed".to_string());
+                        let mut err = Error::with_message(self.rc, msg);
                         // Use extended error code for trigger constraints
                         if is_trigger_constraint {
-                            let mut err = Error::with_message(self.rc, msg);
                             err.extended = Some(ExtendedErrorCode::ConstraintTrigger);
-                            // Carry the on-error action (1=ROLLBACK, 2=ABORT, 3=FAIL)
-                            // so the statement executor can determine rollback behavior
-                            err.on_error_action = Some(op.p2 as u8);
-                            return Err(err);
                         }
-                        return Err(Error::with_message(self.rc, msg));
+                        // Propagate on-error action from P2
+                        if op.p2 >= 1 && op.p2 <= 4 {
+                            err.on_error_action = Some(op.p2 as u8);
+                        }
+                        return Err(err);
                     }
                     // Otherwise continue execution in parent
                 } else {
@@ -1530,14 +1530,13 @@ impl Vdbe {
                             .error_msg
                             .clone()
                             .unwrap_or_else(|| "constraint failed".to_string());
-                        // Use extended error code for trigger constraints
-                        if is_trigger_constraint {
-                            let mut err = Error::with_message(self.rc, msg);
-                            err.extended = Some(ExtendedErrorCode::ConstraintTrigger);
+                        let mut err = Error::with_message(self.rc, msg);
+                        // Propagate on-error action from P2
+                        // P2: OE_Rollback=1, OE_Abort=2, OE_Fail=3, OE_Ignore=4
+                        if op.p2 >= 1 && op.p2 <= 4 {
                             err.on_error_action = Some(op.p2 as u8);
-                            return Err(err);
                         }
-                        return Err(Error::with_message(self.rc, msg));
+                        return Err(err);
                     }
 
                     // Top-level halt - check if we need to return count_changes result
@@ -2208,6 +2207,17 @@ impl Vdbe {
                         cursor.table_name = table_name;
                         cursor.is_sqlite_stat1 = true;
                         cursor.stat1_entries = Some(entries);
+                    }
+                } else if simple_name.starts_with("pragma_") {
+                    // Handle pragma_* virtual tables (e.g., pragma_compile_options)
+                    // These expose pragma results as queryable tables.
+                    // For now, we create empty virtual cursors for these.
+                    self.open_cursor(op.p1, 0, false)?;
+                    if let Some(cursor) = self.cursor_mut(op.p1) {
+                        cursor.n_field = 1;
+                        cursor.table_name = table_name;
+                        cursor.is_virtual = true;
+                        cursor.vtab_name = Some(simple_name.clone());
                     }
                 } else {
                     let mut table_meta = None;
@@ -6004,8 +6014,24 @@ impl Vdbe {
                         }
                     }
                 } else if let Some(cursor) = self.cursor_mut(op.p1) {
-                    // Non-virtual table path
-                    if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                    if cursor.is_ephemeral {
+                        // Ephemeral table: search ephemeral_rows by rowid
+                        if let Some(pos) = cursor
+                            .ephemeral_rows
+                            .iter()
+                            .position(|(rid, _)| *rid == rowid)
+                        {
+                            let data = cursor.ephemeral_rows[pos].1.clone();
+                            cursor.state = CursorState::Valid;
+                            cursor.rowid = Some(rowid);
+                            cursor.ephemeral_index = pos;
+                            cursor.row_data = Some(data);
+                            exists = true;
+                        } else {
+                            cursor.state = CursorState::Invalid;
+                        }
+                    } else if let Some(ref mut bt_cursor) = cursor.btree_cursor {
+                        // Non-virtual table path
                         match bt_cursor.table_moveto(rowid, false) {
                             Ok(0) => {
                                 // Exact match found - row exists
@@ -7170,6 +7196,7 @@ impl Vdbe {
             // ================================================================
             Opcode::IdxGE => {
                 // IdxGE P1 P2 P3 P4: jump if index entry >= key
+                // P3 may be a blob-format record (from MakeRecord) or a base register
                 // For btree indexes: compare current entry with key and jump if >=
                 // For ephemeral tables: jump to P2 if record P3 exists in cursor P1
 
@@ -7187,6 +7214,15 @@ impl Vdbe {
                 };
 
                 let mut should_jump = false;
+
+                // Determine key values: if P3 is a blob, decode as record; otherwise use individual registers
+                let key_vals: Vec<Mem> = if self.mem(op.p3).is_blob() {
+                    self.decode_record_mems(&record)
+                } else {
+                    (0..key_cols)
+                        .map(|i| self.mem(op.p3 + i as i32).clone())
+                        .collect()
+                };
 
                 // Extract cursor's key_info collation names before mutable borrow
                 let cursor_collations: Vec<String> = self
@@ -7218,7 +7254,7 @@ impl Vdbe {
                             let mut cmp = std::cmp::Ordering::Equal;
                             for i in 0..key_cols {
                                 let idx_mem = index_mems.get(i).unwrap_or(&null_mem);
-                                let key_mem = self.mem(op.p3 + i as i32);
+                                let key_mem = key_vals.get(i).unwrap_or(&null_mem);
 
                                 // Get collation for this column - prefer P4 KeyInfo, fall back to cursor's key_info
                                 let collation = p4_key_info
@@ -7253,6 +7289,7 @@ impl Vdbe {
 
             Opcode::IdxGT => {
                 // IdxGT P1 P2 P3 P4: jump if index entry > key
+                // P3 may be a blob-format record (from MakeRecord) or a base register
                 let p4_key_info = match &op.p4 {
                     P4::KeyInfo(info) => Some(info),
                     _ => None,
@@ -7265,6 +7302,16 @@ impl Vdbe {
 
                 if key_cols != 0 {
                     let mut should_jump = false;
+
+                    // Determine key values: if P3 is a blob, decode as record; otherwise use individual registers
+                    let key_vals: Vec<Mem> = if self.mem(op.p3).is_blob() {
+                        let blob = self.mem(op.p3).to_blob();
+                        self.decode_record_mems(&blob)
+                    } else {
+                        (0..key_cols)
+                            .map(|i| self.mem(op.p3 + i as i32).clone())
+                            .collect()
+                    };
 
                     // Extract cursor's key_info collation names before mutable borrow
                     let cursor_collations: Vec<String> = self
@@ -7292,7 +7339,7 @@ impl Vdbe {
                                 let mut cmp = std::cmp::Ordering::Equal;
                                 for i in 0..key_cols {
                                     let idx_mem = index_mems.get(i).unwrap_or(&null_mem);
-                                    let key_mem = self.mem(op.p3 + i as i32);
+                                    let key_mem = key_vals.get(i).unwrap_or(&null_mem);
 
                                     // Get collation for this column - prefer P4 KeyInfo, fall back to cursor's key_info
                                     let collation = p4_key_info
@@ -7327,6 +7374,7 @@ impl Vdbe {
 
             Opcode::IdxLE => {
                 // IdxLE P1 P2 P3 P4: jump if index entry <= key
+                // P3 is the base register of an unpacked key (r[P3@P4])
                 let p4_key_info = match &op.p4 {
                     P4::KeyInfo(info) => Some(info),
                     _ => None,
@@ -7339,6 +7387,16 @@ impl Vdbe {
 
                 if key_cols != 0 {
                     let mut should_jump = false;
+
+                    // Determine key values: if P3 is a blob, decode as record; otherwise use individual registers
+                    let key_vals: Vec<Mem> = if self.mem(op.p3).is_blob() {
+                        let blob = self.mem(op.p3).to_blob();
+                        self.decode_record_mems(&blob)
+                    } else {
+                        (0..key_cols)
+                            .map(|i| self.mem(op.p3 + i as i32).clone())
+                            .collect()
+                    };
 
                     // Extract cursor's key_info collation names before mutable borrow
                     let cursor_collations: Vec<String> = self
@@ -7366,7 +7424,7 @@ impl Vdbe {
                                 let mut cmp = std::cmp::Ordering::Equal;
                                 for i in 0..key_cols {
                                     let idx_mem = index_mems.get(i).unwrap_or(&null_mem);
-                                    let key_mem = self.mem(op.p3 + i as i32);
+                                    let key_mem = key_vals.get(i).unwrap_or(&null_mem);
 
                                     // Get collation for this column - prefer P4 KeyInfo, fall back to cursor's key_info
                                     let collation = p4_key_info
@@ -9845,6 +9903,73 @@ impl Vdbe {
 
             Opcode::VUpdate => {
                 // Update virtual table (insert/delete/update)
+            }
+
+            Opcode::JsonPopulate => {
+                // Populate ephemeral table P1 with json_each/json_tree rows
+                // P1 = ephemeral cursor, P2 = register with JSON text
+                // P3 = register with optional path (0 = no path)
+                // P4 = Text("json_each") or Text("json_tree")
+                let cursor_id = op.p1;
+                let json_reg = op.p2;
+                let path_reg = op.p3;
+
+                let json_val = self.mem(json_reg).to_value();
+                let func_name = match &op.p4 {
+                    P4::Text(s) => s.as_str(),
+                    _ => "json_each",
+                };
+
+                let json_text = match &json_val {
+                    Value::Null => {
+                        // NULL input -> no rows (skip population)
+                        return Ok(ExecResult::Continue);
+                    }
+                    Value::Text(s) => s.clone(),
+                    other => other.to_text(),
+                };
+
+                let path = if path_reg > 0 {
+                    let path_val = self.mem(path_reg).to_value();
+                    match &path_val {
+                        Value::Null => None,
+                        Value::Text(s) => Some(s.clone()),
+                        other => Some(other.to_text()),
+                    }
+                } else {
+                    None
+                };
+
+                let rows = if func_name == "json_tree" {
+                    crate::functions::json::json_tree_rows(&json_text, path.as_deref())?
+                } else {
+                    crate::functions::json::json_each_rows(&json_text, path.as_deref())?
+                };
+
+                // Insert rows into the ephemeral table
+                if let Some(cursor) = self.cursor_mut(cursor_id) {
+                    // Clear any existing data
+                    cursor.ephemeral_rows.clear();
+                    cursor.ephemeral_set.clear();
+                    cursor.ephemeral_index = 0;
+
+                    for (row_idx, row) in rows.iter().enumerate() {
+                        // Convert row values to Mem cells and serialize as a record
+                        let mems: Vec<Mem> = vec![
+                            Mem::from_value(&row.key),
+                            Mem::from_value(&row.value),
+                            Mem::from_value(&row.type_name),
+                            Mem::from_value(&row.atom),
+                            Mem::from_value(&row.id),
+                            Mem::from_value(&row.parent),
+                            Mem::from_value(&row.fullkey),
+                            Mem::from_value(&row.path),
+                        ];
+                        let record = crate::vdbe::auxdata::make_record(&mems, 0, 8);
+                        let rowid = (row_idx + 1) as i64;
+                        cursor.ephemeral_rows.push((rowid, record));
+                    }
+                }
             }
 
             Opcode::MaxOpcode => {

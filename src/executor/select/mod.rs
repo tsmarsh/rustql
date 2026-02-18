@@ -1465,6 +1465,34 @@ impl<'s> SelectCompiler<'s> {
         self.has_aggregates = self.check_for_aggregates(core);
         self.has_window_functions = select_has_window_functions(core);
 
+        // Validate: window functions cannot appear in WHERE, GROUP BY, or HAVING
+        if let Some(ref where_expr) = core.where_clause {
+            if let Some(name) = Self::find_window_func_in_expr(where_expr) {
+                return Err(Error::with_message(
+                    ErrorCode::Error,
+                    format!("misuse of window function {}()", name.to_lowercase()),
+                ));
+            }
+        }
+        if let Some(ref group_by) = core.group_by {
+            for expr in group_by {
+                if let Some(name) = Self::find_window_func_in_expr(expr) {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        format!("misuse of window function {}()", name.to_lowercase()),
+                    ));
+                }
+            }
+        }
+        if let Some(ref having) = core.having {
+            if let Some(name) = Self::find_window_func_in_expr(having) {
+                return Err(Error::with_message(
+                    ErrorCode::Error,
+                    format!("misuse of window function {}()", name.to_lowercase()),
+                ));
+            }
+        }
+
         // Validate no nested aggregates (e.g., SUM(min(f1)))
         self.validate_no_nested_aggregates(&core.columns)?;
 
@@ -2953,6 +2981,7 @@ impl<'s> SelectCompiler<'s> {
             )>,
             counter: &mut usize,
             named_windows: &HashMap<String, crate::parser::ast::WindowSpec>,
+            errors: &mut Vec<String>,
         ) {
             match expr {
                 Expr::Function(crate::parser::ast::FunctionCall {
@@ -2962,10 +2991,125 @@ impl<'s> SelectCompiler<'s> {
                     over: Some(over),
                     ..
                 }) => {
+                    // Check if this is a pure window function vs aggregate
+                    let name_upper = name.to_uppercase();
+                    let is_pure_window = matches!(
+                        name_upper.as_str(),
+                        "ROW_NUMBER"
+                            | "RANK"
+                            | "DENSE_RANK"
+                            | "NTILE"
+                            | "PERCENT_RANK"
+                            | "CUME_DIST"
+                            | "LAG"
+                            | "LEAD"
+                            | "FIRST_VALUE"
+                            | "LAST_VALUE"
+                            | "NTH_VALUE"
+                    );
+                    let is_aggregate = crate::functions::is_aggregate_function(name);
+                    // Non-window, non-aggregate functions may not be used as window functions
+                    if !is_pure_window && !is_aggregate {
+                        errors.push(format!(
+                            "{}() may not be used as a window function",
+                            name.to_lowercase()
+                        ));
+                        return;
+                    }
+                    // FILTER clause may only be used with aggregate window functions
+                    if filter.is_some() && is_pure_window {
+                        errors.push(
+                            "FILTER clause may only be used with aggregate window functions"
+                                .to_string(),
+                        );
+                        return;
+                    }
+                    // Validate argument counts for pure window functions
+                    let expr_args_pre = match args {
+                        crate::parser::ast::FunctionArgs::Exprs(exprs) => exprs.clone(),
+                        crate::parser::ast::FunctionArgs::Star => Vec::new(),
+                    };
+                    let argc = expr_args_pre.len();
+                    match name_upper.as_str() {
+                        "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "PERCENT_RANK" | "CUME_DIST" => {
+                            if argc != 0 {
+                                errors.push(format!(
+                                    "wrong number of arguments to function {}()",
+                                    name.to_lowercase()
+                                ));
+                                return;
+                            }
+                        }
+                        "NTILE" => {
+                            if argc != 1 {
+                                errors.push(format!(
+                                    "wrong number of arguments to function {}()",
+                                    name.to_lowercase()
+                                ));
+                                return;
+                            }
+                        }
+                        "LAG" | "LEAD" => {
+                            if argc < 1 || argc > 3 {
+                                errors.push(format!(
+                                    "wrong number of arguments to function {}()",
+                                    name.to_lowercase()
+                                ));
+                                return;
+                            }
+                        }
+                        "FIRST_VALUE" | "LAST_VALUE" => {
+                            if argc != 1 {
+                                errors.push(format!(
+                                    "wrong number of arguments to function {}()",
+                                    name.to_lowercase()
+                                ));
+                                return;
+                            }
+                        }
+                        "NTH_VALUE" => {
+                            if argc != 2 {
+                                errors.push(format!(
+                                    "wrong number of arguments to function {}()",
+                                    name.to_lowercase()
+                                ));
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+
                     let spec = match over {
                         crate::parser::ast::Over::Spec(s) => {
                             if let Some(base_name) = &s.base {
                                 if let Some(base) = named_windows.get(base_name) {
+                                    // Validate: cannot add a frame spec when referencing a base
+                                    if s.frame.is_some()
+                                        || (base.frame.is_some()
+                                            && (s.order_by.is_some() || s.partition_by.is_some()))
+                                    {
+                                        errors.push(format!(
+                                            "cannot override frame specification of window: {}",
+                                            base_name
+                                        ));
+                                        return;
+                                    }
+                                    // Validate: cannot add PARTITION BY when referencing a base window
+                                    if s.partition_by.is_some() {
+                                        errors.push(format!(
+                                            "cannot override PARTITION clause of window: {}",
+                                            base_name
+                                        ));
+                                        return;
+                                    }
+                                    // Validate: cannot override ORDER BY if base has one
+                                    if base.order_by.is_some() && s.order_by.is_some() {
+                                        errors.push(format!(
+                                            "cannot override ORDER BY clause of window: {}",
+                                            base_name
+                                        ));
+                                        return;
+                                    }
                                     crate::parser::ast::WindowSpec {
                                         base: None,
                                         partition_by: s
@@ -2979,21 +3123,21 @@ impl<'s> SelectCompiler<'s> {
                                         frame: s.frame.clone().or_else(|| base.frame.clone()),
                                     }
                                 } else {
-                                    s.clone()
+                                    errors.push(format!("no such window: {}", base_name));
+                                    return;
                                 }
                             } else {
                                 s.clone()
                             }
                         }
-                        crate::parser::ast::Over::Window(wname) => named_windows
-                            .get(wname)
-                            .cloned()
-                            .unwrap_or(crate::parser::ast::WindowSpec {
-                                base: None,
-                                partition_by: None,
-                                order_by: None,
-                                frame: None,
-                            }),
+                        crate::parser::ast::Over::Window(wname) => {
+                            if let Some(spec) = named_windows.get(wname) {
+                                spec.clone()
+                            } else {
+                                errors.push(format!("no such window: {}", wname));
+                                return;
+                            }
+                        }
                     };
                     let expr_args = match args {
                         crate::parser::ast::FunctionArgs::Exprs(exprs) => exprs.clone(),
@@ -3012,14 +3156,14 @@ impl<'s> SelectCompiler<'s> {
                     ));
                 }
                 Expr::Binary { left, right, .. } => {
-                    collect_wf_from_expr(left, funcs, counter, named_windows);
-                    collect_wf_from_expr(right, funcs, counter, named_windows);
+                    collect_wf_from_expr(left, funcs, counter, named_windows, errors);
+                    collect_wf_from_expr(right, funcs, counter, named_windows, errors);
                 }
                 Expr::Unary { expr: inner, .. } => {
-                    collect_wf_from_expr(inner, funcs, counter, named_windows);
+                    collect_wf_from_expr(inner, funcs, counter, named_windows, errors);
                 }
                 Expr::Cast { expr: inner, .. } => {
-                    collect_wf_from_expr(inner, funcs, counter, named_windows);
+                    collect_wf_from_expr(inner, funcs, counter, named_windows, errors);
                 }
                 _ => {}
             }
@@ -3032,15 +3176,229 @@ impl<'s> SelectCompiler<'s> {
             }
         }
 
+        // Also validate named window definitions that reference each other
+        if let Some(window_defs) = &core.window {
+            for def in window_defs {
+                if let Some(base_name) = &def.spec.base {
+                    if !named_windows.contains_key(base_name) {
+                        return Err(Error::with_message(
+                            ErrorCode::Error,
+                            format!("no such window: {}", base_name),
+                        ));
+                    }
+                    let base = &named_windows[base_name];
+                    if def.spec.frame.is_some()
+                        || (base.frame.is_some()
+                            && (def.spec.order_by.is_some() || def.spec.partition_by.is_some()))
+                    {
+                        return Err(Error::with_message(
+                            ErrorCode::Error,
+                            format!(
+                                "cannot override frame specification of window: {}",
+                                base_name
+                            ),
+                        ));
+                    }
+                    if def.spec.partition_by.is_some() {
+                        return Err(Error::with_message(
+                            ErrorCode::Error,
+                            format!("cannot override PARTITION clause of window: {}", base_name),
+                        ));
+                    }
+                    if base.order_by.is_some() && def.spec.order_by.is_some() {
+                        return Err(Error::with_message(
+                            ErrorCode::Error,
+                            format!("cannot override ORDER BY clause of window: {}", base_name),
+                        ));
+                    }
+                }
+            }
+        }
+
         let mut raw_funcs = Vec::new();
+        let mut wf_errors = Vec::new();
         for col in &core.columns {
             if let ResultColumn::Expr { expr, .. } = col {
-                collect_wf_from_expr(expr, &mut raw_funcs, &mut wf_counter, &named_windows);
+                collect_wf_from_expr(
+                    expr,
+                    &mut raw_funcs,
+                    &mut wf_counter,
+                    &named_windows,
+                    &mut wf_errors,
+                );
             }
+        }
+
+        // Return the first validation error if any
+        if let Some(err) = wf_errors.into_iter().next() {
+            return Err(Error::with_message(ErrorCode::Error, err));
         }
 
         if raw_funcs.is_empty() {
             return self.compile_simple_select(core, dest);
+        }
+
+        // Validate frame bounds for all window functions
+        for (_name, _args, _filter, _partition_by, _order_by, ref frame, _idx) in &raw_funcs {
+            if let Some(f) = frame {
+                let is_rows = matches!(f.mode, crate::parser::ast::WindowFrameMode::Rows);
+                let is_groups = matches!(f.mode, crate::parser::ast::WindowFrameMode::Groups);
+                let is_range = matches!(f.mode, crate::parser::ast::WindowFrameMode::Range);
+                let kind_str = if is_range { "number" } else { "integer" };
+
+                // Helper: validate a frame bound expression is a non-negative number/integer
+                let validate_frame_bound = |bound: &crate::parser::ast::WindowFrameBound,
+                                            which: &str|
+                 -> std::result::Result<(), String> {
+                    match bound {
+                        crate::parser::ast::WindowFrameBound::Preceding(expr)
+                        | crate::parser::ast::WindowFrameBound::Following(expr) => {
+                            match expr.as_ref() {
+                                Expr::Literal(Literal::Integer(i)) => {
+                                    if *i < 0 {
+                                        return Err(format!(
+                                            "frame {} offset must be a non-negative {}",
+                                            which, kind_str
+                                        ));
+                                    }
+                                }
+                                Expr::Literal(Literal::Float(f_val)) => {
+                                    if *f_val < 0.0 {
+                                        return Err(format!(
+                                            "frame {} offset must be a non-negative {}",
+                                            which, kind_str
+                                        ));
+                                    }
+                                    if is_rows || is_groups {
+                                        // ROWS/GROUPS need integer offsets
+                                        if f_val.fract() != 0.0 {
+                                            return Err(format!(
+                                                "frame {} offset must be a non-negative integer",
+                                                which
+                                            ));
+                                        }
+                                    }
+                                }
+                                Expr::Literal(Literal::Null) => {
+                                    return Err(format!(
+                                        "frame {} offset must be a non-negative {}",
+                                        which, kind_str
+                                    ));
+                                }
+                                Expr::Literal(Literal::String(s)) => {
+                                    // Try to parse as number
+                                    if let Ok(v) = s.parse::<f64>() {
+                                        if v < 0.0 {
+                                            return Err(format!(
+                                                "frame {} offset must be a non-negative {}",
+                                                which, kind_str
+                                            ));
+                                        }
+                                    } else {
+                                        return Err(format!(
+                                            "frame {} offset must be a non-negative {}",
+                                            which, kind_str
+                                        ));
+                                    }
+                                }
+                                Expr::Literal(Literal::Blob(_)) => {
+                                    return Err(format!(
+                                        "frame {} offset must be a non-negative {}",
+                                        which, kind_str
+                                    ));
+                                }
+                                Expr::Unary {
+                                    op: crate::parser::ast::UnaryOp::Neg,
+                                    expr: inner,
+                                } => {
+                                    // Negative literal: -N
+                                    match inner.as_ref() {
+                                        Expr::Literal(Literal::Integer(i)) if *i > 0 => {
+                                            return Err(format!(
+                                                "frame {} offset must be a non-negative {}",
+                                                which, kind_str
+                                            ));
+                                        }
+                                        Expr::Literal(Literal::Float(f_val)) if *f_val > 0.0 => {
+                                            return Err(format!(
+                                                "frame {} offset must be a non-negative {}",
+                                                which, kind_str
+                                            ));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                // For column references or other expressions,
+                                // validation happens at runtime
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                };
+
+                if let Err(msg) = validate_frame_bound(&f.start, "starting") {
+                    return Err(Error::with_message(ErrorCode::Error, msg));
+                }
+                if let Some(ref end) = f.end {
+                    if let Err(msg) = validate_frame_bound(end, "ending") {
+                        return Err(Error::with_message(ErrorCode::Error, msg));
+                    }
+                }
+            }
+        }
+
+        // Validate ntile argument
+        for (name, args, _filter, _partition_by, _order_by, _frame, _idx) in &raw_funcs {
+            if name.eq_ignore_ascii_case("ntile") {
+                if let Some(arg) = args.first() {
+                    match arg {
+                        Expr::Literal(Literal::Integer(i)) if *i <= 0 => {
+                            return Err(Error::with_message(
+                                ErrorCode::Error,
+                                "argument of ntile must be a positive integer",
+                            ));
+                        }
+                        Expr::Literal(Literal::Null) => {
+                            return Err(Error::with_message(
+                                ErrorCode::Error,
+                                "argument of ntile must be a positive integer",
+                            ));
+                        }
+                        Expr::Literal(Literal::String(s)) => {
+                            if s.parse::<i64>().map(|v| v <= 0).unwrap_or(true) {
+                                return Err(Error::with_message(
+                                    ErrorCode::Error,
+                                    "argument of ntile must be a positive integer",
+                                ));
+                            }
+                        }
+                        Expr::Literal(Literal::Float(_)) => {
+                            return Err(Error::with_message(
+                                ErrorCode::Error,
+                                "argument of ntile must be a positive integer",
+                            ));
+                        }
+                        Expr::Literal(Literal::Blob(_)) => {
+                            return Err(Error::with_message(
+                                ErrorCode::Error,
+                                "argument of ntile must be a positive integer",
+                            ));
+                        }
+                        Expr::Unary {
+                            op: crate::parser::ast::UnaryOp::Neg,
+                            ..
+                        } => {
+                            return Err(Error::with_message(
+                                ErrorCode::Error,
+                                "argument of ntile must be a positive integer",
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
 
         for (name, args, filter, partition_by, order_by, frame, idx) in raw_funcs {
@@ -3294,6 +3652,19 @@ impl<'s> SelectCompiler<'s> {
 
         let has_whole_partition_aggs = win_funcs.iter().any(|wf| wf.is_whole_partition);
 
+        // Check if any window functions need a row buffer for lag/lead/first_value/last_value/nth_value
+        let needs_row_buffer = win_funcs.iter().any(|wf| {
+            matches!(
+                wf.func_type,
+                WindowFuncType::Lag
+                    | WindowFuncType::Lead
+                    | WindowFuncType::FirstValue
+                    | WindowFuncType::LastValue
+                    | WindowFuncType::NthValue
+            )
+        });
+        let needs_pass1 = has_whole_partition_aggs || needs_row_buffer;
+
         // Allocate registers for finalized whole-partition agg values
         // These persist across pass 1 to pass 2
         let mut wp_agg_accum_regs: Vec<i32> = Vec::new();
@@ -3303,20 +3674,57 @@ impl<'s> SelectCompiler<'s> {
             wp_agg_final_regs.push(self.alloc_reg());
         }
 
+        // Row buffer: ephemeral table storing all rows' wf argument values
+        // Layout: [absolute_row_num (key), wf_arg_0, wf_arg_1, ...]
+        // Used for lag/lead/first_value/last_value/nth_value lookups
+        let row_buf_cursor = self.alloc_cursor();
+        let row_buf_abs_row_reg = self.alloc_reg(); // absolute row counter
+                                                    // Track first absolute row number of current partition (for row_num -> abs_row mapping)
+        let partition_start_row_reg = self.alloc_reg();
+        // Track size of current partition (filled in pass 1 via partition size table)
+        let partition_size_reg = self.alloc_reg();
+        // Partition size lookup table: maps partition key to size
+        let psize_cursor = self.alloc_cursor();
+
+        if needs_row_buffer {
+            let wf_count = win_funcs.len();
+            // Row buffer: ephemeral table with wf_count columns, rowid is the absolute row number
+            self.emit(
+                Opcode::OpenEphemeral,
+                row_buf_cursor,
+                wf_count as i32,
+                0,
+                P4::Unused,
+            );
+            // Partition size table: [partition_key_cols..., size]
+            self.emit(
+                Opcode::OpenEphemeral,
+                psize_cursor,
+                (partition_count + 1) as i32,
+                0,
+                P4::Unused,
+            );
+            self.emit(Opcode::Integer, 0, row_buf_abs_row_reg, 0, P4::Unused);
+            self.emit(Opcode::Integer, 0, partition_start_row_reg, 0, P4::Unused);
+            self.emit(Opcode::Integer, 0, partition_size_reg, 0, P4::Unused);
+        }
+
         // Open an ephemeral table to store per-partition whole-partition aggregate values.
         // Layout: [partition_key_cols..., agg_value_0, agg_value_1, ...]
         let wp_lookup_cursor = self.alloc_cursor();
         let wp_agg_count = win_funcs.iter().filter(|wf| wf.is_whole_partition).count();
 
-        if has_whole_partition_aggs {
-            let wp_lookup_cols = partition_count + wp_agg_count;
-            self.emit(
-                Opcode::OpenEphemeral,
-                wp_lookup_cursor,
-                wp_lookup_cols as i32,
-                0,
-                P4::Unused,
-            );
+        if needs_pass1 {
+            if has_whole_partition_aggs {
+                let wp_lookup_cols = partition_count + wp_agg_count;
+                self.emit(
+                    Opcode::OpenEphemeral,
+                    wp_lookup_cursor,
+                    wp_lookup_cols as i32,
+                    0,
+                    P4::Unused,
+                );
+            }
 
             // Initialize accumulators and partition tracking BEFORE the loop
             for (wf_idx, wf) in win_funcs.iter().enumerate() {
@@ -3329,8 +3737,10 @@ impl<'s> SelectCompiler<'s> {
             let p1_data_reg = self.alloc_reg();
             let p1_prev_partition = self.alloc_regs(partition_count.max(1));
             let p1_first_flag = self.alloc_reg();
+            let p1_partition_size_counter = self.alloc_reg(); // count rows per partition
 
             self.emit(Opcode::Integer, 1, p1_first_flag, 0, P4::Unused);
+            self.emit(Opcode::Integer, 0, p1_partition_size_counter, 0, P4::Unused);
             for i in 0..partition_count {
                 self.emit(Opcode::Null, 0, p1_prev_partition + i as i32, 0, P4::Unused);
             }
@@ -3387,56 +3797,96 @@ impl<'s> SelectCompiler<'s> {
                 let skip_store = self.alloc_label();
                 self.emit(Opcode::If, p1_first_flag, skip_store, 0, P4::Unused);
 
-                // Build lookup record: [prev_partition_keys..., finalized_aggs...]
-                let wp_rec_base = self.alloc_regs(partition_count + wp_agg_count);
-                for i in 0..partition_count {
+                if has_whole_partition_aggs {
+                    // Build lookup record: [prev_partition_keys..., finalized_aggs...]
+                    let wp_rec_base = self.alloc_regs(partition_count + wp_agg_count);
+                    for i in 0..partition_count {
+                        self.emit(
+                            Opcode::Copy,
+                            p1_prev_partition + i as i32,
+                            wp_rec_base + i as i32,
+                            0,
+                            P4::Unused,
+                        );
+                    }
+                    let mut agg_offset = 0;
+                    for (wf_idx, wf) in win_funcs.iter().enumerate() {
+                        if !wf.is_whole_partition {
+                            continue;
+                        }
+                        if let WindowFuncType::Aggregate(ref agg_name) = wf.func_type {
+                            self.emit(
+                                Opcode::AggFinal,
+                                wp_agg_accum_regs[wf_idx],
+                                wp_rec_base + (partition_count + agg_offset) as i32,
+                                0,
+                                P4::Text(agg_name.clone()),
+                            );
+                        }
+                        agg_offset += 1;
+                    }
+                    let wp_rec_reg = self.alloc_reg();
                     self.emit(
-                        Opcode::Copy,
-                        p1_prev_partition + i as i32,
-                        wp_rec_base + i as i32,
+                        Opcode::MakeRecord,
+                        wp_rec_base,
+                        (partition_count + wp_agg_count) as i32,
+                        wp_rec_reg,
+                        P4::Unused,
+                    );
+                    let wp_rowid_reg = self.alloc_reg();
+                    self.emit(
+                        Opcode::NewRowid,
+                        wp_lookup_cursor,
+                        wp_rowid_reg,
                         0,
                         P4::Unused,
                     );
+                    self.emit(
+                        Opcode::Insert,
+                        wp_lookup_cursor,
+                        wp_rec_reg,
+                        wp_rowid_reg,
+                        P4::Unused,
+                    );
                 }
-                let mut agg_offset = 0;
-                for (wf_idx, wf) in win_funcs.iter().enumerate() {
-                    if !wf.is_whole_partition {
-                        continue;
-                    }
-                    if let WindowFuncType::Aggregate(ref agg_name) = wf.func_type {
+
+                // Store partition size for previous partition
+                if needs_row_buffer && partition_count > 0 {
+                    let ps_rec_base = self.alloc_regs(partition_count + 1);
+                    for i in 0..partition_count {
                         self.emit(
-                            Opcode::AggFinal,
-                            wp_agg_accum_regs[wf_idx],
-                            wp_rec_base + (partition_count + agg_offset) as i32,
+                            Opcode::Copy,
+                            p1_prev_partition + i as i32,
+                            ps_rec_base + i as i32,
                             0,
-                            P4::Text(agg_name.clone()),
+                            P4::Unused,
                         );
                     }
-                    agg_offset += 1;
+                    self.emit(
+                        Opcode::Copy,
+                        p1_partition_size_counter,
+                        ps_rec_base + partition_count as i32,
+                        0,
+                        P4::Unused,
+                    );
+                    let ps_rec_reg = self.alloc_reg();
+                    self.emit(
+                        Opcode::MakeRecord,
+                        ps_rec_base,
+                        (partition_count + 1) as i32,
+                        ps_rec_reg,
+                        P4::Unused,
+                    );
+                    let ps_rowid_reg = self.alloc_reg();
+                    self.emit(Opcode::NewRowid, psize_cursor, ps_rowid_reg, 0, P4::Unused);
+                    self.emit(
+                        Opcode::Insert,
+                        psize_cursor,
+                        ps_rec_reg,
+                        ps_rowid_reg,
+                        P4::Unused,
+                    );
                 }
-                let wp_rec_reg = self.alloc_reg();
-                self.emit(
-                    Opcode::MakeRecord,
-                    wp_rec_base,
-                    (partition_count + wp_agg_count) as i32,
-                    wp_rec_reg,
-                    P4::Unused,
-                );
-                let wp_rowid_reg = self.alloc_reg();
-                self.emit(
-                    Opcode::NewRowid,
-                    wp_lookup_cursor,
-                    wp_rowid_reg,
-                    0,
-                    P4::Unused,
-                );
-                self.emit(
-                    Opcode::Insert,
-                    wp_lookup_cursor,
-                    wp_rec_reg,
-                    wp_rowid_reg,
-                    P4::Unused,
-                );
 
                 self.resolve_label(skip_store, self.current_addr());
 
@@ -3445,6 +3895,10 @@ impl<'s> SelectCompiler<'s> {
                     if wf.is_whole_partition {
                         self.emit(Opcode::Null, 0, wp_agg_accum_regs[wf_idx], 0, P4::Unused);
                     }
+                }
+                // Reset partition size counter
+                if needs_row_buffer {
+                    self.emit(Opcode::Integer, 0, p1_partition_size_counter, 0, P4::Unused);
                 }
 
                 for i in 0..partition_count {
@@ -3463,6 +3917,46 @@ impl<'s> SelectCompiler<'s> {
             }
             self.resolve_label(p1_no_change, self.current_addr());
 
+            // Increment partition size counter
+            if needs_row_buffer {
+                self.emit(Opcode::AddImm, p1_partition_size_counter, 1, 0, P4::Unused);
+            }
+
+            // Insert row into row buffer (for lag/lead/first_value/last_value)
+            if needs_row_buffer {
+                let wf_count = win_funcs.len();
+                let buf_rec_base = self.alloc_regs(wf_count);
+                // Absolute row number is used as the rowid key (not in the record)
+                self.emit(Opcode::AddImm, row_buf_abs_row_reg, 1, 0, P4::Unused);
+                // Store wf argument values
+                for (wf_idx, _wf) in win_funcs.iter().enumerate() {
+                    let wf_arg_col = sort_key_count + result_count + wf_idx;
+                    self.emit(
+                        Opcode::Copy,
+                        p1_read_base + wf_arg_col as i32,
+                        buf_rec_base + wf_idx as i32,
+                        0,
+                        P4::Unused,
+                    );
+                }
+                let buf_rec_reg = self.alloc_reg();
+                self.emit(
+                    Opcode::MakeRecord,
+                    buf_rec_base,
+                    wf_count as i32,
+                    buf_rec_reg,
+                    P4::Unused,
+                );
+                // Use abs_row_reg as the rowid key
+                self.emit(
+                    Opcode::Insert,
+                    row_buf_cursor,
+                    buf_rec_reg,
+                    row_buf_abs_row_reg,
+                    P4::Unused,
+                );
+            }
+
             // Accumulate aggregate values
             for (wf_idx, wf) in win_funcs.iter().enumerate() {
                 if !wf.is_whole_partition {
@@ -3470,13 +3964,29 @@ impl<'s> SelectCompiler<'s> {
                 }
                 if let WindowFuncType::Aggregate(ref agg_name) = wf.func_type {
                     let wf_arg_col = sort_key_count + result_count + wf_idx;
-                    let arg_reg = self.alloc_reg();
                     let argc;
+                    let arg_reg;
                     if wf.args.is_empty() {
                         argc = 0;
+                        arg_reg = self.alloc_reg();
                         self.emit(Opcode::Null, 0, arg_reg, 0, P4::Unused);
+                    } else if wf.args.len() > 1 {
+                        argc = wf.args.len() as i32;
+                        let base = self.alloc_regs(wf.args.len());
+                        arg_reg = base;
+                        self.emit(
+                            Opcode::Copy,
+                            p1_read_base + wf_arg_col as i32,
+                            base,
+                            0,
+                            P4::Unused,
+                        );
+                        for extra_idx in 1..wf.args.len() {
+                            self.compile_expr(&wf.args[extra_idx], base + extra_idx as i32)?;
+                        }
                     } else {
                         argc = 1;
+                        arg_reg = self.alloc_reg();
                         self.emit(
                             Opcode::Copy,
                             p1_read_base + wf_arg_col as i32,
@@ -3516,72 +4026,131 @@ impl<'s> SelectCompiler<'s> {
             self.resolve_label(pass1_done, self.current_addr());
 
             // Finalize and store the LAST partition's aggregates
-            if partition_count > 0 {
-                let wp_rec_base = self.alloc_regs(partition_count + wp_agg_count);
+            if has_whole_partition_aggs {
+                if partition_count > 0 {
+                    let wp_rec_base = self.alloc_regs(partition_count + wp_agg_count);
+                    for i in 0..partition_count {
+                        self.emit(
+                            Opcode::Copy,
+                            p1_prev_partition + i as i32,
+                            wp_rec_base + i as i32,
+                            0,
+                            P4::Unused,
+                        );
+                    }
+                    let mut agg_offset = 0;
+                    for (wf_idx, wf) in win_funcs.iter().enumerate() {
+                        if !wf.is_whole_partition {
+                            continue;
+                        }
+                        if let WindowFuncType::Aggregate(ref agg_name) = wf.func_type {
+                            self.emit(
+                                Opcode::AggFinal,
+                                wp_agg_accum_regs[wf_idx],
+                                wp_rec_base + (partition_count + agg_offset) as i32,
+                                0,
+                                P4::Text(agg_name.clone()),
+                            );
+                        }
+                        agg_offset += 1;
+                    }
+                    let wp_rec_reg = self.alloc_reg();
+                    self.emit(
+                        Opcode::MakeRecord,
+                        wp_rec_base,
+                        (partition_count + wp_agg_count) as i32,
+                        wp_rec_reg,
+                        P4::Unused,
+                    );
+                    let wp_rowid_reg = self.alloc_reg();
+                    self.emit(
+                        Opcode::NewRowid,
+                        wp_lookup_cursor,
+                        wp_rowid_reg,
+                        0,
+                        P4::Unused,
+                    );
+                    self.emit(
+                        Opcode::Insert,
+                        wp_lookup_cursor,
+                        wp_rec_reg,
+                        wp_rowid_reg,
+                        P4::Unused,
+                    );
+                } else {
+                    // Non-partitioned: just finalize into wp_agg_final_regs
+                    for (wf_idx, wf) in win_funcs.iter().enumerate() {
+                        if !wf.is_whole_partition {
+                            continue;
+                        }
+                        if let WindowFuncType::Aggregate(ref agg_name) = wf.func_type {
+                            self.emit(
+                                Opcode::AggFinal,
+                                wp_agg_accum_regs[wf_idx],
+                                wp_agg_final_regs[wf_idx],
+                                0,
+                                P4::Text(agg_name.clone()),
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Store partition size for the LAST partition
+            if needs_row_buffer && partition_count > 0 {
+                let ps_rec_base = self.alloc_regs(partition_count + 1);
                 for i in 0..partition_count {
                     self.emit(
                         Opcode::Copy,
                         p1_prev_partition + i as i32,
-                        wp_rec_base + i as i32,
+                        ps_rec_base + i as i32,
                         0,
                         P4::Unused,
                     );
                 }
-                let mut agg_offset = 0;
-                for (wf_idx, wf) in win_funcs.iter().enumerate() {
-                    if !wf.is_whole_partition {
-                        continue;
-                    }
-                    if let WindowFuncType::Aggregate(ref agg_name) = wf.func_type {
-                        self.emit(
-                            Opcode::AggFinal,
-                            wp_agg_accum_regs[wf_idx],
-                            wp_rec_base + (partition_count + agg_offset) as i32,
-                            0,
-                            P4::Text(agg_name.clone()),
-                        );
-                    }
-                    agg_offset += 1;
-                }
-                let wp_rec_reg = self.alloc_reg();
                 self.emit(
-                    Opcode::MakeRecord,
-                    wp_rec_base,
-                    (partition_count + wp_agg_count) as i32,
-                    wp_rec_reg,
-                    P4::Unused,
-                );
-                let wp_rowid_reg = self.alloc_reg();
-                self.emit(
-                    Opcode::NewRowid,
-                    wp_lookup_cursor,
-                    wp_rowid_reg,
+                    Opcode::Copy,
+                    p1_partition_size_counter,
+                    ps_rec_base + partition_count as i32,
                     0,
                     P4::Unused,
                 );
+                let ps_rec_reg = self.alloc_reg();
                 self.emit(
-                    Opcode::Insert,
-                    wp_lookup_cursor,
-                    wp_rec_reg,
-                    wp_rowid_reg,
+                    Opcode::MakeRecord,
+                    ps_rec_base,
+                    (partition_count + 1) as i32,
+                    ps_rec_reg,
                     P4::Unused,
                 );
-            } else {
-                // Non-partitioned: just finalize into wp_agg_final_regs
-                for (wf_idx, wf) in win_funcs.iter().enumerate() {
-                    if !wf.is_whole_partition {
-                        continue;
-                    }
-                    if let WindowFuncType::Aggregate(ref agg_name) = wf.func_type {
-                        self.emit(
-                            Opcode::AggFinal,
-                            wp_agg_accum_regs[wf_idx],
-                            wp_agg_final_regs[wf_idx],
-                            0,
-                            P4::Text(agg_name.clone()),
-                        );
-                    }
-                }
+                let ps_rowid_reg = self.alloc_reg();
+                self.emit(Opcode::NewRowid, psize_cursor, ps_rowid_reg, 0, P4::Unused);
+                self.emit(
+                    Opcode::Insert,
+                    psize_cursor,
+                    ps_rec_reg,
+                    ps_rowid_reg,
+                    P4::Unused,
+                );
+            } else if needs_row_buffer {
+                // Non-partitioned: store total row count directly
+                self.emit(
+                    Opcode::Copy,
+                    p1_partition_size_counter,
+                    partition_size_reg,
+                    0,
+                    P4::Unused,
+                );
+            }
+            // Save total row count for non-partitioned use
+            if needs_row_buffer {
+                self.emit(
+                    Opcode::Copy,
+                    row_buf_abs_row_reg,
+                    partition_size_reg,
+                    0,
+                    P4::Unused,
+                );
             }
         }
 
@@ -3596,6 +4165,8 @@ impl<'s> SelectCompiler<'s> {
         let row_num_reg = self.alloc_reg();
         let partition_first_flag = self.alloc_reg();
         let prev_order_base = self.alloc_regs(order_count.max(1));
+        let pass2_abs_row_reg = self.alloc_reg(); // absolute row counter in pass 2
+        let partition_end_row_reg = self.alloc_reg(); // last abs row in current partition
 
         struct WfState {
             accum_reg: i32,
@@ -3629,6 +4200,8 @@ impl<'s> SelectCompiler<'s> {
         // Initialize state registers (BEFORE the loop)
         self.emit(Opcode::Integer, 1, partition_first_flag, 0, P4::Unused);
         self.emit(Opcode::Integer, 0, row_num_reg, 0, P4::Unused);
+        self.emit(Opcode::Integer, 0, pass2_abs_row_reg, 0, P4::Unused);
+        self.emit(Opcode::Integer, 0, partition_end_row_reg, 0, P4::Unused);
         for state in &wf_states {
             self.emit(Opcode::Null, 0, state.accum_reg, 0, P4::Unused);
             self.emit(Opcode::Integer, 1, state.rank_reg, 0, P4::Unused);
@@ -3708,6 +4281,87 @@ impl<'s> SelectCompiler<'s> {
 
             self.resolve_label(partition_changed, self.current_addr());
             self.emit(Opcode::Integer, 0, row_num_reg, 0, P4::Unused);
+
+            // Save partition start absolute row number for row buffer lookups
+            if needs_row_buffer {
+                // partition_start_row_reg = pass2_abs_row_reg (current abs row, before increment)
+                self.emit(
+                    Opcode::Copy,
+                    pass2_abs_row_reg,
+                    partition_start_row_reg,
+                    0,
+                    P4::Unused,
+                );
+
+                // Look up partition size from psize_cursor to compute partition_end_row_reg
+                if partition_count > 0 {
+                    let ps_lookup_done = self.alloc_label();
+                    self.emit(Opcode::Rewind, psize_cursor, ps_lookup_done, 0, P4::Unused);
+                    let ps_lookup_loop = self.current_addr();
+                    let ps_lookup_next = self.alloc_label();
+                    for i in 0..partition_count {
+                        let ps_col_reg = self.alloc_reg();
+                        self.emit(
+                            Opcode::Column,
+                            psize_cursor,
+                            i as i32,
+                            ps_col_reg,
+                            P4::Unused,
+                        );
+                        self.emit_with_p5(
+                            Opcode::Ne,
+                            read_base + i as i32,
+                            ps_lookup_next,
+                            ps_col_reg,
+                            P4::Unused,
+                            0x10,
+                        );
+                    }
+                    // Match found: read partition size
+                    let ps_size_reg = self.alloc_reg();
+                    self.emit(
+                        Opcode::Column,
+                        psize_cursor,
+                        partition_count as i32,
+                        ps_size_reg,
+                        P4::Unused,
+                    );
+                    // partition_end_row_reg = partition_start_row_reg + partition_size
+                    self.emit(
+                        Opcode::Copy,
+                        partition_start_row_reg,
+                        partition_end_row_reg,
+                        0,
+                        P4::Unused,
+                    );
+                    self.emit(
+                        Opcode::Add,
+                        ps_size_reg,
+                        partition_end_row_reg,
+                        partition_end_row_reg,
+                        P4::Unused,
+                    );
+                    self.emit(Opcode::Goto, 0, ps_lookup_done, 0, P4::Unused);
+                    self.resolve_label(ps_lookup_next, self.current_addr());
+                    self.emit(
+                        Opcode::Next,
+                        psize_cursor,
+                        ps_lookup_loop as i32,
+                        0,
+                        P4::Unused,
+                    );
+                    self.resolve_label(ps_lookup_done, self.current_addr());
+                } else {
+                    // No partition: end = total number of rows (partition_size_reg from pass 1)
+                    self.emit(
+                        Opcode::Copy,
+                        partition_size_reg,
+                        partition_end_row_reg,
+                        0,
+                        P4::Unused,
+                    );
+                }
+            }
 
             // Reset aggregate accumulators: use AggFinal to clear the agg_contexts,
             // then set the register to NULL for a fresh start
@@ -3806,11 +4460,29 @@ impl<'s> SelectCompiler<'s> {
                 P4::Unused,
             );
             self.emit(Opcode::Integer, 0, partition_first_flag, 0, P4::Unused);
+
+            // For non-partitioned window: set partition start and end on the first row
+            if needs_row_buffer {
+                // partition_start_row_reg = 0 (already initialized)
+                // partition_end_row_reg = total number of rows
+                self.emit(
+                    Opcode::Copy,
+                    partition_size_reg,
+                    partition_end_row_reg,
+                    0,
+                    P4::Unused,
+                );
+            }
+
+            // Reset row counter for non-partitioned (single partition)
+            self.emit(Opcode::Integer, 0, row_num_reg, 0, P4::Unused);
         }
         self.resolve_label(no_partition_change, self.current_addr());
 
         // Row number increment
         self.emit(Opcode::AddImm, row_num_reg, 1, 0, P4::Unused);
+        // Absolute row number increment (for row buffer lookups)
+        self.emit(Opcode::AddImm, pass2_abs_row_reg, 1, 0, P4::Unused);
 
         // ----- Order key change detection -----
         let order_same = self.alloc_label();
@@ -3884,14 +4556,33 @@ impl<'s> SelectCompiler<'s> {
                         }
                     } else {
                         // Running aggregate (has ORDER BY)
-                        let arg_reg = self.alloc_reg();
                         let argc;
+                        let arg_reg;
                         if wf.args.is_empty() {
                             // count(*) - zero args
                             argc = 0;
+                            arg_reg = self.alloc_reg();
                             self.emit(Opcode::Null, 0, arg_reg, 0, P4::Unused);
+                        } else if wf.args.len() > 1 {
+                            // Multi-arg aggregate (e.g., group_concat(x, sep))
+                            // First arg comes from the sorter data, remaining args compiled in place
+                            argc = wf.args.len() as i32;
+                            let base = self.alloc_regs(wf.args.len());
+                            arg_reg = base;
+                            self.emit(
+                                Opcode::Copy,
+                                read_base + wf_arg_col as i32,
+                                base,
+                                0,
+                                P4::Unused,
+                            );
+                            // Compile remaining args (typically constants like separator)
+                            for extra_idx in 1..wf.args.len() {
+                                self.compile_expr(&wf.args[extra_idx], base + extra_idx as i32)?;
+                            }
                         } else {
                             argc = 1;
+                            arg_reg = self.alloc_reg();
                             self.emit(
                                 Opcode::Copy,
                                 read_base + wf_arg_col as i32,
@@ -3941,12 +4632,214 @@ impl<'s> SelectCompiler<'s> {
                 WindowFuncType::CumeDist => {
                     self.emit(Opcode::Real, 0, wf.result_reg, 0, P4::Real(1.0));
                 }
-                WindowFuncType::Lag
-                | WindowFuncType::Lead
-                | WindowFuncType::FirstValue
-                | WindowFuncType::LastValue
-                | WindowFuncType::NthValue => {
+                WindowFuncType::Lag => {
+                    // lag(expr, offset, default)
+                    // offset defaults to 1, default defaults to NULL
+                    let offset = if wf.args.len() >= 2 {
+                        match &wf.args[1] {
+                            Expr::Literal(Literal::Integer(n)) => *n as i32,
+                            _ => 1,
+                        }
+                    } else {
+                        1
+                    };
+                    let has_default = wf.args.len() >= 3;
+
+                    // target_abs_row = pass2_abs_row_reg - offset
+                    let target_reg = self.alloc_reg();
+                    self.emit(Opcode::Copy, pass2_abs_row_reg, target_reg, 0, P4::Unused);
+                    self.emit(Opcode::AddImm, target_reg, -offset, 0, P4::Unused);
+
+                    // If target < partition_start + 1, use default/NULL
+                    let lag_default_label = self.alloc_label();
+                    let lag_done_label = self.alloc_label();
+                    let min_row_reg = self.alloc_reg();
+                    self.emit(
+                        Opcode::Copy,
+                        partition_start_row_reg,
+                        min_row_reg,
+                        0,
+                        P4::Unused,
+                    );
+                    self.emit(Opcode::AddImm, min_row_reg, 1, 0, P4::Unused);
+                    // Lt p1 p2 p3: if r[p3] < r[p1] then jump to p2
+                    // We want: if target < min_row then jump to default
+                    // So p1=min_row_reg, p3=target_reg
+                    self.emit_with_p5(
+                        Opcode::Lt,
+                        min_row_reg,
+                        lag_default_label,
+                        target_reg,
+                        P4::Unused,
+                        0,
+                    );
+                    // SeekRowid on row buffer and read wf_idx column
+                    let not_found_label = self.alloc_label();
+                    self.emit(
+                        Opcode::NotExists,
+                        row_buf_cursor,
+                        not_found_label,
+                        target_reg,
+                        P4::Unused,
+                    );
+                    self.emit(
+                        Opcode::Column,
+                        row_buf_cursor,
+                        wf_idx as i32,
+                        wf.result_reg,
+                        P4::Unused,
+                    );
+                    self.emit(Opcode::Goto, 0, lag_done_label, 0, P4::Unused);
+                    self.resolve_label(not_found_label, self.current_addr());
+                    self.resolve_label(lag_default_label, self.current_addr());
+                    if has_default {
+                        // Compile the default expression
+                        self.compile_expr(&wf.args[2], wf.result_reg)?;
+                    } else {
+                        self.emit(Opcode::Null, 0, wf.result_reg, 0, P4::Unused);
+                    }
+                    self.resolve_label(lag_done_label, self.current_addr());
+                }
+                WindowFuncType::Lead => {
+                    // lead(expr, offset, default)
+                    // offset defaults to 1, default defaults to NULL
+                    let offset = if wf.args.len() >= 2 {
+                        match &wf.args[1] {
+                            Expr::Literal(Literal::Integer(n)) => *n as i32,
+                            _ => 1,
+                        }
+                    } else {
+                        1
+                    };
+                    let has_default = wf.args.len() >= 3;
+
+                    // target_abs_row = pass2_abs_row_reg + offset
+                    let target_reg = self.alloc_reg();
+                    self.emit(Opcode::Copy, pass2_abs_row_reg, target_reg, 0, P4::Unused);
+                    self.emit(Opcode::AddImm, target_reg, offset, 0, P4::Unused);
+
+                    // If target > partition_end_row, use default/NULL
+                    let lead_default_label = self.alloc_label();
+                    let lead_done_label = self.alloc_label();
+                    // Gt p1 p2 p3: if r[p3] > r[p1] then jump to p2
+                    // We want: if target > partition_end then jump to default
+                    self.emit_with_p5(
+                        Opcode::Gt,
+                        partition_end_row_reg,
+                        lead_default_label,
+                        target_reg,
+                        P4::Unused,
+                        0,
+                    );
+
+                    // SeekRowid on row buffer, if not found use default
+                    let not_found_label = self.alloc_label();
+                    self.emit(
+                        Opcode::NotExists,
+                        row_buf_cursor,
+                        not_found_label,
+                        target_reg,
+                        P4::Unused,
+                    );
+                    self.emit(
+                        Opcode::Column,
+                        row_buf_cursor,
+                        wf_idx as i32,
+                        wf.result_reg,
+                        P4::Unused,
+                    );
+                    self.emit(Opcode::Goto, 0, lead_done_label, 0, P4::Unused);
+                    self.resolve_label(not_found_label, self.current_addr());
+                    self.resolve_label(lead_default_label, self.current_addr());
+                    if has_default {
+                        self.compile_expr(&wf.args[2], wf.result_reg)?;
+                    } else {
+                        self.emit(Opcode::Null, 0, wf.result_reg, 0, P4::Unused);
+                    }
+                    self.resolve_label(lead_done_label, self.current_addr());
+                }
+                WindowFuncType::FirstValue => {
+                    // first_value(expr) - always the first row's value in the partition
+                    let target_reg = self.alloc_reg();
+                    self.emit(
+                        Opcode::Copy,
+                        partition_start_row_reg,
+                        target_reg,
+                        0,
+                        P4::Unused,
+                    );
+                    self.emit(Opcode::AddImm, target_reg, 1, 0, P4::Unused);
+                    let fv_null_label = self.alloc_label();
+                    let fv_done_label = self.alloc_label();
+                    self.emit(
+                        Opcode::NotExists,
+                        row_buf_cursor,
+                        fv_null_label,
+                        target_reg,
+                        P4::Unused,
+                    );
+                    self.emit(
+                        Opcode::Column,
+                        row_buf_cursor,
+                        wf_idx as i32,
+                        wf.result_reg,
+                        P4::Unused,
+                    );
+                    self.emit(Opcode::Goto, 0, fv_done_label, 0, P4::Unused);
+                    self.resolve_label(fv_null_label, self.current_addr());
                     self.emit(Opcode::Null, 0, wf.result_reg, 0, P4::Unused);
+                    self.resolve_label(fv_done_label, self.current_addr());
+                }
+                WindowFuncType::LastValue => {
+                    // last_value(expr) - with default frame (RANGE UNBOUNDED PRECEDING AND CURRENT ROW)
+                    // just use the current row's argument value
+                    self.emit(
+                        Opcode::Copy,
+                        read_base + wf_arg_col as i32,
+                        wf.result_reg,
+                        0,
+                        P4::Unused,
+                    );
+                }
+                WindowFuncType::NthValue => {
+                    // nth_value(expr, N) - Nth row in partition (1-based)
+                    let n_val = if wf.args.len() >= 2 {
+                        match &wf.args[1] {
+                            Expr::Literal(Literal::Integer(n)) => *n as i32,
+                            _ => 1,
+                        }
+                    } else {
+                        1
+                    };
+                    let target_reg = self.alloc_reg();
+                    self.emit(
+                        Opcode::Copy,
+                        partition_start_row_reg,
+                        target_reg,
+                        0,
+                        P4::Unused,
+                    );
+                    self.emit(Opcode::AddImm, target_reg, n_val, 0, P4::Unused);
+                    let nv_null_label = self.alloc_label();
+                    let nv_done_label = self.alloc_label();
+                    self.emit(
+                        Opcode::NotExists,
+                        row_buf_cursor,
+                        nv_null_label,
+                        target_reg,
+                        P4::Unused,
+                    );
+                    self.emit(
+                        Opcode::Column,
+                        row_buf_cursor,
+                        wf_idx as i32,
+                        wf.result_reg,
+                        P4::Unused,
+                    );
+                    self.emit(Opcode::Goto, 0, nv_done_label, 0, P4::Unused);
+                    self.resolve_label(nv_null_label, self.current_addr());
+                    self.emit(Opcode::Null, 0, wf.result_reg, 0, P4::Unused);
+                    self.resolve_label(nv_done_label, self.current_addr());
                 }
             }
         }
@@ -4020,10 +4913,21 @@ impl<'s> SelectCompiler<'s> {
             }
         }
 
-        self.output_row(dest, output_base, result_count)?;
+        // Output the row, applying LIMIT/OFFSET if set
+        let sort_next_label = self.alloc_label();
+        if self.limit_counter_reg.is_some() || self.offset_counter_reg.is_some() {
+            // Set limit_done_label to break out of the sort loop when limit is exhausted
+            if self.limit_done_label.is_none() && self.limit_counter_reg.is_some() {
+                self.limit_done_label = Some(sort_done_label);
+            }
+            self.output_row_with_limit(dest, output_base, result_count, sort_next_label)?;
+        } else {
+            self.output_row(dest, output_base, result_count)?;
+        }
 
         self.saved_column_regs = None;
 
+        self.resolve_label(sort_next_label, self.current_addr());
         if sort_key_count > 0 {
             self.emit(
                 Opcode::SorterNext,
@@ -6153,11 +7057,58 @@ impl<'s> SelectCompiler<'s> {
                     subquery_columns: Some(subquery_col_names),
                 });
             }
-            TableSource::TableFunction { name, args: _ } => {
-                return Err(Error::with_message(
-                    ErrorCode::Error,
-                    format!("Table-valued function {} not yet supported", name),
-                ));
+            TableSource::TableFunction { name, args } => {
+                let name_upper = name.to_uppercase();
+                if name_upper == "JSON_EACH" || name_upper == "JSON_TREE" {
+                    if args.is_empty() || args.len() > 2 {
+                        return Err(Error::with_message(
+                            ErrorCode::Error,
+                            format!("wrong number of arguments to function {}()", name),
+                        ));
+                    }
+                    let cursor = self.alloc_cursor();
+                    // Open ephemeral table with 8 columns
+                    self.emit(Opcode::OpenEphemeral, cursor, 8, 0, P4::Unused);
+                    // Compile JSON argument
+                    let json_reg = self.alloc_reg();
+                    self.compile_expr(&args[0], json_reg)?;
+                    // Compile optional path argument
+                    let path_reg = if args.len() > 1 {
+                        let r = self.alloc_reg();
+                        self.compile_expr(&args[1], r)?;
+                        r
+                    } else {
+                        0
+                    };
+                    // Emit JsonPopulate to fill the ephemeral table
+                    self.emit(
+                        Opcode::JsonPopulate,
+                        cursor,
+                        json_reg,
+                        path_reg,
+                        P4::Text(name.to_lowercase()),
+                    );
+
+                    let display_name = item.alias.clone().unwrap_or_else(|| name.to_string());
+                    let col_names: Vec<String> = crate::functions::json::JSON_EACH_COLUMNS
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect();
+                    self.tables.push(TableInfo {
+                        name: display_name,
+                        table_name: name.clone(),
+                        cursor,
+                        schema_table: None,
+                        is_subquery: true,
+                        join_type: item.join_type,
+                        subquery_columns: Some(col_names),
+                    });
+                } else {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        format!("Table-valued function {} not yet supported", name),
+                    ));
+                }
             }
         }
         Ok(())
@@ -6167,6 +7118,11 @@ impl<'s> SelectCompiler<'s> {
     fn lookup_table_schema(&self, table_name_lower: &str) -> Option<std::sync::Arc<Table>> {
         if let Some(db_idx) = self.sqlite_master_db_idx(table_name_lower, None) {
             return Some(self.sqlite_master_table(table_name_lower, db_idx));
+        }
+
+        // Handle pragma_* virtual tables
+        if let Some(table) = self.pragma_virtual_table(table_name_lower) {
+            return Some(table);
         }
 
         if let Some(temp_schema) = self.temp_schema {
@@ -6208,6 +7164,102 @@ impl<'s> SelectCompiler<'s> {
                 .find(|(name, _)| name.eq_ignore_ascii_case(schema_name))
                 .and_then(|(_, schema)| schema.table(&table_name_lower).map(|t| t.clone())),
             None => self.lookup_table_schema(&table_name_lower),
+        }
+    }
+
+    /// Create a synthetic Table schema for pragma_* virtual tables.
+    /// These allow querying pragma results as tables (e.g., `SELECT * FROM pragma_compile_options`).
+    fn pragma_virtual_table(&self, table_name_lower: &str) -> Option<std::sync::Arc<Table>> {
+        use crate::schema::Column;
+
+        if !table_name_lower.starts_with("pragma_") {
+            return None;
+        }
+
+        let pragma_name = &table_name_lower["pragma_".len()..];
+        match pragma_name {
+            "compile_options" => {
+                Some(std::sync::Arc::new(Table {
+                    name: table_name_lower.to_string(),
+                    db_idx: 0,
+                    root_page: 0, // Virtual table, no actual b-tree page
+                    columns: vec![Column {
+                        name: "compile_options".to_string(),
+                        type_name: Some("TEXT".to_string()),
+                        affinity: Affinity::Text,
+                        ..Default::default()
+                    }],
+                    primary_key: None,
+                    indexes: Vec::new(),
+                    without_rowid: false,
+                    strict: false,
+                    is_virtual: true,
+                    virtual_module: None,
+                    virtual_args: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    ..Default::default()
+                }))
+            }
+            "database_list" => Some(std::sync::Arc::new(Table {
+                name: table_name_lower.to_string(),
+                db_idx: 0,
+                root_page: 0,
+                columns: vec![
+                    Column {
+                        name: "seq".to_string(),
+                        type_name: Some("INTEGER".to_string()),
+                        affinity: Affinity::Integer,
+                        ..Default::default()
+                    },
+                    Column {
+                        name: "name".to_string(),
+                        type_name: Some("TEXT".to_string()),
+                        affinity: Affinity::Text,
+                        ..Default::default()
+                    },
+                    Column {
+                        name: "file".to_string(),
+                        type_name: Some("TEXT".to_string()),
+                        affinity: Affinity::Text,
+                        ..Default::default()
+                    },
+                ],
+                primary_key: None,
+                indexes: Vec::new(),
+                without_rowid: false,
+                strict: false,
+                is_virtual: true,
+                virtual_module: None,
+                virtual_args: Vec::new(),
+                foreign_keys: Vec::new(),
+                ..Default::default()
+            })),
+            "table_info" | "table_list" | "index_list" | "index_info" | "function_list"
+            | "module_list" | "collation_list" => {
+                // Generic pragma table stub - just return a 1-column table
+                // so the query doesn't crash
+                Some(std::sync::Arc::new(Table {
+                    name: table_name_lower.to_string(),
+                    db_idx: 0,
+                    root_page: 0,
+                    columns: vec![Column {
+                        name: pragma_name.to_string(),
+                        type_name: Some("TEXT".to_string()),
+                        affinity: Affinity::Text,
+                        ..Default::default()
+                    }],
+                    primary_key: None,
+                    indexes: Vec::new(),
+                    without_rowid: false,
+                    strict: false,
+                    is_virtual: true,
+                    virtual_module: None,
+                    virtual_args: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    ..Default::default()
+                }))
+            }
+            _ => None,
         }
     }
 
@@ -8563,17 +9615,53 @@ impl<'s> SelectCompiler<'s> {
             TableRef::Parens(inner) => {
                 self.compile_table_ref(inner, join_type)?;
             }
-            TableRef::TableFunction {
-                name,
-                args: _,
-                alias: _,
-            } => {
-                // Table-valued functions are more complex
-                // For now, treat as error
-                return Err(Error::with_message(
-                    ErrorCode::Error,
-                    format!("Table-valued function {} not yet supported", name),
-                ));
+            TableRef::TableFunction { name, args, alias } => {
+                let name_upper = name.to_uppercase();
+                if name_upper == "JSON_EACH" || name_upper == "JSON_TREE" {
+                    if args.is_empty() || args.len() > 2 {
+                        return Err(Error::with_message(
+                            ErrorCode::Error,
+                            format!("wrong number of arguments to function {}()", name),
+                        ));
+                    }
+                    let cursor = self.alloc_cursor();
+                    self.emit(Opcode::OpenEphemeral, cursor, 8, 0, P4::Unused);
+                    let json_reg = self.alloc_reg();
+                    self.compile_expr(&args[0], json_reg)?;
+                    let path_reg = if args.len() > 1 {
+                        let r = self.alloc_reg();
+                        self.compile_expr(&args[1], r)?;
+                        r
+                    } else {
+                        0
+                    };
+                    self.emit(
+                        Opcode::JsonPopulate,
+                        cursor,
+                        json_reg,
+                        path_reg,
+                        P4::Text(name.to_lowercase()),
+                    );
+                    let display_name = alias.clone().unwrap_or_else(|| name.to_string());
+                    let col_names: Vec<String> = crate::functions::json::JSON_EACH_COLUMNS
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect();
+                    self.tables.push(TableInfo {
+                        name: display_name,
+                        table_name: name.clone(),
+                        cursor,
+                        schema_table: None,
+                        is_subquery: true,
+                        join_type: join_type,
+                        subquery_columns: Some(col_names),
+                    });
+                } else {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        format!("Table-valued function {} not yet supported", name),
+                    ));
+                }
             }
         }
         Ok(())
@@ -11047,6 +12135,26 @@ impl<'s> SelectCompiler<'s> {
                             format!("no such function: {}", func_call.name),
                         ));
                     }
+                    // Window-only functions used without OVER clause = misuse
+                    if is_window_function && func_call.over.is_none() {
+                        return Err(Error::with_message(
+                            ErrorCode::Error,
+                            format!(
+                                "misuse of window function {}()",
+                                func_call.name.to_lowercase()
+                            ),
+                        ));
+                    }
+                    // Non-window-capable functions used with OVER clause
+                    if func_call.over.is_some() && !is_window_function && !is_aggregate {
+                        return Err(Error::with_message(
+                            ErrorCode::Error,
+                            format!(
+                                "{}() may not be used as a window function",
+                                func_call.name.to_lowercase()
+                            ),
+                        ));
+                    }
 
                     // Compile as scalar function
                     // Pre-allocate contiguous registers for all arguments first,
@@ -12290,6 +13398,10 @@ impl<'s> SelectCompiler<'s> {
     fn expr_has_aggregate(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Function(func_call) => {
+                // Window functions (with OVER clause) are NOT regular aggregates
+                if func_call.over.is_some() {
+                    return false;
+                }
                 let name_upper = func_call.name.to_uppercase();
                 let arg_count = match &func_call.args {
                     crate::parser::ast::FunctionArgs::Exprs(exprs) => exprs.len(),
@@ -12299,17 +13411,7 @@ impl<'s> SelectCompiler<'s> {
                 let is_agg = if matches!(name_upper.as_str(), "MIN" | "MAX") && arg_count > 1 {
                     false
                 } else {
-                    matches!(
-                        name_upper.as_str(),
-                        "COUNT"
-                            | "SUM"
-                            | "AVG"
-                            | "MIN"
-                            | "MAX"
-                            | "GROUP_CONCAT"
-                            | "STRING_AGG"
-                            | "TOTAL"
-                    )
+                    crate::functions::is_aggregate_function(&func_call.name)
                 };
                 if is_agg {
                     return true;
@@ -12393,10 +13495,38 @@ impl<'s> SelectCompiler<'s> {
         }
     }
 
+    /// Find if expression contains a window function (func with OVER clause), returning its name
+    fn find_window_func_in_expr(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Function(func_call) => {
+                if func_call.over.is_some() {
+                    return Some(func_call.name.clone());
+                }
+                if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
+                    for arg in exprs {
+                        if let Some(name) = Self::find_window_func_in_expr(arg) {
+                            return Some(name);
+                        }
+                    }
+                }
+                None
+            }
+            Expr::Binary { left, right, .. } => Self::find_window_func_in_expr(left)
+                .or_else(|| Self::find_window_func_in_expr(right)),
+            Expr::Unary { expr: inner, .. } => Self::find_window_func_in_expr(inner),
+            Expr::Cast { expr: inner, .. } => Self::find_window_func_in_expr(inner),
+            _ => None,
+        }
+    }
+
     /// Find if expression contains an aggregate function, returning its name
     fn find_aggregate_in_expr(&self, expr: &Expr) -> Option<String> {
         match expr {
             Expr::Function(func_call) => {
+                // Window functions (with OVER clause) are not regular aggregates
+                if func_call.over.is_some() {
+                    return None;
+                }
                 let name_upper = func_call.name.to_uppercase();
                 let arg_count = match &func_call.args {
                     crate::parser::ast::FunctionArgs::Exprs(exprs) => exprs.len(),
@@ -12794,30 +13924,16 @@ impl<'s> SelectCompiler<'s> {
                     return Ok(());
                 }
 
-                if matches!(
-                    name_upper.as_str(),
-                    "COUNT"
-                        | "SUM"
-                        | "AVG"
-                        | "MIN"
-                        | "MAX"
-                        | "GROUP_CONCAT"
-                        | "STRING_AGG"
-                        | "TOTAL"
-                ) {
+                if let Some(agg_info) = crate::functions::get_aggregate_function(&name_upper) {
                     if *agg_idx >= agg_regs.len() {
                         return Ok(()); // No more aggregate registers
                     }
                     let reg = agg_regs[*agg_idx];
 
                     // Check argument count limits
-                    let (min_args, max_args, skip_if_exceeded) = match name_upper.as_str() {
-                        "COUNT" => (0, 1, false),
-                        "SUM" | "AVG" | "TOTAL" => (1, 1, false),
-                        "MIN" | "MAX" => (1, 1, true),
-                        "GROUP_CONCAT" => (1, 2, false),
-                        _ => (0, 255, false),
-                    };
+                    let min_args = agg_info.min_args;
+                    let max_args = agg_info.max_args;
+                    let skip_if_exceeded = matches!(name_upper.as_str(), "MIN" | "MAX");
 
                     if arg_count < min_args {
                         return Err(crate::error::Error::with_message(
@@ -12945,30 +14061,16 @@ impl<'s> SelectCompiler<'s> {
                     return Ok(());
                 }
 
-                if matches!(
-                    name_upper.as_str(),
-                    "COUNT"
-                        | "SUM"
-                        | "AVG"
-                        | "MIN"
-                        | "MAX"
-                        | "GROUP_CONCAT"
-                        | "STRING_AGG"
-                        | "TOTAL"
-                ) {
+                if let Some(agg_info) = crate::functions::get_aggregate_function(&name_upper) {
                     if *agg_idx >= agg_regs.len() {
                         return Ok(()); // No more aggregate registers
                     }
                     let reg = agg_regs[*agg_idx];
 
                     // Check argument count limits
-                    let (min_args, max_args, skip_if_exceeded) = match name_upper.as_str() {
-                        "COUNT" => (0, 1, false),
-                        "SUM" | "AVG" | "TOTAL" => (1, 1, false),
-                        "MIN" | "MAX" => (1, 1, true),
-                        "GROUP_CONCAT" => (1, 2, false),
-                        _ => (0, 255, false),
-                    };
+                    let min_args = agg_info.min_args;
+                    let max_args = agg_info.max_args;
+                    let skip_if_exceeded = matches!(name_upper.as_str(), "MIN" | "MAX");
 
                     if arg_count < min_args {
                         return Err(crate::error::Error::with_message(
@@ -13257,18 +14359,7 @@ impl<'s> SelectCompiler<'s> {
                     // MIN/MAX with multiple args are scalar functions
                     let is_multi_arg_min_max =
                         matches!(name_upper.as_str(), "MIN" | "MAX") && arg_count > 1;
-                    if !is_multi_arg_min_max
-                        && matches!(
-                            name_upper.as_str(),
-                            "COUNT"
-                                | "SUM"
-                                | "AVG"
-                                | "MIN"
-                                | "MAX"
-                                | "GROUP_CONCAT"
-                                | "STRING_AGG"
-                                | "TOTAL"
-                        )
+                    if !is_multi_arg_min_max && crate::functions::is_aggregate_function(&name_upper)
                     {
                         let agg_reg = agg_regs[agg_idx];
                         self.emit(Opcode::AggFinal, agg_reg, dest_reg, 0, P4::Text(name_upper));
@@ -13465,18 +14556,7 @@ impl<'s> SelectCompiler<'s> {
                 };
                 let is_multi_arg_min_max =
                     matches!(name_upper.as_str(), "MIN" | "MAX") && arg_count > 1;
-                if !is_multi_arg_min_max
-                    && matches!(
-                        name_upper.as_str(),
-                        "COUNT"
-                            | "SUM"
-                            | "AVG"
-                            | "MIN"
-                            | "MAX"
-                            | "GROUP_CONCAT"
-                            | "STRING_AGG"
-                            | "TOTAL"
-                    )
+                if !is_multi_arg_min_max && crate::functions::is_aggregate_function(&func_call.name)
                 {
                     1
                 } else {
@@ -13588,19 +14668,7 @@ impl<'s> SelectCompiler<'s> {
                 };
                 let is_multi_arg_min_max =
                     matches!(name_upper.as_str(), "MIN" | "MAX") && arg_count > 1;
-                if !is_multi_arg_min_max
-                    && matches!(
-                        name_upper.as_str(),
-                        "COUNT"
-                            | "SUM"
-                            | "AVG"
-                            | "MIN"
-                            | "MAX"
-                            | "GROUP_CONCAT"
-                            | "STRING_AGG"
-                            | "TOTAL"
-                    )
-                {
+                if !is_multi_arg_min_max && crate::functions::is_aggregate_function(&name_upper) {
                     if *current_idx == target_idx {
                         return Some(name_upper);
                     }
@@ -13659,19 +14727,7 @@ impl<'s> SelectCompiler<'s> {
                 };
                 let is_multi_arg_min_max =
                     matches!(name_upper.as_str(), "MIN" | "MAX") && arg_count > 1;
-                if !is_multi_arg_min_max
-                    && matches!(
-                        name_upper.as_str(),
-                        "COUNT"
-                            | "SUM"
-                            | "AVG"
-                            | "MIN"
-                            | "MAX"
-                            | "GROUP_CONCAT"
-                            | "STRING_AGG"
-                            | "TOTAL"
-                    )
-                {
+                if !is_multi_arg_min_max && crate::functions::is_aggregate_function(&name_upper) {
                     // This is an aggregate - count its arguments
                     arg_count
                 } else {
@@ -13737,19 +14793,7 @@ impl<'s> SelectCompiler<'s> {
                 };
                 let is_multi_arg_min_max =
                     matches!(name_upper.as_str(), "MIN" | "MAX") && arg_count > 1;
-                if !is_multi_arg_min_max
-                    && matches!(
-                        name_upper.as_str(),
-                        "COUNT"
-                            | "SUM"
-                            | "AVG"
-                            | "MIN"
-                            | "MAX"
-                            | "GROUP_CONCAT"
-                            | "STRING_AGG"
-                            | "TOTAL"
-                    )
-                {
+                if !is_multi_arg_min_max && crate::functions::is_aggregate_function(&name_upper) {
                     // This is an aggregate - compile its arguments
                     if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
                         for arg in exprs {
@@ -13933,19 +14977,7 @@ impl<'s> SelectCompiler<'s> {
                 // MIN/MAX with multiple args are scalar functions
                 let is_multi_arg_min_max =
                     matches!(name_upper.as_str(), "MIN" | "MAX") && arg_count > 1;
-                if !is_multi_arg_min_max
-                    && matches!(
-                        name_upper.as_str(),
-                        "COUNT"
-                            | "SUM"
-                            | "AVG"
-                            | "MIN"
-                            | "MAX"
-                            | "GROUP_CONCAT"
-                            | "STRING_AGG"
-                            | "TOTAL"
-                    )
-                {
+                if !is_multi_arg_min_max && crate::functions::is_aggregate_function(&name_upper) {
                     // For COUNT(*) (arg_count == 0), use a constant
                     // For other cases, read ALL arguments from sorter
                     let arg_base = self.next_reg;

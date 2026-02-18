@@ -200,6 +200,20 @@ impl<'a> InsertCompiler<'a> {
         self.dqs_dml = enabled;
     }
 
+    /// Return the effective schema for a table name, checking temp_schema first.
+    /// SQLite resolves unqualified names by searching temp before main.
+    fn effective_schema_for_table(&self, table_name: &str) -> Option<&'a Schema> {
+        let table_lower = table_name.to_lowercase();
+        // Check temp schema first
+        if let Some(temp) = self.temp_schema {
+            if temp.tables.contains_key(&table_lower) {
+                return Some(temp);
+            }
+        }
+        // Fall back to main schema
+        self.schema
+    }
+
     /// Return the insert flags for a real table insert.
     /// Includes OPFLAG_NCHANGE and OPFLAG_LASTROWID (unless WITHOUT ROWID).
     fn insert_flags(&self) -> u16 {
@@ -563,7 +577,9 @@ impl<'a> InsertCompiler<'a> {
 
             // Fill in defaults or NULL for unspecified columns
             let table_lower = insert.table.name.to_lowercase();
-            let table_opt = self.schema.and_then(|s| s.tables.get(&table_lower));
+            let table_opt = self
+                .effective_schema_for_table(&insert.table.name)
+                .and_then(|s| s.tables.get(&table_lower));
 
             for (col_idx, seen) in present.iter().enumerate() {
                 if !*seen {
@@ -602,6 +618,9 @@ impl<'a> InsertCompiler<'a> {
                 self.emit_instead_of_triggers(&table_name, data_base)?;
             } else {
                 // Regular insert path for tables
+
+                // Check NOT NULL constraints before other checks
+                self.emit_not_null_checks(conflict_action, data_base)?;
 
                 // Check CHECK constraints before inserting
                 self.emit_check_constraints(data_base)?;
@@ -655,7 +674,8 @@ impl<'a> InsertCompiler<'a> {
 
     fn infer_num_columns(&self, insert: &InsertStmt) -> usize {
         // Always try to get actual table/view column count from schema
-        if let Some(schema) = self.schema {
+        // Use effective_schema_for_table to find temp tables too
+        if let Some(schema) = self.effective_schema_for_table(&insert.table.name) {
             let table_name_lower = insert.table.name.to_lowercase();
             // Check tables first
             if let Some(table) = schema.tables.get(&table_name_lower) {
@@ -754,7 +774,7 @@ impl<'a> InsertCompiler<'a> {
     /// Initialize column affinity string from schema
     fn init_column_affinities(&mut self, table_name: &str) {
         self.column_affinities.clear();
-        if let Some(schema) = self.schema {
+        if let Some(schema) = self.effective_schema_for_table(table_name) {
             let table_name_lower = table_name.to_lowercase();
             if let Some(table) = schema.tables.get(&table_name_lower) {
                 for col in &table.columns {
@@ -966,7 +986,7 @@ impl<'a> InsertCompiler<'a> {
             &insert.table.name,
             explicit_cols.as_deref(),
             select_col_count,
-            self.schema,
+            self.effective_schema_for_table(&insert.table.name),
         )?;
 
         // Allocate rowid register for target table
@@ -1053,6 +1073,9 @@ impl<'a> InsertCompiler<'a> {
             self.emit_instead_of_triggers(&table_name, data_base)?;
         } else {
             // Regular insert path for tables
+
+            // Check NOT NULL constraints
+            self.emit_not_null_checks(conflict_action, data_base)?;
 
             // Check CHECK constraints before inserting
             self.emit_check_constraints(data_base)?;
@@ -1301,7 +1324,7 @@ impl<'a> InsertCompiler<'a> {
             &insert.table.name,
             explicit_cols.as_deref(),
             select_col_count,
-            self.schema,
+            self.effective_schema_for_table(&insert.table.name),
         )?;
 
         // Allocate rowid register for target table
@@ -1389,6 +1412,9 @@ impl<'a> InsertCompiler<'a> {
         } else {
             // Regular insert path for tables
 
+            // Check NOT NULL constraints
+            self.emit_not_null_checks(conflict_action, data_base)?;
+
             // Check CHECK constraints before inserting
             self.emit_check_constraints(data_base)?;
 
@@ -1465,7 +1491,7 @@ impl<'a> InsertCompiler<'a> {
     /// Get number of columns in the source table
     fn get_source_table_column_count(&self, select: &SelectStmt) -> usize {
         if let Ok(source_table) = self.get_source_table(select) {
-            if let Some(schema) = self.schema {
+            if let Some(schema) = self.effective_schema_for_table(&source_table) {
                 let table_lower = source_table.to_lowercase();
                 if let Some(table) = schema.tables.get(&table_lower) {
                     return table.columns.len();
@@ -1545,7 +1571,7 @@ impl<'a> InsertCompiler<'a> {
     /// Build column name to index map for source table
     fn build_source_column_map(&self, table_name: &str) -> HashMap<String, usize> {
         let mut map = HashMap::new();
-        if let Some(schema) = self.schema {
+        if let Some(schema) = self.effective_schema_for_table(table_name) {
             let table_lower = table_name.to_lowercase();
             if let Some(table) = schema.tables.get(&table_lower) {
                 for (i, col) in table.columns.iter().enumerate() {
@@ -1941,6 +1967,9 @@ impl<'a> InsertCompiler<'a> {
         } else {
             // Regular insert path for tables
 
+            // Check NOT NULL constraints
+            self.emit_not_null_checks(conflict_action, data_base)?;
+
             // Check CHECK constraints before inserting
             self.emit_check_constraints(data_base)?;
 
@@ -2237,40 +2266,282 @@ impl<'a> InsertCompiler<'a> {
         data_base: i32,
         _rowid_reg: i32,
     ) -> Result<()> {
-        // First, check indexes with IGNORE conflict_action
-        // This handles "UNIQUE ON CONFLICT IGNORE" at the column/table level
-        self.emit_ignore_conflict_handling(data_base)?;
-
-        // Check for schema-level REPLACE conflict actions on indexes/columns.
-        // These apply even when the INSERT itself has no explicit OR REPLACE.
-        if action == ConflictAction::Abort
-            || action == ConflictAction::Rollback
-            || action == ConflictAction::Fail
-        {
-            self.emit_schema_replace_conflict_handling(data_base)?;
-        }
-
+        // For REPLACE: use the dedicated handler that fires DELETE triggers
+        // and rechecks constraints after triggers (handles the case where a
+        // trigger re-inserts a conflicting row).
+        // For all other actions: use the unified constraint check.
         match action {
-            ConflictAction::Abort => {
-                // Default behavior - abort on constraint violation
-            }
-            ConflictAction::Rollback => {
-                // Will be handled by the Insert opcode flags
-            }
-            ConflictAction::Fail => {
-                // Will be handled by the Insert opcode flags
-            }
-            ConflictAction::Ignore => {
-                // Skip entire row on any UNIQUE constraint conflict.
-                // This handles both INSERT OR IGNORE and ON CONFLICT DO NOTHING.
-                // Check ALL unique indexes (not just those with schema-level IGNORE).
-                self.emit_stmt_ignore_conflict_handling(data_base)?;
-            }
             ConflictAction::Replace => {
-                // For REPLACE: check each unique index for conflicts and delete if found
                 self.emit_replace_conflict_handling(data_base)?;
             }
+            _ => {
+                self.emit_unique_constraint_checks(action, data_base)?;
+            }
         }
+        Ok(())
+    }
+
+    /// Emit UNIQUE constraint checks for all unique indexes.
+    /// For each index, the effective conflict action is determined by:
+    ///   - If the INSERT has an explicit OR clause, use that for all indexes
+    ///   - Otherwise, use the index's own ON CONFLICT clause (or default ABORT)
+    fn emit_unique_constraint_checks(
+        &mut self,
+        stmt_action: ConflictAction,
+        data_base: i32,
+    ) -> Result<()> {
+        let schema = match self.effective_schema_for_table(&self.table_name) {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        let table = match schema.tables.get(&self.table_name.to_lowercase()) {
+            Some(t) => t.clone(),
+            None => return Ok(()),
+        };
+
+        // Collect unique indexes from both table.indexes (auto-indexes from column constraints)
+        // and schema.indexes (explicitly created indexes via CREATE UNIQUE INDEX)
+        let mut unique_indexes: Vec<Arc<crate::schema::Index>> = table
+            .indexes
+            .iter()
+            .filter(|idx| idx.unique)
+            .cloned()
+            .collect();
+
+        // Add explicitly created UNIQUE indexes from schema.indexes
+        let table_lower = self.table_name.to_lowercase();
+        for (_, idx) in &schema.indexes {
+            if idx.unique && idx.table.to_lowercase() == table_lower {
+                // Avoid duplicates (check by name)
+                if !unique_indexes
+                    .iter()
+                    .any(|existing| existing.name == idx.name)
+                {
+                    unique_indexes.push(idx.clone());
+                }
+            }
+        }
+
+        if unique_indexes.is_empty() {
+            return Ok(());
+        }
+
+        for index in &unique_indexes {
+            // Determine effective conflict action for this index
+            let effective_action = if stmt_action != ConflictAction::Abort {
+                // Statement has explicit OR clause - use it for all indexes
+                stmt_action
+            } else if let Some(ref idx_action) = index.conflict_action {
+                // Use the index's own ON CONFLICT clause
+                match idx_action {
+                    crate::schema::ConflictAction::Replace => ConflictAction::Replace,
+                    crate::schema::ConflictAction::Ignore => ConflictAction::Ignore,
+                    crate::schema::ConflictAction::Fail => ConflictAction::Fail,
+                    crate::schema::ConflictAction::Rollback => ConflictAction::Rollback,
+                    crate::schema::ConflictAction::Abort => ConflictAction::Abort,
+                }
+            } else {
+                ConflictAction::Abort
+            };
+
+            // For partial indexes, check the WHERE condition
+            let partial_skip_label = if let Some(ref partial_expr) = index.partial {
+                let skip_label = self.alloc_label();
+                let cond_reg = self.alloc_reg();
+                if self
+                    .compile_partial_index_expr(partial_expr, cond_reg, data_base)
+                    .is_ok()
+                {
+                    self.emit(Opcode::IfNot, cond_reg, skip_label, 1, P4::Unused);
+                }
+                Some(skip_label)
+            } else {
+                None
+            };
+
+            let idx_root = if index.root_page > 0 {
+                index.root_page
+            } else {
+                schema
+                    .indexes
+                    .get(&index.name.to_lowercase())
+                    .map(|i| i.root_page)
+                    .unwrap_or(0)
+            };
+
+            if idx_root == 0 {
+                if let Some(skip_label) = partial_skip_label {
+                    self.resolve_label(skip_label, self.current_addr() as i32);
+                }
+                continue;
+            }
+
+            // Build search key from new row values
+            let key_base = self.alloc_regs(index.columns.len());
+            let mut has_non_null = false;
+            for (i, col) in index.columns.iter().enumerate() {
+                if col.column_idx >= 0 {
+                    self.emit(
+                        Opcode::Copy,
+                        data_base + col.column_idx,
+                        key_base + i as i32,
+                        0,
+                        P4::Unused,
+                    );
+                    has_non_null = true;
+                } else {
+                    self.emit(Opcode::Null, 0, key_base + i as i32, 0, P4::Unused);
+                }
+            }
+
+            // If all key columns are NULL, skip the UNIQUE check (NULL is never equal to NULL)
+            let no_conflict_label = self.alloc_label();
+            if has_non_null {
+                for (i, col) in index.columns.iter().enumerate() {
+                    if col.column_idx >= 0 {
+                        self.emit(
+                            Opcode::IsNull,
+                            key_base + i as i32,
+                            no_conflict_label,
+                            0,
+                            P4::Unused,
+                        );
+                    }
+                }
+            }
+
+            // Open a read cursor on the index
+            let idx_cursor = self.alloc_cursor();
+            self.emit(
+                Opcode::OpenRead,
+                idx_cursor,
+                0,
+                (index.columns.len() + 1) as i32,
+                P4::Text(index.name.clone()),
+            );
+
+            let search_key_reg = self.alloc_reg();
+            self.emit(
+                Opcode::MakeRecord,
+                key_base,
+                index.columns.len() as i32,
+                search_key_reg,
+                P4::Unused,
+            );
+
+            // SeekGE + IdxGT to check for exact match
+            self.emit(
+                Opcode::SeekGE,
+                idx_cursor,
+                no_conflict_label,
+                search_key_reg,
+                P4::Int64(index.columns.len() as i64),
+            );
+            self.emit(
+                Opcode::IdxGT,
+                idx_cursor,
+                no_conflict_label,
+                search_key_reg,
+                P4::Int64(index.columns.len() as i64),
+            );
+
+            // Conflict detected! Handle based on effective action
+            match effective_action {
+                ConflictAction::Ignore => {
+                    // Skip this entire row
+                    self.emit(Opcode::Close, idx_cursor, 0, 0, P4::Unused);
+                    let skip_label = self.skip_row_label.unwrap_or_else(|| {
+                        let label = self.alloc_label();
+                        self.skip_row_label = Some(label);
+                        label
+                    });
+                    self.emit(Opcode::Goto, 0, skip_label, 0, P4::Unused);
+                }
+                ConflictAction::Replace => {
+                    // Delete the conflicting row
+                    let conflict_rowid_reg = self.alloc_reg();
+                    self.emit(
+                        Opcode::IdxRowid,
+                        idx_cursor,
+                        conflict_rowid_reg,
+                        0,
+                        P4::Unused,
+                    );
+                    self.emit(Opcode::Close, idx_cursor, 0, 0, P4::Unused);
+
+                    let del_cursor = self.alloc_cursor();
+                    self.emit(
+                        Opcode::OpenWrite,
+                        del_cursor,
+                        table.root_page as i32,
+                        self.num_columns as i32,
+                        P4::Text(self.table_name.clone()),
+                    );
+
+                    let not_found_label = self.alloc_label();
+                    self.emit(
+                        Opcode::NotExists,
+                        del_cursor,
+                        not_found_label,
+                        conflict_rowid_reg,
+                        P4::Unused,
+                    );
+
+                    // Delete from all indexes first
+                    self.emit_delete_from_indexes(del_cursor, conflict_rowid_reg, &table)?;
+
+                    // Delete the conflicting row
+                    self.emit_with_p5(
+                        Opcode::Delete,
+                        del_cursor,
+                        0,
+                        conflict_rowid_reg,
+                        P4::Text(self.table_name.clone()),
+                        OPFLAG_NCHANGE,
+                    );
+
+                    self.resolve_label(not_found_label, self.current_addr() as i32);
+                    self.emit(Opcode::Close, del_cursor, 0, 0, P4::Unused);
+                    // Jump past the no_conflict path to continue with the insert
+                    let done_label = self.alloc_label();
+                    self.emit(Opcode::Goto, 0, done_label, 0, P4::Unused);
+                    self.resolve_label(no_conflict_label, self.current_addr() as i32);
+                    self.emit(Opcode::Close, idx_cursor, 0, 0, P4::Unused);
+                    self.resolve_label(done_label, self.current_addr() as i32);
+
+                    if let Some(skip_label) = partial_skip_label {
+                        self.resolve_label(skip_label, self.current_addr() as i32);
+                    }
+                    continue; // no_conflict_label already resolved
+                }
+                ConflictAction::Fail => {
+                    let err_msg = self.unique_constraint_error_msg(&table, index);
+                    self.emit(Opcode::Close, idx_cursor, 0, 0, P4::Unused);
+                    self.emit(Opcode::Halt, 19, 3, 0, P4::Text(err_msg));
+                }
+                ConflictAction::Rollback => {
+                    let err_msg = self.unique_constraint_error_msg(&table, index);
+                    self.emit(Opcode::Close, idx_cursor, 0, 0, P4::Unused);
+                    // OE_Rollback = 1
+                    self.emit(Opcode::Halt, 19, 1, 0, P4::Text(err_msg));
+                }
+                ConflictAction::Abort => {
+                    let err_msg = self.unique_constraint_error_msg(&table, index);
+                    self.emit(Opcode::Close, idx_cursor, 0, 0, P4::Unused);
+                    // OE_Abort = 2
+                    self.emit(Opcode::Halt, 19, 2, 0, P4::Text(err_msg));
+                }
+            }
+
+            self.resolve_label(no_conflict_label, self.current_addr() as i32);
+            self.emit(Opcode::Close, idx_cursor, 0, 0, P4::Unused);
+
+            if let Some(skip_label) = partial_skip_label {
+                self.resolve_label(skip_label, self.current_addr() as i32);
+            }
+        }
+
         Ok(())
     }
 
@@ -2278,7 +2549,7 @@ impl<'a> InsertCompiler<'a> {
     /// ON CONFLICT REPLACE. These apply when the INSERT has no explicit conflict action
     /// (e.g. plain INSERT, not INSERT OR REPLACE).
     fn emit_schema_replace_conflict_handling(&mut self, data_base: i32) -> Result<()> {
-        let schema = match self.schema {
+        let schema = match self.effective_schema_for_table(&self.table_name) {
             Some(s) => s,
             None => return Ok(()),
         };
@@ -2312,7 +2583,7 @@ impl<'a> InsertCompiler<'a> {
     /// This is called before the main Insert to check if any UNIQUE constraint
     /// with IGNORE would be violated. If so, we skip the entire row.
     fn emit_ignore_conflict_handling(&mut self, data_base: i32) -> Result<()> {
-        let schema = match self.schema {
+        let schema = match self.effective_schema_for_table(&self.table_name) {
             Some(s) => s,
             None => return Ok(()),
         };
@@ -2454,7 +2725,7 @@ impl<'a> InsertCompiler<'a> {
     /// or INSERT OR IGNORE). Checks ALL unique indexes for conflicts and skips
     /// the entire row if any conflict is found.
     fn emit_stmt_ignore_conflict_handling(&mut self, data_base: i32) -> Result<()> {
-        let schema = match self.schema {
+        let schema = match self.effective_schema_for_table(&self.table_name) {
             Some(s) => s,
             None => return Ok(()),
         };
@@ -2600,7 +2871,7 @@ impl<'a> InsertCompiler<'a> {
     /// 2. If any DELETE triggers fired, recheck all constraints
     /// 3. If recheck fails, abort (don't try to REPLACE again)
     fn emit_replace_conflict_handling(&mut self, data_base: i32) -> Result<()> {
-        let schema = match self.schema {
+        let schema = match self.effective_schema_for_table(&self.table_name) {
             Some(s) => s,
             None => return Ok(()),
         };
@@ -3114,6 +3385,33 @@ impl<'a> InsertCompiler<'a> {
         Ok(())
     }
 
+    /// Build UNIQUE constraint error message in SQLite format: "UNIQUE constraint failed: table.col1, table.col2"
+    fn unique_constraint_error_msg(
+        &self,
+        table: &crate::schema::Table,
+        index: &crate::schema::Index,
+    ) -> String {
+        let col_names: Vec<String> = index
+            .columns
+            .iter()
+            .filter_map(|ic| {
+                if ic.column_idx >= 0 {
+                    table
+                        .columns
+                        .get(ic.column_idx as usize)
+                        .map(|col| format!("{}.{}", self.table_name, col.name))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if col_names.is_empty() {
+            format!("UNIQUE constraint failed: {}", index.name)
+        } else {
+            format!("UNIQUE constraint failed: {}", col_names.join(", "))
+        }
+    }
+
     /// Get Insert opcode flags for conflict action
     /// Must match OE_* constants in vdbe/engine/state.rs
     fn conflict_flags(&self, action: ConflictAction) -> i64 {
@@ -3327,7 +3625,9 @@ impl<'a> InsertCompiler<'a> {
                     _ => Opcode::Add,
                 };
 
-                self.emit(opcode, left_reg, right_reg, dest_reg, P4::Unused);
+                // Arithmetic/Concat opcodes: P3 = P2 op P1
+                // So P1=right, P2=left gives P3 = left op right
+                self.emit(opcode, right_reg, left_reg, dest_reg, P4::Unused);
             }
             Expr::Unary { op, expr: inner } => {
                 self.compile_expr(inner, dest_reg)?;
@@ -3404,11 +3704,147 @@ impl<'a> InsertCompiler<'a> {
     // CHECK constraint methods
     // ========================================================================
 
+    /// Emit NOT NULL constraint checks for each column.
+    /// The effective conflict action is determined by: INSERT OR xxx overrides the column's
+    /// ON CONFLICT clause. If no INSERT-level clause, use the column's own clause.
+    fn emit_not_null_checks(
+        &mut self,
+        stmt_conflict_action: ConflictAction,
+        data_base: i32,
+    ) -> Result<()> {
+        let schema = match self.effective_schema_for_table(&self.table_name) {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        let table = match schema.tables.get(&self.table_name.to_lowercase()) {
+            Some(t) => t.clone(),
+            None => return Ok(()),
+        };
+
+        for (col_idx, col) in table.columns.iter().enumerate() {
+            if !col.not_null {
+                continue;
+            }
+
+            // Skip INTEGER PRIMARY KEY columns - NULL means auto-assign rowid
+            if col.is_primary_key {
+                if let Some(ref tn) = col.type_name {
+                    if tn.eq_ignore_ascii_case("INTEGER") {
+                        continue;
+                    }
+                }
+            }
+
+            let reg = data_base + col_idx as i32;
+            let ok_label = self.alloc_label();
+            // If the register is not NULL, skip the constraint handling
+            self.emit(Opcode::NotNull, reg, ok_label, 0, P4::Unused);
+
+            // Determine effective conflict action:
+            // INSERT OR xxx overrides column-level ON CONFLICT clause
+            let effective_action = if stmt_conflict_action != ConflictAction::Abort {
+                // Statement has explicit conflict action
+                stmt_conflict_action
+            } else if let Some(ref col_action) = col.not_null_conflict {
+                // Use column's ON CONFLICT clause
+                match col_action {
+                    crate::schema::ConflictAction::Replace => ConflictAction::Replace,
+                    crate::schema::ConflictAction::Ignore => ConflictAction::Ignore,
+                    crate::schema::ConflictAction::Fail => ConflictAction::Fail,
+                    crate::schema::ConflictAction::Rollback => ConflictAction::Rollback,
+                    crate::schema::ConflictAction::Abort => ConflictAction::Abort,
+                }
+            } else {
+                ConflictAction::Abort
+            };
+
+            match effective_action {
+                ConflictAction::Replace => {
+                    // Substitute default value for NULL
+                    if let Some(ref default_val) = col.default_value {
+                        match default_val {
+                            crate::schema::DefaultValue::Integer(n) => {
+                                self.emit(Opcode::Integer, *n as i32, reg, 0, P4::Unused);
+                            }
+                            crate::schema::DefaultValue::Float(f) => {
+                                self.emit(Opcode::Real, 0, reg, 0, P4::Real(*f));
+                            }
+                            crate::schema::DefaultValue::String(s) => {
+                                self.emit(Opcode::String8, 0, reg, 0, P4::Text(s.clone()));
+                            }
+                            crate::schema::DefaultValue::Null => {
+                                // Default is NULL but column is NOT NULL - error (OE_Abort=2)
+                                let err_msg = format!(
+                                    "NOT NULL constraint failed: {}.{}",
+                                    self.table_name, col.name
+                                );
+                                self.emit(Opcode::Halt, 19, 2, 0, P4::Text(err_msg));
+                            }
+                            _ => {
+                                // For complex defaults (Expr, CurrentTime, etc.), fall back to error (OE_Abort=2)
+                                let err_msg = format!(
+                                    "NOT NULL constraint failed: {}.{}",
+                                    self.table_name, col.name
+                                );
+                                self.emit(Opcode::Halt, 19, 2, 0, P4::Text(err_msg));
+                            }
+                        }
+                    } else {
+                        // No default value and REPLACE action - still error (OE_Abort=2)
+                        let err_msg = format!(
+                            "NOT NULL constraint failed: {}.{}",
+                            self.table_name, col.name
+                        );
+                        self.emit(Opcode::Halt, 19, 2, 0, P4::Text(err_msg));
+                    }
+                }
+                ConflictAction::Ignore => {
+                    // Skip this entire row
+                    let skip_label = self.skip_row_label.unwrap_or_else(|| {
+                        let label = self.alloc_label();
+                        self.skip_row_label = Some(label);
+                        label
+                    });
+                    self.emit(Opcode::Goto, 0, skip_label, 0, P4::Unused);
+                }
+                ConflictAction::Rollback => {
+                    let err_msg = format!(
+                        "NOT NULL constraint failed: {}.{}",
+                        self.table_name, col.name
+                    );
+                    // OE_Rollback = 1
+                    self.emit(Opcode::Halt, 19, 1, 0, P4::Text(err_msg));
+                }
+                ConflictAction::Fail => {
+                    let err_msg = format!(
+                        "NOT NULL constraint failed: {}.{}",
+                        self.table_name, col.name
+                    );
+                    // OE_Fail = 3
+                    self.emit(Opcode::Halt, 19, 3, 0, P4::Text(err_msg));
+                }
+                ConflictAction::Abort => {
+                    let err_msg = format!(
+                        "NOT NULL constraint failed: {}.{}",
+                        self.table_name, col.name
+                    );
+                    // OE_Abort = 2
+                    self.emit(Opcode::Halt, 19, 2, 0, P4::Text(err_msg));
+                }
+            }
+
+            self.resolve_label(ok_label, self.current_addr() as i32);
+        }
+
+        Ok(())
+    }
+
     /// Emit CHECK constraint verification code.
     /// Called after loading column values into registers but before the INSERT.
     /// data_base: register containing first column value
     fn emit_check_constraints(&mut self, data_base: i32) -> Result<()> {
-        let schema = match self.schema {
+        let schema = match self.effective_schema_for_table(&self.table_name) {
             Some(s) => s,
             None => return Ok(()),
         };
@@ -3616,7 +4052,9 @@ impl<'a> InsertCompiler<'a> {
                             SBinOp::RightShift => Opcode::ShiftRight,
                             _ => Opcode::Add,
                         };
-                        self.emit(opcode, left_reg, right_reg, dest_reg, P4::Unused);
+                        // Arithmetic/Concat opcodes: P3 = P2 op P1
+                        // So P1=right, P2=left gives P3 = left op right
+                        self.emit(opcode, right_reg, left_reg, dest_reg, P4::Unused);
                     }
                 }
             }
@@ -4020,8 +4458,8 @@ impl<'a> InsertCompiler<'a> {
     /// Open indexes for write access
     /// SQLite checks UNIQUE constraints in reverse column order (later columns first)
     fn open_indexes_for_write(&mut self, table_name: &str) -> Result<()> {
-        // Get indexes from schema
-        if let Some(schema) = self.schema {
+        // Get indexes from schema (check temp schema first for temp tables)
+        if let Some(schema) = self.effective_schema_for_table(table_name) {
             let table_name_lower = table_name.to_lowercase();
 
             // Collect all indexes for this table with their first column position

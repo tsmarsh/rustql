@@ -641,6 +641,10 @@ pub enum Opcode {
     /// Update virtual table (insert/delete/update)
     VUpdate,
 
+    /// Populate ephemeral table P1 with json_each(reg[P2]) rows.
+    /// P3 = optional path register (0 if no path). P4 = Text("json_each" or "json_tree").
+    JsonPopulate,
+
     /// Explain opcode - used for EXPLAIN QUERY PLAN output
     /// This is a no-op during normal execution but carries metadata for explain mode
     Explain,
@@ -991,6 +995,7 @@ impl Opcode {
             Opcode::VOpen => "VOpen",
             Opcode::VRename => "VRename",
             Opcode::VUpdate => "VUpdate",
+            Opcode::JsonPopulate => "JsonPopulate",
             Opcode::Explain => "Explain",
             Opcode::MaxOpcode => "MaxOpcode",
         }

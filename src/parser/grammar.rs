@@ -1468,7 +1468,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_column_def(&mut self) -> Result<ColumnDef> {
-        let name = self.expect_identifier()?;
+        // SQLite allows single-quoted strings as column names (DQS misfeature legacy)
+        let name = self.expect_identifier_or_string()?;
 
         let type_name = if (self.check(TokenKind::Identifier) || self.current().kind.is_keyword())
             && !self.is_column_constraint_start()
@@ -1769,9 +1770,14 @@ impl<'a> Parser<'a> {
                 self.expect(TokenKind::Key)?;
                 self.expect(TokenKind::LParen)?;
                 let columns = self.parse_indexed_columns()?;
+                let autoincrement = self.match_token(TokenKind::Autoincrement);
                 self.expect(TokenKind::RParen)?;
                 let conflict = self.parse_conflict_clause()?;
-                TableConstraintKind::PrimaryKey { columns, conflict }
+                TableConstraintKind::PrimaryKey {
+                    columns,
+                    conflict,
+                    autoincrement,
+                }
             } else if self.match_token(TokenKind::Unique) {
                 self.expect(TokenKind::LParen)?;
                 let columns = self.parse_indexed_columns()?;
@@ -1847,10 +1853,22 @@ impl<'a> Parser<'a> {
 
         let order = self.parse_sort_order();
 
+        let nulls = if self.match_token(TokenKind::Nulls) {
+            if self.match_token(TokenKind::First) {
+                Some(NullsOrder::First)
+            } else {
+                self.expect(TokenKind::Last)?;
+                Some(NullsOrder::Last)
+            }
+        } else {
+            None
+        };
+
         Ok(IndexedColumn {
             column,
             collation,
             order,
+            nulls,
         })
     }
 
@@ -3682,5 +3700,124 @@ mod tests {
     fn test_parse_multiple_statements() {
         let stmts = parse_all("SELECT 1; SELECT 2; SELECT 3").unwrap();
         assert_eq!(stmts.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_nulls_first_last_in_order_by() {
+        let stmt = parse("SELECT * FROM t1 ORDER BY a NULLS FIRST, b DESC NULLS LAST").unwrap();
+        if let Stmt::Select(select) = stmt {
+            let order_by = select.order_by.unwrap();
+            assert_eq!(order_by.len(), 2);
+            assert_eq!(order_by[0].nulls, NullsOrder::First);
+            assert_eq!(order_by[0].order, SortOrder::Asc);
+            assert_eq!(order_by[1].nulls, NullsOrder::Last);
+            assert_eq!(order_by[1].order, SortOrder::Desc);
+        } else {
+            panic!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_parse_nulls_in_indexed_column() {
+        // NULLS FIRST/LAST in CREATE INDEX
+        let stmt = parse("CREATE INDEX idx1 ON t1(a ASC NULLS FIRST, b DESC NULLS LAST)").unwrap();
+        if let Stmt::CreateIndex(ci) = stmt {
+            assert_eq!(ci.columns.len(), 2);
+            assert_eq!(ci.columns[0].nulls, Some(NullsOrder::First));
+            assert_eq!(ci.columns[0].order, Some(SortOrder::Asc));
+            assert_eq!(ci.columns[1].nulls, Some(NullsOrder::Last));
+            assert_eq!(ci.columns[1].order, Some(SortOrder::Desc));
+        } else {
+            panic!("expected CreateIndex");
+        }
+    }
+
+    #[test]
+    fn test_parse_nulls_in_table_primary_key() {
+        // NULLS LAST in table-level PRIMARY KEY (SQLite parses but rejects semantically)
+        let stmt = parse("CREATE TABLE t1(a, b, PRIMARY KEY(b NULLS LAST)) WITHOUT ROWID").unwrap();
+        if let Stmt::CreateTable(ct) = stmt {
+            if let TableDefinition::Columns { constraints, .. } = &ct.definition {
+                assert_eq!(constraints.len(), 1);
+                if let TableConstraintKind::PrimaryKey { columns, .. } = &constraints[0].kind {
+                    assert_eq!(columns[0].nulls, Some(NullsOrder::Last));
+                } else {
+                    panic!("expected PrimaryKey constraint");
+                }
+            } else {
+                panic!("expected Columns definition");
+            }
+        } else {
+            panic!("expected CreateTable");
+        }
+    }
+
+    #[test]
+    fn test_parse_autoincrement_in_table_primary_key() {
+        let stmt =
+            parse("CREATE TABLE t1(x INTEGER, y REAL, PRIMARY KEY(x AUTOINCREMENT))").unwrap();
+        if let Stmt::CreateTable(ct) = stmt {
+            if let TableDefinition::Columns { constraints, .. } = &ct.definition {
+                assert_eq!(constraints.len(), 1);
+                if let TableConstraintKind::PrimaryKey { autoincrement, .. } = &constraints[0].kind
+                {
+                    assert!(*autoincrement);
+                } else {
+                    panic!("expected PrimaryKey constraint");
+                }
+            } else {
+                panic!("expected Columns definition");
+            }
+        } else {
+            panic!("expected CreateTable");
+        }
+    }
+
+    #[test]
+    fn test_parse_single_quoted_column_name() {
+        // SQLite allows single-quoted strings as column names (legacy DQS behavior)
+        let stmt = parse("CREATE TABLE t1('a' INTEGER, 'b' TEXT)").unwrap();
+        if let Stmt::CreateTable(ct) = stmt {
+            if let TableDefinition::Columns { columns, .. } = &ct.definition {
+                assert_eq!(columns[0].name, "a");
+                assert_eq!(columns[1].name, "b");
+            } else {
+                panic!("expected Columns definition");
+            }
+        } else {
+            panic!("expected CreateTable");
+        }
+    }
+
+    #[test]
+    fn test_parse_single_quoted_column_in_primary_key() {
+        // Single-quoted column name in table-level PRIMARY KEY
+        let stmt = parse("CREATE TABLE t1('a' integer, b, PRIMARY KEY('a'))").unwrap();
+        if let Stmt::CreateTable(ct) = stmt {
+            if let TableDefinition::Columns {
+                columns,
+                constraints,
+            } = &ct.definition
+            {
+                assert_eq!(columns[0].name, "a");
+                assert_eq!(constraints.len(), 1);
+                if let TableConstraintKind::PrimaryKey {
+                    columns: pk_cols, ..
+                } = &constraints[0].kind
+                {
+                    if let IndexedColumnKind::Name(name) = &pk_cols[0].column {
+                        assert_eq!(name, "a");
+                    } else {
+                        panic!("expected Name");
+                    }
+                } else {
+                    panic!("expected PrimaryKey");
+                }
+            } else {
+                panic!("expected Columns");
+            }
+        } else {
+            panic!("expected CreateTable");
+        }
     }
 }

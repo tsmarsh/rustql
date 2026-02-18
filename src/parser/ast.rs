@@ -953,6 +953,7 @@ pub enum TableConstraintKind {
     PrimaryKey {
         columns: Vec<IndexedColumn>,
         conflict: Option<ConflictAction>,
+        autoincrement: bool,
     },
     Unique {
         columns: Vec<IndexedColumn>,
@@ -971,6 +972,7 @@ pub struct IndexedColumn {
     pub column: IndexedColumnKind,
     pub collation: Option<String>,
     pub order: Option<SortOrder>,
+    pub nulls: Option<NullsOrder>,
 }
 
 /// Indexed column kind

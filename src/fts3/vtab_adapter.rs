@@ -114,6 +114,7 @@ impl VtabModule for Fts4VtabModule {
         table_name: &str,
         args: &[String],
     ) -> Result<(String, Arc<dyn VtabTable>)> {
+        validate_fts4_args(args)?;
         Fts3VtabModule.create(db_name, table_name, args)
     }
     fn connect(
@@ -122,6 +123,7 @@ impl VtabModule for Fts4VtabModule {
         table_name: &str,
         args: &[String],
     ) -> Result<(String, Arc<dyn VtabTable>)> {
+        validate_fts4_args(args)?;
         Fts3VtabModule.connect(db_name, table_name, args)
     }
     fn destroy(&self, table: Arc<dyn VtabTable>) -> Result<()> {
@@ -133,6 +135,54 @@ impl VtabModule for Fts4VtabModule {
     fn shadow_table_suffixes(&self) -> Vec<&'static str> {
         vec!["_content", "_segments", "_segdir", "_stat"]
     }
+}
+
+/// Known FTS4 option names (case-insensitive).
+/// These are the recognized `key=value` parameters for FTS4.
+const FTS4_KNOWN_OPTIONS: &[&str] = &[
+    "matchinfo",
+    "prefix",
+    "compress",
+    "uncompress",
+    "order",
+    "content",
+    "languageid",
+    "notindexed",
+];
+
+/// Validate FTS4 arguments.
+///
+/// In SQLite, FTS4 rejects unknown `key=value` parameters (unlike FTS3 which
+/// treats them as column names). The first `tokenize=` is accepted; any
+/// subsequent `tokenize=` or unrecognized `key=value` triggers an error.
+fn validate_fts4_args(args: &[String]) -> Result<()> {
+    let mut seen_tokenize = false;
+    for arg in args {
+        let arg = arg.trim();
+        if arg.is_empty() {
+            continue;
+        }
+        // Check for key=value pattern (contains '=' anywhere)
+        if let Some(eq_pos) = arg.find('=') {
+            let key = arg[..eq_pos].trim().to_ascii_lowercase();
+            if key == "tokenize" {
+                if seen_tokenize {
+                    // Duplicate tokenize - unrecognized parameter
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        format!("unrecognized parameter: {}", arg),
+                    ));
+                }
+                seen_tokenize = true;
+            } else if !FTS4_KNOWN_OPTIONS.iter().any(|opt| *opt == key) {
+                return Err(Error::with_message(
+                    ErrorCode::Error,
+                    format!("unrecognized parameter: {}", arg),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// FTS3 virtual table instance adapter

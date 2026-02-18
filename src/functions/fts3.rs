@@ -971,20 +971,53 @@ fn tokenize_exprtest(expr: &str) -> Vec<ExprTestToken> {
                 continue;
             }
             if upper == "NEAR" {
-                let mut dist = 10;
+                // Match SQLite's NEAR keyword parsing:
+                // NEAR must be followed by optional /N (where N is digits and the char
+                // after / must be a digit). After NEAR or NEAR/N, the next char must be
+                // whitespace, '"', '(', ')', or EOF. Otherwise "NEAR" is a regular word.
+                let saved_i = i;
+                let mut dist = 10i32;
+                let mut is_near_keyword = true;
+
                 if i < len && chars[i] == '/' {
-                    i += 1;
-                    let mut ns = String::new();
-                    while i < len && chars[i].is_ascii_digit() {
-                        ns.push(chars[i]);
-                        i += 1;
-                    }
-                    if !ns.is_empty() {
+                    // Check that the character after '/' is a digit
+                    if i + 1 < len && chars[i + 1].is_ascii_digit() {
+                        i += 1; // skip '/'
+                        let mut ns = String::new();
+                        while i < len && chars[i].is_ascii_digit() {
+                            ns.push(chars[i]);
+                            i += 1;
+                        }
                         dist = ns.parse::<i32>().unwrap_or(10);
+                    } else {
+                        // '/' not followed by digit - not a NEAR keyword
+                        is_near_keyword = false;
                     }
                 }
-                tokens.push(ExprTestToken::Near(dist));
-                continue;
+
+                // Check that next char is whitespace, '"', '(', ')', or EOF
+                if is_near_keyword {
+                    if i < len {
+                        let c_next = chars[i];
+                        if !(c_next.is_ascii_whitespace()
+                            || c_next == '"'
+                            || c_next == '('
+                            || c_next == ')')
+                        {
+                            is_near_keyword = false;
+                        }
+                    }
+                    // else EOF is fine
+                }
+
+                if is_near_keyword {
+                    tokens.push(ExprTestToken::Near(dist));
+                    continue;
+                } else {
+                    // Not a NEAR keyword, treat "near" as a regular word
+                    i = saved_i;
+                    // fall through to word handling below
+                }
             }
             let mut col_prefix = None;
             if i < len && chars[i] == ':' {
@@ -1059,9 +1092,9 @@ impl ExprTestParser {
         };
         while let Some(ExprTestToken::Or) = self.peek() {
             self.advance();
-            let right = self.parse_and()?.ok_or_else(|| {
-                Error::with_message(ErrorCode::Error, "expected expression after OR")
-            })?;
+            let right = self
+                .parse_and()?
+                .ok_or_else(|| Error::with_message(ErrorCode::Error, "Error parsing expression"))?;
             left = ExprTestNode::Or(Box::new(left), Box::new(right));
         }
         Ok(Some(left))
@@ -1075,7 +1108,7 @@ impl ExprTestParser {
             if let Some(ExprTestToken::And) = self.peek() {
                 self.advance();
                 let right = self.parse_not()?.ok_or_else(|| {
-                    Error::with_message(ErrorCode::Error, "expected expression after AND")
+                    Error::with_message(ErrorCode::Error, "Error parsing expression")
                 })?;
                 left = ExprTestNode::And(Box::new(left), Box::new(right));
                 continue;
@@ -1085,7 +1118,7 @@ impl ExprTestParser {
                 | Some(ExprTestToken::QuotedPhrase(_))
                 | Some(ExprTestToken::LParen) => {
                     let right = self.parse_not()?.ok_or_else(|| {
-                        Error::with_message(ErrorCode::Error, "expected expression")
+                        Error::with_message(ErrorCode::Error, "Error parsing expression")
                     })?;
                     left = ExprTestNode::And(Box::new(left), Box::new(right));
                     continue;
@@ -1102,9 +1135,9 @@ impl ExprTestParser {
         };
         while let Some(ExprTestToken::Not) = self.peek() {
             self.advance();
-            let right = self.parse_near()?.ok_or_else(|| {
-                Error::with_message(ErrorCode::Error, "expected expression after NOT")
-            })?;
+            let right = self
+                .parse_near()?
+                .ok_or_else(|| Error::with_message(ErrorCode::Error, "Error parsing expression"))?;
             left = ExprTestNode::Not(Box::new(left), Box::new(right));
         }
         Ok(Some(left))
@@ -1117,9 +1150,9 @@ impl ExprTestParser {
         while let Some(ExprTestToken::Near(dist)) = self.peek() {
             let dist = *dist;
             self.advance();
-            let right = self.parse_primary()?.ok_or_else(|| {
-                Error::with_message(ErrorCode::Error, "expected expression after NEAR")
-            })?;
+            let right = self
+                .parse_primary()?
+                .ok_or_else(|| Error::with_message(ErrorCode::Error, "Error parsing expression"))?;
             left = ExprTestNode::Near(dist, Box::new(left), Box::new(right));
         }
         Ok(Some(left))
@@ -1204,10 +1237,12 @@ pub fn func_fts3_exprtest(args: &[Value]) -> Result<Value> {
     if args.len() < 3 {
         return Err(Error::with_message(
             ErrorCode::Error,
-            "fts3_exprtest requires at least 3 arguments",
+            "Usage: fts3_exprtest(tokenizer, expr, col1, ...",
         ));
     }
-    let _tokenizer_name = value_to_string(&args[0]);
+    let tokenizer_name = value_to_string(&args[0]);
+    // Validate the tokenizer exists
+    let _tokenizer = crate::fts3::tokenizer::create_tokenizer(&tokenizer_name, &[])?;
     let expression = value_to_string(&args[1]);
     let columns: Vec<String> = args[2..]
         .iter()
@@ -1219,7 +1254,7 @@ pub fn func_fts3_exprtest(args: &[Value]) -> Result<Value> {
         Some(node) => Ok(Value::Text(node.to_string_repr())),
         None => Err(Error::with_message(
             ErrorCode::Error,
-            "fts3_exprtest: parse error",
+            "Error parsing expression",
         )),
     }
 }
@@ -1228,10 +1263,12 @@ pub fn func_fts3_exprtest_rebalance(args: &[Value]) -> Result<Value> {
     if args.len() < 3 {
         return Err(Error::with_message(
             ErrorCode::Error,
-            "fts3_exprtest_rebalance requires at least 3 arguments",
+            "Usage: fts3_exprtest(tokenizer, expr, col1, ...",
         ));
     }
-    let _tokenizer_name = value_to_string(&args[0]);
+    let tokenizer_name = value_to_string(&args[0]);
+    // Validate the tokenizer exists
+    let _tokenizer = crate::fts3::tokenizer::create_tokenizer(&tokenizer_name, &[])?;
     let expression = value_to_string(&args[1]);
     let columns: Vec<String> = args[2..]
         .iter()
@@ -1246,7 +1283,7 @@ pub fn func_fts3_exprtest_rebalance(args: &[Value]) -> Result<Value> {
         }
         None => Err(Error::with_message(
             ErrorCode::Error,
-            "fts3_exprtest_rebalance: parse error",
+            "Error parsing expression",
         )),
     }
 }

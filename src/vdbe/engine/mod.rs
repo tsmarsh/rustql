@@ -9768,7 +9768,7 @@ impl Vdbe {
                                     // Mark that vtab needs sync/commit at Halt
                                     self.vtab_needs_sync = true;
                                 }
-                                Err(_e) => {
+                                Err(e) => {
                                     // Module's create() returned an error
                                     // Clean up the table entry that ParseSchema created
                                     if let Some(ref schema_lock) = self.schema {
@@ -9777,10 +9777,8 @@ impl Vdbe {
                                             schema_guard.tables.remove(&table_name_lower);
                                         }
                                     }
-                                    return Err(Error::with_message(
-                                        ErrorCode::Error,
-                                        format!("vtable constructor failed: {}", info.table_name),
-                                    ));
+                                    // Propagate the module's error message directly
+                                    return Err(e);
                                 }
                             }
                         } else {

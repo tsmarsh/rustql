@@ -583,6 +583,7 @@ pub unsafe fn register_test_stubs(interp: *mut Tcl_Interp) {
         ("fts5", "1"),
         ("rtree", "1"),
         ("json", "1"),
+        ("mathlib", "1"),
         ("memdebug", "0"),
         ("crashtest", "0"),
         ("debug", "0"),

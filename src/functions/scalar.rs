@@ -41,12 +41,33 @@ pub fn get_scalar_function(name: &str) -> Option<ScalarFunc> {
         "MIN" => Some(func_min),
         "ROUND" => Some(func_round),
         "SIGN" => Some(func_sign),
-        "LOG" | "LN" => Some(func_log),
+        "LOG" => Some(func_log),
+        "LN" => Some(func_ln),
         "LOG10" => Some(func_log10),
         "LOG2" => Some(func_log2),
         "EXP" => Some(func_exp),
         "SQRT" => Some(func_sqrt),
         "POWER" | "POW" => Some(func_power),
+        "PI" => Some(func_pi),
+        "CEIL" | "CEILING" => Some(func_ceil),
+        "FLOOR" => Some(func_floor),
+        "TRUNC" => Some(func_trunc),
+        "MOD" => Some(func_mod),
+        "RADIANS" => Some(func_radians),
+        "DEGREES" => Some(func_degrees),
+        "ACOS" => Some(func_acos),
+        "ASIN" => Some(func_asin),
+        "ATAN" => Some(func_atan),
+        "ATAN2" => Some(func_atan2),
+        "COS" => Some(func_cos),
+        "SIN" => Some(func_sin),
+        "TAN" => Some(func_tan),
+        "SINH" => Some(func_sinh),
+        "COSH" => Some(func_cosh),
+        "TANH" => Some(func_tanh),
+        "ASINH" => Some(func_asinh),
+        "ACOSH" => Some(func_acosh),
+        "ATANH" => Some(func_atanh),
 
         // String functions
         "LENGTH" => Some(func_length),
@@ -354,8 +375,37 @@ pub fn func_sign(args: &[Value]) -> Result<Value> {
     }
 }
 
-/// log(X) - natural logarithm of X
-/// log(B, X) - logarithm of X to base B
+/// ln(X) - natural logarithm of X
+pub fn func_ln(args: &[Value]) -> Result<Value> {
+    fn to_float(v: &Value) -> Option<f64> {
+        match v {
+            Value::Null => None,
+            Value::Integer(n) => Some(*n as f64),
+            Value::Real(f) => Some(*f),
+            Value::Text(s) => s.parse().ok(),
+            Value::Blob(_) => Some(0.0),
+        }
+    }
+
+    if args.len() != 1 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function ln()",
+        ));
+    }
+
+    let Some(x) = to_float(&args[0]) else {
+        return Ok(Value::Null);
+    };
+    if x <= 0.0 {
+        Ok(Value::Null)
+    } else {
+        Ok(Value::Real(x.ln()))
+    }
+}
+
+/// log(X) - log base 10 of X (single argument)
+/// log(B, X) - logarithm of X to base B (two arguments)
 pub fn func_log(args: &[Value]) -> Result<Value> {
     fn to_float(v: &Value) -> Option<f64> {
         match v {
@@ -369,14 +419,14 @@ pub fn func_log(args: &[Value]) -> Result<Value> {
 
     match args.len() {
         1 => {
-            // log(X) - natural logarithm
+            // log(X) - log base 10 (SQLite convention)
             let Some(x) = to_float(&args[0]) else {
                 return Ok(Value::Null);
             };
             if x <= 0.0 {
                 Ok(Value::Null)
             } else {
-                Ok(Value::Real(x.ln()))
+                Ok(Value::Real(x.log10()))
             }
         }
         2 => {
@@ -522,6 +572,345 @@ pub fn func_power(args: &[Value]) -> Result<Value> {
         Ok(Value::Null)
     } else {
         Ok(Value::Real(result))
+    }
+}
+
+/// pi() - Return the value of pi
+pub fn func_pi(args: &[Value]) -> Result<Value> {
+    if !args.is_empty() {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function pi()",
+        ));
+    }
+    Ok(Value::Real(std::f64::consts::PI))
+}
+
+/// Helper to extract a float from a Value for math functions.
+/// Returns None for NULL (caller should return NULL).
+fn math_to_float(v: &Value) -> Option<f64> {
+    match v {
+        Value::Null => None,
+        Value::Integer(n) => Some(*n as f64),
+        Value::Real(f) => Some(*f),
+        Value::Text(s) => {
+            let s = s.trim();
+            if s.is_empty() {
+                Some(0.0)
+            } else {
+                s.parse().ok()
+            }
+        }
+        Value::Blob(_) => Some(0.0),
+    }
+}
+
+/// ceil(X) / ceiling(X) - Return the smallest integer not less than X
+pub fn func_ceil(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function ceil()",
+        ));
+    }
+    match &args[0] {
+        Value::Null => Ok(Value::Null),
+        Value::Integer(n) => Ok(Value::Integer(*n)),
+        _ => {
+            let Some(x) = math_to_float(&args[0]) else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Real(x.ceil()))
+        }
+    }
+}
+
+/// floor(X) - Return the largest integer not greater than X
+pub fn func_floor(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function floor()",
+        ));
+    }
+    match &args[0] {
+        Value::Null => Ok(Value::Null),
+        Value::Integer(n) => Ok(Value::Integer(*n)),
+        _ => {
+            let Some(x) = math_to_float(&args[0]) else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Real(x.floor()))
+        }
+    }
+}
+
+/// trunc(X) - Return the integer part of X (truncate toward zero)
+pub fn func_trunc(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function trunc()",
+        ));
+    }
+    match &args[0] {
+        Value::Null => Ok(Value::Null),
+        Value::Integer(n) => Ok(Value::Integer(*n)),
+        _ => {
+            let Some(x) = math_to_float(&args[0]) else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Real(x.trunc()))
+        }
+    }
+}
+
+/// mod(X, Y) - Return the remainder of X / Y
+pub fn func_mod(args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function mod()",
+        ));
+    }
+    let Some(x) = math_to_float(&args[0]) else {
+        return Ok(Value::Null);
+    };
+    let Some(y) = math_to_float(&args[1]) else {
+        return Ok(Value::Null);
+    };
+    if y == 0.0 {
+        return Ok(Value::Null);
+    }
+    Ok(Value::Real(x % y))
+}
+
+/// radians(X) - Convert degrees to radians
+pub fn func_radians(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function radians()",
+        ));
+    }
+    let Some(x) = math_to_float(&args[0]) else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Real(x.to_radians()))
+}
+
+/// degrees(X) - Convert radians to degrees
+pub fn func_degrees(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function degrees()",
+        ));
+    }
+    let Some(x) = math_to_float(&args[0]) else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Real(x.to_degrees()))
+}
+
+/// acos(X) - Return the arc cosine of X
+pub fn func_acos(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function acos()",
+        ));
+    }
+    let Some(x) = math_to_float(&args[0]) else {
+        return Ok(Value::Null);
+    };
+    if x < -1.0 || x > 1.0 {
+        Ok(Value::Null)
+    } else {
+        Ok(Value::Real(x.acos()))
+    }
+}
+
+/// asin(X) - Return the arc sine of X
+pub fn func_asin(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function asin()",
+        ));
+    }
+    let Some(x) = math_to_float(&args[0]) else {
+        return Ok(Value::Null);
+    };
+    if x < -1.0 || x > 1.0 {
+        Ok(Value::Null)
+    } else {
+        Ok(Value::Real(x.asin()))
+    }
+}
+
+/// atan(X) - Return the arc tangent of X
+pub fn func_atan(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function atan()",
+        ));
+    }
+    let Some(x) = math_to_float(&args[0]) else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Real(x.atan()))
+}
+
+/// atan2(Y, X) - Return the arc tangent of Y/X
+pub fn func_atan2(args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function atan2()",
+        ));
+    }
+    let Some(y) = math_to_float(&args[0]) else {
+        return Ok(Value::Null);
+    };
+    let Some(x) = math_to_float(&args[1]) else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Real(y.atan2(x)))
+}
+
+/// cos(X) - Return the cosine of X (in radians)
+pub fn func_cos(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function cos()",
+        ));
+    }
+    let Some(x) = math_to_float(&args[0]) else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Real(x.cos()))
+}
+
+/// sin(X) - Return the sine of X (in radians)
+pub fn func_sin(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function sin()",
+        ));
+    }
+    let Some(x) = math_to_float(&args[0]) else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Real(x.sin()))
+}
+
+/// tan(X) - Return the tangent of X (in radians)
+pub fn func_tan(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function tan()",
+        ));
+    }
+    let Some(x) = math_to_float(&args[0]) else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Real(x.tan()))
+}
+
+/// sinh(X) - Return the hyperbolic sine of X
+pub fn func_sinh(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function sinh()",
+        ));
+    }
+    let Some(x) = math_to_float(&args[0]) else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Real(x.sinh()))
+}
+
+/// cosh(X) - Return the hyperbolic cosine of X
+pub fn func_cosh(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function cosh()",
+        ));
+    }
+    let Some(x) = math_to_float(&args[0]) else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Real(x.cosh()))
+}
+
+/// tanh(X) - Return the hyperbolic tangent of X
+pub fn func_tanh(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function tanh()",
+        ));
+    }
+    let Some(x) = math_to_float(&args[0]) else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Real(x.tanh()))
+}
+
+/// asinh(X) - Return the inverse hyperbolic sine of X
+pub fn func_asinh(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function asinh()",
+        ));
+    }
+    let Some(x) = math_to_float(&args[0]) else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Real(x.asinh()))
+}
+
+/// acosh(X) - Return the inverse hyperbolic cosine of X
+pub fn func_acosh(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function acosh()",
+        ));
+    }
+    let Some(x) = math_to_float(&args[0]) else {
+        return Ok(Value::Null);
+    };
+    if x < 1.0 {
+        Ok(Value::Null)
+    } else {
+        Ok(Value::Real(x.acosh()))
+    }
+}
+
+/// atanh(X) - Return the inverse hyperbolic tangent of X
+pub fn func_atanh(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(Error::with_message(
+            crate::error::ErrorCode::Error,
+            "wrong number of arguments to function atanh()",
+        ));
+    }
+    let Some(x) = math_to_float(&args[0]) else {
+        return Ok(Value::Null);
+    };
+    if x <= -1.0 || x >= 1.0 {
+        Ok(Value::Null)
+    } else {
+        Ok(Value::Real(x.atanh()))
     }
 }
 

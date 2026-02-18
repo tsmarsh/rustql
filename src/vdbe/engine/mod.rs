@@ -1462,7 +1462,31 @@ impl Vdbe {
             }
 
             Opcode::Halt => {
-                self.rc = ErrorCode::from_i32(op.p1).unwrap_or(ErrorCode::Error);
+                // P1 may carry an extended error code (primary | (subcode << 8))
+                // Extract primary code as (p1 & 0xFF) and extended subcode as (p1 >> 8)
+                let primary_code = op.p1 & 0xFF;
+                let ext_subcode = op.p1 >> 8;
+                self.rc = ErrorCode::from_i32(primary_code).unwrap_or(ErrorCode::Error);
+
+                // Map extended constraint subcodes to ExtendedErrorCode variants
+                // Subcodes: 1=CHECK, 2=COMMITHOOK, 3=FOREIGNKEY, 4=FUNCTION,
+                //           5=NOTNULL, 6=PRIMARYKEY, 7=TRIGGER, 8=UNIQUE,
+                //           9=VTAB, 10=ROWID, 11=PINNED, 12=DATATYPE
+                let extended_code = if self.rc == ErrorCode::Constraint && ext_subcode > 0 {
+                    match ext_subcode {
+                        1 => Some(ExtendedErrorCode::ConstraintCheck),
+                        3 => Some(ExtendedErrorCode::ConstraintForeignKey),
+                        5 => Some(ExtendedErrorCode::ConstraintNotNull),
+                        6 => Some(ExtendedErrorCode::ConstraintPrimaryKey),
+                        7 => Some(ExtendedErrorCode::ConstraintTrigger),
+                        8 => Some(ExtendedErrorCode::ConstraintUnique),
+                        10 => Some(ExtendedErrorCode::ConstraintRowId),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
                 if let P4::Text(ref msg) = op.p4 {
                     self.error_msg = Some(msg.clone());
                 }
@@ -1472,6 +1496,28 @@ impl Vdbe {
                     let msg_str = self.mem(op.p3).to_str();
                     if !msg_str.is_empty() {
                         self.error_msg = Some(msg_str);
+                    }
+                }
+
+                // P5 controls error message formatting (SQLite P5_Constraint* constants):
+                // P5=1: "NOT NULL constraint failed: {P4}"
+                // P5=2: "UNIQUE constraint failed: {P4}"
+                // P5=3: "CHECK constraint failed: {P4}"
+                // P5=4: "FOREIGN KEY constraint failed: {P4}"
+                // When P5 > 0, build the formatted error message
+                if op.p5 > 0 && op.p5 <= 4 && self.rc != ErrorCode::Ok {
+                    let type_name = match op.p5 {
+                        1 => "NOT NULL",
+                        2 => "UNIQUE",
+                        3 => "CHECK",
+                        4 => "FOREIGN KEY",
+                        _ => unreachable!(),
+                    };
+                    if let P4::Text(ref p4_text) = op.p4 {
+                        self.error_msg =
+                            Some(format!("{} constraint failed: {}", type_name, p4_text));
+                    } else {
+                        self.error_msg = Some(format!("{} constraint failed", type_name));
                     }
                 }
 
@@ -1512,8 +1558,10 @@ impl Vdbe {
                             .clone()
                             .unwrap_or_else(|| "constraint failed".to_string());
                         let mut err = Error::with_message(self.rc, msg);
-                        // Use extended error code for trigger constraints
-                        if is_trigger_constraint {
+                        // Use extended error code: prefer P1-derived, fall back to trigger
+                        if let Some(ext) = extended_code {
+                            err.extended = Some(ext);
+                        } else if is_trigger_constraint {
                             err.extended = Some(ExtendedErrorCode::ConstraintTrigger);
                         }
                         // Propagate on-error action from P2
@@ -1531,6 +1579,10 @@ impl Vdbe {
                             .clone()
                             .unwrap_or_else(|| "constraint failed".to_string());
                         let mut err = Error::with_message(self.rc, msg);
+                        // Set extended error code from P1
+                        if let Some(ext) = extended_code {
+                            err.extended = Some(ext);
+                        }
                         // Propagate on-error action from P2
                         // P2: OE_Rollback=1, OE_Abort=2, OE_Fail=3, OE_Ignore=4
                         if op.p2 >= 1 && op.p2 <= 4 {
@@ -5673,13 +5725,20 @@ impl Vdbe {
                                             };
                                             let col_name =
                                                 ipk_column_name.as_deref().unwrap_or("rowid");
-                                            return Err(Error::with_message(
+                                            let mut err = Error::with_message(
                                                 ErrorCode::Constraint,
                                                 format!(
                                                     "UNIQUE constraint failed: {}.{}",
                                                     table_name, col_name
                                                 ),
-                                            ));
+                                            );
+                                            // Set extended code: PRIMARYKEY for IPK, ROWID otherwise
+                                            err.extended = Some(if ipk_column_name.is_some() {
+                                                ExtendedErrorCode::ConstraintPrimaryKey
+                                            } else {
+                                                ExtendedErrorCode::ConstraintRowId
+                                            });
+                                            return Err(err);
                                         }
                                         OE_ROLLBACK => {
                                             // Rollback transaction and return error
@@ -5690,13 +5749,20 @@ impl Vdbe {
                                             };
                                             let col_name =
                                                 ipk_column_name.as_deref().unwrap_or("rowid");
-                                            return Err(Error::with_message(
+                                            let mut err = Error::with_message(
                                                 ErrorCode::Constraint,
                                                 format!(
                                                     "UNIQUE constraint failed: {}.{}",
                                                     table_name, col_name
                                                 ),
-                                            ));
+                                            );
+                                            // Set extended code: PRIMARYKEY for IPK, ROWID otherwise
+                                            err.extended = Some(if ipk_column_name.is_some() {
+                                                ExtendedErrorCode::ConstraintPrimaryKey
+                                            } else {
+                                                ExtendedErrorCode::ConstraintRowId
+                                            });
+                                            return Err(err);
                                         }
                                         _ => {
                                             // OE_NONE or unknown - proceed with insert (overwrite)
@@ -5872,10 +5938,16 @@ impl Vdbe {
                             _ => "table",
                         };
                         let col_name = ipk_column_name.as_deref().unwrap_or("rowid");
-                        return Err(Error::with_message(
+                        let mut err = Error::with_message(
                             ErrorCode::Constraint,
                             format!("UNIQUE constraint failed: {}.{}", table_name, col_name),
-                        ));
+                        );
+                        err.extended = Some(if ipk_column_name.is_some() {
+                            ExtendedErrorCode::ConstraintPrimaryKey
+                        } else {
+                            ExtendedErrorCode::ConstraintRowId
+                        });
+                        return Err(err);
                     }
 
                     // Proceed with the insert now that we've verified no conflict
@@ -6133,14 +6205,13 @@ impl Vdbe {
                     .map(|c| c.root_page);
 
                 // Save positions of all OTHER cursors on the same root page
+                // This includes both read and write cursors, because another cursor's
+                // delete can invalidate any cursor's position on the same btree.
                 if let Some(root) = root_page {
                     for i in 0..self.cursors.len() {
                         if i != delete_cursor_id {
                             if let Some(ref mut c) = self.cursors[i] {
-                                if c.root_page == root
-                                    && !c.writable
-                                    && c.state == CursorState::Valid
-                                {
+                                if c.root_page == root && c.state == CursorState::Valid {
                                     c.save_position();
                                 }
                             }

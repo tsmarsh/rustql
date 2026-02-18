@@ -391,7 +391,6 @@ impl TokenKind {
                 | TokenKind::Union
                 | TokenKind::Intersect
                 | TokenKind::Except
-                | TokenKind::Window
                 | TokenKind::Returning
         )
     }
@@ -590,14 +589,14 @@ impl<'a> Tokenizer<'a> {
         if self.current() == b'0' && matches!(self.peek(), Some(b'x') | Some(b'X')) {
             self.advance();
             self.advance();
-            while !self.is_eof() && self.current().is_ascii_hexdigit() {
+            while !self.is_eof() && (self.current().is_ascii_hexdigit() || self.current() == b'_') {
                 self.advance();
             }
             return Ok(TokenKind::Integer);
         }
 
-        // Integer part
-        while !self.is_eof() && self.current().is_ascii_digit() {
+        // Integer part (allow underscores as digit separators, SQLite 3.38+)
+        while !self.is_eof() && (self.current().is_ascii_digit() || self.current() == b'_') {
             self.advance();
         }
 
@@ -606,7 +605,9 @@ impl<'a> Tokenizer<'a> {
             if let Some(next) = self.peek() {
                 if next.is_ascii_digit() {
                     self.advance(); // consume '.'
-                    while !self.is_eof() && self.current().is_ascii_digit() {
+                    while !self.is_eof()
+                        && (self.current().is_ascii_digit() || self.current() == b'_')
+                    {
                         self.advance();
                     }
                     // Check for exponent
@@ -615,7 +616,9 @@ impl<'a> Tokenizer<'a> {
                         if !self.is_eof() && matches!(self.current(), b'+' | b'-') {
                             self.advance();
                         }
-                        while !self.is_eof() && self.current().is_ascii_digit() {
+                        while !self.is_eof()
+                            && (self.current().is_ascii_digit() || self.current() == b'_')
+                        {
                             self.advance();
                         }
                     }
@@ -632,7 +635,8 @@ impl<'a> Tokenizer<'a> {
                 self.advance();
             }
             if !self.is_eof() && self.current().is_ascii_digit() {
-                while !self.is_eof() && self.current().is_ascii_digit() {
+                while !self.is_eof() && (self.current().is_ascii_digit() || self.current() == b'_')
+                {
                     self.advance();
                 }
                 return Ok(TokenKind::Float);

@@ -792,12 +792,75 @@ impl<'s> SelectCompiler<'s> {
     pub fn process_with_clause(&mut self, with: &WithClause) -> Result<()> {
         for cte in &with.ctes {
             let name_lower = cte.name.to_lowercase();
-            if with.recursive {
+            // Auto-detect recursive CTEs: if the CTE body references its own name,
+            // treat it as recursive even without the RECURSIVE keyword.
+            // SQLite allows recursive CTEs without the RECURSIVE keyword.
+            let is_recursive =
+                with.recursive || Self::select_references_table(&cte.query, &name_lower);
+            if is_recursive {
+                // Validate: window functions cannot be used in recursive queries
+                if Self::select_body_has_window_functions(&cte.query.body) {
+                    return Err(Error::with_message(
+                        ErrorCode::Error,
+                        "cannot use window functions in recursive queries",
+                    ));
+                }
                 self.recursive_ctes.insert(name_lower.clone());
             }
             self.ctes.insert(name_lower, cte.clone());
         }
         Ok(())
+    }
+
+    /// Check if a SELECT statement references a given table name
+    fn select_references_table(select: &SelectStmt, table_name: &str) -> bool {
+        Self::select_body_references_table(&select.body, table_name)
+    }
+
+    /// Check if a SELECT body references a given table name
+    fn select_body_references_table(body: &SelectBody, table_name: &str) -> bool {
+        match body {
+            SelectBody::Select(core) => {
+                if let Some(from) = &core.from {
+                    for table_ref in &from.tables {
+                        if Self::table_ref_references_table(table_ref, table_name) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            SelectBody::Compound { left, right, .. } => {
+                Self::select_body_references_table(left, table_name)
+                    || Self::select_body_references_table(right, table_name)
+            }
+        }
+    }
+
+    /// Check if a table reference references a given table name
+    fn table_ref_references_table(table_ref: &TableRef, table_name: &str) -> bool {
+        match table_ref {
+            TableRef::Table { name, .. } => name.name.to_lowercase() == table_name,
+            TableRef::Subquery { .. } => false,
+            TableRef::Join { left, right, .. } => {
+                Self::table_ref_references_table(left, table_name)
+                    || Self::table_ref_references_table(right, table_name)
+            }
+            TableRef::TableFunction { .. } => false,
+            TableRef::Parens(inner) => Self::table_ref_references_table(inner, table_name),
+        }
+    }
+
+    /// Check if a SELECT body contains any window functions
+    fn select_body_has_window_functions(body: &SelectBody) -> bool {
+        use crate::executor::window::select_has_window_functions;
+        match body {
+            SelectBody::Select(core) => select_has_window_functions(core),
+            SelectBody::Compound { left, right, .. } => {
+                Self::select_body_has_window_functions(left)
+                    || Self::select_body_has_window_functions(right)
+            }
+        }
     }
 
     /// Compile SELECT body
@@ -3083,8 +3146,9 @@ impl<'s> SelectCompiler<'s> {
                         crate::parser::ast::Over::Spec(s) => {
                             if let Some(base_name) = &s.base {
                                 if let Some(base) = named_windows.get(base_name) {
-                                    // Validate: cannot add a frame spec when referencing a base
-                                    if s.frame.is_some()
+                                    // Validate: cannot override frame spec if base already has one,
+                                    // or if base has a frame and we try to add ORDER BY / PARTITION BY
+                                    if (s.frame.is_some() && base.frame.is_some())
                                         || (base.frame.is_some()
                                             && (s.order_by.is_some() || s.partition_by.is_some()))
                                     {
@@ -3176,7 +3240,7 @@ impl<'s> SelectCompiler<'s> {
             }
         }
 
-        // Also validate named window definitions that reference each other
+        // Validate and resolve named window definitions that reference each other
         if let Some(window_defs) = &core.window {
             for def in window_defs {
                 if let Some(base_name) = &def.spec.base {
@@ -3186,8 +3250,8 @@ impl<'s> SelectCompiler<'s> {
                             format!("no such window: {}", base_name),
                         ));
                     }
-                    let base = &named_windows[base_name];
-                    if def.spec.frame.is_some()
+                    let base = named_windows[base_name].clone();
+                    if (def.spec.frame.is_some() && base.frame.is_some())
                         || (base.frame.is_some()
                             && (def.spec.order_by.is_some() || def.spec.partition_by.is_some()))
                     {
@@ -3211,6 +3275,18 @@ impl<'s> SelectCompiler<'s> {
                             format!("cannot override ORDER BY clause of window: {}", base_name),
                         ));
                     }
+                    // Resolve the window definition: merge with base
+                    let resolved = crate::parser::ast::WindowSpec {
+                        base: None,
+                        partition_by: def
+                            .spec
+                            .partition_by
+                            .clone()
+                            .or_else(|| base.partition_by.clone()),
+                        order_by: def.spec.order_by.clone().or_else(|| base.order_by.clone()),
+                        frame: def.spec.frame.clone().or_else(|| base.frame.clone()),
+                    };
+                    named_windows.insert(def.name.clone(), resolved);
                 }
             }
         }
@@ -3408,7 +3484,8 @@ impl<'s> SelectCompiler<'s> {
             self.window_func_regs.insert(idx, result_reg);
 
             // Determine if this is a whole-partition aggregate:
-            // An aggregate with no ORDER BY and no explicit frame ending at CURRENT ROW
+            // An aggregate with no ORDER BY and no explicit frame ending at CURRENT ROW,
+            // OR one with an explicit UNBOUNDED PRECEDING to UNBOUNDED FOLLOWING frame.
             let has_order = order_by.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
             let has_frame_current_row = frame
                 .as_ref()
@@ -3419,8 +3496,23 @@ impl<'s> SelectCompiler<'s> {
                     )
                 })
                 .unwrap_or(false);
+            let has_unbounded_frame = frame
+                .as_ref()
+                .map(|f| {
+                    matches!(
+                        f.start,
+                        crate::parser::ast::WindowFrameBound::UnboundedPreceding
+                    ) && matches!(
+                        f.end,
+                        Some(crate::parser::ast::WindowFrameBound::UnboundedFollowing)
+                    )
+                })
+                .unwrap_or(false);
+            let has_explicit_frame = frame.is_some();
             let is_whole_partition = match &func_type {
-                WindowFuncType::Aggregate(_) => !has_order && !has_frame_current_row,
+                WindowFuncType::Aggregate(_) => {
+                    has_unbounded_frame || (!has_order && !has_explicit_frame)
+                }
                 _ => false,
             };
 
@@ -3652,7 +3744,9 @@ impl<'s> SelectCompiler<'s> {
 
         let has_whole_partition_aggs = win_funcs.iter().any(|wf| wf.is_whole_partition);
 
-        // Check if any window functions need a row buffer for lag/lead/first_value/last_value/nth_value
+        // Check if any window functions need a row buffer.
+        // Required for: lag/lead/first_value/last_value/nth_value, or
+        // aggregates with non-trivial frame specs (ROWS BETWEEN N PRECEDING AND M FOLLOWING, etc.)
         let needs_row_buffer = win_funcs.iter().any(|wf| {
             matches!(
                 wf.func_type,
@@ -3661,7 +3755,9 @@ impl<'s> SelectCompiler<'s> {
                     | WindowFuncType::FirstValue
                     | WindowFuncType::LastValue
                     | WindowFuncType::NthValue
-            )
+            ) || (matches!(wf.func_type, WindowFuncType::Aggregate(_))
+                && !wf.is_whole_partition
+                && wf.frame.is_some())
         });
         let needs_pass1 = has_whole_partition_aggs || needs_row_buffer;
 
@@ -4554,8 +4650,300 @@ impl<'s> SelectCompiler<'s> {
                                 P4::Unused,
                             );
                         }
+                    } else if wf.frame.is_some() && needs_row_buffer {
+                        // Frame-based aggregate: iterate over frame rows in the row buffer
+                        let frame = wf.frame.as_ref().unwrap();
+                        let is_rows =
+                            matches!(frame.mode, crate::parser::ast::WindowFrameMode::Rows);
+
+                        // Compute frame start row number
+                        let frame_start_reg = self.alloc_reg();
+                        match &frame.start {
+                            crate::parser::ast::WindowFrameBound::UnboundedPreceding => {
+                                // Frame starts at partition start
+                                self.emit(
+                                    Opcode::Copy,
+                                    partition_start_row_reg,
+                                    frame_start_reg,
+                                    0,
+                                    P4::Unused,
+                                );
+                                self.emit(Opcode::AddImm, frame_start_reg, 1, 0, P4::Unused);
+                            }
+                            crate::parser::ast::WindowFrameBound::CurrentRow => {
+                                self.emit(
+                                    Opcode::Copy,
+                                    pass2_abs_row_reg,
+                                    frame_start_reg,
+                                    0,
+                                    P4::Unused,
+                                );
+                            }
+                            crate::parser::ast::WindowFrameBound::Preceding(expr) => {
+                                self.emit(
+                                    Opcode::Copy,
+                                    pass2_abs_row_reg,
+                                    frame_start_reg,
+                                    0,
+                                    P4::Unused,
+                                );
+                                if let Expr::Literal(Literal::Integer(n)) = expr.as_ref() {
+                                    self.emit(
+                                        Opcode::AddImm,
+                                        frame_start_reg,
+                                        -(*n as i32),
+                                        0,
+                                        P4::Unused,
+                                    );
+                                }
+                                // Clamp to partition start + 1
+                                let clamp_start = self.alloc_label();
+                                let clamp_start_done = self.alloc_label();
+                                let min_row = self.alloc_reg();
+                                self.emit(
+                                    Opcode::Copy,
+                                    partition_start_row_reg,
+                                    min_row,
+                                    0,
+                                    P4::Unused,
+                                );
+                                self.emit(Opcode::AddImm, min_row, 1, 0, P4::Unused);
+                                self.emit(
+                                    Opcode::Ge,
+                                    min_row,
+                                    clamp_start_done,
+                                    frame_start_reg,
+                                    P4::Unused,
+                                );
+                                self.emit(Opcode::Copy, min_row, frame_start_reg, 0, P4::Unused);
+                                self.resolve_label(clamp_start_done, self.current_addr());
+                            }
+                            crate::parser::ast::WindowFrameBound::Following(expr) => {
+                                self.emit(
+                                    Opcode::Copy,
+                                    pass2_abs_row_reg,
+                                    frame_start_reg,
+                                    0,
+                                    P4::Unused,
+                                );
+                                if let Expr::Literal(Literal::Integer(n)) = expr.as_ref() {
+                                    self.emit(
+                                        Opcode::AddImm,
+                                        frame_start_reg,
+                                        *n as i32,
+                                        0,
+                                        P4::Unused,
+                                    );
+                                }
+                            }
+                            _ => {
+                                self.emit(
+                                    Opcode::Copy,
+                                    pass2_abs_row_reg,
+                                    frame_start_reg,
+                                    0,
+                                    P4::Unused,
+                                );
+                            }
+                        }
+
+                        // Compute frame end row number
+                        let frame_end_reg = self.alloc_reg();
+                        match frame
+                            .end
+                            .as_ref()
+                            .unwrap_or(&crate::parser::ast::WindowFrameBound::CurrentRow)
+                        {
+                            crate::parser::ast::WindowFrameBound::UnboundedFollowing => {
+                                self.emit(
+                                    Opcode::Copy,
+                                    partition_end_row_reg,
+                                    frame_end_reg,
+                                    0,
+                                    P4::Unused,
+                                );
+                            }
+                            crate::parser::ast::WindowFrameBound::CurrentRow => {
+                                self.emit(
+                                    Opcode::Copy,
+                                    pass2_abs_row_reg,
+                                    frame_end_reg,
+                                    0,
+                                    P4::Unused,
+                                );
+                            }
+                            crate::parser::ast::WindowFrameBound::Following(expr) => {
+                                self.emit(
+                                    Opcode::Copy,
+                                    pass2_abs_row_reg,
+                                    frame_end_reg,
+                                    0,
+                                    P4::Unused,
+                                );
+                                if let Expr::Literal(Literal::Integer(n)) = expr.as_ref() {
+                                    self.emit(
+                                        Opcode::AddImm,
+                                        frame_end_reg,
+                                        *n as i32,
+                                        0,
+                                        P4::Unused,
+                                    );
+                                }
+                                // Clamp to partition end
+                                let clamp_end_done = self.alloc_label();
+                                self.emit(
+                                    Opcode::Le,
+                                    partition_end_row_reg,
+                                    clamp_end_done,
+                                    frame_end_reg,
+                                    P4::Unused,
+                                );
+                                self.emit(
+                                    Opcode::Copy,
+                                    partition_end_row_reg,
+                                    frame_end_reg,
+                                    0,
+                                    P4::Unused,
+                                );
+                                self.resolve_label(clamp_end_done, self.current_addr());
+                            }
+                            crate::parser::ast::WindowFrameBound::Preceding(expr) => {
+                                self.emit(
+                                    Opcode::Copy,
+                                    pass2_abs_row_reg,
+                                    frame_end_reg,
+                                    0,
+                                    P4::Unused,
+                                );
+                                if let Expr::Literal(Literal::Integer(n)) = expr.as_ref() {
+                                    self.emit(
+                                        Opcode::AddImm,
+                                        frame_end_reg,
+                                        -(*n as i32),
+                                        0,
+                                        P4::Unused,
+                                    );
+                                }
+                            }
+                            _ => {
+                                self.emit(
+                                    Opcode::Copy,
+                                    pass2_abs_row_reg,
+                                    frame_end_reg,
+                                    0,
+                                    P4::Unused,
+                                );
+                            }
+                        }
+
+                        // Check if frame is empty (start > end) - use NULL result
+                        let frame_empty_label = self.alloc_label();
+                        let frame_done_label = self.alloc_label();
+                        // Gt p1 p2 p3: if r[p3] > r[p1] jump p2
+                        self.emit(
+                            Opcode::Gt,
+                            frame_end_reg,
+                            frame_empty_label,
+                            frame_start_reg,
+                            P4::Unused,
+                        );
+
+                        // Reset aggregate accumulator for this frame
+                        // AggFinal clears the aggregate context (Null alone doesn't reset internal state)
+                        self.emit(
+                            Opcode::AggFinal,
+                            state.accum_reg,
+                            0,
+                            0,
+                            P4::Text(agg_name.clone()),
+                        );
+                        self.emit(Opcode::Null, 0, state.accum_reg, 0, P4::Unused);
+
+                        // Loop counter: iterate from frame_start to frame_end
+                        let loop_counter_reg = self.alloc_reg();
+                        self.emit(
+                            Opcode::Copy,
+                            frame_start_reg,
+                            loop_counter_reg,
+                            0,
+                            P4::Unused,
+                        );
+
+                        let frame_loop_start = self.current_addr();
+                        // Gt p1 p2 p3: if r[p3] > r[p1] jump p2
+                        let frame_loop_done = self.alloc_label();
+                        self.emit(
+                            Opcode::Gt,
+                            frame_end_reg,
+                            frame_loop_done,
+                            loop_counter_reg,
+                            P4::Unused,
+                        );
+
+                        // NotExists on row buffer to get the value for this row
+                        // (NotExists handles ephemeral tables, SeekRowid does not)
+                        let seek_miss = self.alloc_label();
+                        self.emit(
+                            Opcode::NotExists,
+                            row_buf_cursor,
+                            seek_miss,
+                            loop_counter_reg,
+                            P4::Unused,
+                        );
+
+                        // Read the wf argument value from the buffer
+                        let buf_val_reg = self.alloc_reg();
+                        self.emit(
+                            Opcode::Column,
+                            row_buf_cursor,
+                            wf_idx as i32,
+                            buf_val_reg,
+                            P4::Unused,
+                        );
+
+                        // AggStep
+                        let argc;
+                        let arg_reg;
+                        if wf.args.is_empty() {
+                            argc = 0;
+                            arg_reg = buf_val_reg; // placeholder
+                        } else {
+                            argc = 1;
+                            arg_reg = buf_val_reg;
+                        }
+                        self.emit(
+                            Opcode::AggStep,
+                            argc,
+                            arg_reg,
+                            state.accum_reg,
+                            P4::Text(agg_name.clone()),
+                        );
+
+                        self.resolve_label(seek_miss, self.current_addr());
+
+                        // Increment loop counter and continue
+                        self.emit(Opcode::AddImm, loop_counter_reg, 1, 0, P4::Unused);
+                        self.emit(Opcode::Goto, 0, frame_loop_start as i32, 0, P4::Unused);
+
+                        self.resolve_label(frame_loop_done, self.current_addr());
+
+                        // Get final value
+                        self.emit(
+                            Opcode::AggValue,
+                            state.accum_reg,
+                            wf.result_reg,
+                            0,
+                            P4::Text(agg_name.clone()),
+                        );
+                        self.emit(Opcode::Goto, 0, frame_done_label, 0, P4::Unused);
+
+                        // Empty frame: result is NULL
+                        self.resolve_label(frame_empty_label, self.current_addr());
+                        self.emit(Opcode::Null, 0, wf.result_reg, 0, P4::Unused);
+
+                        self.resolve_label(frame_done_label, self.current_addr());
                     } else {
-                        // Running aggregate (has ORDER BY)
+                        // Running aggregate (has ORDER BY, no frame spec)
                         let argc;
                         let arg_reg;
                         if wf.args.is_empty() {
@@ -4913,14 +5301,25 @@ impl<'s> SelectCompiler<'s> {
             }
         }
 
+        // Reset the window function counter so ORDER BY expressions that contain
+        // the same window function calls can look up the pre-computed result registers.
+        // Only reset when we have an outer sorter, as that's the only case where
+        // ORDER BY key expressions will be compiled containing window function references.
+        if matches!(dest, SelectDest::Sorter { .. }) {
+            self.window_func_counter = 0;
+        }
+
         // Output the row, applying LIMIT/OFFSET if set
         let sort_next_label = self.alloc_label();
         if self.limit_counter_reg.is_some() || self.offset_counter_reg.is_some() {
-            // Set limit_done_label to break out of the sort loop when limit is exhausted
-            if self.limit_done_label.is_none() && self.limit_counter_reg.is_some() {
+            // Override limit_done_label to break out of the sort loop when limit is exhausted
+            // The label from compile_limit may not be resolved in the window function path
+            let saved_limit_done = self.limit_done_label;
+            if self.limit_counter_reg.is_some() {
                 self.limit_done_label = Some(sort_done_label);
             }
             self.output_row_with_limit(dest, output_base, result_count, sort_next_label)?;
+            self.limit_done_label = saved_limit_done;
         } else {
             self.output_row(dest, output_base, result_count)?;
         }
@@ -4941,6 +5340,13 @@ impl<'s> SelectCompiler<'s> {
         }
 
         self.resolve_label(sort_done_label, self.current_addr());
+
+        // Also resolve the original limit_done_label (from compile_limit)
+        // so it jumps to the end of the sort loop too
+        if let Some(limit_done) = self.limit_done_label {
+            self.resolve_label(limit_done, self.current_addr());
+            self.limit_done_label = None; // Don't resolve again in outer code
+        }
 
         self.emit(Opcode::Close, sorter_cursor, 0, 0, P4::Unused);
         for cursor in &table_cursors {
@@ -13467,8 +13873,11 @@ impl<'s> SelectCompiler<'s> {
                     crate::functions::is_aggregate_function(&func_call.name)
                 };
 
-                if is_aggregate {
+                if is_aggregate && func_call.over.is_none() {
                     // Check if any argument contains an aggregate
+                    // Skip this check for window functions (OVER clause) since
+                    // sum(sum(b)) OVER (...) is valid: inner sum is GROUP BY aggregate,
+                    // outer sum is window function
                     if let crate::parser::ast::FunctionArgs::Exprs(exprs) = &func_call.args {
                         for arg in exprs {
                             if let Some(nested_name) = self.find_aggregate_in_expr(arg) {

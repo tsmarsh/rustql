@@ -623,7 +623,7 @@ impl<'a> InsertCompiler<'a> {
                 self.emit_not_null_checks(conflict_action, data_base)?;
 
                 // Check CHECK constraints before inserting
-                self.emit_check_constraints(data_base)?;
+                self.emit_check_constraints(data_base, conflict_action)?;
 
                 // Handle conflict action (REPLACE deletes conflicting rows)
                 self.emit_conflict_check(conflict_action, data_base, rowid_reg)?;
@@ -1078,7 +1078,7 @@ impl<'a> InsertCompiler<'a> {
             self.emit_not_null_checks(conflict_action, data_base)?;
 
             // Check CHECK constraints before inserting
-            self.emit_check_constraints(data_base)?;
+            self.emit_check_constraints(data_base, conflict_action)?;
 
             // Handle conflict (REPLACE deletes conflicting rows)
             self.emit_conflict_check(conflict_action, data_base, rowid_reg)?;
@@ -1416,7 +1416,7 @@ impl<'a> InsertCompiler<'a> {
             self.emit_not_null_checks(conflict_action, data_base)?;
 
             // Check CHECK constraints before inserting
-            self.emit_check_constraints(data_base)?;
+            self.emit_check_constraints(data_base, conflict_action)?;
 
             // Handle conflict (REPLACE deletes conflicting rows)
             self.emit_conflict_check(conflict_action, data_base, rowid_reg)?;
@@ -1971,7 +1971,7 @@ impl<'a> InsertCompiler<'a> {
             self.emit_not_null_checks(conflict_action, data_base)?;
 
             // Check CHECK constraints before inserting
-            self.emit_check_constraints(data_base)?;
+            self.emit_check_constraints(data_base, conflict_action)?;
 
             // Handle conflict (REPLACE deletes conflicting rows)
             self.emit_conflict_check(conflict_action, data_base, rowid_reg)?;
@@ -2492,13 +2492,14 @@ impl<'a> InsertCompiler<'a> {
                     self.emit_delete_from_indexes(del_cursor, conflict_rowid_reg, &table)?;
 
                     // Delete the conflicting row
-                    self.emit_with_p5(
+                    // Do NOT use OPFLAG_NCHANGE - REPLACE-triggered deletes
+                    // should not be counted in changes()
+                    self.emit(
                         Opcode::Delete,
                         del_cursor,
                         0,
                         conflict_rowid_reg,
                         P4::Text(self.table_name.clone()),
-                        OPFLAG_NCHANGE,
                     );
 
                     self.resolve_label(not_found_label, self.current_addr() as i32);
@@ -2518,19 +2519,25 @@ impl<'a> InsertCompiler<'a> {
                 ConflictAction::Fail => {
                     let err_msg = self.unique_constraint_error_msg(&table, index);
                     self.emit(Opcode::Close, idx_cursor, 0, 0, P4::Unused);
-                    self.emit(Opcode::Halt, 19, 3, 0, P4::Text(err_msg));
+                    // Extended code: PRIMARYKEY for PK index, UNIQUE otherwise
+                    let ext_code = if index.is_primary_key { 1555 } else { 2067 };
+                    self.emit(Opcode::Halt, ext_code, 3, 0, P4::Text(err_msg));
                 }
                 ConflictAction::Rollback => {
                     let err_msg = self.unique_constraint_error_msg(&table, index);
                     self.emit(Opcode::Close, idx_cursor, 0, 0, P4::Unused);
+                    // Extended code: PRIMARYKEY for PK index, UNIQUE otherwise
+                    let ext_code = if index.is_primary_key { 1555 } else { 2067 };
                     // OE_Rollback = 1
-                    self.emit(Opcode::Halt, 19, 1, 0, P4::Text(err_msg));
+                    self.emit(Opcode::Halt, ext_code, 1, 0, P4::Text(err_msg));
                 }
                 ConflictAction::Abort => {
                     let err_msg = self.unique_constraint_error_msg(&table, index);
                     self.emit(Opcode::Close, idx_cursor, 0, 0, P4::Unused);
+                    // Extended code: PRIMARYKEY for PK index, UNIQUE otherwise
+                    let ext_code = if index.is_primary_key { 1555 } else { 2067 };
                     // OE_Abort = 2
-                    self.emit(Opcode::Halt, 19, 2, 0, P4::Text(err_msg));
+                    self.emit(Opcode::Halt, ext_code, 2, 0, P4::Text(err_msg));
                 }
             }
 
@@ -3081,13 +3088,14 @@ impl<'a> InsertCompiler<'a> {
             self.emit_delete_from_indexes(del_cursor, conflict_rowid_reg, &table)?;
 
             // Delete the conflicting row
-            self.emit_with_p5(
+            // Do NOT use OPFLAG_NCHANGE - REPLACE-triggered deletes
+            // should not be counted in changes()
+            self.emit(
                 Opcode::Delete,
                 del_cursor,
                 0,
                 conflict_rowid_reg,
                 P4::Text(self.table_name.clone()),
-                OPFLAG_NCHANGE,
             );
 
             // Fire AFTER DELETE triggers
@@ -3779,7 +3787,7 @@ impl<'a> InsertCompiler<'a> {
                                     "NOT NULL constraint failed: {}.{}",
                                     self.table_name, col.name
                                 );
-                                self.emit(Opcode::Halt, 19, 2, 0, P4::Text(err_msg));
+                                self.emit(Opcode::Halt, 1299, 2, 0, P4::Text(err_msg));
                             }
                             _ => {
                                 // For complex defaults (Expr, CurrentTime, etc.), fall back to error (OE_Abort=2)
@@ -3787,7 +3795,7 @@ impl<'a> InsertCompiler<'a> {
                                     "NOT NULL constraint failed: {}.{}",
                                     self.table_name, col.name
                                 );
-                                self.emit(Opcode::Halt, 19, 2, 0, P4::Text(err_msg));
+                                self.emit(Opcode::Halt, 1299, 2, 0, P4::Text(err_msg));
                             }
                         }
                     } else {
@@ -3796,7 +3804,7 @@ impl<'a> InsertCompiler<'a> {
                             "NOT NULL constraint failed: {}.{}",
                             self.table_name, col.name
                         );
-                        self.emit(Opcode::Halt, 19, 2, 0, P4::Text(err_msg));
+                        self.emit(Opcode::Halt, 1299, 2, 0, P4::Text(err_msg));
                     }
                 }
                 ConflictAction::Ignore => {
@@ -3813,24 +3821,24 @@ impl<'a> InsertCompiler<'a> {
                         "NOT NULL constraint failed: {}.{}",
                         self.table_name, col.name
                     );
-                    // OE_Rollback = 1
-                    self.emit(Opcode::Halt, 19, 1, 0, P4::Text(err_msg));
+                    // OE_Rollback = 1, SQLITE_CONSTRAINT_NOTNULL = 1299
+                    self.emit(Opcode::Halt, 1299, 1, 0, P4::Text(err_msg));
                 }
                 ConflictAction::Fail => {
                     let err_msg = format!(
                         "NOT NULL constraint failed: {}.{}",
                         self.table_name, col.name
                     );
-                    // OE_Fail = 3
-                    self.emit(Opcode::Halt, 19, 3, 0, P4::Text(err_msg));
+                    // OE_Fail = 3, SQLITE_CONSTRAINT_NOTNULL = 1299
+                    self.emit(Opcode::Halt, 1299, 3, 0, P4::Text(err_msg));
                 }
                 ConflictAction::Abort => {
                     let err_msg = format!(
                         "NOT NULL constraint failed: {}.{}",
                         self.table_name, col.name
                     );
-                    // OE_Abort = 2
-                    self.emit(Opcode::Halt, 19, 2, 0, P4::Text(err_msg));
+                    // OE_Abort = 2, SQLITE_CONSTRAINT_NOTNULL = 1299
+                    self.emit(Opcode::Halt, 1299, 2, 0, P4::Text(err_msg));
                 }
             }
 
@@ -3843,7 +3851,11 @@ impl<'a> InsertCompiler<'a> {
     /// Emit CHECK constraint verification code.
     /// Called after loading column values into registers but before the INSERT.
     /// data_base: register containing first column value
-    fn emit_check_constraints(&mut self, data_base: i32) -> Result<()> {
+    fn emit_check_constraints(
+        &mut self,
+        data_base: i32,
+        conflict_action: ConflictAction,
+    ) -> Result<()> {
         let schema = match self.effective_schema_for_table(&self.table_name) {
             Some(s) => s,
             None => return Ok(()),
@@ -3879,18 +3891,41 @@ impl<'a> InsertCompiler<'a> {
             self.emit(Opcode::If, result_reg, pass_label, 0, P4::Unused);
 
             // Fall through: result is 0 (false) -> CHECK constraint failed
-            let check_text = if check_text.is_empty() {
-                Self::expr_to_sql(check_expr)
-            } else {
-                check_text.clone()
+            // In SQLite: REPLACE converts to ABORT for CHECK constraints (IMP: R-26383-51744)
+            let effective_action = match conflict_action {
+                ConflictAction::Replace => ConflictAction::Abort,
+                other => other,
             };
-            self.emit(
-                Opcode::Halt,
-                19, // SQLITE_CONSTRAINT
-                2,  // OE_ABORT
-                0,
-                P4::Text(format!("CHECK constraint failed: {}", check_text)),
-            );
+            match effective_action {
+                ConflictAction::Ignore => {
+                    // Skip this row
+                    let skip_label = self.skip_row_label.unwrap_or_else(|| {
+                        let label = self.alloc_label();
+                        self.skip_row_label = Some(label);
+                        label
+                    });
+                    self.emit(Opcode::Goto, 0, skip_label, 0, P4::Unused);
+                }
+                _ => {
+                    let check_text = if check_text.is_empty() {
+                        Self::expr_to_sql(check_expr)
+                    } else {
+                        check_text.clone()
+                    };
+                    let oe = match effective_action {
+                        ConflictAction::Rollback => 1, // OE_Rollback
+                        ConflictAction::Fail => 3,     // OE_Fail
+                        _ => 2,                        // OE_Abort (default)
+                    };
+                    self.emit(
+                        Opcode::Halt,
+                        275, // SQLITE_CONSTRAINT_CHECK
+                        oe,
+                        0,
+                        P4::Text(format!("CHECK constraint failed: {}", check_text)),
+                    );
+                }
+            }
 
             self.resolve_label(pass_label, self.current_addr() as i32);
         }
@@ -4240,7 +4275,7 @@ impl<'a> InsertCompiler<'a> {
                     SBinOp::Div => "/",
                     SBinOp::Mod => "%",
                     SBinOp::Eq => "=",
-                    SBinOp::Ne => "<>",
+                    SBinOp::Ne => "!=",
                     SBinOp::Lt => "<",
                     SBinOp::Le => "<=",
                     SBinOp::Gt => ">",

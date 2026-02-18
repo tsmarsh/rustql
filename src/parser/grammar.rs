@@ -1788,6 +1788,9 @@ impl<'a> Parser<'a> {
                 self.expect(TokenKind::LParen)?;
                 let expr = self.parse_expr()?;
                 self.expect(TokenKind::RParen)?;
+                // Accept optional ON CONFLICT clause on table-level CHECK (SQLite quirk:
+                // accepted for backward compatibility but ignored - CHECK always uses ABORT)
+                let _conflict = self.parse_conflict_clause()?;
                 TableConstraintKind::Check(Box::new(expr))
             } else if self.match_token(TokenKind::Foreign) {
                 self.expect(TokenKind::Key)?;
@@ -2970,6 +2973,12 @@ impl<'a> Parser<'a> {
             TokenKind::False => Ok(Literal::Integer(0)),
             TokenKind::Integer => {
                 let text = token.text(self.source);
+                // Strip underscores (digit separators, SQLite 3.38+)
+                let text = if text.contains('_') {
+                    std::borrow::Cow::Owned(text.replace('_', ""))
+                } else {
+                    std::borrow::Cow::Borrowed(text)
+                };
                 if text.starts_with("0x") || text.starts_with("0X") {
                     // Parse as u64 first, then reinterpret as i64 (two's complement)
                     // This handles values like 0x8000000000000000 = -9223372036854775808
@@ -2992,8 +3001,14 @@ impl<'a> Parser<'a> {
                 }
             }
             TokenKind::Float => {
-                let value = token
-                    .text(self.source)
+                let text = token.text(self.source);
+                // Strip underscores (digit separators, SQLite 3.38+)
+                let text = if text.contains('_') {
+                    text.replace('_', "")
+                } else {
+                    text.to_string()
+                };
+                let value = text
                     .parse()
                     .map_err(|_| Error::with_message(ErrorCode::Error, "invalid float"))?;
                 Ok(Literal::Float(value))
@@ -3096,7 +3111,15 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::LParen)?;
         let expr = self.parse_expr()?;
         self.expect(TokenKind::As)?;
-        let type_name = self.parse_type_name()?;
+        // SQLite allows CAST(expr AS ) with an empty type name
+        let type_name = if self.check(TokenKind::RParen) {
+            TypeName {
+                name: String::new(),
+                args: Vec::new(),
+            }
+        } else {
+            self.parse_type_name()?
+        };
         self.expect(TokenKind::RParen)?;
 
         Ok(Expr::Cast {

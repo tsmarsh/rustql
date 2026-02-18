@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use crate::error::Result;
 use crate::parser::ast::{ConflictAction, Expr, ResultColumn, UpdateStmt};
-use crate::schema::{Trigger, TriggerEvent, TriggerTiming};
-use crate::vdbe::ops::{Opcode, VdbeOp, P4};
+use crate::schema::{Affinity, Trigger, TriggerEvent, TriggerTiming};
+use crate::vdbe::ops::{affinity as vdbe_affinity, Opcode, VdbeOp, P4};
 
 use super::column_mapping::ColumnMapper;
 use super::trigger::{find_matching_triggers, generate_trigger_code};
@@ -92,6 +92,9 @@ pub struct UpdateCompiler<'s> {
 
     /// AFTER DELETE triggers (for REPLACE conflict resolution)
     after_delete_triggers: Vec<Arc<Trigger>>,
+
+    /// Label to jump to when IGNORE conflict action should skip the current row
+    skip_row_label: Option<i32>,
 }
 
 impl<'s> UpdateCompiler<'s> {
@@ -117,6 +120,7 @@ impl<'s> UpdateCompiler<'s> {
             after_triggers: Vec::new(),
             before_delete_triggers: Vec::new(),
             after_delete_triggers: Vec::new(),
+            skip_row_label: None,
         }
     }
 
@@ -142,6 +146,7 @@ impl<'s> UpdateCompiler<'s> {
             after_triggers: Vec::new(),
             before_delete_triggers: Vec::new(),
             after_delete_triggers: Vec::new(),
+            skip_row_label: None,
         }
     }
 
@@ -439,6 +444,9 @@ impl<'s> UpdateCompiler<'s> {
             P4::Unused,
         );
 
+        // Set skip_row_label so IGNORE conflict action can skip to next row
+        self.skip_row_label = Some(phase2_continue);
+
         // Now cursor is positioned at the row - perform the update
         self.compile_row_update_phase2(update, write_cursor, update_rowid_reg, conflict_action)?;
 
@@ -647,14 +655,25 @@ impl<'s> UpdateCompiler<'s> {
         // Use new rowid if INTEGER PRIMARY KEY was updated, otherwise same rowid
         // Set OPFLAG_NCHANGE so the changes counter is updated
         let insert_rowid_reg = new_rowid_reg.unwrap_or(rowid_reg);
-        let flags = self.conflict_flags(conflict_action);
+        // When the rowid is NOT changing (same rowid after Delete+Insert), use OE_NONE
+        // to skip the Insert handler's rowid conflict check. We Delete before Insert,
+        // so the rowid shouldn't conflict with itself. Using OE_NONE avoids false
+        // conflicts from stale btree cursor state.
+        // When the rowid IS changing (IPK update), pass the conflict action through
+        // P5 upper byte so the engine checks for rowid conflicts with other rows.
+        let insert_p5 = if new_rowid_reg.is_some() {
+            let oe = self.conflict_flags(conflict_action) as u16;
+            OPFLAG_NCHANGE | (oe << 8)
+        } else {
+            OPFLAG_NCHANGE
+        };
         self.emit_with_p5(
             Opcode::Insert,
             cursor,
             record_reg,
             insert_rowid_reg,
-            P4::Int64(flags),
-            OPFLAG_NCHANGE,
+            P4::Text(self.table_name.clone()),
+            insert_p5,
         );
 
         // Insert new index entries AFTER inserting the table row
@@ -932,7 +951,7 @@ impl<'s> UpdateCompiler<'s> {
         rowid_reg: i32,
         data_base: i32,
         updated_columns: &[usize],
-        conflict_action: ConflictAction,
+        stmt_conflict_action: ConflictAction,
     ) -> Result<()> {
         let schema = match self.schema {
             Some(s) => s,
@@ -945,14 +964,18 @@ impl<'s> UpdateCompiler<'s> {
         };
 
         // Find all UNIQUE indexes on this table
-        let mut unique_checks: Vec<(String, Vec<usize>)> = Vec::new(); // (index_name, column_indices)
+        // (index_name, column_indices, per-index conflict action)
+        let mut unique_checks: Vec<(
+            String,
+            Vec<usize>,
+            Option<crate::schema::ConflictAction>,
+            bool,
+        )> = Vec::new();
 
         for index in &table.indexes {
             if !index.unique {
                 continue;
             }
-
-            // Check if any of the indexed columns are being updated
             let indexed_col_indices: Vec<usize> = index
                 .columns
                 .iter()
@@ -964,42 +987,80 @@ impl<'s> UpdateCompiler<'s> {
                     }
                 })
                 .collect();
-
-            let has_updated_column = indexed_col_indices
+            if indexed_col_indices
                 .iter()
-                .any(|idx| updated_columns.contains(idx));
-
-            if has_updated_column {
-                unique_checks.push((index.name.clone(), indexed_col_indices));
+                .any(|idx| updated_columns.contains(idx))
+            {
+                unique_checks.push((
+                    index.name.clone(),
+                    indexed_col_indices,
+                    index.conflict_action.clone(),
+                    index.is_primary_key,
+                ));
             }
         }
 
-        // Also check for UNIQUE constraints defined directly on columns (column.is_unique)
-        // and PRIMARY KEY columns (which also imply uniqueness)
-        for (col_idx, col) in table.columns.iter().enumerate() {
-            if !updated_columns.contains(&col_idx) {
-                continue;
-            }
-
-            // Check if column has direct UNIQUE constraint or is PRIMARY KEY
-            if col.is_unique || col.is_primary_key {
-                // Check if already covered by an explicit unique index
-                let has_unique_index = unique_checks
+        // Also check explicitly created UNIQUE indexes from schema.indexes
+        let table_lower = self.table_name.to_lowercase();
+        for (_, idx) in &schema.indexes {
+            if idx.unique && idx.table.to_lowercase() == table_lower {
+                let indexed_col_indices: Vec<usize> = idx
+                    .columns
                     .iter()
-                    .any(|(_, cols)| cols.len() == 1 && cols[0] == col_idx);
-
-                if !has_unique_index {
-                    // Add this column's UNIQUE constraint to checks
-                    unique_checks.push((col.name.clone(), vec![col_idx]));
+                    .filter_map(|ic| {
+                        if ic.column_idx >= 0 {
+                            Some(ic.column_idx as usize)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if indexed_col_indices
+                    .iter()
+                    .any(|idx_col| updated_columns.contains(idx_col))
+                {
+                    if !unique_checks
+                        .iter()
+                        .any(|(name, _, _, _)| *name == idx.name)
+                    {
+                        unique_checks.push((
+                            idx.name.clone(),
+                            indexed_col_indices,
+                            idx.conflict_action.clone(),
+                            idx.is_primary_key,
+                        ));
+                    }
                 }
             }
         }
 
-        // Generate constraint checking code for each unique constraint
-        // that involves updated columns
+        // Also check for UNIQUE/PRIMARY KEY columns not covered by indexes
+        for (col_idx, col) in table.columns.iter().enumerate() {
+            if !updated_columns.contains(&col_idx) {
+                continue;
+            }
+            if col.is_unique || col.is_primary_key {
+                let has_unique_index = unique_checks
+                    .iter()
+                    .any(|(_, cols, _, _)| cols.len() == 1 && cols[0] == col_idx);
+                if !has_unique_index {
+                    unique_checks.push((
+                        col.name.clone(),
+                        vec![col_idx],
+                        col.unique_conflict.clone(),
+                        col.is_primary_key,
+                    ));
+                }
+            }
+        }
+
+        if unique_checks.is_empty() {
+            return Ok(());
+        }
+
         let (root_page, _) = self.lookup_table_info(&self.table_name)?;
 
-        for (idx_name, col_indices) in unique_checks {
+        for (idx_name, col_indices, idx_conflict_action, is_pk) in &unique_checks {
             // Determine column name(s) for error message
             // Format: "table.col" for single column, "table.col1, table.col2" for multiple
             let col_name = if col_indices.len() == 1 {
@@ -1114,26 +1175,65 @@ impl<'s> UpdateCompiler<'s> {
             let after_conflict = self.alloc_label();
             self.emit(Opcode::Goto, 0, after_conflict, 0, P4::Unused);
 
-            // Conflict detected - handle according to action
+            // Conflict detected - determine effective action and handle
             self.resolve_label(conflict_label, self.current_addr() as i32);
             self.emit(Opcode::Close, check_cursor, 0, 0, P4::Unused);
 
-            match conflict_action {
-                ConflictAction::Abort | ConflictAction::Rollback | ConflictAction::Fail => {
-                    // Raise UNIQUE constraint error
+            // Determine effective conflict action for this index
+            let effective_action = if stmt_conflict_action != ConflictAction::Abort {
+                // Statement has explicit OR clause - use it
+                stmt_conflict_action
+            } else if let Some(ref idx_action) = idx_conflict_action {
+                match idx_action {
+                    crate::schema::ConflictAction::Replace => ConflictAction::Replace,
+                    crate::schema::ConflictAction::Ignore => ConflictAction::Ignore,
+                    crate::schema::ConflictAction::Fail => ConflictAction::Fail,
+                    crate::schema::ConflictAction::Rollback => ConflictAction::Rollback,
+                    crate::schema::ConflictAction::Abort => ConflictAction::Abort,
+                }
+            } else {
+                ConflictAction::Abort
+            };
+
+            // Extended code: PRIMARYKEY for PK index, UNIQUE otherwise
+            let ext_code = if *is_pk { 1555 } else { 2067 };
+
+            match effective_action {
+                ConflictAction::Abort => {
                     let error_msg = format!("UNIQUE constraint failed: {}", error_col_name);
                     self.emit(
                         Opcode::Halt,
-                        crate::error::ErrorCode::Constraint as i32,
+                        ext_code,
                         2, // OE_Abort
                         0,
                         P4::Text(error_msg),
                     );
                 }
+                ConflictAction::Rollback => {
+                    let error_msg = format!("UNIQUE constraint failed: {}", error_col_name);
+                    self.emit(
+                        Opcode::Halt,
+                        ext_code,
+                        1, // OE_Rollback
+                        0,
+                        P4::Text(error_msg),
+                    );
+                }
+                ConflictAction::Fail => {
+                    let error_msg = format!("UNIQUE constraint failed: {}", error_col_name);
+                    self.emit(
+                        Opcode::Halt,
+                        ext_code,
+                        3, // OE_Fail
+                        0,
+                        P4::Text(error_msg),
+                    );
+                }
                 ConflictAction::Ignore => {
-                    // Skip this row - jump past the delete/insert
-                    // This needs to jump to the next row in the update loop
-                    // For now, we'll just skip to after_conflict
+                    // Skip this row - jump to phase2_continue
+                    if let Some(skip_label) = self.skip_row_label {
+                        self.emit(Opcode::Goto, 0, skip_label, 0, P4::Unused);
+                    }
                 }
                 ConflictAction::Replace => {
                     // Delete the conflicting row and its index entries
@@ -1250,14 +1350,14 @@ impl<'s> UpdateCompiler<'s> {
                     }
 
                     // Delete the conflicting row from table
-                    // Use OPFLAG_NCHANGE to update change counter
-                    self.emit_with_p5(
+                    // Do NOT use OPFLAG_NCHANGE - REPLACE-triggered deletes during
+                    // UPDATE should not be counted in changes()
+                    self.emit(
                         Opcode::Delete,
                         del_cursor,
                         0,
                         check_rowid_reg,
                         P4::Text(self.table_name.clone()),
-                        OPFLAG_NCHANGE,
                     );
 
                     // Fire AFTER DELETE triggers
@@ -1548,7 +1648,16 @@ impl<'s> UpdateCompiler<'s> {
                         crate::parser::ast::BinaryOp::Ge => Opcode::Ge,
                         _ => unreachable!(),
                     };
-                    self.emit(cmp_opcode, right_reg, set_true_label, left_reg, P4::Unused);
+                    // Determine comparison affinity from column types
+                    let cmp_affinity = self.get_comparison_affinity(left, right);
+                    self.emit_with_p5(
+                        cmp_opcode,
+                        right_reg,
+                        set_true_label,
+                        left_reg,
+                        P4::Unused,
+                        cmp_affinity,
+                    );
 
                     // Jump past set_true
                     self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
@@ -2117,7 +2226,15 @@ impl<'s> UpdateCompiler<'s> {
                         crate::parser::ast::BinaryOp::Ge => Opcode::Ge,
                         _ => Opcode::Eq,
                     };
-                    self.emit(cmp_opcode, right_reg, set_true_label, left_reg, P4::Unused);
+                    let cmp_affinity = self.get_comparison_affinity(left, right);
+                    self.emit_with_p5(
+                        cmp_opcode,
+                        right_reg,
+                        set_true_label,
+                        left_reg,
+                        P4::Unused,
+                        cmp_affinity,
+                    );
 
                     self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
 
@@ -2421,6 +2538,50 @@ impl<'s> UpdateCompiler<'s> {
 
     fn current_addr(&self) -> usize {
         self.ops.len()
+    }
+
+    /// Get the affinity of an expression for comparison purposes.
+    fn get_expr_affinity(&self, expr: &Expr) -> Option<Affinity> {
+        match expr {
+            Expr::Column(col_ref) => {
+                if let Some(schema) = self.schema {
+                    if let Some(table) = schema.table(&self.table_name) {
+                        for col in &table.columns {
+                            if col.name.eq_ignore_ascii_case(&col_ref.column) {
+                                return Some(col.affinity);
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            Expr::Parens(inner) => self.get_expr_affinity(inner),
+            Expr::Cast { type_name, .. } => Some(crate::schema::type_affinity(&type_name.name)),
+            _ => None,
+        }
+    }
+
+    /// Get comparison affinity from two expressions.
+    fn get_comparison_affinity(&self, left: &Expr, right: &Expr) -> u16 {
+        let left_aff = self.get_expr_affinity(left);
+        let right_aff = self.get_expr_affinity(right);
+
+        let is_numeric = |a: Option<Affinity>| {
+            matches!(
+                a,
+                Some(Affinity::Integer) | Some(Affinity::Real) | Some(Affinity::Numeric)
+            )
+        };
+
+        if is_numeric(left_aff) || is_numeric(right_aff) {
+            vdbe_affinity::NUMERIC
+        } else if matches!(left_aff, Some(Affinity::Text))
+            || matches!(right_aff, Some(Affinity::Text))
+        {
+            vdbe_affinity::TEXT
+        } else {
+            vdbe_affinity::BLOB
+        }
     }
 
     fn emit(&mut self, opcode: Opcode, p1: i32, p2: i32, p3: i32, p4: P4) {

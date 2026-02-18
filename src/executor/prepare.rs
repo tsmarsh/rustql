@@ -131,6 +131,8 @@ pub struct StatementCompiler<'s> {
     attached_schemas: Vec<(String, &'s crate::schema::Schema)>,
     /// Enable double-quoted string literals in DML (SQLITE_DBCONFIG_DQS_DML)
     dqs_dml: bool,
+    /// Original SQL text for current statement (used for CREATE TABLE to store in sqlite_master)
+    original_sql: Option<String>,
 }
 
 impl<'s> StatementCompiler<'s> {
@@ -149,6 +151,7 @@ impl<'s> StatementCompiler<'s> {
             vtab_registry: None,
             attached_schemas: Vec::new(),
             dqs_dml: true, // Default: enabled for backward compatibility
+            original_sql: None,
         }
     }
 
@@ -167,6 +170,7 @@ impl<'s> StatementCompiler<'s> {
             vtab_registry: None,
             attached_schemas: Vec::new(),
             dqs_dml: true, // Default: enabled for backward compatibility
+            original_sql: None,
         }
     }
 
@@ -200,6 +204,31 @@ impl<'s> StatementCompiler<'s> {
                     ))
                 }
             }
+        }
+    }
+
+    /// Check if an expression contains a window function call, returning its name
+    fn find_window_func_in_expr(expr: &Expr) -> Option<String> {
+        use crate::parser::ast::FunctionArgs;
+        match expr {
+            Expr::Function(func_call) => {
+                if func_call.over.is_some() {
+                    return Some(func_call.name.clone());
+                }
+                if let FunctionArgs::Exprs(exprs) = &func_call.args {
+                    for arg in exprs {
+                        if let Some(name) = Self::find_window_func_in_expr(arg) {
+                            return Some(name);
+                        }
+                    }
+                }
+                None
+            }
+            Expr::Binary { left, right, .. } => Self::find_window_func_in_expr(left)
+                .or_else(|| Self::find_window_func_in_expr(right)),
+            Expr::Unary { expr: inner, .. } => Self::find_window_func_in_expr(inner),
+            Expr::Cast { expr: inner, .. } => Self::find_window_func_in_expr(inner),
+            _ => None,
         }
     }
 
@@ -546,6 +575,11 @@ impl<'s> StatementCompiler<'s> {
 
         // Extract parameters from the AST
         self.extract_parameters(&stmt);
+
+        // Store the original SQL for CREATE TABLE (used for sqlite_master storage)
+        // Trim to just the first statement (before the tail)
+        let stmt_sql = sql[..sql.len() - tail.len()].trim_end_matches(';').trim();
+        self.original_sql = Some(stmt_sql.to_string());
 
         // Compile based on statement type
         let (ops, stmt_type, column_names, column_types) = self.compile_stmt(&stmt)?;
@@ -1339,8 +1373,12 @@ impl<'s> StatementCompiler<'s> {
             P4::Unused,
         ));
 
-        // Build the CREATE TABLE SQL for the schema
-        let create_sql = self.build_create_table_sql(create);
+        // Use original SQL for schema storage (preserves CHECK expression text exactly)
+        // Fall back to reconstructed SQL if original is not available
+        let create_sql = self
+            .original_sql
+            .clone()
+            .unwrap_or_else(|| self.build_create_table_sql(create));
 
         // 3: ParseSchema - parse the CREATE statement and add to schema
         // P4 contains the SQL text
@@ -2803,6 +2841,26 @@ impl<'s> StatementCompiler<'s> {
         let table_name = &create.table;
         let table_name_lower = table_name.to_lowercase();
         let db_idx = self.resolve_db_idx(&create.name, false)?;
+
+        // Check for misuse of window functions in index expressions and WHERE clause
+        for idx_col in &create.columns {
+            if let crate::parser::ast::IndexedColumnKind::Expr(ref e) = idx_col.column {
+                if let Some(name) = Self::find_window_func_in_expr(e) {
+                    return Err(crate::error::Error::with_message(
+                        crate::error::ErrorCode::Error,
+                        format!("misuse of window function {}()", name.to_lowercase()),
+                    ));
+                }
+            }
+        }
+        if let Some(ref where_expr) = create.where_clause {
+            if let Some(name) = Self::find_window_func_in_expr(where_expr) {
+                return Err(crate::error::Error::with_message(
+                    crate::error::ErrorCode::Error,
+                    format!("misuse of window function {}()", name.to_lowercase()),
+                ));
+            }
+        }
 
         // Reject index names starting with "sqlite_" - reserved for internal use
         if index_name_lower.starts_with("sqlite_") {

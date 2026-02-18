@@ -697,6 +697,10 @@ fn extract_default_value(col_def_upper: &str, col_def: &str) -> Option<DefaultVa
                 .unwrap_or("");
 
             if !value_str.is_empty() {
+                // Check for NULL keyword
+                if value_str.eq_ignore_ascii_case("NULL") {
+                    return Some(DefaultValue::Null);
+                }
                 // Try integer first
                 if let Ok(n) = value_str.parse::<i64>() {
                     return Some(DefaultValue::Integer(n));
@@ -1520,27 +1524,97 @@ fn extract_check_constraints(sql: &str) -> Vec<(Expr, String)> {
 
     let mut checks = Vec::new();
 
+    // Extract CHECK expression texts from original SQL by finding CHECK(...) patterns
+    let check_texts = extract_check_texts_from_sql(sql);
+
     if let ast::TableDefinition::Columns {
         columns,
         constraints,
     } = &create.definition
     {
+        let mut check_idx = 0;
         for col_def in columns {
             for constraint in &col_def.constraints {
                 if let ast::ColumnConstraintKind::Check(expr) = &constraint.kind {
-                    checks.push((ast_expr_to_schema_expr(expr), String::new()));
+                    let text = check_texts.get(check_idx).cloned().unwrap_or_default();
+                    checks.push((ast_expr_to_schema_expr(expr), text));
+                    check_idx += 1;
                 }
             }
         }
 
         for constraint in constraints {
             if let ast::TableConstraintKind::Check(expr) = &constraint.kind {
-                checks.push((ast_expr_to_schema_expr(expr), String::new()));
+                let text = check_texts.get(check_idx).cloned().unwrap_or_default();
+                checks.push((ast_expr_to_schema_expr(expr), text));
+                check_idx += 1;
             }
         }
     }
 
     checks
+}
+
+/// Extract CHECK constraint expression texts from the original SQL.
+/// This finds all CHECK(...) patterns and extracts the expression text inside
+/// the parentheses, preserving the original formatting (e.g., `a!=2` stays as `a!=2`).
+fn extract_check_texts_from_sql(sql: &str) -> Vec<String> {
+    let mut texts = Vec::new();
+    let upper = sql.to_uppercase();
+    let bytes = sql.as_bytes();
+    let mut pos = 0;
+
+    while pos < bytes.len() {
+        // Find "CHECK" keyword (case-insensitive)
+        if let Some(check_pos) = upper[pos..].find("CHECK") {
+            let abs_pos = pos + check_pos + 5; // skip "CHECK"
+                                               // Skip whitespace
+            let mut i = abs_pos;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            // Expect '('
+            if i < bytes.len() && bytes[i] == b'(' {
+                // Find matching ')' accounting for nesting
+                let start = i + 1;
+                let mut depth = 1;
+                let mut j = start;
+                while j < bytes.len() && depth > 0 {
+                    match bytes[j] {
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
+                        b'\'' => {
+                            // Skip string literal
+                            j += 1;
+                            while j < bytes.len() {
+                                if bytes[j] == b'\'' {
+                                    if j + 1 < bytes.len() && bytes[j + 1] == b'\'' {
+                                        j += 1; // escaped quote
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                j += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if depth == 0 {
+                    let text = sql[start..j - 1].trim().to_string();
+                    texts.push(text);
+                }
+                pos = j;
+            } else {
+                pos = abs_pos;
+            }
+        } else {
+            break;
+        }
+    }
+
+    texts
 }
 
 /// Parse a CREATE INDEX SQL string into an Index struct.

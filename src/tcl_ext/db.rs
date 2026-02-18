@@ -145,6 +145,8 @@ pub unsafe extern "C" fn sqlite3_extended_errcode_cmd(
         1299 => "SQLITE_CONSTRAINT_NOTNULL",
         // SQLITE_CONSTRAINT_FOREIGNKEY = 19 | (3 << 8) = 19 | 768 = 787
         787 => "SQLITE_CONSTRAINT_FOREIGNKEY",
+        // SQLITE_CONSTRAINT_ROWID = 19 | (10 << 8) = 19 | 2560 = 2579
+        2579 => "SQLITE_CONSTRAINT_ROWID",
         // Plain SQLITE_CONSTRAINT = 19
         19 => "SQLITE_CONSTRAINT",
         // SQLITE_OK = 0

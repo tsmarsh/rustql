@@ -8,8 +8,9 @@ use std::sync::Arc;
 
 use crate::error::Result;
 use crate::parser::ast::{DeleteStmt, Expr, ResultColumn};
+use crate::schema::Affinity;
 use crate::schema::{Trigger, TriggerEvent, TriggerTiming};
-use crate::vdbe::ops::{Opcode, VdbeOp, P4};
+use crate::vdbe::ops::{affinity as vdbe_affinity, Opcode, VdbeOp, P4};
 
 use super::column_mapping::ColumnMapper;
 use super::select::{SelectCompiler, SelectDest};
@@ -1162,7 +1163,16 @@ impl<'s> DeleteCompiler<'s> {
                         crate::parser::ast::BinaryOp::Ge => Opcode::Ge,
                         _ => unreachable!(),
                     };
-                    self.emit(opcode, right_reg, done_label, left_reg, P4::Unused);
+                    // Determine comparison affinity from column types
+                    let cmp_affinity = self.get_comparison_affinity(left, right);
+                    self.emit_with_p5(
+                        opcode,
+                        right_reg,
+                        done_label,
+                        left_reg,
+                        P4::Unused,
+                        cmp_affinity,
+                    );
 
                     // If we get here, condition was false - set dest_reg = 0
                     self.emit(Opcode::Integer, 0, dest_reg, 0, P4::Unused);
@@ -1709,6 +1719,53 @@ impl<'s> DeleteCompiler<'s> {
 
     fn current_addr(&self) -> usize {
         self.ops.len()
+    }
+
+    /// Get the affinity of an expression for comparison purposes.
+    /// Returns Some(Affinity) if the expression is a column with known affinity.
+    fn get_expr_affinity(&self, expr: &Expr) -> Option<Affinity> {
+        match expr {
+            Expr::Column(col_ref) => {
+                if let Some(schema_table) = &self.schema_table {
+                    for col in &schema_table.columns {
+                        if col.name.eq_ignore_ascii_case(&col_ref.column) {
+                            return Some(col.affinity);
+                        }
+                    }
+                }
+                None
+            }
+            Expr::Parens(inner) => self.get_expr_affinity(inner),
+            Expr::Cast { type_name, .. } => Some(crate::schema::type_affinity(&type_name.name)),
+            _ => None,
+        }
+    }
+
+    /// Get comparison affinity from two expressions.
+    /// SQLite rules:
+    /// - If either has INTEGER/REAL/NUMERIC affinity, use NUMERIC
+    /// - If either has TEXT affinity, use TEXT
+    /// - Otherwise BLOB (type ordering)
+    fn get_comparison_affinity(&self, left: &Expr, right: &Expr) -> u16 {
+        let left_aff = self.get_expr_affinity(left);
+        let right_aff = self.get_expr_affinity(right);
+
+        let is_numeric = |a: Option<Affinity>| {
+            matches!(
+                a,
+                Some(Affinity::Integer) | Some(Affinity::Real) | Some(Affinity::Numeric)
+            )
+        };
+
+        if is_numeric(left_aff) || is_numeric(right_aff) {
+            vdbe_affinity::NUMERIC
+        } else if matches!(left_aff, Some(Affinity::Text))
+            || matches!(right_aff, Some(Affinity::Text))
+        {
+            vdbe_affinity::TEXT
+        } else {
+            vdbe_affinity::BLOB
+        }
     }
 
     fn emit(&mut self, opcode: Opcode, p1: i32, p2: i32, p3: i32, p4: P4) {

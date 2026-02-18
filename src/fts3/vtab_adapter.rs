@@ -105,16 +105,34 @@ impl VtabModule for Fts3VtabModule {
 }
 
 impl VtabModule for Fts4VtabModule {
-    fn name(&self) -> &str { "fts4" }
-    fn create(&self, db_name: &str, table_name: &str, args: &[String]) -> Result<(String, Arc<dyn VtabTable>)> {
+    fn name(&self) -> &str {
+        "fts4"
+    }
+    fn create(
+        &self,
+        db_name: &str,
+        table_name: &str,
+        args: &[String],
+    ) -> Result<(String, Arc<dyn VtabTable>)> {
         Fts3VtabModule.create(db_name, table_name, args)
     }
-    fn connect(&self, db_name: &str, table_name: &str, args: &[String]) -> Result<(String, Arc<dyn VtabTable>)> {
+    fn connect(
+        &self,
+        db_name: &str,
+        table_name: &str,
+        args: &[String],
+    ) -> Result<(String, Arc<dyn VtabTable>)> {
         Fts3VtabModule.connect(db_name, table_name, args)
     }
-    fn destroy(&self, table: Arc<dyn VtabTable>) -> Result<()> { Fts3VtabModule.destroy(table) }
-    fn uses_shadow_tables(&self) -> bool { true }
-    fn shadow_table_suffixes(&self) -> Vec<&'static str> { vec!["_content", "_segments", "_segdir", "_stat"] }
+    fn destroy(&self, table: Arc<dyn VtabTable>) -> Result<()> {
+        Fts3VtabModule.destroy(table)
+    }
+    fn uses_shadow_tables(&self) -> bool {
+        true
+    }
+    fn shadow_table_suffixes(&self) -> Vec<&'static str> {
+        vec!["_content", "_segments", "_segdir", "_stat"]
+    }
 }
 
 /// FTS3 virtual table instance adapter

@@ -521,7 +521,7 @@ fn flatten_table_ref(table_ref: &TableRef, items: &mut Vec<SrcItem>, join_type: 
                         on_clause,
                         using_columns,
                         indexed_by: indexed_by.clone(),
-                            });
+                    });
                 }
                 TableRef::Subquery { query, alias } => {
                     items.push(SrcItem {
@@ -531,7 +531,7 @@ fn flatten_table_ref(table_ref: &TableRef, items: &mut Vec<SrcItem>, join_type: 
                         on_clause,
                         using_columns,
                         indexed_by: None,
-                            });
+                    });
                 }
                 TableRef::TableFunction { name, args, alias } => {
                     items.push(SrcItem {
@@ -544,7 +544,7 @@ fn flatten_table_ref(table_ref: &TableRef, items: &mut Vec<SrcItem>, join_type: 
                         on_clause,
                         using_columns,
                         indexed_by: None,
-                            });
+                    });
                 }
                 // Always flatten parenthesized joins so that individual table
                 // names remain visible to the outer query for column resolution.

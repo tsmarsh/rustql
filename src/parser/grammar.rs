@@ -1434,7 +1434,10 @@ impl<'a> Parser<'a> {
 
         loop {
             // Check if this looks like a column definition
-            if !self.check(TokenKind::Identifier) && !self.check(TokenKind::String) && !self.current().kind.is_keyword() {
+            if !self.check(TokenKind::Identifier)
+                && !self.check(TokenKind::String)
+                && !self.current().kind.is_keyword()
+            {
                 break;
             }
 
@@ -1467,7 +1470,9 @@ impl<'a> Parser<'a> {
     fn parse_column_def(&mut self) -> Result<ColumnDef> {
         let name = self.expect_identifier()?;
 
-        let type_name = if (self.check(TokenKind::Identifier) || self.current().kind.is_keyword()) && !self.is_column_constraint_start() {
+        let type_name = if (self.check(TokenKind::Identifier) || self.current().kind.is_keyword())
+            && !self.is_column_constraint_start()
+        {
             Some(self.parse_type_name()?)
         } else {
             None
@@ -1503,7 +1508,9 @@ impl<'a> Parser<'a> {
         let mut name = self.expect_identifier()?;
 
         // Handle multi-word type names like "VARYING CHARACTER"
-        while (self.check(TokenKind::Identifier) || self.current().kind.is_keyword()) && !self.is_column_constraint_start() {
+        while (self.check(TokenKind::Identifier) || self.current().kind.is_keyword())
+            && !self.is_column_constraint_start()
+        {
             name.push(' ');
             name.push_str(&self.expect_identifier()?);
         }
@@ -1827,9 +1834,7 @@ impl<'a> Parser<'a> {
                 }) => IndexedColumnKind::Name(column),
                 // SQLite legacy: single-quoted strings can be column names in CREATE INDEX
                 // This is for backward compatibility with old SQL scripts
-                Expr::Literal(crate::parser::ast::Literal::String(s)) => {
-                    IndexedColumnKind::Name(s)
-                }
+                Expr::Literal(crate::parser::ast::Literal::String(s)) => IndexedColumnKind::Name(s),
                 _ => IndexedColumnKind::Expr(Box::new(expr)),
             }
         };
@@ -2933,9 +2938,14 @@ impl<'a> Parser<'a> {
                 if text.starts_with("0x") || text.starts_with("0X") {
                     // Parse as u64 first, then reinterpret as i64 (two's complement)
                     // This handles values like 0x8000000000000000 = -9223372036854775808
-                    let value = u64::from_str_radix(&text[2..], 16).map(|u| u as i64).map_err(|_| {
-                        Error::with_message(ErrorCode::Error, format!("hex literal too big: {}", text))
-                    })?;
+                    let value = u64::from_str_radix(&text[2..], 16)
+                        .map(|u| u as i64)
+                        .map_err(|_| {
+                            Error::with_message(
+                                ErrorCode::Error,
+                                format!("hex literal too big: {}", text),
+                            )
+                        })?;
                     Ok(Literal::Integer(value))
                 } else if let Ok(value) = text.parse::<i64>() {
                     Ok(Literal::Integer(value))
@@ -3080,7 +3090,9 @@ impl<'a> Parser<'a> {
             // SQLite 3.46+ allows arbitrary expressions as the RAISE message
             if self.check(TokenKind::String) {
                 // Simple string literal (traditional behavior)
-                Some(crate::parser::ast::RaiseMessage::Literal(self.expect_string()?))
+                Some(crate::parser::ast::RaiseMessage::Literal(
+                    self.expect_string()?,
+                ))
             } else {
                 // Arbitrary expression (new behavior)
                 let expr = self.parse_expr()?;
@@ -3645,7 +3657,10 @@ mod tests {
     fn test_parse_order_by_with_window_function() {
         let stmt = parse("SELECT a, sum(a) OVER () FROM t ORDER BY a").unwrap();
         if let Stmt::Select(select) = stmt {
-            assert!(select.order_by.is_some(), "ORDER BY should be present after window function");
+            assert!(
+                select.order_by.is_some(),
+                "ORDER BY should be present after window function"
+            );
             let order_by = select.order_by.unwrap();
             assert_eq!(order_by.len(), 1);
         } else {

@@ -1909,15 +1909,20 @@ impl<'a> InsertCompiler<'a> {
 
         // Look up column defaults from schema
         let table_lower = insert.table.name.to_lowercase();
-        let table_columns: Vec<Option<crate::schema::DefaultValue>> = if let Some(schema) = self.schema {
-            if let Some(table) = schema.tables.get(&table_lower) {
-                table.columns.iter().map(|c| c.default_value.clone()).collect()
+        let table_columns: Vec<Option<crate::schema::DefaultValue>> =
+            if let Some(schema) = self.schema {
+                if let Some(table) = schema.tables.get(&table_lower) {
+                    table
+                        .columns
+                        .iter()
+                        .map(|c| c.default_value.clone())
+                        .collect()
+                } else {
+                    vec![None; self.num_columns]
+                }
             } else {
                 vec![None; self.num_columns]
-            }
-        } else {
-            vec![None; self.num_columns]
-        };
+            };
 
         for i in 0..self.num_columns {
             let reg = data_base + i as i32;
@@ -2238,7 +2243,10 @@ impl<'a> InsertCompiler<'a> {
 
         // Check for schema-level REPLACE conflict actions on indexes/columns.
         // These apply even when the INSERT itself has no explicit OR REPLACE.
-        if action == ConflictAction::Abort || action == ConflictAction::Rollback || action == ConflictAction::Fail {
+        if action == ConflictAction::Abort
+            || action == ConflictAction::Rollback
+            || action == ConflictAction::Fail
+        {
             self.emit_schema_replace_conflict_handling(data_base)?;
         }
 
@@ -3181,7 +3189,13 @@ impl<'a> InsertCompiler<'a> {
                 self.emit(Opcode::String8, 0, dest_reg, 0, P4::Text(s.clone()));
             }
             DefaultValue::Blob(b) => {
-                self.emit(Opcode::Blob, b.len() as i32, dest_reg, 0, P4::Blob(b.clone()));
+                self.emit(
+                    Opcode::Blob,
+                    b.len() as i32,
+                    dest_reg,
+                    0,
+                    P4::Blob(b.clone()),
+                );
             }
             DefaultValue::Expr(_expr) => {
                 // For expression defaults, emit NULL as fallback for now
@@ -3429,7 +3443,11 @@ impl<'a> InsertCompiler<'a> {
             self.emit(Opcode::If, result_reg, pass_label, 0, P4::Unused);
 
             // Fall through: result is 0 (false) -> CHECK constraint failed
-            let check_text = if check_text.is_empty() { Self::expr_to_sql(check_expr) } else { check_text.clone() };
+            let check_text = if check_text.is_empty() {
+                Self::expr_to_sql(check_expr)
+            } else {
+                check_text.clone()
+            };
             self.emit(
                 Opcode::Halt,
                 19, // SQLITE_CONSTRAINT
@@ -3452,7 +3470,7 @@ impl<'a> InsertCompiler<'a> {
         dest_reg: i32,
         col_map: &[(String, i32)],
     ) -> Result<()> {
-        use crate::schema::{BinaryOp as SBinOp, UnaryOp as SUnOp, Expr as SExpr};
+        use crate::schema::{BinaryOp as SBinOp, Expr as SExpr, UnaryOp as SUnOp};
         match expr {
             SExpr::Null => {
                 self.emit(Opcode::Null, 0, dest_reg, 0, P4::Unused);
@@ -3495,8 +3513,14 @@ impl<'a> InsertCompiler<'a> {
                 self.compile_check_expr(right, right_reg, col_map)?;
 
                 match op {
-                    SBinOp::Eq | SBinOp::Ne | SBinOp::Lt | SBinOp::Le
-                    | SBinOp::Gt | SBinOp::Ge | SBinOp::Is | SBinOp::IsNot => {
+                    SBinOp::Eq
+                    | SBinOp::Ne
+                    | SBinOp::Lt
+                    | SBinOp::Le
+                    | SBinOp::Gt
+                    | SBinOp::Ge
+                    | SBinOp::Is
+                    | SBinOp::IsNot => {
                         let is_is = matches!(op, SBinOp::Is | SBinOp::IsNot);
                         let cmp_opcode = match op {
                             SBinOp::Eq | SBinOp::Is => Opcode::Eq,
@@ -3613,7 +3637,11 @@ impl<'a> InsertCompiler<'a> {
                     SUnOp::Plus => {} // No-op
                 }
             }
-            SExpr::In { expr, list, negated } => {
+            SExpr::In {
+                expr,
+                list,
+                negated,
+            } => {
                 let expr_reg = self.alloc_reg();
                 self.compile_check_expr(expr, expr_reg, col_map)?;
                 let found_label = self.alloc_label();
@@ -3626,18 +3654,25 @@ impl<'a> InsertCompiler<'a> {
                 self.emit(
                     Opcode::Integer,
                     if *negated { 1 } else { 0 },
-                    dest_reg, 0, P4::Unused,
+                    dest_reg,
+                    0,
+                    P4::Unused,
                 );
                 self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
                 self.resolve_label(found_label, self.current_addr() as i32);
                 self.emit(
                     Opcode::Integer,
                     if *negated { 0 } else { 1 },
-                    dest_reg, 0, P4::Unused,
+                    dest_reg,
+                    0,
+                    P4::Unused,
                 );
                 self.resolve_label(end_label, self.current_addr() as i32);
             }
-            SExpr::IsNull { expr: inner, negated } => {
+            SExpr::IsNull {
+                expr: inner,
+                negated,
+            } => {
                 self.compile_check_expr(inner, dest_reg, col_map)?;
                 let true_label = self.alloc_label();
                 let end_label = self.alloc_label();
@@ -3645,18 +3680,27 @@ impl<'a> InsertCompiler<'a> {
                 self.emit(
                     Opcode::Integer,
                     if *negated { 1 } else { 0 },
-                    dest_reg, 0, P4::Unused,
+                    dest_reg,
+                    0,
+                    P4::Unused,
                 );
                 self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
                 self.resolve_label(true_label, self.current_addr() as i32);
                 self.emit(
                     Opcode::Integer,
                     if *negated { 0 } else { 1 },
-                    dest_reg, 0, P4::Unused,
+                    dest_reg,
+                    0,
+                    P4::Unused,
                 );
                 self.resolve_label(end_label, self.current_addr() as i32);
             }
-            SExpr::Between { expr, low, high, negated } => {
+            SExpr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => {
                 let expr_reg = self.alloc_reg();
                 let low_reg = self.alloc_reg();
                 let high_reg = self.alloc_reg();
@@ -3670,14 +3714,18 @@ impl<'a> InsertCompiler<'a> {
                 self.emit(
                     Opcode::Integer,
                     if *negated { 0 } else { 1 },
-                    dest_reg, 0, P4::Unused,
+                    dest_reg,
+                    0,
+                    P4::Unused,
                 );
                 self.emit(Opcode::Goto, 0, end_label, 0, P4::Unused);
                 self.resolve_label(false_label, self.current_addr() as i32);
                 self.emit(
                     Opcode::Integer,
                     if *negated { 1 } else { 0 },
-                    dest_reg, 0, P4::Unused,
+                    dest_reg,
+                    0,
+                    P4::Unused,
                 );
                 self.resolve_label(end_label, self.current_addr() as i32);
             }
@@ -3732,7 +3780,7 @@ impl<'a> InsertCompiler<'a> {
 
     /// Convert a schema::Expr to SQL text for CHECK constraint error messages
     fn expr_to_sql(expr: &crate::schema::Expr) -> String {
-        use crate::schema::{BinaryOp as SBinOp, UnaryOp as SUnOp, Expr as SExpr};
+        use crate::schema::{BinaryOp as SBinOp, Expr as SExpr, UnaryOp as SUnOp};
         match expr {
             SExpr::Null => "NULL".to_string(),
             SExpr::Integer(n) => n.to_string(),
@@ -3777,30 +3825,46 @@ impl<'a> InsertCompiler<'a> {
                 // to match SQLite's CHECK error message formatting.
                 let needs_space = !op_str.starts_with(' ') && !op_str.ends_with(' ');
                 if needs_space {
-                    format!("{} {} {}", Self::expr_to_sql(left), op_str, Self::expr_to_sql(right))
+                    format!(
+                        "{} {} {}",
+                        Self::expr_to_sql(left),
+                        op_str,
+                        Self::expr_to_sql(right)
+                    )
                 } else {
-                    format!("{}{}{}", Self::expr_to_sql(left), op_str, Self::expr_to_sql(right))
+                    format!(
+                        "{}{}{}",
+                        Self::expr_to_sql(left),
+                        op_str,
+                        Self::expr_to_sql(right)
+                    )
                 }
             }
-            SExpr::UnaryOp { op, operand } => {
-                match op {
-                    SUnOp::Neg => format!("-{}", Self::expr_to_sql(operand)),
-                    SUnOp::Not => format!("NOT {}", Self::expr_to_sql(operand)),
-                    SUnOp::BitNot => format!("~{}", Self::expr_to_sql(operand)),
-                    SUnOp::Plus => format!("+{}", Self::expr_to_sql(operand)),
-                }
-            }
+            SExpr::UnaryOp { op, operand } => match op {
+                SUnOp::Neg => format!("-{}", Self::expr_to_sql(operand)),
+                SUnOp::Not => format!("NOT {}", Self::expr_to_sql(operand)),
+                SUnOp::BitNot => format!("~{}", Self::expr_to_sql(operand)),
+                SUnOp::Plus => format!("+{}", Self::expr_to_sql(operand)),
+            },
             SExpr::Collate { expr, collation } => {
                 format!("{} COLLATE {}", Self::expr_to_sql(expr), collation)
             }
-            SExpr::IsNull { expr: inner, negated } => {
+            SExpr::IsNull {
+                expr: inner,
+                negated,
+            } => {
                 if *negated {
                     format!("{} IS NOT NULL", Self::expr_to_sql(inner))
                 } else {
                     format!("{} IS NULL", Self::expr_to_sql(inner))
                 }
             }
-            SExpr::Between { expr, low, high, negated } => {
+            SExpr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => {
                 if *negated {
                     format!(
                         "{} NOT BETWEEN {} AND {}",
@@ -3817,7 +3881,11 @@ impl<'a> InsertCompiler<'a> {
                     )
                 }
             }
-            SExpr::In { expr, list, negated } => {
+            SExpr::In {
+                expr,
+                list,
+                negated,
+            } => {
                 let items: Vec<_> = list.iter().map(|e| Self::expr_to_sql(e)).collect();
                 if *negated {
                     format!("{} NOT IN ({})", Self::expr_to_sql(expr), items.join(","))

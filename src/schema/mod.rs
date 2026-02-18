@@ -1298,7 +1298,8 @@ pub fn parse_create_sql(sql: &str, root_page: Pgno) -> Option<Table> {
         // Extract ON CONFLICT action for UNIQUE or PRIMARY KEY constraints
         let unique_conflict = if is_unique || is_primary_key {
             // Look for "UNIQUE ON CONFLICT <action>" or "PRIMARY KEY ON CONFLICT <action>" pattern
-            let search_key = if is_primary_key && col_def_upper.contains("PRIMARY KEY ON CONFLICT") {
+            let search_key = if is_primary_key && col_def_upper.contains("PRIMARY KEY ON CONFLICT")
+            {
                 Some("PRIMARY KEY ON CONFLICT")
             } else if is_unique && col_def_upper.contains("UNIQUE ON CONFLICT") {
                 Some("UNIQUE ON CONFLICT")
@@ -1499,7 +1500,11 @@ fn extract_check_constraints(sql: &str) -> Vec<(Expr, String)> {
 
     let mut checks = Vec::new();
 
-    if let ast::TableDefinition::Columns { columns, constraints } = &create.definition {
+    if let ast::TableDefinition::Columns {
+        columns,
+        constraints,
+    } = &create.definition
+    {
         for col_def in columns {
             for constraint in &col_def.constraints {
                 if let ast::ColumnConstraintKind::Check(expr) = &constraint.kind {

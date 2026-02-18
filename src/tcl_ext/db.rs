@@ -17,7 +17,9 @@ use super::ffi::{
     Tcl_NewListObj, Tcl_Obj, Tcl_SetObjResult, Tcl_SetVar, Tcl_SetVar2Ex, TCL_ERROR,
     TCL_GLOBAL_ONLY, TCL_OK,
 };
-use super::helpers::{obj_to_string, set_result_int, set_result_string, set_result_wide_int, string_to_obj};
+use super::helpers::{
+    obj_to_string, set_result_int, set_result_string, set_result_wide_int, string_to_obj,
+};
 use super::user_func::{clear_current_interp, set_current_interp};
 use super::{CONNECTIONS, FUNCTION_DESTRUCTORS, NULL_VALUES, USER_COLLATIONS, USER_FUNCTIONS};
 
@@ -891,8 +893,7 @@ pub unsafe extern "C" fn db_method_cmd(
             let source_path = CONNECTIONS.with(|connections| {
                 let conns = connections.borrow();
                 if let Some(conn) = conns.get(db_name) {
-                    conn.find_db(&target_db)
-                        .and_then(|db| db.path.clone())
+                    conn.find_db(&target_db).and_then(|db| db.path.clone())
                 } else {
                     None
                 }
@@ -904,10 +905,7 @@ pub unsafe extern "C" fn db_method_cmd(
                     match std::fs::copy(path, &filename) {
                         Ok(_) => TCL_OK,
                         Err(e) => {
-                            set_result_string(
-                                interp,
-                                &format!("backup failed: {}", e),
-                            );
+                            set_result_string(interp, &format!("backup failed: {}", e));
                             TCL_ERROR
                         }
                     }
@@ -920,18 +918,16 @@ pub unsafe extern "C" fn db_method_cmd(
                         let mut conns = connections.borrow_mut();
                         if let Some(conn) = conns.get_mut(db_name) {
                             match crate::sqlite3_prepare_v2(conn, &vacuum_sql) {
-                                Ok((mut stmt, _)) => {
-                                    match crate::sqlite3_step(&mut stmt) {
-                                        Ok(_) => {
-                                            let _ = crate::sqlite3_finalize(stmt);
-                                            Ok(())
-                                        }
-                                        Err(e) => {
-                                            let _ = crate::sqlite3_finalize(stmt);
-                                            Err(e.sqlite_errmsg())
-                                        }
+                                Ok((mut stmt, _)) => match crate::sqlite3_step(&mut stmt) {
+                                    Ok(_) => {
+                                        let _ = crate::sqlite3_finalize(stmt);
+                                        Ok(())
                                     }
-                                }
+                                    Err(e) => {
+                                        let _ = crate::sqlite3_finalize(stmt);
+                                        Err(e.sqlite_errmsg())
+                                    }
+                                },
                                 Err(e) => Err(e.sqlite_errmsg()),
                             }
                         } else {
@@ -1205,28 +1201,33 @@ pub unsafe fn db_eval(
             }
 
             // Prepare statement inside a short borrow, then release the borrow
-            let prepare_result: Result<(Box<PreparedStmt>, String), (crate::error::ErrorCode, String)> =
-                CONNECTIONS.with(|connections| {
-                    let mut conns = connections.borrow_mut();
-                    let conn = match conns.get_mut(&db_name_owned) {
-                        Some(c) => c.as_mut(),
-                        None => {
-                            return Err((crate::error::ErrorCode::Error, format!("no such database: {}", db_name_owned)));
-                        }
-                    };
-
-                    match sqlite3_prepare_v2(conn, &remaining) {
-                        Ok((mut stmt, tail)) => {
-                            // Bind TCL variables to SQL parameters
-                            bind_tcl_variables(interp, &mut stmt);
-                            Ok((stmt, tail.to_string()))
-                        }
-                        Err(e) => {
-                            conn.set_error(e.code, &e.sqlite_errmsg());
-                            Err((e.code, e.sqlite_errmsg()))
-                        }
+            let prepare_result: Result<
+                (Box<PreparedStmt>, String),
+                (crate::error::ErrorCode, String),
+            > = CONNECTIONS.with(|connections| {
+                let mut conns = connections.borrow_mut();
+                let conn = match conns.get_mut(&db_name_owned) {
+                    Some(c) => c.as_mut(),
+                    None => {
+                        return Err((
+                            crate::error::ErrorCode::Error,
+                            format!("no such database: {}", db_name_owned),
+                        ));
                     }
-                });
+                };
+
+                match sqlite3_prepare_v2(conn, &remaining) {
+                    Ok((mut stmt, tail)) => {
+                        // Bind TCL variables to SQL parameters
+                        bind_tcl_variables(interp, &mut stmt);
+                        Ok((stmt, tail.to_string()))
+                    }
+                    Err(e) => {
+                        conn.set_error(e.code, &e.sqlite_errmsg());
+                        Err((e.code, e.sqlite_errmsg()))
+                    }
+                }
+            });
 
             let (mut stmt, tail) = match prepare_result {
                 Ok(r) => r,

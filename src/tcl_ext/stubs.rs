@@ -1746,12 +1746,7 @@ unsafe extern "C" fn faultsim_restore_and_reopen_cmd(
     tcl_eval_str(interp, "catch {db close}");
 
     // Restore the saved database files
-    let restore_rc = faultsim_restore_cmd(
-        std::ptr::null_mut(),
-        interp,
-        0,
-        std::ptr::null(),
-    );
+    let restore_rc = faultsim_restore_cmd(std::ptr::null_mut(), interp, 0, std::ptr::null());
     if restore_rc != TCL_OK {
         return restore_rc;
     }
@@ -1993,10 +1988,7 @@ unsafe extern "C" fn do_malloc_test_cmd(
     }
 
     // Record test result: since we ran without fault injection, it should pass
-    let test_script = format!(
-        "do_test {}.nofault [list list 1 1] {{1 1}}",
-        test_name
-    );
+    let test_script = format!("do_test {}.nofault [list list 1 1] {{1 1}}", test_name);
     let _ = tcl_eval_str(interp, &test_script);
 
     // Execute -cleanup
@@ -2025,10 +2017,7 @@ unsafe extern "C" fn register_tcl_module_cmd(
     objv: *const *mut Tcl_Obj,
 ) -> c_int {
     if objc < 2 {
-        set_result_string(
-            interp,
-            "wrong # args: should be \"register_tcl_module DB\"",
-        );
+        set_result_string(interp, "wrong # args: should be \"register_tcl_module DB\"");
         return TCL_ERROR;
     }
 
@@ -2169,12 +2158,7 @@ unsafe extern "C" fn sqlite3_test_control_pending_byte_cmd(
             // Update the ::sqlite_pending_byte variable
             let var_name = CString::new("::sqlite_pending_byte").unwrap();
             let val_str = CString::new(offset.to_string()).unwrap();
-            Tcl_SetVar(
-                interp,
-                var_name.as_ptr(),
-                val_str.as_ptr(),
-                TCL_GLOBAL_ONLY,
-            );
+            Tcl_SetVar(interp, var_name.as_ptr(), val_str.as_ptr(), TCL_GLOBAL_ONLY);
             // Return the old value (we just return 0 as we don't actually track it)
             set_result_int(interp, 0);
             return TCL_OK;
@@ -2524,10 +2508,7 @@ unsafe extern "C" fn fts3_test_varint_cmd(
         Err(_) => match val_str.parse::<u64>() {
             Ok(v) => v as i64,
             Err(_) => {
-                set_result_string(
-                    interp,
-                    &format!("expected integer but got \"{}\"", val_str),
-                );
+                set_result_string(interp, &format!("expected integer but got \"{}\"", val_str));
                 return TCL_ERROR;
             }
         },

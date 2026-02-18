@@ -349,13 +349,17 @@ impl<'s> TriggerBodyCompiler<'s> {
                     let mut col_idx = 0usize;
                     for col in &core.columns {
                         match col {
-                            ResultColumn::Expr { alias: Some(name), .. } => {
+                            ResultColumn::Expr {
+                                alias: Some(name), ..
+                            } => {
                                 compiler.column_map.insert(name.to_lowercase(), col_idx);
                                 col_idx += 1;
                             }
                             ResultColumn::Expr { expr, alias: None } => {
                                 if let crate::parser::ast::Expr::Column(col_ref) = expr {
-                                    compiler.column_map.insert(col_ref.column.to_lowercase(), col_idx);
+                                    compiler
+                                        .column_map
+                                        .insert(col_ref.column.to_lowercase(), col_idx);
                                 }
                                 col_idx += 1;
                             }
@@ -363,7 +367,12 @@ impl<'s> TriggerBodyCompiler<'s> {
                                 // Expand * by looking at all FROM source tables
                                 if let Some(ref from) = core.from {
                                     for table_ref in &from.tables {
-                                        Self::expand_star_columns(table_ref, schema, &mut compiler.column_map, &mut col_idx);
+                                        Self::expand_star_columns(
+                                            table_ref,
+                                            schema,
+                                            &mut compiler.column_map,
+                                            &mut col_idx,
+                                        );
                                     }
                                 }
                             }
@@ -372,7 +381,9 @@ impl<'s> TriggerBodyCompiler<'s> {
                                 let src_lower = tname.to_lowercase();
                                 if let Some(src_table) = schema.tables.get(&src_lower) {
                                     for src_col in &src_table.columns {
-                                        compiler.column_map.insert(src_col.name.to_lowercase(), col_idx);
+                                        compiler
+                                            .column_map
+                                            .insert(src_col.name.to_lowercase(), col_idx);
                                         col_idx += 1;
                                     }
                                 }
@@ -631,7 +642,9 @@ impl<'s> TriggerBodyCompiler<'s> {
                     .unwrap_or(false);
                 if is_replace {
                     if let Some(ref table) = table_info {
-                        let unique_indexes: Vec<_> = table.indexes.iter()
+                        let unique_indexes: Vec<_> = table
+                            .indexes
+                            .iter()
                             .filter(|idx| idx.unique)
                             .cloned()
                             .collect();
@@ -713,7 +726,8 @@ impl<'s> TriggerBodyCompiler<'s> {
                             // Delete from all indexes first
                             for (del_idx_cursor, del_col_indices) in &index_cursors {
                                 // Build old index key
-                                let old_key_base = self.alloc_regs((del_col_indices.len() + 1) as i32);
+                                let old_key_base =
+                                    self.alloc_regs((del_col_indices.len() + 1) as i32);
                                 for (i, &col_idx) in del_col_indices.iter().enumerate() {
                                     if col_idx >= 0 {
                                         self.emit(
@@ -724,7 +738,13 @@ impl<'s> TriggerBodyCompiler<'s> {
                                             P4::Unused,
                                         );
                                     } else {
-                                        self.emit(Opcode::Null, 0, old_key_base + i as i32, 0, P4::Unused);
+                                        self.emit(
+                                            Opcode::Null,
+                                            0,
+                                            old_key_base + i as i32,
+                                            0,
+                                            P4::Unused,
+                                        );
                                     }
                                 }
                                 let rowid_pos = old_key_base + del_col_indices.len() as i32;
@@ -737,7 +757,13 @@ impl<'s> TriggerBodyCompiler<'s> {
                                     old_idx_rec,
                                     P4::Unused,
                                 );
-                                self.emit(Opcode::IdxDelete, *del_idx_cursor, old_idx_rec, 0, P4::Unused);
+                                self.emit(
+                                    Opcode::IdxDelete,
+                                    *del_idx_cursor,
+                                    old_idx_rec,
+                                    0,
+                                    P4::Unused,
+                                );
                             }
 
                             // Delete the conflicting row
@@ -1745,12 +1771,20 @@ impl<'s> TriggerBodyCompiler<'s> {
                     let mut max_cursor = self.next_cursor;
                     for op in &sub_ops {
                         for &r in &[op.p1, op.p3] {
-                            if r > max_reg { max_reg = r; }
+                            if r > max_reg {
+                                max_reg = r;
+                            }
                         }
-                        if matches!(op.opcode, Opcode::OpenRead | Opcode::OpenWrite
-                            | Opcode::OpenEphemeral | Opcode::OpenAutoindex)
-                        {
-                            if op.p1 + 1 > max_cursor { max_cursor = op.p1 + 1; }
+                        if matches!(
+                            op.opcode,
+                            Opcode::OpenRead
+                                | Opcode::OpenWrite
+                                | Opcode::OpenEphemeral
+                                | Opcode::OpenAutoindex
+                        ) {
+                            if op.p1 + 1 > max_cursor {
+                                max_cursor = op.p1 + 1;
+                            }
                         }
                     }
 
@@ -1780,7 +1814,7 @@ impl<'s> TriggerBodyCompiler<'s> {
                     let return_label = self.alloc_label();
                     self.emit(
                         Opcode::Program,
-                        dest_reg, // P1: base register
+                        dest_reg,     // P1: base register
                         return_label, // P2: return address in parent
                         0,
                         P4::Subprogram(Arc::new(subprogram)),

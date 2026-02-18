@@ -568,7 +568,13 @@ impl<'s> DeleteCompiler<'s> {
         let collect_loop_start = self.alloc_label();
         let collect_loop_end = self.alloc_label();
 
-        self.emit(Opcode::Rewind, self.table_cursor, collect_loop_end, 0, P4::Unused);
+        self.emit(
+            Opcode::Rewind,
+            self.table_cursor,
+            collect_loop_end,
+            0,
+            P4::Unused,
+        );
         self.resolve_label(collect_loop_start, self.current_addr() as i32);
 
         if let Some(where_expr) = &delete.where_clause {
@@ -580,7 +586,13 @@ impl<'s> DeleteCompiler<'s> {
             self.emit(Opcode::Rowid, self.table_cursor, rowid_reg, 0, P4::Unused);
             let record_reg = self.alloc_reg();
             self.emit(Opcode::MakeRecord, rowid_reg, 1, record_reg, P4::Unused);
-            self.emit(Opcode::IdxInsert, ephemeral_cursor, record_reg, 0, P4::Unused);
+            self.emit(
+                Opcode::IdxInsert,
+                ephemeral_cursor,
+                record_reg,
+                0,
+                P4::Unused,
+            );
 
             self.resolve_label(skip_label, self.current_addr() as i32);
         } else {
@@ -588,10 +600,22 @@ impl<'s> DeleteCompiler<'s> {
             self.emit(Opcode::Rowid, self.table_cursor, rowid_reg, 0, P4::Unused);
             let record_reg = self.alloc_reg();
             self.emit(Opcode::MakeRecord, rowid_reg, 1, record_reg, P4::Unused);
-            self.emit(Opcode::IdxInsert, ephemeral_cursor, record_reg, 0, P4::Unused);
+            self.emit(
+                Opcode::IdxInsert,
+                ephemeral_cursor,
+                record_reg,
+                0,
+                P4::Unused,
+            );
         }
 
-        self.emit(Opcode::Next, self.table_cursor, collect_loop_start, 0, P4::Unused);
+        self.emit(
+            Opcode::Next,
+            self.table_cursor,
+            collect_loop_start,
+            0,
+            P4::Unused,
+        );
         self.resolve_label(collect_loop_end, self.current_addr() as i32);
 
         // Phase 2: Delete rows with triggers
@@ -609,7 +633,13 @@ impl<'s> DeleteCompiler<'s> {
             None
         };
 
-        self.emit(Opcode::Rewind, ephemeral_cursor, delete_loop_end, 0, P4::Unused);
+        self.emit(
+            Opcode::Rewind,
+            ephemeral_cursor,
+            delete_loop_end,
+            0,
+            P4::Unused,
+        );
         self.resolve_label(delete_loop_start, self.current_addr() as i32);
 
         // Get rowid from ephemeral table
@@ -618,7 +648,13 @@ impl<'s> DeleteCompiler<'s> {
 
         // Skip if row no longer exists (deleted by trigger)
         let skip_delete_label = self.alloc_label();
-        self.emit(Opcode::NotExists, self.table_cursor, skip_delete_label, rowid_reg, P4::Unused);
+        self.emit(
+            Opcode::NotExists,
+            self.table_cursor,
+            skip_delete_label,
+            rowid_reg,
+            P4::Unused,
+        );
 
         // Load OLD row
         if let Some(old_reg) = old_base_reg {
@@ -649,7 +685,13 @@ impl<'s> DeleteCompiler<'s> {
         }
 
         self.resolve_label(skip_delete_label, self.current_addr() as i32);
-        self.emit(Opcode::Next, ephemeral_cursor, delete_loop_start, 0, P4::Unused);
+        self.emit(
+            Opcode::Next,
+            ephemeral_cursor,
+            delete_loop_start,
+            0,
+            P4::Unused,
+        );
         self.resolve_label(delete_loop_end, self.current_addr() as i32);
 
         // Close ephemeral cursor

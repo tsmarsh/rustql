@@ -358,7 +358,7 @@ impl KeyInfo {
         // Use default_rc as tiebreaker, following SQLite convention.
         if fields_b.len() < n_key {
             return match default_rc {
-                rc if rc < 0 => std::cmp::Ordering::Less,    // rec_a < rec_b (entry before target)
+                rc if rc < 0 => std::cmp::Ordering::Less, // rec_a < rec_b (entry before target)
                 rc if rc > 0 => std::cmp::Ordering::Greater, // rec_a > rec_b (entry after target)
                 _ => std::cmp::Ordering::Equal,
             };
@@ -1263,8 +1263,7 @@ fn initialize_page1(shared: &mut BtShared) -> Result<()> {
     page.data[header_offset + 4] = 0;
     // Cell content offset = usable_size (end of page)
     let cell_offset = shared.usable_size as u16;
-    page.data[header_offset + 5..header_offset + 7]
-        .copy_from_slice(&cell_offset.to_be_bytes());
+    page.data[header_offset + 5..header_offset + 7].copy_from_slice(&cell_offset.to_be_bytes());
     // Fragmented free bytes = 0
     page.data[header_offset + 7] = 0;
 
@@ -1290,7 +1289,11 @@ fn update_database_header(shared: &mut BtShared) -> Result<()> {
     write_u32(&mut page1.data, 28, shared.pager.db_size)?;
 
     // Bytes 52-55: Auto-vacuum flag
-    let auto_vacuum_value: u32 = if shared.auto_vacuum == BTREE_AUTOVACUUM_NONE { 0 } else { 1 };
+    let auto_vacuum_value: u32 = if shared.auto_vacuum == BTREE_AUTOVACUUM_NONE {
+        0
+    } else {
+        1
+    };
     write_u32(&mut page1.data, 52, auto_vacuum_value)?;
 
     // Bytes 64-67: Incremental vacuum flag
@@ -1856,7 +1859,11 @@ fn collapse_root_if_empty(shared: &mut BtShared, root_pgno: Pgno) -> Result<()> 
 
     let _ = MemPage::parse_with_shared(
         root_pgno,
-        shared.pager.get(root_pgno, PagerGetFlags::empty())?.data.clone(),
+        shared
+            .pager
+            .get(root_pgno, PagerGetFlags::empty())?
+            .data
+            .clone(),
         root_limits,
         Some(shared),
     )?;
@@ -4122,12 +4129,9 @@ impl Btree {
             // Rebuild page1 reference at the new page size
             let page1_limits = PageLimits::for_page1(shared.page_size, shared.usable_size);
             if let Ok(page) = shared.pager.get(1, PagerGetFlags::empty()) {
-                if let Ok(mem_page) = MemPage::parse_with_shared(
-                    1,
-                    page.data.clone(),
-                    page1_limits,
-                    Some(&shared),
-                ) {
+                if let Ok(mem_page) =
+                    MemPage::parse_with_shared(1, page.data.clone(), page1_limits, Some(&shared))
+                {
                     let _ = mem_page.validate_layout(page1_limits);
                     shared.page1 = Some(mem_page);
                 }
@@ -4893,7 +4897,10 @@ impl Btree {
                     if std::env::var("RUSTQL_BTREE_TRACE").is_ok() {
                         trace_btree(&format!(
                             "btree: merge_result={:?} child_index={} actual_pgno={}",
-                            merge_result.as_ref().map(|r| format!("{:?}", r)).unwrap_or_else(|e| format!("Err({:?})", e)),
+                            merge_result
+                                .as_ref()
+                                .map(|r| format!("{:?}", r))
+                                .unwrap_or_else(|e| format!("Err({:?})", e)),
                             child_index,
                             actual_pgno,
                         ));
@@ -5236,7 +5243,9 @@ impl Btree {
             .shared
             .write()
             .map_err(|_| Error::new(ErrorCode::Internal))?;
-        shared.pager.checkpoint(crate::storage::wal::CheckpointMode::Passive)
+        shared
+            .pager
+            .checkpoint(crate::storage::wal::CheckpointMode::Passive)
     }
 
     /// Open WAL mode on this btree (sqlite3BtreeSetVersion)
@@ -5268,12 +5277,15 @@ impl Btree {
             page.data[19] = 2; // Read version = WAL
 
             // Also update change counter and database size (like update_database_header)
-            let change_counter = u32::from_be_bytes([
-                page.data[24], page.data[25], page.data[26], page.data[27],
-            ]);
+            let change_counter =
+                u32::from_be_bytes([page.data[24], page.data[25], page.data[26], page.data[27]]);
             let _ = write_u32(&mut page.data, 24, change_counter.wrapping_add(1));
             let _ = write_u32(&mut page.data, 28, shared.pager.db_size);
-            let auto_vacuum_value: u32 = if shared.auto_vacuum == BTREE_AUTOVACUUM_NONE { 0 } else { 1 };
+            let auto_vacuum_value: u32 = if shared.auto_vacuum == BTREE_AUTOVACUUM_NONE {
+                0
+            } else {
+                1
+            };
             let _ = write_u32(&mut page.data, 52, auto_vacuum_value);
             let incr_vacuum_value: u32 = if shared.incr_vacuum != 0 { 1 } else { 0 };
             let _ = write_u32(&mut page.data, 64, incr_vacuum_value);
@@ -6495,11 +6507,7 @@ impl BtCursor {
                 // if separator >= search_key (i.e., if separator is Greater OR Equal to search_key).
                 // Pass default_rc for consistent prefix key handling at all tree levels.
                 let cmp = if let Some(ki) = key_info {
-                    ki.compare_records_with_bias(
-                        payload,
-                        &search_key.key,
-                        search_key.default_rc,
-                    )
+                    ki.compare_records_with_bias(payload, &search_key.key, search_key.default_rc)
                 } else {
                     compare_records_default(payload, &search_key.key)
                 };

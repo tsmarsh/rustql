@@ -19,9 +19,7 @@ use crate::types::Value;
 use crate::vdbe::mem::Mem;
 use crate::vtab::{ConstraintValue, DbContext, IndexInfo, VtabCursor, VtabModule, VtabTable};
 
-use super::ffi::{
-    Tcl_Eval, Tcl_GetObjResult, Tcl_GetStringFromObj, Tcl_Interp, TCL_OK,
-};
+use super::ffi::{Tcl_Eval, Tcl_GetObjResult, Tcl_GetStringFromObj, Tcl_Interp, TCL_OK};
 use super::CURRENT_INTERP;
 
 /// Evaluate a TCL script and return the result as a String.

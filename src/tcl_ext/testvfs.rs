@@ -27,10 +27,10 @@ use std::sync::{Arc, Mutex};
 
 use super::ffi::{
     Tcl_BackgroundError, Tcl_CreateObjCommand, Tcl_DecrRefCount, Tcl_DeleteCommand,
-    Tcl_DuplicateObj, Tcl_EvalObjEx, Tcl_GetBooleanFromObj, Tcl_GetIntFromObj,
-    Tcl_GetStringResult, Tcl_IncrRefCount, Tcl_Interp, Tcl_ListObjAppendElement,
-    Tcl_ListObjGetElements, Tcl_NewListObj, Tcl_NewStringObj, Tcl_Obj,
-    Tcl_ResetResult, Tcl_SetObjResult, TCL_ERROR, TCL_EVAL_GLOBAL, TCL_OK,
+    Tcl_DuplicateObj, Tcl_EvalObjEx, Tcl_GetBooleanFromObj, Tcl_GetIntFromObj, Tcl_GetStringResult,
+    Tcl_IncrRefCount, Tcl_Interp, Tcl_ListObjAppendElement, Tcl_ListObjGetElements, Tcl_NewListObj,
+    Tcl_NewStringObj, Tcl_Obj, Tcl_ResetResult, Tcl_SetObjResult, TCL_ERROR, TCL_EVAL_GLOBAL,
+    TCL_OK,
 };
 use super::helpers::{obj_to_string, set_result_int, set_result_string};
 
@@ -446,24 +446,18 @@ impl VfsFile for TestvfsFile {
     fn sync(&self, flags: SyncFlags) -> crate::error::Result<()> {
         let state = self.state.lock().unwrap();
         if state.script.is_some() && (state.mask & TESTVFS_SYNC_MASK) != 0 {
-            let flags_str = if flags.contains(SyncFlags::FULL) && flags.contains(SyncFlags::DATAONLY)
-            {
-                "full|dataonly"
-            } else if flags.contains(SyncFlags::NORMAL) && flags.contains(SyncFlags::DATAONLY) {
-                "normal|dataonly"
-            } else if flags.contains(SyncFlags::FULL) {
-                "full"
-            } else {
-                "normal"
-            };
+            let flags_str =
+                if flags.contains(SyncFlags::FULL) && flags.contains(SyncFlags::DATAONLY) {
+                    "full|dataonly"
+                } else if flags.contains(SyncFlags::NORMAL) && flags.contains(SyncFlags::DATAONLY) {
+                    "normal|dataonly"
+                } else if flags.contains(SyncFlags::FULL) {
+                    "full"
+                } else {
+                    "normal"
+                };
             unsafe {
-                state.exec_tcl(
-                    "xSync",
-                    Some(&self.filename),
-                    Some(flags_str),
-                    None,
-                    None,
-                );
+                state.exec_tcl("xSync", Some(&self.filename), Some(flags_str), None, None);
             }
             if let Some(code) = unsafe { state.result_code() } {
                 if code != crate::error::ErrorCode::Ok {
@@ -522,13 +516,7 @@ impl VfsFile for TestvfsFile {
                 LockType::Exclusive => "exclusive",
             };
             unsafe {
-                state.exec_tcl(
-                    "xUnlock",
-                    Some(&self.filename),
-                    Some(lock_str),
-                    None,
-                    None,
-                );
+                state.exec_tcl("xUnlock", Some(&self.filename), Some(lock_str), None, None);
             }
             if let Some(code) = unsafe { state.result_code() } {
                 if code != crate::error::ErrorCode::Ok {
@@ -544,13 +532,7 @@ impl VfsFile for TestvfsFile {
         let state = self.state.lock().unwrap();
         if state.script.is_some() && (state.mask & TESTVFS_CKLOCK_MASK) != 0 {
             unsafe {
-                state.exec_tcl(
-                    "xCheckReservedLock",
-                    Some(&self.filename),
-                    None,
-                    None,
-                    None,
-                );
+                state.exec_tcl("xCheckReservedLock", Some(&self.filename), None, None, None);
             }
             if let Some(code) = unsafe { state.result_code() } {
                 if code != crate::error::ErrorCode::Ok {
@@ -699,11 +681,7 @@ impl Vfs for TestvfsVfs {
         }
     }
 
-    fn open(
-        &self,
-        path: Option<&str>,
-        flags: OpenFlags,
-    ) -> crate::error::Result<Box<dyn VfsFile>> {
+    fn open(&self, path: Option<&str>, flags: OpenFlags) -> crate::error::Result<Box<dyn VfsFile>> {
         let filename = path.unwrap_or("").to_string();
 
         // Execute callback if filtered
@@ -1144,7 +1122,10 @@ unsafe fn testvfs_cmd_script(
             state.script = Some(new_script);
         }
     } else if objc != 2 {
-        set_result_string(interp, "wrong # args: should be \"VFSNAME script ?SCRIPT?\"");
+        set_result_string(
+            interp,
+            "wrong # args: should be \"VFSNAME script ?SCRIPT?\"",
+        );
         return TCL_ERROR;
     }
 
@@ -1267,8 +1248,7 @@ unsafe fn testvfs_cmd_devchar(
         let mut elem_count: c_int = 0;
         let mut elem_ptr: *const *mut Tcl_Obj = std::ptr::null();
 
-        if Tcl_ListObjGetElements(interp, *objv.offset(2), &mut elem_count, &mut elem_ptr)
-            != TCL_OK
+        if Tcl_ListObjGetElements(interp, *objv.offset(2), &mut elem_count, &mut elem_ptr) != TCL_OK
         {
             return TCL_ERROR;
         }
@@ -1443,4 +1423,3 @@ pub unsafe extern "C" fn sqlite3_simulate_device_cmd(
     set_result_string(interp, "");
     TCL_OK
 }
-

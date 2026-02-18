@@ -364,7 +364,7 @@ impl DbHeader {
         let reserve = data[20];
         let file_format = data[18];
         let read_version = data[19]; // 1=legacy journal, 2=WAL
-        // Offset 32-35: First freelist trunk page
+                                     // Offset 32-35: First freelist trunk page
         let first_trunk_page = read_u32(data, 32).unwrap_or(0);
         // Offset 36-39: Total number of freelist pages
         let free_page_count = read_u32(data, 36).unwrap_or(0);

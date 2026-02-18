@@ -732,7 +732,11 @@ impl Pager {
             // Update page cache to use new page size
             self.pcache.set_page_size(page_size as usize);
         }
-        let reserve = if reserve >= 0 { reserve as u32 } else { self.page_size - self.usable_size };
+        let reserve = if reserve >= 0 {
+            reserve as u32
+        } else {
+            self.page_size - self.usable_size
+        };
         self.usable_size = page_size - reserve.min(page_size - 480);
         self.tmp_space = vec![0u8; page_size as usize];
 
@@ -1113,8 +1117,10 @@ impl Pager {
                     SyncFlags::NORMAL
                 };
                 // Build reference slice for write_frames
-                let page_refs: Vec<(Pgno, &[u8])> =
-                    pages.iter().map(|(pgno, data)| (*pgno, data.as_slice())).collect();
+                let page_refs: Vec<(Pgno, &[u8])> = pages
+                    .iter()
+                    .map(|(pgno, data)| (*pgno, data.as_slice()))
+                    .collect();
                 if let Some(ref mut wal) = self.wal {
                     wal.write_frames(page_size, &page_refs, db_size, true, sync_flags)?;
                 }
@@ -1453,7 +1459,10 @@ impl Pager {
 
         // In memory mode doesn't need a journal file
         // WAL mode uses the WAL file instead of a journal
-        if self.journal_mode == JournalMode::Off || self.journal_mode == JournalMode::Wal || self.mem_db {
+        if self.journal_mode == JournalMode::Off
+            || self.journal_mode == JournalMode::Wal
+            || self.mem_db
+        {
             return Ok(());
         }
 

@@ -853,7 +853,11 @@ impl<'s> SelectCompiler<'s> {
                             SelectBody::Select(core) => {
                                 self.compile_select_core(core, &eph_dest)?;
                             }
-                            SelectBody::Compound { op: inner_op, left: l, right: r } => {
+                            SelectBody::Compound {
+                                op: inner_op,
+                                left: l,
+                                right: r,
+                            } => {
                                 self.compile_compound(*inner_op, l, r, &eph_dest)?;
                             }
                         }
@@ -1523,7 +1527,9 @@ impl<'s> SelectCompiler<'s> {
 
         for (table_idx, cond) in &self.join_conditions {
             let table_idx_local = table_idx.saturating_sub(self.outer_tables_boundary);
-            let is_outer = self.tables.get(*table_idx)
+            let is_outer = self
+                .tables
+                .get(*table_idx)
                 .map(|t| t.join_type.is_outer())
                 .unwrap_or(false);
             if is_outer {
@@ -1544,8 +1550,12 @@ impl<'s> SelectCompiler<'s> {
         // Outer join conditions will be applied at the innermost level with found_match.
         // For the non-outer-join path, merge everything into WHERE as before.
         let mut remaining_where = original_where.clone();
-        if outer_join_conditions_per_table.values().all(|v| v.is_empty())
-            && inner_join_conditions_per_table.values().all(|v| v.is_empty())
+        if outer_join_conditions_per_table
+            .values()
+            .all(|v| v.is_empty())
+            && inner_join_conditions_per_table
+                .values()
+                .all(|v| v.is_empty())
         {
             // No special handling needed - merge all conditions as before
             let conditions = std::mem::take(&mut self.join_conditions);
@@ -1594,7 +1604,9 @@ impl<'s> SelectCompiler<'s> {
         // For outer joins, a constant-false ON condition (e.g., LEFT JOIN ab ON 0) should
         // NOT skip all rows - the left table rows should still be output with NULLs.
         // Only a constant-false user WHERE clause means truly no rows are returned.
-        let any_outer_join = self.tables.iter()
+        let any_outer_join = self
+            .tables
+            .iter()
             .skip(self.outer_tables_boundary)
             .any(|t| t.join_type.is_outer());
         let false_check_target = if any_outer_join {
@@ -2555,7 +2567,10 @@ impl<'s> SelectCompiler<'s> {
                     .get(&from_idx)
                     .cloned()
                     .unwrap_or_default();
-                let all_conds: Vec<Expr> = inner_conds.into_iter().chain(outer_conds.into_iter()).collect();
+                let all_conds: Vec<Expr> = inner_conds
+                    .into_iter()
+                    .chain(outer_conds.into_iter())
+                    .collect();
 
                 if !all_conds.is_empty() {
                     // Allocate a label that will resolve to just before Next for this table
@@ -2927,30 +2942,58 @@ impl<'s> SelectCompiler<'s> {
 
         fn collect_wf_from_expr(
             expr: &Expr,
-            funcs: &mut Vec<(String, Vec<Expr>, Option<Box<Expr>>, Option<Vec<Expr>>, Option<Vec<OrderingTerm>>, Option<crate::parser::ast::WindowFrame>, usize)>,
+            funcs: &mut Vec<(
+                String,
+                Vec<Expr>,
+                Option<Box<Expr>>,
+                Option<Vec<Expr>>,
+                Option<Vec<OrderingTerm>>,
+                Option<crate::parser::ast::WindowFrame>,
+                usize,
+            )>,
             counter: &mut usize,
             named_windows: &HashMap<String, crate::parser::ast::WindowSpec>,
         ) {
             match expr {
-                Expr::Function(crate::parser::ast::FunctionCall { name, args, filter, over: Some(over), .. }) => {
+                Expr::Function(crate::parser::ast::FunctionCall {
+                    name,
+                    args,
+                    filter,
+                    over: Some(over),
+                    ..
+                }) => {
                     let spec = match over {
                         crate::parser::ast::Over::Spec(s) => {
                             if let Some(base_name) = &s.base {
                                 if let Some(base) = named_windows.get(base_name) {
                                     crate::parser::ast::WindowSpec {
                                         base: None,
-                                        partition_by: s.partition_by.clone().or_else(|| base.partition_by.clone()),
-                                        order_by: s.order_by.clone().or_else(|| base.order_by.clone()),
+                                        partition_by: s
+                                            .partition_by
+                                            .clone()
+                                            .or_else(|| base.partition_by.clone()),
+                                        order_by: s
+                                            .order_by
+                                            .clone()
+                                            .or_else(|| base.order_by.clone()),
                                         frame: s.frame.clone().or_else(|| base.frame.clone()),
                                     }
-                                } else { s.clone() }
-                            } else { s.clone() }
+                                } else {
+                                    s.clone()
+                                }
+                            } else {
+                                s.clone()
+                            }
                         }
-                        crate::parser::ast::Over::Window(wname) => {
-                            named_windows.get(wname).cloned().unwrap_or(crate::parser::ast::WindowSpec {
-                                base: None, partition_by: None, order_by: None, frame: None,
-                            })
-                        }
+                        crate::parser::ast::Over::Window(wname) => named_windows
+                            .get(wname)
+                            .cloned()
+                            .unwrap_or(crate::parser::ast::WindowSpec {
+                                base: None,
+                                partition_by: None,
+                                order_by: None,
+                                frame: None,
+                            }),
                     };
                     let expr_args = match args {
                         crate::parser::ast::FunctionArgs::Exprs(exprs) => exprs.clone(),
@@ -2958,7 +3001,15 @@ impl<'s> SelectCompiler<'s> {
                     };
                     let idx = *counter;
                     *counter += 1;
-                    funcs.push((name.clone(), expr_args, filter.clone(), spec.partition_by, spec.order_by, spec.frame, idx));
+                    funcs.push((
+                        name.clone(),
+                        expr_args,
+                        filter.clone(),
+                        spec.partition_by,
+                        spec.order_by,
+                        spec.frame,
+                        idx,
+                    ));
                 }
                 Expr::Binary { left, right, .. } => {
                     collect_wf_from_expr(left, funcs, counter, named_windows);
@@ -3001,17 +3052,30 @@ impl<'s> SelectCompiler<'s> {
             // Determine if this is a whole-partition aggregate:
             // An aggregate with no ORDER BY and no explicit frame ending at CURRENT ROW
             let has_order = order_by.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
-            let has_frame_current_row = frame.as_ref().map(|f| {
-                matches!(f.end, Some(crate::parser::ast::WindowFrameBound::CurrentRow))
-            }).unwrap_or(false);
+            let has_frame_current_row = frame
+                .as_ref()
+                .map(|f| {
+                    matches!(
+                        f.end,
+                        Some(crate::parser::ast::WindowFrameBound::CurrentRow)
+                    )
+                })
+                .unwrap_or(false);
             let is_whole_partition = match &func_type {
                 WindowFuncType::Aggregate(_) => !has_order && !has_frame_current_row,
                 _ => false,
             };
 
             win_funcs.push(WinFuncInfo {
-                func_type, name: name.to_uppercase(), args, filter,
-                partition_by, order_by, frame, result_reg, wf_index: idx,
+                func_type,
+                name: name.to_uppercase(),
+                args,
+                filter,
+                partition_by,
+                order_by,
+                frame,
+                result_reg,
+                wf_index: idx,
                 is_whole_partition,
             });
         }
@@ -3019,10 +3083,12 @@ impl<'s> SelectCompiler<'s> {
         // =====================================================================
         // Step 1: Collect source rows into a sorter
         // =====================================================================
-        let primary_partition: Vec<Expr> = win_funcs.first()
+        let primary_partition: Vec<Expr> = win_funcs
+            .first()
             .and_then(|f| f.partition_by.clone())
             .unwrap_or_default();
-        let primary_order: Vec<OrderingTerm> = win_funcs.first()
+        let primary_order: Vec<OrderingTerm> = win_funcs
+            .first()
             .and_then(|f| f.order_by.clone())
             .unwrap_or_default();
 
@@ -3040,17 +3106,30 @@ impl<'s> SelectCompiler<'s> {
                 collations.push("BINARY".to_string());
                 bignull.push(false);
             }
-            let ki = KeyInfo { sort_orders, collations, bignull, n_key_field: sort_key_count as u16 };
-            self.emit(Opcode::SorterOpen, sorter_cursor, sort_key_count as i32, 0,
-                P4::KeyInfo(std::sync::Arc::new(ki)));
+            let ki = KeyInfo {
+                sort_orders,
+                collations,
+                bignull,
+                n_key_field: sort_key_count as u16,
+            };
+            self.emit(
+                Opcode::SorterOpen,
+                sorter_cursor,
+                sort_key_count as i32,
+                0,
+                P4::KeyInfo(std::sync::Arc::new(ki)),
+            );
         } else {
             self.emit(Opcode::OpenEphemeral, sorter_cursor, 0, 0, P4::Unused);
         }
 
         // Collect table cursors and generate nested loop
-        let table_cursors: Vec<i32> = self.tables.iter()
+        let table_cursors: Vec<i32> = self
+            .tables
+            .iter()
             .skip(self.outer_tables_boundary)
-            .map(|t| t.cursor).collect();
+            .map(|t| t.cursor)
+            .collect();
 
         let mut loop_labels = Vec::with_capacity(table_cursors.len());
         let mut done_labels = Vec::with_capacity(table_cursors.len());
@@ -3067,7 +3146,9 @@ impl<'s> SelectCompiler<'s> {
             let label = self.alloc_label();
             self.compile_where_condition(where_expr, label)?;
             Some(label)
-        } else { None };
+        } else {
+            None
+        };
 
         // Compile result columns (non-window cols get real values, window cols get NULL)
         let (result_base, result_count) = self.compile_result_columns_for_window(core)?;
@@ -3098,9 +3179,19 @@ impl<'s> SelectCompiler<'s> {
         // stored record instead of the (now-consumed) table cursors.
         // source_col_map: (cursor, col_idx) -> offset within source_col_regs
         let mut source_col_map: Vec<(i32, i32)> = Vec::new();
-        let tables_snapshot: Vec<_> = self.tables.iter()
+        let tables_snapshot: Vec<_> = self
+            .tables
+            .iter()
             .skip(self.outer_tables_boundary)
-            .map(|t| (t.cursor, t.schema_table.as_ref().map(|s| s.columns.len()).unwrap_or(0)))
+            .map(|t| {
+                (
+                    t.cursor,
+                    t.schema_table
+                        .as_ref()
+                        .map(|s| s.columns.len())
+                        .unwrap_or(0),
+                )
+            })
             .collect();
         let mut source_col_regs = Vec::new();
         for &(cursor, num_cols) in &tables_snapshot {
@@ -3117,28 +3208,64 @@ impl<'s> SelectCompiler<'s> {
         let total_cols = sort_key_count + result_count + win_funcs.len() + source_col_count;
         let record_base = self.alloc_regs(total_cols);
         for i in 0..sort_key_count {
-            self.emit(Opcode::Copy, sort_key_base + i as i32, record_base + i as i32, 0, P4::Unused);
+            self.emit(
+                Opcode::Copy,
+                sort_key_base + i as i32,
+                record_base + i as i32,
+                0,
+                P4::Unused,
+            );
         }
         for i in 0..result_count {
-            self.emit(Opcode::Copy, result_base + i as i32, record_base + (sort_key_count + i) as i32, 0, P4::Unused);
+            self.emit(
+                Opcode::Copy,
+                result_base + i as i32,
+                record_base + (sort_key_count + i) as i32,
+                0,
+                P4::Unused,
+            );
         }
         for (i, arg_reg) in wf_arg_regs.iter().enumerate() {
-            self.emit(Opcode::Copy, *arg_reg, record_base + (sort_key_count + result_count + i) as i32, 0, P4::Unused);
+            self.emit(
+                Opcode::Copy,
+                *arg_reg,
+                record_base + (sort_key_count + result_count + i) as i32,
+                0,
+                P4::Unused,
+            );
         }
         let source_col_record_offset = sort_key_count + result_count + win_funcs.len();
         for (i, src_reg) in source_col_regs.iter().enumerate() {
-            self.emit(Opcode::Copy, *src_reg, record_base + (source_col_record_offset + i) as i32, 0, P4::Unused);
+            self.emit(
+                Opcode::Copy,
+                *src_reg,
+                record_base + (source_col_record_offset + i) as i32,
+                0,
+                P4::Unused,
+            );
         }
 
         let rec_reg = self.alloc_reg();
-        self.emit(Opcode::MakeRecord, record_base, total_cols as i32, rec_reg, P4::Unused);
+        self.emit(
+            Opcode::MakeRecord,
+            record_base,
+            total_cols as i32,
+            rec_reg,
+            P4::Unused,
+        );
 
         if sort_key_count > 0 {
             self.emit(Opcode::SorterInsert, sorter_cursor, rec_reg, 0, P4::Unused);
         } else {
             let rowid_reg = self.alloc_reg();
             self.emit(Opcode::NewRowid, sorter_cursor, rowid_reg, 0, P4::Unused);
-            self.emit(Opcode::Insert, sorter_cursor, rec_reg, rowid_reg, P4::Unused);
+            self.emit(
+                Opcode::Insert,
+                sorter_cursor,
+                rec_reg,
+                rowid_reg,
+                P4::Unused,
+            );
         }
 
         if let Some(label) = where_skip_label {
@@ -3146,7 +3273,13 @@ impl<'s> SelectCompiler<'s> {
         }
 
         for i in (0..table_cursors.len()).rev() {
-            self.emit(Opcode::Next, table_cursors[i], loop_labels[i], 0, P4::Unused);
+            self.emit(
+                Opcode::Next,
+                table_cursors[i],
+                loop_labels[i],
+                0,
+                P4::Unused,
+            );
             self.resolve_label(done_labels[i], self.current_addr());
         }
 
@@ -3177,7 +3310,13 @@ impl<'s> SelectCompiler<'s> {
 
         if has_whole_partition_aggs {
             let wp_lookup_cols = partition_count + wp_agg_count;
-            self.emit(Opcode::OpenEphemeral, wp_lookup_cursor, wp_lookup_cols as i32, 0, P4::Unused);
+            self.emit(
+                Opcode::OpenEphemeral,
+                wp_lookup_cursor,
+                wp_lookup_cols as i32,
+                0,
+                P4::Unused,
+            );
 
             // Initialize accumulators and partition tracking BEFORE the loop
             for (wf_idx, wf) in win_funcs.iter().enumerate() {
@@ -3208,18 +3347,36 @@ impl<'s> SelectCompiler<'s> {
 
             // Read record columns (inside loop)
             if sort_key_count > 0 {
-                self.emit(Opcode::SorterData, sorter_cursor, p1_data_reg, 0, P4::Unused);
+                self.emit(
+                    Opcode::SorterData,
+                    sorter_cursor,
+                    p1_data_reg,
+                    0,
+                    P4::Unused,
+                );
             }
             for i in 0..total_cols {
-                self.emit(Opcode::Column, sorter_cursor, i as i32, p1_read_base + i as i32, P4::Unused);
+                self.emit(
+                    Opcode::Column,
+                    sorter_cursor,
+                    i as i32,
+                    p1_read_base + i as i32,
+                    P4::Unused,
+                );
             }
 
             let p1_no_change = self.alloc_label();
             if partition_count > 0 {
                 let p1_changed = self.alloc_label();
                 for i in 0..partition_count {
-                    self.emit_with_p5(Opcode::Ne, p1_read_base + i as i32, p1_changed,
-                        p1_prev_partition + i as i32, P4::Unused, 0x10);
+                    self.emit_with_p5(
+                        Opcode::Ne,
+                        p1_read_base + i as i32,
+                        p1_changed,
+                        p1_prev_partition + i as i32,
+                        P4::Unused,
+                        0x10,
+                    );
                 }
                 self.emit(Opcode::IfNot, p1_first_flag, p1_no_change, 0, P4::Unused);
 
@@ -3233,25 +3390,53 @@ impl<'s> SelectCompiler<'s> {
                 // Build lookup record: [prev_partition_keys..., finalized_aggs...]
                 let wp_rec_base = self.alloc_regs(partition_count + wp_agg_count);
                 for i in 0..partition_count {
-                    self.emit(Opcode::Copy, p1_prev_partition + i as i32,
-                        wp_rec_base + i as i32, 0, P4::Unused);
+                    self.emit(
+                        Opcode::Copy,
+                        p1_prev_partition + i as i32,
+                        wp_rec_base + i as i32,
+                        0,
+                        P4::Unused,
+                    );
                 }
                 let mut agg_offset = 0;
                 for (wf_idx, wf) in win_funcs.iter().enumerate() {
-                    if !wf.is_whole_partition { continue; }
+                    if !wf.is_whole_partition {
+                        continue;
+                    }
                     if let WindowFuncType::Aggregate(ref agg_name) = wf.func_type {
-                        self.emit(Opcode::AggFinal, wp_agg_accum_regs[wf_idx],
-                            wp_rec_base + (partition_count + agg_offset) as i32, 0,
-                            P4::Text(agg_name.clone()));
+                        self.emit(
+                            Opcode::AggFinal,
+                            wp_agg_accum_regs[wf_idx],
+                            wp_rec_base + (partition_count + agg_offset) as i32,
+                            0,
+                            P4::Text(agg_name.clone()),
+                        );
                     }
                     agg_offset += 1;
                 }
                 let wp_rec_reg = self.alloc_reg();
-                self.emit(Opcode::MakeRecord, wp_rec_base,
-                    (partition_count + wp_agg_count) as i32, wp_rec_reg, P4::Unused);
+                self.emit(
+                    Opcode::MakeRecord,
+                    wp_rec_base,
+                    (partition_count + wp_agg_count) as i32,
+                    wp_rec_reg,
+                    P4::Unused,
+                );
                 let wp_rowid_reg = self.alloc_reg();
-                self.emit(Opcode::NewRowid, wp_lookup_cursor, wp_rowid_reg, 0, P4::Unused);
-                self.emit(Opcode::Insert, wp_lookup_cursor, wp_rec_reg, wp_rowid_reg, P4::Unused);
+                self.emit(
+                    Opcode::NewRowid,
+                    wp_lookup_cursor,
+                    wp_rowid_reg,
+                    0,
+                    P4::Unused,
+                );
+                self.emit(
+                    Opcode::Insert,
+                    wp_lookup_cursor,
+                    wp_rec_reg,
+                    wp_rowid_reg,
+                    P4::Unused,
+                );
 
                 self.resolve_label(skip_store, self.current_addr());
 
@@ -3263,7 +3448,13 @@ impl<'s> SelectCompiler<'s> {
                 }
 
                 for i in 0..partition_count {
-                    self.emit(Opcode::Copy, p1_read_base + i as i32, p1_prev_partition + i as i32, 0, P4::Unused);
+                    self.emit(
+                        Opcode::Copy,
+                        p1_read_base + i as i32,
+                        p1_prev_partition + i as i32,
+                        0,
+                        P4::Unused,
+                    );
                 }
                 self.emit(Opcode::Integer, 0, p1_first_flag, 0, P4::Unused);
             } else {
@@ -3274,7 +3465,9 @@ impl<'s> SelectCompiler<'s> {
 
             // Accumulate aggregate values
             for (wf_idx, wf) in win_funcs.iter().enumerate() {
-                if !wf.is_whole_partition { continue; }
+                if !wf.is_whole_partition {
+                    continue;
+                }
                 if let WindowFuncType::Aggregate(ref agg_name) = wf.func_type {
                     let wf_arg_col = sort_key_count + result_count + wf_idx;
                     let arg_reg = self.alloc_reg();
@@ -3284,16 +3477,40 @@ impl<'s> SelectCompiler<'s> {
                         self.emit(Opcode::Null, 0, arg_reg, 0, P4::Unused);
                     } else {
                         argc = 1;
-                        self.emit(Opcode::Copy, p1_read_base + wf_arg_col as i32, arg_reg, 0, P4::Unused);
+                        self.emit(
+                            Opcode::Copy,
+                            p1_read_base + wf_arg_col as i32,
+                            arg_reg,
+                            0,
+                            P4::Unused,
+                        );
                     }
-                    self.emit(Opcode::AggStep, argc, arg_reg, wp_agg_accum_regs[wf_idx], P4::Text(agg_name.clone()));
+                    self.emit(
+                        Opcode::AggStep,
+                        argc,
+                        arg_reg,
+                        wp_agg_accum_regs[wf_idx],
+                        P4::Text(agg_name.clone()),
+                    );
                 }
             }
 
             if sort_key_count > 0 {
-                self.emit(Opcode::SorterNext, sorter_cursor, pass1_loop as i32, 0, P4::Unused);
+                self.emit(
+                    Opcode::SorterNext,
+                    sorter_cursor,
+                    pass1_loop as i32,
+                    0,
+                    P4::Unused,
+                );
             } else {
-                self.emit(Opcode::Next, sorter_cursor, pass1_loop as i32, 0, P4::Unused);
+                self.emit(
+                    Opcode::Next,
+                    sorter_cursor,
+                    pass1_loop as i32,
+                    0,
+                    P4::Unused,
+                );
             }
 
             self.resolve_label(pass1_done, self.current_addr());
@@ -3302,32 +3519,67 @@ impl<'s> SelectCompiler<'s> {
             if partition_count > 0 {
                 let wp_rec_base = self.alloc_regs(partition_count + wp_agg_count);
                 for i in 0..partition_count {
-                    self.emit(Opcode::Copy, p1_prev_partition + i as i32,
-                        wp_rec_base + i as i32, 0, P4::Unused);
+                    self.emit(
+                        Opcode::Copy,
+                        p1_prev_partition + i as i32,
+                        wp_rec_base + i as i32,
+                        0,
+                        P4::Unused,
+                    );
                 }
                 let mut agg_offset = 0;
                 for (wf_idx, wf) in win_funcs.iter().enumerate() {
-                    if !wf.is_whole_partition { continue; }
+                    if !wf.is_whole_partition {
+                        continue;
+                    }
                     if let WindowFuncType::Aggregate(ref agg_name) = wf.func_type {
-                        self.emit(Opcode::AggFinal, wp_agg_accum_regs[wf_idx],
-                            wp_rec_base + (partition_count + agg_offset) as i32, 0,
-                            P4::Text(agg_name.clone()));
+                        self.emit(
+                            Opcode::AggFinal,
+                            wp_agg_accum_regs[wf_idx],
+                            wp_rec_base + (partition_count + agg_offset) as i32,
+                            0,
+                            P4::Text(agg_name.clone()),
+                        );
                     }
                     agg_offset += 1;
                 }
                 let wp_rec_reg = self.alloc_reg();
-                self.emit(Opcode::MakeRecord, wp_rec_base,
-                    (partition_count + wp_agg_count) as i32, wp_rec_reg, P4::Unused);
+                self.emit(
+                    Opcode::MakeRecord,
+                    wp_rec_base,
+                    (partition_count + wp_agg_count) as i32,
+                    wp_rec_reg,
+                    P4::Unused,
+                );
                 let wp_rowid_reg = self.alloc_reg();
-                self.emit(Opcode::NewRowid, wp_lookup_cursor, wp_rowid_reg, 0, P4::Unused);
-                self.emit(Opcode::Insert, wp_lookup_cursor, wp_rec_reg, wp_rowid_reg, P4::Unused);
+                self.emit(
+                    Opcode::NewRowid,
+                    wp_lookup_cursor,
+                    wp_rowid_reg,
+                    0,
+                    P4::Unused,
+                );
+                self.emit(
+                    Opcode::Insert,
+                    wp_lookup_cursor,
+                    wp_rec_reg,
+                    wp_rowid_reg,
+                    P4::Unused,
+                );
             } else {
                 // Non-partitioned: just finalize into wp_agg_final_regs
                 for (wf_idx, wf) in win_funcs.iter().enumerate() {
-                    if !wf.is_whole_partition { continue; }
+                    if !wf.is_whole_partition {
+                        continue;
+                    }
                     if let WindowFuncType::Aggregate(ref agg_name) = wf.func_type {
-                        self.emit(Opcode::AggFinal, wp_agg_accum_regs[wf_idx], wp_agg_final_regs[wf_idx], 0,
-                            P4::Text(agg_name.clone()));
+                        self.emit(
+                            Opcode::AggFinal,
+                            wp_agg_accum_regs[wf_idx],
+                            wp_agg_final_regs[wf_idx],
+                            0,
+                            P4::Text(agg_name.clone()),
+                        );
                     }
                 }
             }
@@ -3345,7 +3597,11 @@ impl<'s> SelectCompiler<'s> {
         let partition_first_flag = self.alloc_reg();
         let prev_order_base = self.alloc_regs(order_count.max(1));
 
-        struct WfState { accum_reg: i32, rank_reg: i32, dense_rank_reg: i32 }
+        struct WfState {
+            accum_reg: i32,
+            rank_reg: i32,
+            dense_rank_reg: i32,
+        }
         let mut wf_states: Vec<WfState> = Vec::new();
         for _wf in &win_funcs {
             wf_states.push(WfState {
@@ -3355,7 +3611,14 @@ impl<'s> SelectCompiler<'s> {
             });
         }
 
-        let has_partitioned_wp_aggs = win_funcs.iter().any(|wf| wf.is_whole_partition && wf.partition_by.as_ref().map(|v| !v.is_empty()).unwrap_or(false));
+        let has_partitioned_wp_aggs = win_funcs.iter().any(|wf| {
+            wf.is_whole_partition
+                && wf
+                    .partition_by
+                    .as_ref()
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false)
+        });
         let mut wp2_accum_regs: Vec<i32> = Vec::new();
         if has_partitioned_wp_aggs {
             for _wf in &win_funcs {
@@ -3372,7 +3635,13 @@ impl<'s> SelectCompiler<'s> {
             self.emit(Opcode::Integer, 0, state.dense_rank_reg, 0, P4::Unused);
         }
         for i in 0..partition_count {
-            self.emit(Opcode::Null, 0, prev_partition_base + i as i32, 0, P4::Unused);
+            self.emit(
+                Opcode::Null,
+                0,
+                prev_partition_base + i as i32,
+                0,
+                P4::Unused,
+            );
         }
         for i in 0..order_count {
             self.emit(Opcode::Null, 0, prev_order_base + i as i32, 0, P4::Unused);
@@ -3381,9 +3650,21 @@ impl<'s> SelectCompiler<'s> {
         // Start the sort loop
         let sort_done_label = self.alloc_label();
         if sort_key_count > 0 {
-            self.emit(Opcode::SorterSort, sorter_cursor, sort_done_label, 0, P4::Unused);
+            self.emit(
+                Opcode::SorterSort,
+                sorter_cursor,
+                sort_done_label,
+                0,
+                P4::Unused,
+            );
         } else {
-            self.emit(Opcode::Rewind, sorter_cursor, sort_done_label, 0, P4::Unused);
+            self.emit(
+                Opcode::Rewind,
+                sorter_cursor,
+                sort_done_label,
+                0,
+                P4::Unused,
+            );
         }
 
         let sort_loop = self.current_addr();
@@ -3393,7 +3674,13 @@ impl<'s> SelectCompiler<'s> {
             self.emit(Opcode::SorterData, sorter_cursor, data_reg, 0, P4::Unused);
         }
         for i in 0..total_cols {
-            self.emit(Opcode::Column, sorter_cursor, i as i32, read_base + i as i32, P4::Unused);
+            self.emit(
+                Opcode::Column,
+                sorter_cursor,
+                i as i32,
+                read_base + i as i32,
+                P4::Unused,
+            );
         }
 
         // ----- Partition boundary detection -----
@@ -3402,10 +3689,22 @@ impl<'s> SelectCompiler<'s> {
             let partition_changed = self.alloc_label();
             for i in 0..partition_count {
                 // Use JUMPIFNULL (p5=0x10) so NULL prev key triggers "changed" on first row
-                self.emit_with_p5(Opcode::Ne, read_base + i as i32, partition_changed,
-                    prev_partition_base + i as i32, P4::Unused, 0x10);
+                self.emit_with_p5(
+                    Opcode::Ne,
+                    read_base + i as i32,
+                    partition_changed,
+                    prev_partition_base + i as i32,
+                    P4::Unused,
+                    0x10,
+                );
             }
-            self.emit(Opcode::IfNot, partition_first_flag, no_partition_change, 0, P4::Unused);
+            self.emit(
+                Opcode::IfNot,
+                partition_first_flag,
+                no_partition_change,
+                0,
+                P4::Unused,
+            );
 
             self.resolve_label(partition_changed, self.current_addr());
             self.emit(Opcode::Integer, 0, row_num_reg, 0, P4::Unused);
@@ -3416,8 +3715,13 @@ impl<'s> SelectCompiler<'s> {
                 let state = &wf_states[wf_idx];
                 if let WindowFuncType::Aggregate(ref agg_name) = wf.func_type {
                     // AggFinal clears the agg_context entry
-                    self.emit(Opcode::AggFinal, state.accum_reg, state.accum_reg, 0,
-                        P4::Text(agg_name.clone()));
+                    self.emit(
+                        Opcode::AggFinal,
+                        state.accum_reg,
+                        state.accum_reg,
+                        0,
+                        P4::Text(agg_name.clone()),
+                    );
                 }
                 self.emit(Opcode::Null, 0, state.accum_reg, 0, P4::Unused);
                 self.emit(Opcode::Integer, 1, state.rank_reg, 0, P4::Unused);
@@ -3435,24 +3739,48 @@ impl<'s> SelectCompiler<'s> {
                 let lookup_next = self.alloc_label();
                 for i in 0..partition_count {
                     let lookup_col_reg = self.alloc_reg();
-                    self.emit(Opcode::Column, wp_lookup_cursor, i as i32, lookup_col_reg, P4::Unused);
-                    self.emit_with_p5(Opcode::Ne, read_base + i as i32, lookup_next,
-                        lookup_col_reg, P4::Unused, 0x10);
+                    self.emit(
+                        Opcode::Column,
+                        wp_lookup_cursor,
+                        i as i32,
+                        lookup_col_reg,
+                        P4::Unused,
+                    );
+                    self.emit_with_p5(
+                        Opcode::Ne,
+                        read_base + i as i32,
+                        lookup_next,
+                        lookup_col_reg,
+                        P4::Unused,
+                        0x10,
+                    );
                 }
 
                 // Match found: read aggregate values into wp_agg_final_regs
                 let mut agg_offset = 0;
                 for (wf_idx, wf) in win_funcs.iter().enumerate() {
-                    if !wf.is_whole_partition { continue; }
-                    self.emit(Opcode::Column, wp_lookup_cursor,
+                    if !wf.is_whole_partition {
+                        continue;
+                    }
+                    self.emit(
+                        Opcode::Column,
+                        wp_lookup_cursor,
                         (partition_count + agg_offset) as i32,
-                        wp_agg_final_regs[wf_idx], P4::Unused);
+                        wp_agg_final_regs[wf_idx],
+                        P4::Unused,
+                    );
                     agg_offset += 1;
                 }
                 self.emit(Opcode::Goto, 0, lookup_done, 0, P4::Unused);
 
                 self.resolve_label(lookup_next, self.current_addr());
-                self.emit(Opcode::Next, wp_lookup_cursor, lookup_loop as i32, 0, P4::Unused);
+                self.emit(
+                    Opcode::Next,
+                    wp_lookup_cursor,
+                    lookup_loop as i32,
+                    0,
+                    P4::Unused,
+                );
                 self.resolve_label(lookup_done, self.current_addr());
             }
 
@@ -3460,11 +3788,23 @@ impl<'s> SelectCompiler<'s> {
                 self.emit(Opcode::Null, 0, prev_order_base + i as i32, 0, P4::Unused);
             }
             for i in 0..partition_count {
-                self.emit(Opcode::Copy, read_base + i as i32, prev_partition_base + i as i32, 0, P4::Unused);
+                self.emit(
+                    Opcode::Copy,
+                    read_base + i as i32,
+                    prev_partition_base + i as i32,
+                    0,
+                    P4::Unused,
+                );
             }
             self.emit(Opcode::Integer, 0, partition_first_flag, 0, P4::Unused);
         } else {
-            self.emit(Opcode::IfNot, partition_first_flag, no_partition_change, 0, P4::Unused);
+            self.emit(
+                Opcode::IfNot,
+                partition_first_flag,
+                no_partition_change,
+                0,
+                P4::Unused,
+            );
             self.emit(Opcode::Integer, 0, partition_first_flag, 0, P4::Unused);
         }
         self.resolve_label(no_partition_change, self.current_addr());
@@ -3478,8 +3818,14 @@ impl<'s> SelectCompiler<'s> {
         if order_count > 0 {
             for i in 0..order_count {
                 // Use JUMPIFNULL (p5=0x10) so NULL prev key triggers "changed" on first row
-                self.emit_with_p5(Opcode::Ne, read_base + (partition_count + i) as i32,
-                    order_changed, prev_order_base + i as i32, P4::Unused, 0x10);
+                self.emit_with_p5(
+                    Opcode::Ne,
+                    read_base + (partition_count + i) as i32,
+                    order_changed,
+                    prev_order_base + i as i32,
+                    P4::Unused,
+                    0x10,
+                );
             }
             self.emit(Opcode::Goto, 0, order_same, 0, P4::Unused);
 
@@ -3489,8 +3835,13 @@ impl<'s> SelectCompiler<'s> {
                 self.emit(Opcode::AddImm, state.dense_rank_reg, 1, 0, P4::Unused);
             }
             for i in 0..order_count {
-                self.emit(Opcode::Copy, read_base + (partition_count + i) as i32,
-                    prev_order_base + i as i32, 0, P4::Unused);
+                self.emit(
+                    Opcode::Copy,
+                    read_base + (partition_count + i) as i32,
+                    prev_order_base + i as i32,
+                    0,
+                    P4::Unused,
+                );
             }
             self.resolve_label(order_same, self.current_addr());
         } else {
@@ -3506,14 +3857,30 @@ impl<'s> SelectCompiler<'s> {
             match &wf.func_type {
                 WindowFuncType::Aggregate(agg_name) => {
                     if wf.is_whole_partition {
-                        let is_partitioned = wf.partition_by.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
+                        let is_partitioned = wf
+                            .partition_by
+                            .as_ref()
+                            .map(|v| !v.is_empty())
+                            .unwrap_or(false);
                         if !is_partitioned {
                             // Non-partitioned whole-partition aggregate: use pre-computed value from pass 1
-                            self.emit(Opcode::Copy, wp_agg_final_regs[wf_idx], wf.result_reg, 0, P4::Unused);
+                            self.emit(
+                                Opcode::Copy,
+                                wp_agg_final_regs[wf_idx],
+                                wf.result_reg,
+                                0,
+                                P4::Unused,
+                            );
                         } else {
                             // Partitioned whole-partition aggregate: use value looked up
                             // from the wp_lookup table on partition boundary
-                            self.emit(Opcode::Copy, wp_agg_final_regs[wf_idx], wf.result_reg, 0, P4::Unused);
+                            self.emit(
+                                Opcode::Copy,
+                                wp_agg_final_regs[wf_idx],
+                                wf.result_reg,
+                                0,
+                                P4::Unused,
+                            );
                         }
                     } else {
                         // Running aggregate (has ORDER BY)
@@ -3525,10 +3892,28 @@ impl<'s> SelectCompiler<'s> {
                             self.emit(Opcode::Null, 0, arg_reg, 0, P4::Unused);
                         } else {
                             argc = 1;
-                            self.emit(Opcode::Copy, read_base + wf_arg_col as i32, arg_reg, 0, P4::Unused);
+                            self.emit(
+                                Opcode::Copy,
+                                read_base + wf_arg_col as i32,
+                                arg_reg,
+                                0,
+                                P4::Unused,
+                            );
                         }
-                        self.emit(Opcode::AggStep, argc, arg_reg, state.accum_reg, P4::Text(agg_name.clone()));
-                        self.emit(Opcode::AggValue, state.accum_reg, wf.result_reg, 0, P4::Text(agg_name.clone()));
+                        self.emit(
+                            Opcode::AggStep,
+                            argc,
+                            arg_reg,
+                            state.accum_reg,
+                            P4::Text(agg_name.clone()),
+                        );
+                        self.emit(
+                            Opcode::AggValue,
+                            state.accum_reg,
+                            wf.result_reg,
+                            0,
+                            P4::Text(agg_name.clone()),
+                        );
                     }
                 }
                 WindowFuncType::RowNumber => {
@@ -3538,7 +3923,13 @@ impl<'s> SelectCompiler<'s> {
                     self.emit(Opcode::Copy, state.rank_reg, wf.result_reg, 0, P4::Unused);
                 }
                 WindowFuncType::DenseRank => {
-                    self.emit(Opcode::Copy, state.dense_rank_reg, wf.result_reg, 0, P4::Unused);
+                    self.emit(
+                        Opcode::Copy,
+                        state.dense_rank_reg,
+                        wf.result_reg,
+                        0,
+                        P4::Unused,
+                    );
                 }
                 WindowFuncType::Ntile => {
                     // ntile: not properly implementable in single pass, use row_number placeholder
@@ -3550,8 +3941,10 @@ impl<'s> SelectCompiler<'s> {
                 WindowFuncType::CumeDist => {
                     self.emit(Opcode::Real, 0, wf.result_reg, 0, P4::Real(1.0));
                 }
-                WindowFuncType::Lag | WindowFuncType::Lead
-                | WindowFuncType::FirstValue | WindowFuncType::LastValue
+                WindowFuncType::Lag
+                | WindowFuncType::Lead
+                | WindowFuncType::FirstValue
+                | WindowFuncType::LastValue
                 | WindowFuncType::NthValue => {
                     self.emit(Opcode::Null, 0, wf.result_reg, 0, P4::Unused);
                 }
@@ -3563,7 +3956,10 @@ impl<'s> SelectCompiler<'s> {
         // reads from the stored record instead of the (consumed) table cursors.
         let mut saved_col_map = HashMap::new();
         for (i, &(cursor, col_idx)) in source_col_map.iter().enumerate() {
-            saved_col_map.insert((cursor, col_idx), read_base + (source_col_record_offset + i) as i32);
+            saved_col_map.insert(
+                (cursor, col_idx),
+                read_base + (source_col_record_offset + i) as i32,
+            );
         }
         self.saved_column_regs = Some(saved_col_map);
 
@@ -3581,20 +3977,30 @@ impl<'s> SelectCompiler<'s> {
                         if let Some(schema_table) = &table.schema_table {
                             for col_def in &schema_table.columns {
                                 if let Some(excluded) = excluded_cols {
-                                    if excluded.contains(&col_def.name.to_lowercase()) { continue; }
+                                    if excluded.contains(&col_def.name.to_lowercase()) {
+                                        continue;
+                                    }
                                 }
-                                self.emit(Opcode::Copy,
+                                self.emit(
+                                    Opcode::Copy,
                                     read_base + (sort_key_count + star_col) as i32,
-                                    output_base + star_col as i32, 0, P4::Unused);
+                                    output_base + star_col as i32,
+                                    0,
+                                    P4::Unused,
+                                );
                                 star_col += 1;
                             }
                         }
                     }
                 }
                 ResultColumn::TableStar { .. } => {
-                    self.emit(Opcode::Copy,
+                    self.emit(
+                        Opcode::Copy,
                         read_base + (sort_key_count + col_idx) as i32,
-                        output_base + col_idx as i32, 0, P4::Unused);
+                        output_base + col_idx as i32,
+                        0,
+                        P4::Unused,
+                    );
                 }
                 ResultColumn::Expr { expr, .. } => {
                     if crate::executor::window::has_window_function(expr) {
@@ -3602,9 +4008,13 @@ impl<'s> SelectCompiler<'s> {
                         // for column references and window_func_regs for window funcs
                         self.compile_expr(expr, output_base + col_idx as i32)?;
                     } else {
-                        self.emit(Opcode::Copy,
+                        self.emit(
+                            Opcode::Copy,
                             read_base + (sort_key_count + col_idx) as i32,
-                            output_base + col_idx as i32, 0, P4::Unused);
+                            output_base + col_idx as i32,
+                            0,
+                            P4::Unused,
+                        );
                     }
                 }
             }
@@ -3615,7 +4025,13 @@ impl<'s> SelectCompiler<'s> {
         self.saved_column_regs = None;
 
         if sort_key_count > 0 {
-            self.emit(Opcode::SorterNext, sorter_cursor, sort_loop as i32, 0, P4::Unused);
+            self.emit(
+                Opcode::SorterNext,
+                sorter_cursor,
+                sort_loop as i32,
+                0,
+                P4::Unused,
+            );
         } else {
             self.emit(Opcode::Next, sorter_cursor, sort_loop as i32, 0, P4::Unused);
         }
@@ -7099,8 +7515,9 @@ impl<'s> SelectCompiler<'s> {
                     // For a chain like `t1 NATURAL JOIN t2 NATURAL JOIN t3`, when
                     // processing t3, column `x` shared by t1 and t3 (but coalesced
                     // in t2) must generate `t1.x = t3.x`, not `t2.x = t3.x`.
-                    let left_table_idx =
-                        self.find_left_table_for_column(i, &col_name).unwrap_or(i - 1);
+                    let left_table_idx = self
+                        .find_left_table_for_column(i, &col_name)
+                        .unwrap_or(i - 1);
                     let left_table_name = self.tables[left_table_idx].name.clone();
                     let left_expr = Expr::Column(ColumnRef {
                         database: None,
@@ -7142,8 +7559,9 @@ impl<'s> SelectCompiler<'s> {
                     //   - USING(a) on t3 must reference t1.a (since t2.a is coalesced).
                     //     This ensures the join condition is `t1.a = t3.a` which works
                     //     even when t2 yields NULL from the LEFT JOIN.
-                    let left_table_idx =
-                        self.find_left_table_for_column(i, col_name).unwrap_or(i - 1);
+                    let left_table_idx = self
+                        .find_left_table_for_column(i, col_name)
+                        .unwrap_or(i - 1);
                     let left_table = &self.tables[left_table_idx];
 
                     // For self-joins (same table name without distinct aliases),
@@ -7309,7 +7727,9 @@ impl<'s> SelectCompiler<'s> {
                                 // Unqualified column in alias - check if it resolves to right tables
                                 let alias_col_name = alias_col.column.to_lowercase();
                                 let mut alias_found_left = false;
-                                for idx in base..=(base + join_index).min(self.tables.len().saturating_sub(1)) {
+                                for idx in base..=(base + join_index)
+                                    .min(self.tables.len().saturating_sub(1))
+                                {
                                     let table = &self.tables[idx];
                                     if self.table_has_column(table, &alias_col_name) {
                                         alias_found_left = true;
@@ -10604,9 +11024,17 @@ impl<'s> SelectCompiler<'s> {
                     let is_tcl_function = false;
                     let is_window_function = matches!(
                         name_upper.as_str(),
-                        "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "NTILE"
-                            | "PERCENT_RANK" | "CUME_DIST" | "LAG" | "LEAD"
-                            | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE"
+                        "ROW_NUMBER"
+                            | "RANK"
+                            | "DENSE_RANK"
+                            | "NTILE"
+                            | "PERCENT_RANK"
+                            | "CUME_DIST"
+                            | "LAG"
+                            | "LEAD"
+                            | "FIRST_VALUE"
+                            | "LAST_VALUE"
+                            | "NTH_VALUE"
                     );
                     let is_known_function = is_aggregate
                         || is_connection_function

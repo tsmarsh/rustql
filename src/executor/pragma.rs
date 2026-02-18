@@ -186,7 +186,7 @@ pub fn execute_pragma(conn: &mut SqliteConnection, pragma: &PragmaStmt) -> Resul
                 types: vec![ColumnType::Integer, ColumnType::Text],
                 rows,
             })
-        },
+        }
         // Compile options
         "compile_options" => Ok(empty_result()),
         // Debug/trace pragmas - no-ops in RustQL but recognized for compatibility

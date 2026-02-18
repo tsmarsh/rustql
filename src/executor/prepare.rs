@@ -1959,16 +1959,24 @@ impl<'s> StatementCompiler<'s> {
                         // Add column constraints
                         for constraint in &col.constraints {
                             match &constraint.kind {
-                                ColumnConstraintKind::PrimaryKey { autoincrement, conflict, .. } => {
+                                ColumnConstraintKind::PrimaryKey {
+                                    autoincrement,
+                                    conflict,
+                                    ..
+                                } => {
                                     col_sql.push_str(" PRIMARY KEY");
                                     if let Some(action) = conflict {
                                         col_sql.push_str(" ON CONFLICT ");
                                         col_sql.push_str(match action {
                                             crate::parser::ast::ConflictAction::Abort => "ABORT",
-                                            crate::parser::ast::ConflictAction::Rollback => "ROLLBACK",
+                                            crate::parser::ast::ConflictAction::Rollback => {
+                                                "ROLLBACK"
+                                            }
                                             crate::parser::ast::ConflictAction::Fail => "FAIL",
                                             crate::parser::ast::ConflictAction::Ignore => "IGNORE",
-                                            crate::parser::ast::ConflictAction::Replace => "REPLACE",
+                                            crate::parser::ast::ConflictAction::Replace => {
+                                                "REPLACE"
+                                            }
                                         });
                                     }
                                     if *autoincrement {
@@ -1981,10 +1989,14 @@ impl<'s> StatementCompiler<'s> {
                                         col_sql.push_str(" ON CONFLICT ");
                                         col_sql.push_str(match action {
                                             crate::parser::ast::ConflictAction::Abort => "ABORT",
-                                            crate::parser::ast::ConflictAction::Rollback => "ROLLBACK",
+                                            crate::parser::ast::ConflictAction::Rollback => {
+                                                "ROLLBACK"
+                                            }
                                             crate::parser::ast::ConflictAction::Fail => "FAIL",
                                             crate::parser::ast::ConflictAction::Ignore => "IGNORE",
-                                            crate::parser::ast::ConflictAction::Replace => "REPLACE",
+                                            crate::parser::ast::ConflictAction::Replace => {
+                                                "REPLACE"
+                                            }
                                         });
                                     }
                                 }
@@ -2810,7 +2822,10 @@ impl<'s> StatementCompiler<'s> {
             if !table_in_temp {
                 return Err(crate::error::Error::with_message(
                     crate::error::ErrorCode::Error,
-                    format!("cannot create a TEMP index on non-TEMP table \"{}\"", table_name),
+                    format!(
+                        "cannot create a TEMP index on non-TEMP table \"{}\"",
+                        table_name
+                    ),
                 ));
             }
         }
@@ -2903,7 +2918,11 @@ impl<'s> StatementCompiler<'s> {
                         }
                     };
                     if let Some(ref name) = col_name {
-                        if !table.columns.iter().any(|c| c.name.eq_ignore_ascii_case(name)) {
+                        if !table
+                            .columns
+                            .iter()
+                            .any(|c| c.name.eq_ignore_ascii_case(name))
+                        {
                             return Err(crate::error::Error::with_message(
                                 crate::error::ErrorCode::Error,
                                 format!("no such column: {}", name),
@@ -3278,7 +3297,10 @@ impl<'s> StatementCompiler<'s> {
         if create.name.name.to_lowercase().starts_with("sqlite_") {
             return Err(crate::error::Error::with_message(
                 crate::error::ErrorCode::Error,
-                format!("object name reserved for internal use: {}", create.name.name),
+                format!(
+                    "object name reserved for internal use: {}",
+                    create.name.name
+                ),
             ));
         }
 
@@ -3453,7 +3475,10 @@ impl<'s> StatementCompiler<'s> {
         if create.name.name.to_lowercase().starts_with("sqlite_") {
             return Err(crate::error::Error::with_message(
                 crate::error::ErrorCode::Error,
-                format!("object name reserved for internal use: {}", create.name.name),
+                format!(
+                    "object name reserved for internal use: {}",
+                    create.name.name
+                ),
             ));
         }
 
@@ -4692,11 +4717,21 @@ impl<'s> StatementCompiler<'s> {
         match stmt {
             Stmt::Update(update) => {
                 let mut sql = match &update.or_action {
-                    Some(ConflictAction::Replace) => format!("UPDATE OR REPLACE {} SET ", update.table.name),
-                    Some(ConflictAction::Abort) => format!("UPDATE OR ABORT {} SET ", update.table.name),
-                    Some(ConflictAction::Rollback) => format!("UPDATE OR ROLLBACK {} SET ", update.table.name),
-                    Some(ConflictAction::Fail) => format!("UPDATE OR FAIL {} SET ", update.table.name),
-                    Some(ConflictAction::Ignore) => format!("UPDATE OR IGNORE {} SET ", update.table.name),
+                    Some(ConflictAction::Replace) => {
+                        format!("UPDATE OR REPLACE {} SET ", update.table.name)
+                    }
+                    Some(ConflictAction::Abort) => {
+                        format!("UPDATE OR ABORT {} SET ", update.table.name)
+                    }
+                    Some(ConflictAction::Rollback) => {
+                        format!("UPDATE OR ROLLBACK {} SET ", update.table.name)
+                    }
+                    Some(ConflictAction::Fail) => {
+                        format!("UPDATE OR FAIL {} SET ", update.table.name)
+                    }
+                    Some(ConflictAction::Ignore) => {
+                        format!("UPDATE OR IGNORE {} SET ", update.table.name)
+                    }
                     None => format!("UPDATE {} SET ", update.table.name),
                 };
                 let assignments: Vec<String> = update
@@ -4717,10 +4752,18 @@ impl<'s> StatementCompiler<'s> {
             Stmt::Insert(insert) => {
                 let mut sql = match &insert.or_action {
                     Some(ConflictAction::Replace) => format!("REPLACE INTO {}", insert.table.name),
-                    Some(ConflictAction::Abort) => format!("INSERT OR ABORT INTO {}", insert.table.name),
-                    Some(ConflictAction::Rollback) => format!("INSERT OR ROLLBACK INTO {}", insert.table.name),
-                    Some(ConflictAction::Fail) => format!("INSERT OR FAIL INTO {}", insert.table.name),
-                    Some(ConflictAction::Ignore) => format!("INSERT OR IGNORE INTO {}", insert.table.name),
+                    Some(ConflictAction::Abort) => {
+                        format!("INSERT OR ABORT INTO {}", insert.table.name)
+                    }
+                    Some(ConflictAction::Rollback) => {
+                        format!("INSERT OR ROLLBACK INTO {}", insert.table.name)
+                    }
+                    Some(ConflictAction::Fail) => {
+                        format!("INSERT OR FAIL INTO {}", insert.table.name)
+                    }
+                    Some(ConflictAction::Ignore) => {
+                        format!("INSERT OR IGNORE INTO {}", insert.table.name)
+                    }
                     None => format!("INSERT INTO {}", insert.table.name),
                 };
                 if let Some(ref cols) = insert.columns {
@@ -4983,7 +5026,8 @@ impl<'s> StatementCompiler<'s> {
                 // SQLite-compatible error message for autoindexes
                 return Err(crate::error::Error::with_message(
                     crate::error::ErrorCode::Error,
-                    "index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped".to_string(),
+                    "index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped"
+                        .to_string(),
                 ));
             }
             return Err(crate::error::Error::with_message(

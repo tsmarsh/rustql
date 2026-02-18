@@ -68,7 +68,10 @@ impl AggregateState {
                 separator: ",".to_string(),
             }),
             "MD5SUM" => Some(AggregateState::Md5Sum { data: Vec::new() }),
-            "DECIMAL_SUM" => Some(AggregateState::DecimalSum { sum: 0.0, has_value: false }),
+            "DECIMAL_SUM" => Some(AggregateState::DecimalSum {
+                sum: 0.0,
+                has_value: false,
+            }),
             _ => None,
         }
     }
@@ -225,7 +228,11 @@ impl AggregateState {
                         match val {
                             Value::Integer(n) => *sum += *n as f64,
                             Value::Real(f) => *sum += f,
-                            Value::Text(s) => { if let Ok(f) = s.parse::<f64>() { *sum += f; } }
+                            Value::Text(s) => {
+                                if let Ok(f) = s.parse::<f64>() {
+                                    *sum += f;
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -284,7 +291,11 @@ impl AggregateState {
             }
 
             AggregateState::DecimalSum { sum, has_value } => {
-                if *has_value { Ok(Value::Real(*sum)) } else { Ok(Value::Null) }
+                if *has_value {
+                    Ok(Value::Real(*sum))
+                } else {
+                    Ok(Value::Null)
+                }
             }
         }
     }

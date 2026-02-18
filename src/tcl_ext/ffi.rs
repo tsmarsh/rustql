@@ -143,11 +143,7 @@ extern "C" {
         boolPtr: *mut c_int,
     ) -> c_int;
 
-    pub fn Tcl_EvalObjEx(
-        interp: *mut Tcl_Interp,
-        objPtr: *mut Tcl_Obj,
-        flags: c_int,
-    ) -> c_int;
+    pub fn Tcl_EvalObjEx(interp: *mut Tcl_Interp, objPtr: *mut Tcl_Obj, flags: c_int) -> c_int;
 
     pub fn Tcl_DuplicateObj(objPtr: *mut Tcl_Obj) -> *mut Tcl_Obj;
 

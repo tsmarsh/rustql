@@ -643,10 +643,18 @@ fn compare_records(key_a: &[u8], key_b: &[u8], key_info: &KeyInfo) -> Ordering {
             match (a_null, b_null) {
                 (true, true) => Ordering::Equal,
                 (true, false) => {
-                    if bignull { Ordering::Greater } else { Ordering::Less }
+                    if bignull {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    }
                 }
                 (false, true) => {
-                    if bignull { Ordering::Less } else { Ordering::Greater }
+                    if bignull {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    }
                 }
                 _ => unreachable!(),
             }

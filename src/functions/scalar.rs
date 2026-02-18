@@ -12,14 +12,16 @@ use super::datetime::{
     func_julianday, func_strftime, func_time, func_unixepoch,
 };
 #[cfg(feature = "fts3")]
-use super::fts3::{func_fts3_exprtest, func_fts3_exprtest_rebalance, func_matchinfo, func_offsets, func_snippet};
+use super::fts3::{
+    func_fts3_exprtest, func_fts3_exprtest_rebalance, func_matchinfo, func_offsets, func_snippet,
+};
 #[cfg(feature = "fts5")]
 use super::fts5::{func_bm25, func_highlight, func_snippet as func_snippet_fts5};
 use super::json::{
-    func_json, func_json_array, func_json_array_length, func_json_extract,
-    func_json_group_array, func_json_group_object, func_json_insert, func_json_object,
-    func_json_patch, func_json_quote, func_json_remove, func_json_replace, func_json_set,
-    func_json_type, func_json_valid, func_jsonb,
+    func_json, func_json_array, func_json_array_length, func_json_extract, func_json_group_array,
+    func_json_group_object, func_json_insert, func_json_object, func_json_patch, func_json_quote,
+    func_json_remove, func_json_replace, func_json_set, func_json_type, func_json_valid,
+    func_jsonb,
 };
 use super::printf::printf_format;
 
@@ -1954,7 +1956,9 @@ fn func_rtreecheck(args: &[Value]) -> Result<Value> {
 // ============================================================================
 
 fn func_real2hex(args: &[Value]) -> Result<Value> {
-    if args.is_empty() { return Ok(Value::Null); }
+    if args.is_empty() {
+        return Ok(Value::Null);
+    }
     let r = match &args[0] {
         Value::Null => return Ok(Value::Null),
         Value::Integer(n) => *n as f64,
@@ -1966,7 +1970,9 @@ fn func_real2hex(args: &[Value]) -> Result<Value> {
 }
 
 fn func_hex2real(args: &[Value]) -> Result<Value> {
-    if args.is_empty() { return Ok(Value::Null); }
+    if args.is_empty() {
+        return Ok(Value::Null);
+    }
     let hex_str = match &args[0] {
         Value::Null => return Ok(Value::Null),
         Value::Text(s) => s.clone(),
@@ -1986,17 +1992,30 @@ fn func_hex2real(args: &[Value]) -> Result<Value> {
 fn ieee754_decompose(r: f64) -> (i64, i64) {
     let (is_neg, r_abs) = if r < 0.0 { (true, -r) } else { (false, r) };
     let a = r_abs.to_bits() as i64;
-    if a == 0 { return (0, 0); }
+    if a == 0 {
+        return (0, 0);
+    }
     let mut e = (a >> 52) & 0x7FF;
     let mut m = a & ((1i64 << 52) - 1);
-    if e == 0 { m <<= 1; } else { m |= 1i64 << 52; }
-    while e < 1075 && m > 0 && (m & 1) == 0 { m >>= 1; e += 1; }
-    if is_neg { m = -m; }
+    if e == 0 {
+        m <<= 1;
+    } else {
+        m |= 1i64 << 52;
+    }
+    while e < 1075 && m > 0 && (m & 1) == 0 {
+        m >>= 1;
+        e += 1;
+    }
+    if is_neg {
+        m = -m;
+    }
     (m, e - 1075)
 }
 
 fn func_ieee754(args: &[Value]) -> Result<Value> {
-    if args.is_empty() { return Ok(Value::Null); }
+    if args.is_empty() {
+        return Ok(Value::Null);
+    }
     if args.len() == 1 {
         let r = match &args[0] {
             Value::Null => return Ok(Value::Null),
@@ -2005,9 +2024,15 @@ fn func_ieee754(args: &[Value]) -> Result<Value> {
             Value::Text(s) => s.parse::<f64>().unwrap_or(0.0),
             _ => return Ok(Value::Null),
         };
-        if r.is_nan() { return Ok(Value::Text("ieee754(NaN)".to_string())); }
+        if r.is_nan() {
+            return Ok(Value::Text("ieee754(NaN)".to_string()));
+        }
         if r.is_infinite() {
-            return Ok(Value::Text(if r > 0.0 { "ieee754(Inf)".to_string() } else { "ieee754(-Inf)".to_string() }));
+            return Ok(Value::Text(if r > 0.0 {
+                "ieee754(Inf)".to_string()
+            } else {
+                "ieee754(-Inf)".to_string()
+            }));
         }
         let (m, e) = ieee754_decompose(r);
         Ok(Value::Text(format!("ieee754({},{})", m, e)))
@@ -2024,16 +2049,28 @@ fn func_ieee754(args: &[Value]) -> Result<Value> {
             Value::Text(s) => s.parse::<i64>().unwrap_or(0),
             _ => 0,
         };
-        if m == 0 { return Ok(Value::Real(0.0)); }
+        if m == 0 {
+            return Ok(Value::Real(0.0));
+        }
         let is_neg = m < 0;
         let mut m = if is_neg { -m } else { m } as u64;
         let mut e = e;
-        while m > 0 && (m >> 53) != 0 { m >>= 1; e += 1; }
-        while m > 0 && (m >> 52) == 0 { m <<= 1; e -= 1; }
+        while m > 0 && (m >> 53) != 0 {
+            m >>= 1;
+            e += 1;
+        }
+        while m > 0 && (m >> 52) == 0 {
+            m <<= 1;
+            e -= 1;
+        }
         let biased_e = e + 1075;
         let bits = if biased_e <= 0 {
             let shift = 1 - biased_e;
-            if shift >= 64 { 0u64 } else { m >> shift }
+            if shift >= 64 {
+                0u64
+            } else {
+                m >> shift
+            }
         } else if biased_e >= 2047 {
             0x7FF0_0000_0000_0000u64
         } else {
@@ -2046,7 +2083,9 @@ fn func_ieee754(args: &[Value]) -> Result<Value> {
 }
 
 fn func_ieee754_mantissa(args: &[Value]) -> Result<Value> {
-    if args.is_empty() { return Ok(Value::Null); }
+    if args.is_empty() {
+        return Ok(Value::Null);
+    }
     let r = match &args[0] {
         Value::Null => return Ok(Value::Null),
         Value::Integer(n) => *n as f64,
@@ -2059,7 +2098,9 @@ fn func_ieee754_mantissa(args: &[Value]) -> Result<Value> {
 }
 
 fn func_ieee754_exponent(args: &[Value]) -> Result<Value> {
-    if args.is_empty() { return Ok(Value::Null); }
+    if args.is_empty() {
+        return Ok(Value::Null);
+    }
     let r = match &args[0] {
         Value::Null => return Ok(Value::Null),
         Value::Integer(n) => *n as f64,
@@ -2072,7 +2113,9 @@ fn func_ieee754_exponent(args: &[Value]) -> Result<Value> {
 }
 
 fn func_ieee754_to_blob(args: &[Value]) -> Result<Value> {
-    if args.is_empty() { return Ok(Value::Null); }
+    if args.is_empty() {
+        return Ok(Value::Null);
+    }
     let r = match &args[0] {
         Value::Null => return Ok(Value::Null),
         Value::Integer(n) => *n as f64,
@@ -2084,7 +2127,9 @@ fn func_ieee754_to_blob(args: &[Value]) -> Result<Value> {
 }
 
 fn func_ieee754_from_blob(args: &[Value]) -> Result<Value> {
-    if args.is_empty() { return Ok(Value::Null); }
+    if args.is_empty() {
+        return Ok(Value::Null);
+    }
     match &args[0] {
         Value::Blob(b) if b.len() == 8 => {
             let mut bytes = [0u8; 8];
@@ -2114,7 +2159,9 @@ fn func_concat(args: &[Value]) -> Result<Value> {
 }
 
 fn func_concat_ws(args: &[Value]) -> Result<Value> {
-    if args.is_empty() { return Ok(Value::Null); }
+    if args.is_empty() {
+        return Ok(Value::Null);
+    }
     let sep = match &args[0] {
         Value::Null => return Ok(Value::Null),
         Value::Text(s) => s.clone(),
@@ -2140,7 +2187,9 @@ fn func_concat_ws(args: &[Value]) -> Result<Value> {
 // ============================================================================
 
 fn func_sqlite_source_id(_args: &[Value]) -> Result<Value> {
-    Ok(Value::Text("2024-01-01 00:00:00 0000000000000000000000000000000000000000 rustql".to_string()))
+    Ok(Value::Text(
+        "2024-01-01 00:00:00 0000000000000000000000000000000000000000 rustql".to_string(),
+    ))
 }
 
 fn func_sqlite_version(_args: &[Value]) -> Result<Value> {
@@ -2165,7 +2214,11 @@ impl Decimal {
                 let is_negative = *n < 0;
                 let s = n.abs().to_string();
                 let digits: Vec<u8> = s.bytes().map(|b| b - b'0').collect();
-                Some(Decimal { is_negative, digits, decimal_point: 0 })
+                Some(Decimal {
+                    is_negative,
+                    digits,
+                    decimal_point: 0,
+                })
             }
             Value::Real(f) => Self::from_str(&format_real_sqlite(*f)),
             Value::Text(s) => Self::from_str(s),
@@ -2175,49 +2228,86 @@ impl Decimal {
 
     fn from_str(s: &str) -> Option<Self> {
         let s = s.trim();
-        if s.is_empty() { return None; }
-        let (is_negative, s) = if s.starts_with('-') { (true, &s[1..]) }
-            else if s.starts_with('+') { (false, &s[1..]) }
-            else { (false, s) };
+        if s.is_empty() {
+            return None;
+        }
+        let (is_negative, s) = if s.starts_with('-') {
+            (true, &s[1..])
+        } else if s.starts_with('+') {
+            (false, &s[1..])
+        } else {
+            (false, s)
+        };
         let (mantissa, exp) = if let Some(pos) = s.find(|c: char| c == 'e' || c == 'E') {
             let exp: i32 = s[pos + 1..].parse().ok()?;
             (&s[..pos], exp)
-        } else { (s, 0i32) };
+        } else {
+            (s, 0i32)
+        };
         let mut digits = Vec::new();
         let mut decimal_point: i32 = 0;
         let mut seen_dot = false;
         for ch in mantissa.chars() {
-            if ch == '.' { seen_dot = true; }
-            else if ch.is_ascii_digit() {
+            if ch == '.' {
+                seen_dot = true;
+            } else if ch.is_ascii_digit() {
                 digits.push(ch as u8 - b'0');
-                if seen_dot { decimal_point += 1; }
-            } else { return None; }
+                if seen_dot {
+                    decimal_point += 1;
+                }
+            } else {
+                return None;
+            }
         }
         decimal_point -= exp;
-        while decimal_point < 0 { digits.push(0); decimal_point += 1; }
+        while decimal_point < 0 {
+            digits.push(0);
+            decimal_point += 1;
+        }
         while digits.len() > 1 && digits[0] == 0 && (digits.len() as i32 - decimal_point) > 1 {
             digits.remove(0);
         }
-        Some(Decimal { is_negative, digits, decimal_point: decimal_point as usize })
+        Some(Decimal {
+            is_negative,
+            digits,
+            decimal_point: decimal_point as usize,
+        })
     }
 
-    fn is_zero(&self) -> bool { self.digits.iter().all(|&d| d == 0) }
+    fn is_zero(&self) -> bool {
+        self.digits.iter().all(|&d| d == 0)
+    }
 
     fn to_string_normalized(&self) -> String {
-        if self.digits.is_empty() { return "0".to_string(); }
+        if self.digits.is_empty() {
+            return "0".to_string();
+        }
         let mut s = String::new();
-        if self.is_negative && !self.is_zero() { s.push('-'); }
+        if self.is_negative && !self.is_zero() {
+            s.push('-');
+        }
         if self.decimal_point >= self.digits.len() {
-            s.push('0'); s.push('.');
-            for _ in 0..(self.decimal_point - self.digits.len()) { s.push('0'); }
-            for &d in &self.digits { s.push((d + b'0') as char); }
+            s.push('0');
+            s.push('.');
+            for _ in 0..(self.decimal_point - self.digits.len()) {
+                s.push('0');
+            }
+            for &d in &self.digits {
+                s.push((d + b'0') as char);
+            }
         } else if self.decimal_point == 0 {
-            for &d in &self.digits { s.push((d + b'0') as char); }
+            for &d in &self.digits {
+                s.push((d + b'0') as char);
+            }
         } else {
             let int_len = self.digits.len() - self.decimal_point;
-            for &d in &self.digits[..int_len] { s.push((d + b'0') as char); }
+            for &d in &self.digits[..int_len] {
+                s.push((d + b'0') as char);
+            }
             s.push('.');
-            for &d in &self.digits[int_len..] { s.push((d + b'0') as char); }
+            for &d in &self.digits[int_len..] {
+                s.push((d + b'0') as char);
+            }
         }
         s
     }
@@ -2225,15 +2315,20 @@ impl Decimal {
     fn add(&self, other: &Decimal) -> Decimal {
         if self.is_negative != other.is_negative {
             if self.is_negative {
-                let mut pos = self.clone_d(); pos.is_negative = false;
+                let mut pos = self.clone_d();
+                pos.is_negative = false;
                 return other.sub_unsigned(&pos);
             } else {
-                let mut pos = other.clone_d(); pos.is_negative = false;
+                let mut pos = other.clone_d();
+                pos.is_negative = false;
                 return self.sub_unsigned(&pos);
             }
         }
         let result = self.add_unsigned(other);
-        Decimal { is_negative: self.is_negative, ..result }
+        Decimal {
+            is_negative: self.is_negative,
+            ..result
+        }
     }
 
     fn sub(&self, other: &Decimal) -> Decimal {
@@ -2246,53 +2341,100 @@ impl Decimal {
         let dp = self.decimal_point.max(other.decimal_point);
         let mut a = self.digits.clone();
         let mut b = other.digits.clone();
-        while a.len() < self.digits.len() + (dp - self.decimal_point) { a.push(0); }
-        while b.len() < other.digits.len() + (dp - other.decimal_point) { b.push(0); }
+        while a.len() < self.digits.len() + (dp - self.decimal_point) {
+            a.push(0);
+        }
+        while b.len() < other.digits.len() + (dp - other.decimal_point) {
+            b.push(0);
+        }
         let max_len = a.len().max(b.len());
-        while a.len() < max_len { a.insert(0, 0); }
-        while b.len() < max_len { b.insert(0, 0); }
+        while a.len() < max_len {
+            a.insert(0, 0);
+        }
+        while b.len() < max_len {
+            b.insert(0, 0);
+        }
         let mut result = vec![0u8; max_len + 1];
         let mut carry = 0u8;
         for i in (0..max_len).rev() {
             let sum = a[i] + b[i] + carry;
-            result[i + 1] = sum % 10; carry = sum / 10;
+            result[i + 1] = sum % 10;
+            carry = sum / 10;
         }
         result[0] = carry;
-        if result[0] == 0 && result.len() > 1 { result.remove(0); }
-        Decimal { is_negative: false, digits: result, decimal_point: dp }
+        if result[0] == 0 && result.len() > 1 {
+            result.remove(0);
+        }
+        Decimal {
+            is_negative: false,
+            digits: result,
+            decimal_point: dp,
+        }
     }
 
     fn sub_unsigned(&self, other: &Decimal) -> Decimal {
         let dp = self.decimal_point.max(other.decimal_point);
         let mut a = self.digits.clone();
         let mut b = other.digits.clone();
-        while a.len() < self.digits.len() + (dp - self.decimal_point) { a.push(0); }
-        while b.len() < other.digits.len() + (dp - other.decimal_point) { b.push(0); }
+        while a.len() < self.digits.len() + (dp - self.decimal_point) {
+            a.push(0);
+        }
+        while b.len() < other.digits.len() + (dp - other.decimal_point) {
+            b.push(0);
+        }
         let max_len = a.len().max(b.len());
-        while a.len() < max_len { a.insert(0, 0); }
-        while b.len() < max_len { b.insert(0, 0); }
+        while a.len() < max_len {
+            a.insert(0, 0);
+        }
+        while b.len() < max_len {
+            b.insert(0, 0);
+        }
         let mut a_bigger = true;
         for i in 0..max_len {
-            if a[i] > b[i] { break; }
-            else if a[i] < b[i] { a_bigger = false; break; }
+            if a[i] > b[i] {
+                break;
+            } else if a[i] < b[i] {
+                a_bigger = false;
+                break;
+            }
         }
-        let (big, small, is_negative) = if a_bigger { (a, b, false) } else { (b, a, true) };
+        let (big, small, is_negative) = if a_bigger {
+            (a, b, false)
+        } else {
+            (b, a, true)
+        };
         let mut result = vec![0u8; max_len];
         let mut borrow = 0i8;
         for i in (0..max_len).rev() {
             let diff = big[i] as i8 - small[i] as i8 - borrow;
-            if diff < 0 { result[i] = (diff + 10) as u8; borrow = 1; }
-            else { result[i] = diff as u8; borrow = 0; }
+            if diff < 0 {
+                result[i] = (diff + 10) as u8;
+                borrow = 1;
+            } else {
+                result[i] = diff as u8;
+                borrow = 0;
+            }
         }
-        while result.len() > 1 && result[0] == 0 && result.len() > dp + 1 { result.remove(0); }
-        Decimal { is_negative, digits: result, decimal_point: dp }
+        while result.len() > 1 && result[0] == 0 && result.len() > dp + 1 {
+            result.remove(0);
+        }
+        Decimal {
+            is_negative,
+            digits: result,
+            decimal_point: dp,
+        }
     }
 
     fn mul(&self, other: &Decimal) -> Decimal {
         let dp = self.decimal_point + other.decimal_point;
-        let a = &self.digits; let b = &other.digits;
+        let a = &self.digits;
+        let b = &other.digits;
         if a.is_empty() || b.is_empty() {
-            return Decimal { is_negative: false, digits: vec![0], decimal_point: 0 };
+            return Decimal {
+                is_negative: false,
+                digits: vec![0],
+                decimal_point: 0,
+            };
         }
         let mut result = vec![0u16; a.len() + b.len()];
         for i in (0..a.len()).rev() {
@@ -2305,41 +2447,79 @@ impl Decimal {
             }
         }
         for i in (1..result.len()).rev() {
-            if result[i] >= 10 { result[i - 1] += result[i] / 10; result[i] %= 10; }
+            if result[i] >= 10 {
+                result[i - 1] += result[i] / 10;
+                result[i] %= 10;
+            }
         }
         let digits: Vec<u8> = result.iter().map(|&d| d as u8).collect();
         let mut start = 0;
-        while start < digits.len().saturating_sub(dp + 1) && digits[start] == 0 { start += 1; }
-        Decimal { is_negative: self.is_negative != other.is_negative, digits: digits[start..].to_vec(), decimal_point: dp }
+        while start < digits.len().saturating_sub(dp + 1) && digits[start] == 0 {
+            start += 1;
+        }
+        Decimal {
+            is_negative: self.is_negative != other.is_negative,
+            digits: digits[start..].to_vec(),
+            decimal_point: dp,
+        }
     }
 
     fn compare(&self, other: &Decimal) -> i32 {
-        if self.is_zero() && other.is_zero() { return 0; }
-        if self.is_negative && !other.is_negative { return -1; }
-        if !self.is_negative && other.is_negative { return 1; }
+        if self.is_zero() && other.is_zero() {
+            return 0;
+        }
+        if self.is_negative && !other.is_negative {
+            return -1;
+        }
+        if !self.is_negative && other.is_negative {
+            return 1;
+        }
         let dp = self.decimal_point.max(other.decimal_point);
         let mut a = self.digits.clone();
         let mut b = other.digits.clone();
-        while a.len() < self.digits.len() + (dp - self.decimal_point) { a.push(0); }
-        while b.len() < other.digits.len() + (dp - other.decimal_point) { b.push(0); }
+        while a.len() < self.digits.len() + (dp - self.decimal_point) {
+            a.push(0);
+        }
+        while b.len() < other.digits.len() + (dp - other.decimal_point) {
+            b.push(0);
+        }
         let max_len = a.len().max(b.len());
-        while a.len() < max_len { a.insert(0, 0); }
-        while b.len() < max_len { b.insert(0, 0); }
+        while a.len() < max_len {
+            a.insert(0, 0);
+        }
+        while b.len() < max_len {
+            b.insert(0, 0);
+        }
         let mut ord = 0;
         for i in 0..max_len {
-            if a[i] > b[i] { ord = 1; break; }
-            else if a[i] < b[i] { ord = -1; break; }
+            if a[i] > b[i] {
+                ord = 1;
+                break;
+            } else if a[i] < b[i] {
+                ord = -1;
+                break;
+            }
         }
-        if self.is_negative { -ord } else { ord }
+        if self.is_negative {
+            -ord
+        } else {
+            ord
+        }
     }
 
     fn clone_d(&self) -> Decimal {
-        Decimal { is_negative: self.is_negative, digits: self.digits.clone(), decimal_point: self.decimal_point }
+        Decimal {
+            is_negative: self.is_negative,
+            digits: self.digits.clone(),
+            decimal_point: self.decimal_point,
+        }
     }
 }
 
 fn func_decimal(args: &[Value]) -> Result<Value> {
-    if args.is_empty() { return Ok(Value::Null); }
+    if args.is_empty() {
+        return Ok(Value::Null);
+    }
     match Decimal::from_value(&args[0]) {
         Some(d) => Ok(Value::Text(d.to_string_normalized())),
         None => Ok(Value::Null),
@@ -2347,35 +2527,69 @@ fn func_decimal(args: &[Value]) -> Result<Value> {
 }
 
 fn func_decimal_add(args: &[Value]) -> Result<Value> {
-    if args.len() < 2 { return Ok(Value::Null); }
-    let a = match Decimal::from_value(&args[0]) { Some(d) => d, None => return Ok(Value::Null) };
-    let b = match Decimal::from_value(&args[1]) { Some(d) => d, None => return Ok(Value::Null) };
+    if args.len() < 2 {
+        return Ok(Value::Null);
+    }
+    let a = match Decimal::from_value(&args[0]) {
+        Some(d) => d,
+        None => return Ok(Value::Null),
+    };
+    let b = match Decimal::from_value(&args[1]) {
+        Some(d) => d,
+        None => return Ok(Value::Null),
+    };
     Ok(Value::Text(a.add(&b).to_string_normalized()))
 }
 
 fn func_decimal_sub(args: &[Value]) -> Result<Value> {
-    if args.len() < 2 { return Ok(Value::Null); }
-    let a = match Decimal::from_value(&args[0]) { Some(d) => d, None => return Ok(Value::Null) };
-    let b = match Decimal::from_value(&args[1]) { Some(d) => d, None => return Ok(Value::Null) };
+    if args.len() < 2 {
+        return Ok(Value::Null);
+    }
+    let a = match Decimal::from_value(&args[0]) {
+        Some(d) => d,
+        None => return Ok(Value::Null),
+    };
+    let b = match Decimal::from_value(&args[1]) {
+        Some(d) => d,
+        None => return Ok(Value::Null),
+    };
     Ok(Value::Text(a.sub(&b).to_string_normalized()))
 }
 
 fn func_decimal_mul(args: &[Value]) -> Result<Value> {
-    if args.len() < 2 { return Ok(Value::Null); }
-    let a = match Decimal::from_value(&args[0]) { Some(d) => d, None => return Ok(Value::Null) };
-    let b = match Decimal::from_value(&args[1]) { Some(d) => d, None => return Ok(Value::Null) };
+    if args.len() < 2 {
+        return Ok(Value::Null);
+    }
+    let a = match Decimal::from_value(&args[0]) {
+        Some(d) => d,
+        None => return Ok(Value::Null),
+    };
+    let b = match Decimal::from_value(&args[1]) {
+        Some(d) => d,
+        None => return Ok(Value::Null),
+    };
     Ok(Value::Text(a.mul(&b).to_string_normalized()))
 }
 
 fn func_decimal_cmp(args: &[Value]) -> Result<Value> {
-    if args.len() < 2 { return Ok(Value::Null); }
-    let a = match Decimal::from_value(&args[0]) { Some(d) => d, None => return Ok(Value::Null) };
-    let b = match Decimal::from_value(&args[1]) { Some(d) => d, None => return Ok(Value::Null) };
+    if args.len() < 2 {
+        return Ok(Value::Null);
+    }
+    let a = match Decimal::from_value(&args[0]) {
+        Some(d) => d,
+        None => return Ok(Value::Null),
+    };
+    let b = match Decimal::from_value(&args[1]) {
+        Some(d) => d,
+        None => return Ok(Value::Null),
+    };
     Ok(Value::Integer(a.compare(&b) as i64))
 }
 
 fn func_decimal_exp(args: &[Value]) -> Result<Value> {
-    if args.is_empty() { return Ok(Value::Null); }
+    if args.is_empty() {
+        return Ok(Value::Null);
+    }
     match Decimal::from_value(&args[0]) {
         Some(d) => Ok(Value::Integer(d.decimal_point as i64)),
         None => Ok(Value::Null),
@@ -2386,16 +2600,28 @@ fn func_decimal_exp(args: &[Value]) -> Result<Value> {
 // Timediff Function
 // ============================================================================
 
-struct TimediffDT { year: i32, month: i32, day: i32, hour: i32, minute: i32, second: i32, millisecond: i32 }
+struct TimediffDT {
+    year: i32,
+    month: i32,
+    day: i32,
+    hour: i32,
+    minute: i32,
+    second: i32,
+    millisecond: i32,
+}
 
 impl TimediffDT {
     fn parse(s: &str) -> Option<Self> {
         let s = s.trim();
         let (date_part, time_part) = if let Some(pos) = s.find(|c: char| c == ' ' || c == 'T') {
             (&s[..pos], Some(&s[pos + 1..]))
-        } else { (s, None) };
+        } else {
+            (s, None)
+        };
         let dp: Vec<&str> = date_part.split('-').collect();
-        if dp.len() != 3 { return None; }
+        if dp.len() != 3 {
+            return None;
+        }
         let year: i32 = dp[0].parse().ok()?;
         let month: i32 = dp[1].parse().ok()?;
         let day: i32 = dp[2].parse().ok()?;
@@ -2416,29 +2642,66 @@ impl TimediffDT {
                             _ => frac[..3].parse::<i32>().ok()?,
                         };
                         (sec, ms)
-                    } else { (ss.parse::<i32>().ok()?, 0) }
-                } else { (0, 0) };
+                    } else {
+                        (ss.parse::<i32>().ok()?, 0)
+                    }
+                } else {
+                    (0, 0)
+                };
                 (h, m, s, ms)
-            } else { (0, 0, 0, 0) }
-        } else { (0, 0, 0, 0) };
-        Some(TimediffDT { year, month, day, hour, minute, second, millisecond })
+            } else {
+                (0, 0, 0, 0)
+            }
+        } else {
+            (0, 0, 0, 0)
+        };
+        Some(TimediffDT {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            millisecond,
+        })
     }
 
     fn days_in_month(year: i32, month: i32) -> i32 {
         match month {
-            1|3|5|7|8|10|12 => 31, 4|6|9|11 => 30,
-            2 => if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 { 29 } else { 28 },
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 => {
+                if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 {
+                    29
+                } else {
+                    28
+                }
+            }
             _ => 30,
         }
     }
 }
 
 fn func_timediff(args: &[Value]) -> Result<Value> {
-    if args.len() < 2 { return Ok(Value::Null); }
-    let x_str = match &args[0] { Value::Text(s) => s.clone(), _ => return Ok(Value::Null) };
-    let y_str = match &args[1] { Value::Text(s) => s.clone(), _ => return Ok(Value::Null) };
-    let x = match TimediffDT::parse(&x_str) { Some(dt) => dt, None => return Ok(Value::Null) };
-    let y = match TimediffDT::parse(&y_str) { Some(dt) => dt, None => return Ok(Value::Null) };
+    if args.len() < 2 {
+        return Ok(Value::Null);
+    }
+    let x_str = match &args[0] {
+        Value::Text(s) => s.clone(),
+        _ => return Ok(Value::Null),
+    };
+    let y_str = match &args[1] {
+        Value::Text(s) => s.clone(),
+        _ => return Ok(Value::Null),
+    };
+    let x = match TimediffDT::parse(&x_str) {
+        Some(dt) => dt,
+        None => return Ok(Value::Null),
+    };
+    let y = match TimediffDT::parse(&y_str) {
+        Some(dt) => dt,
+        None => return Ok(Value::Null),
+    };
     let mut ms = x.millisecond - y.millisecond;
     let mut sec = x.second - y.second;
     let mut min = x.minute - y.minute;
@@ -2446,24 +2709,53 @@ fn func_timediff(args: &[Value]) -> Result<Value> {
     let mut day = x.day - y.day;
     let mut mon = x.month - y.month;
     let mut yr = x.year - y.year;
-    let is_neg = yr < 0 || (yr == 0 && mon < 0) || (yr == 0 && mon == 0 && day < 0)
+    let is_neg = yr < 0
+        || (yr == 0 && mon < 0)
+        || (yr == 0 && mon == 0 && day < 0)
         || (yr == 0 && mon == 0 && day == 0 && hr < 0)
         || (yr == 0 && mon == 0 && day == 0 && hr == 0 && min < 0)
         || (yr == 0 && mon == 0 && day == 0 && hr == 0 && min == 0 && sec < 0)
         || (yr == 0 && mon == 0 && day == 0 && hr == 0 && min == 0 && sec == 0 && ms < 0);
-    if is_neg { ms = -ms; sec = -sec; min = -min; hr = -hr; day = -day; mon = -mon; yr = -yr; }
-    if ms < 0 { ms += 1000; sec -= 1; }
-    if sec < 0 { sec += 60; min -= 1; }
-    if min < 0 { min += 60; hr -= 1; }
-    if hr < 0 { hr += 24; day -= 1; }
+    if is_neg {
+        ms = -ms;
+        sec = -sec;
+        min = -min;
+        hr = -hr;
+        day = -day;
+        mon = -mon;
+        yr = -yr;
+    }
+    if ms < 0 {
+        ms += 1000;
+        sec -= 1;
+    }
+    if sec < 0 {
+        sec += 60;
+        min -= 1;
+    }
+    if min < 0 {
+        min += 60;
+        hr -= 1;
+    }
+    if hr < 0 {
+        hr += 24;
+        day -= 1;
+    }
     if day < 0 {
         let pm = if x.month > 1 { x.month - 1 } else { 12 };
         let py = if x.month > 1 { x.year } else { x.year - 1 };
-        day += TimediffDT::days_in_month(py, pm); mon -= 1;
+        day += TimediffDT::days_in_month(py, pm);
+        mon -= 1;
     }
-    if mon < 0 { mon += 12; yr -= 1; }
+    if mon < 0 {
+        mon += 12;
+        yr -= 1;
+    }
     let sign = if is_neg { "-" } else { "+" };
-    Ok(Value::Text(format!("{}{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}", sign, yr, mon, day, hr, min, sec, ms)))
+    Ok(Value::Text(format!(
+        "{}{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        sign, yr, mon, day, hr, min, sec, ms
+    )))
 }
 
 // ============================================================================
@@ -2471,9 +2763,17 @@ fn func_timediff(args: &[Value]) -> Result<Value> {
 // ============================================================================
 
 fn func_sqlite_rename_table(args: &[Value]) -> Result<Value> {
-    if args.len() < 2 { return Ok(Value::Null); }
-    let sql = match &args[0] { Value::Text(s) => s.clone(), _ => return Ok(Value::Null) };
-    let new_name = match &args[1] { Value::Text(s) => s.clone(), _ => return Ok(Value::Null) };
+    if args.len() < 2 {
+        return Ok(Value::Null);
+    }
+    let sql = match &args[0] {
+        Value::Text(s) => s.clone(),
+        _ => return Ok(Value::Null),
+    };
+    let new_name = match &args[1] {
+        Value::Text(s) => s.clone(),
+        _ => return Ok(Value::Null),
+    };
     let upper = sql.to_uppercase();
     if let Some(pos) = upper.find("TABLE") {
         let after = &sql[pos + 5..];
@@ -2482,20 +2782,41 @@ fn func_sqlite_rename_table(args: &[Value]) -> Result<Value> {
         let (nsia, trimmed) = if trimmed.to_uppercase().starts_with("IF NOT EXISTS") {
             let rest = trimmed[13..].trim_start();
             (after.len() - rest.len(), rest)
-        } else { (skip, trimmed) };
-        let name_end = trimmed.find(|c: char| c == '(' || c == ' ' || c == '\n' || c == '\r' || c == '\t').unwrap_or(trimmed.len());
+        } else {
+            (skip, trimmed)
+        };
+        let name_end = trimmed
+            .find(|c: char| c == '(' || c == ' ' || c == '\n' || c == '\r' || c == '\t')
+            .unwrap_or(trimmed.len());
         let abs_start = pos + 5 + nsia;
         let abs_end = abs_start + name_end;
-        let quoted = if new_name.contains(' ') || new_name.contains('"') || new_name.chars().any(|c| !c.is_alphanumeric() && c != '_') {
+        let quoted = if new_name.contains(' ')
+            || new_name.contains('"')
+            || new_name.chars().any(|c| !c.is_alphanumeric() && c != '_')
+        {
             format!("\"{}\"", new_name.replace('"', "\"\""))
-        } else { new_name };
-        Ok(Value::Text(format!("{}{}{}", &sql[..abs_start], quoted, &sql[abs_end..])))
-    } else { Ok(Value::Text(sql)) }
+        } else {
+            new_name
+        };
+        Ok(Value::Text(format!(
+            "{}{}{}",
+            &sql[..abs_start],
+            quoted,
+            &sql[abs_end..]
+        )))
+    } else {
+        Ok(Value::Text(sql))
+    }
 }
 
 fn func_sqlite_rename_quotefix(args: &[Value]) -> Result<Value> {
-    if args.is_empty() { return Ok(Value::Null); }
-    match &args[0] { Value::Text(s) => Ok(Value::Text(s.clone())), _ => Ok(Value::Null) }
+    if args.is_empty() {
+        return Ok(Value::Null);
+    }
+    match &args[0] {
+        Value::Text(s) => Ok(Value::Text(s.clone())),
+        _ => Ok(Value::Null),
+    }
 }
 
 // ============================================================================
@@ -2503,7 +2824,9 @@ fn func_sqlite_rename_quotefix(args: &[Value]) -> Result<Value> {
 // ============================================================================
 
 fn func_test_auxdata(args: &[Value]) -> Result<Value> {
-    if args.is_empty() { return Ok(Value::Integer(0)); }
+    if args.is_empty() {
+        return Ok(Value::Integer(0));
+    }
     let result: Vec<&str> = args.iter().map(|_| "0").collect();
     Ok(Value::Text(result.join(" ")))
 }
@@ -2513,15 +2836,21 @@ fn func_test_auxdata(args: &[Value]) -> Result<Value> {
 // ============================================================================
 
 fn func_intreal(args: &[Value]) -> Result<Value> {
-    if args.is_empty() { return Ok(Value::Null); }
+    if args.is_empty() {
+        return Ok(Value::Null);
+    }
     match &args[0] {
         Value::Null => Ok(Value::Null),
         Value::Integer(n) => Ok(Value::Real(*n as f64)),
         Value::Real(f) => Ok(Value::Real(*f)),
         Value::Text(s) => {
-            if let Ok(n) = s.parse::<i64>() { Ok(Value::Real(n as f64)) }
-            else if let Ok(f) = s.parse::<f64>() { Ok(Value::Real(f)) }
-            else { Ok(Value::Real(0.0)) }
+            if let Ok(n) = s.parse::<i64>() {
+                Ok(Value::Real(n as f64))
+            } else if let Ok(f) = s.parse::<f64>() {
+                Ok(Value::Real(f))
+            } else {
+                Ok(Value::Real(0.0))
+            }
         }
         Value::Blob(_) => Ok(Value::Real(0.0)),
     }
